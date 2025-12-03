@@ -51,6 +51,7 @@ python3 -m venv 2drlenv
 
 Install dependencies:
 ```
+cd indoor-rl-nav
 pip install -r requirements.txt
 ```
 
