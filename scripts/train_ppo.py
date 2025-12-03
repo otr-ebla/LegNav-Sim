@@ -1,7 +1,9 @@
 import gymnasium as gym
 from stable_baselines3 import PPO, SAC
 from sb3_contrib import TQC
+
 from src.envs.gym_nav_env import GymNavEnv  # Updated import path
+
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 import tensorboard
@@ -11,7 +13,7 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 NUM_RAYS = 108
 NUM_PEOPLE = 40
-N_ENVS = 100
+N_ENVS = 64
 
 class TerminationStatsCallback(BaseCallback):
     def __init__(self, verbose=0, training_name="default"):
@@ -74,7 +76,7 @@ def main():
     use_subproc = True
 
     training_name = "30MTQC"
-    total_timesteps = 30000000
+    total_timesteps = 10_000_000
 
     if use_subproc:
         env = SubprocVecEnv([make_env(i) for i in range(N_ENVS)])
@@ -88,7 +90,7 @@ def main():
         device="cpu",   
         verbose=1,
         tensorboard_log="./logs/" + training_name,  # Updated path
-        buffer_size=int(1e6),   
+        buffer_size=int(1e5),   
         learning_rate=3e-4,
         learning_starts=20_000,
         batch_size=512,

@@ -680,16 +680,23 @@ class Simple2DEnv:
         progress = (dist_before - dist_after) # positive if getting closer
         reward += 5*progress
 
-        # B. Time Penalty: small constant negative to encourage speed
-        reward -= 0.01
+        # B. Negative penalty for difference in heading angle to goal in two consecutive steps
+        # Negative penalty for change in heading-to-goal between consecutive steps
+        if self.goal_x is not None and self.goal_y is not None and len(self.trajectory) >= 2:
+            x_prev, y_prev = self.trajectory[-2]
+            ang_prev = math.atan2(self.goal_y - y_prev, self.goal_x - x_prev)
+            ang_curr = math.atan2(self.goal_y - self.y, self.goal_x - self.x)
+            # normalize to [-pi, pi]
+            d_ang = ang_curr - ang_prev
+            d_ang = (d_ang + math.pi) % (2 * math.pi) - math.pi
+            reward -= 5 * abs(d_ang)
 
-        # C. Smoothness penalty: small negative for high angular velocities
-        reward -= 0.05*abs(w)
+        
 
         # D. Safety/LiDAR penalty
         min_lidar = min(lidar)
-        if min_lidar < 0.5:
-            reward -= 0.5*(0.5-min_lidar)
+        if min_lidar < 1.0:
+            reward -= math.exp(1.0 - min_lidar)
 
 
         done = False
@@ -735,3 +742,9 @@ class Simple2DEnv:
         # clip values to max_lidar_distance
         distances = [min(d, self.max_lidar_distance) for d in distances]
         return distances
+    
+    def close(self):
+        """Clean up resources (matplotlib figure)"""
+        if self.fig is not None:
+            plt.close(self.fig)
+            self.fig = None

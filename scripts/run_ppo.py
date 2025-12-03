@@ -12,7 +12,7 @@ def main():
     env = GymNavEnv(render_mode="human", num_rays=NUM_RAYS, num_people=20)
 
     # Updated path to point to the new checkpoints folder
-    model = TQC.load("./checkpoints/30MSAC", env=env)
+    model = TQC.load("./checkpoints/30MTQC", env=env)
 
     obs, info = env.reset()
     done = False
@@ -21,9 +21,11 @@ def main():
 
     while True:
         action, _ = model.predict(obs, deterministic=True)
-        #action = [0.5, 0.0]  # Constant action for testing
-        print(f"Action taken: v={action[0]:.2f}, w={action[1]:.2f}")
+        # Eseguiamo prima lo step per ottenere la reward
         obs, reward, terminated, truncated, info = env.step(action)
+        
+        # Ora possiamo stampare sia l'azione che la reward ottenuta
+        print(f"Action: v={action[0]:.2f}, w={action[1]:.2f} | Step Reward: {reward:.2f}")
 
         if terminated or truncated:
             print("Episode ended:", info.get("termination_reason"))
