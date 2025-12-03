@@ -4,3 +4,4 @@ matplotlib
 stable-baselines3
 sb3-contrib
 tqdm
+tensorboard
