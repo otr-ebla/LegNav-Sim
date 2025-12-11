@@ -2,7 +2,7 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 
-from .simple_env import Simple2DEnv
+from .nav_env import Simple2DEnv
 #from scripts.train_ppo import NUM_PEOPLE, NUM_RAYS, NUM_PEOPLE, PEOPLE_SPEED, STACK_DIM
 
 MAX_LIN_VEL = 0.46  # m/s
@@ -10,8 +10,8 @@ MAX_ANG_VEL = 2.0  # rad/s
 NUM_PEOPLE = 10
 NUM_RAYS = 108
 STACK_DIM = 3
-PEOPLE_SPEED = 0.0
-MAX_STEPS = 1000
+PEOPLE_SPEED = 0.7
+MAX_STEPS = 400
 
 
 class GymNavEnv(gym.Env):

@@ -9,7 +9,7 @@ from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
 from src.envs.gym_nav_env import GymNavEnv, NUM_PEOPLE
 from .train_ppo import NUM_RAYS, PEOPLE_SPEED   
 
-training_name = "15MSAC_jack_resume"
+training_name = "10M_nocollisions"
 
 def main():
     # Setup environment
@@ -49,6 +49,8 @@ def main():
 
     while True:
         action, _ = model.predict(obs, deterministic=True)
+        print("Taking action:", action)  # Debug
+        print
         obs, reward, done, info = env.step(action)
         
         if done[0]:
