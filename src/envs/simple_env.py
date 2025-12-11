@@ -171,15 +171,20 @@ class Simple2DEnv:
         target_v, target_w = action 
         v, w = self._apply_differential_drive_constraints(target_v, target_w)
 
+        # 1. Calcoli preliminari (PRIMA di muovere qualsiasi cosa)
+        dist_before = math.hypot(self.x - self.goal_x, self.y - self.goal_y)
+        prev_x, prev_y = self.x, self.y
+        
+        # Jerk Calculation
+        current_jerk = abs((w - self.last_w) / self.dt)
+        self.episode_jerk_sum += current_jerk
 
-        # --- 1. PREDIZIONE POSIZIONE FUTURA ---
+        # 2. SAFETY LAYER & PREDICTION
+        # Calcolo posizione futura teorica
         next_x = self.x + v * self.dt * math.cos(self.theta)
         next_y = self.y + v * self.dt * math.sin(self.theta)
-        # (Nota: ignoriamo cambio theta per semplicità del check, o puoi calcolarlo)
-        
-        # --- 2. SAFETY LAYER (Il trucco per il 90% SR) ---
-        # Controlliamo se la PROSSIMA posizione causerebbe collisione
-        # Usiamo una funzione helper temporanea o logica inline
+        # Nota: Theta lo aggiorniamo dopo, qui controlliamo solo se il centro del robot sbatte
+
         will_collide = False
         
         # Check Muri
@@ -187,7 +192,7 @@ class Simple2DEnv:
             next_y - self.robot_radius < 0 or next_y + self.robot_radius > self.room_height):
             will_collide = True
             
-        # Check Ostacoli Statici (Solo questi, le persone le lasciamo "morbide" o gestite dopo)
+        # Check Ostacoli Statici
         if not will_collide:
             rr = self.robot_radius
             for obs in self.obstacles:
@@ -199,79 +204,55 @@ class Simple2DEnv:
                     cy = max(obs["ymin"], min(next_y, obs["ymax"]))
                     if (next_x-cx)**2 + (next_y-cy)**2 < rr**2:
                         will_collide = True; break
-                    
 
-        # REWARD
+        # 3. UPDATE FISICO (UNICO E DEFINITIVO)
         reward = 0.0
-        reward -= 0.1 # Living
-
+        
         if will_collide:
-            # BLOCCA IL ROBOT: Non aggiornare self.x e self.y
+            # BLOCCA IL ROBOT (Safety Layer attivo)
             v = 0.0 
-            # w = 0.0 # Opzionale: lasciamolo ruotare per liberarsi
+            # Non aggiorniamo self.x e self.y
+            # Lasciamo aggiornare theta se vuoi permettergli di girare sul posto mentre è bloccato
+            self.theta += w * self.dt 
             
-            # Penalità severa ma NON terminale
-            reward -= 5.0 
-            collision_penalty = True
+            reward -= 5.0 # Penalità per aver provato a sbattere
         else:
-            # Movimento consentito
+            # MOVIMENTO LIBERO
             self.x = next_x
             self.y = next_y
             self.theta += w * self.dt
 
-        
-
-
-        dist_before = math.hypot(self.x - self.goal_x, self.y - self.goal_y)
-
-        # ### NEW METRICS: Accumula Jerk e Path ###
-        # Jerk angolare: |delta_omega| / dt [rad/s^3]
-        current_jerk = abs((w - self.last_w) / self.dt)
-        self.episode_jerk_sum += current_jerk
-
-        prev_x, prev_y = self.x, self.y
-        # #########################################
-
-        self.x += v * self.dt * math.cos(self.theta)
-        self.y += v * self.dt * math.sin(self.theta)
-        self.theta += w * self.dt
-        
-        # ### NEW METRICS: Aggiorna Path Length ###
-        dist_stepped = math.hypot(self.x - prev_x, self.y - prev_y)
-        self.episode_path_length += dist_stepped
-        # #########################################
-
+        # 4. Aggiornamento Stato e Metriche
         self.trajectory.append((self.x, self.y))
         self._step_people()
         self.step_count += 1
+        
+        dist_stepped = math.hypot(self.x - prev_x, self.y - prev_y)
+        self.episode_path_length += dist_stepped
+        
         dist_after = math.hypot(self.x - self.goal_x, self.y - self.goal_y)
 
-        # Collisioni
-        collision_wall = self._is_collision_with_walls()    
+        # 5. Collisioni (Quelle reali rimaste)
         collision_people = self._is_collision_with_people()
-        collision_obstacles = self._is_collision_with_obstacles()
+        # Non serve controllare muri/ostacoli qui per il "done", perché will_collide li ha prevenuti
+        
         lidar = self._compute_lidar()
         obs = (self.x, self.y, self.theta, v, w, lidar)
 
-        
-
-
-
-
-
-
-        # CONTINUE WITH THE REWARD LOGIC
+        # 6. REWARD ENGINEERING
+        reward -= 0.1 # Living Penalty
 
         if v < 0.05:
-            reward -= 0.2  # "Muoviti!"
+            reward -= 0.2  # Anti-Freezing ("Muoviti!")
 
         progress = (dist_before - dist_after) 
         reward += 25.0 * progress 
+        
         goal_angle = math.atan2(self.goal_y - self.y, self.goal_x - self.x)
         error_angle = (goal_angle - self.theta + math.pi) % (2 * math.pi) - math.pi
         reward += 1.0 * v * np.exp(-abs(error_angle))
 
-        # Smoothness (abbassato come richiesto)
+        # Smoothness
         diff_w = w - self.last_w
         diff_v = v - self.last_v
         reward -= 0.05 * (diff_w ** 2) 
@@ -280,11 +261,13 @@ class Simple2DEnv:
         self.last_w = w
         self.last_v = v
 
+        # Lidar Repulsion Field (Distanza < 0.5m)
         min_lidar = min(lidar)
-        safe_dist = 0.35 
-        if min_lidar < safe_dist:
-            reward -= 10.0 * ((safe_dist - min_lidar) / safe_dist) ** 2
+        if min_lidar < 0.5:
+             # Penalità iperbolica per tenerlo lontano dai muri
+             reward -= 0.1 / (min_lidar + 0.01)
 
+        # 7. TERMINATION CONDITIONS
         done = False
         info = {}
 
@@ -293,30 +276,24 @@ class Simple2DEnv:
             reward += 300.0
             info["termination_reason"] = "goal_reached"
 
-        if collision_people or collision_wall or collision_obstacles:
+        elif collision_people:
+            # Solo le persone uccidono l'episodio ora
             done = True
             reward -= 200.0
-            if collision_people: info["termination_reason"] = "people_collision"
-            elif collision_wall: info["termination_reason"] = "wall_collision"
-            else: info["termination_reason"] = "obstacle_collision"
-
-        if self.step_count >= self.max_steps:
+            info["termination_reason"] = "people_collision"
+            
+        elif self.step_count >= self.max_steps:
             done = True
             reward -= 10.0 
             info["termination_reason"] = "max_steps_reached"
 
         if done:
             self.last_termination_reason = info.get("termination_reason", "unknown")
-            
-            # ### NEW METRICS: Esporta i dati per run_ppo.py ###
             info["path_length"] = self.episode_path_length
             info["total_time"] = self.step_count * self.dt
             info["mean_jerk"] = self.episode_jerk_sum / self.step_count if self.step_count > 0 else 0.0
-            
-            # Calcolo distanza ottima (Euclidea per ora, o Dijkstra se volessimo essere pignoli)
             optimal_dist = math.hypot(self.goal_x - self.start_x, self.goal_y - self.start_y)
             info["optimal_length"] = optimal_dist
-            # ################################################
 
         return obs, reward, done, info
 
