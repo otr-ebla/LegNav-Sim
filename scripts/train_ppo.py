@@ -15,13 +15,14 @@ NUM_RAYS = 108
 NUM_PEOPLE = 25
 N_ENVS = 64
 PEOPLE_SPEED = 0.0
-TRAINING_NAME = "25MSAC_jack"
-LOAD_MODEL = None  # Set to True to load existing model
+TRAINING_NAME = "15MSAC_jack_resume"
+LOAD_MODEL = True  # Set to True to load existing model
 STACK_DIM = 3
 
 
-PREV_MODEL = None
-PREV_ENV_STATS = None
+PREV_MODEL_PATH = "checkpoints/25MSAC_jack.zip"
+# Assicurati che questo percorso sia corretto (usa il percorso assoluto se serve)
+PREV_ENV_STATS_PATH = "25MSAC_jack_vecnormalize.pkl"
 
 
 
@@ -79,90 +80,80 @@ def make_env(rank: int):
 
 def main():
     use_subproc = True
+    total_timesteps = 15_000_000  # O quanti ne vuoi fare in più
 
-    training_name = TRAINING_NAME
-    total_timesteps = 25_000_000
-
+    # 1. Creazione dell'ambiente base (uguale a prima)
+    print("Creating environment...")
     if use_subproc:
         env = SubprocVecEnv([make_env(i) for i in range(N_ENVS)])
     else:
         env = DummyVecEnv([make_env(i) for i in range(N_ENVS)])
 
-    env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.)  # Normalizza osservazioni e reward
+    # 2. Gestione VecNormalize (Caricamento vs Nuova Creazione)
+    if LOAD_MODEL and PREV_ENV_STATS_PATH:
+        print(f"Loading VecNormalize stats from: {PREV_ENV_STATS_PATH}")
+        # Carica le statistiche (media/var) salvate
+        env = VecNormalize.load(PREV_ENV_STATS_PATH, env)
+        # Importante: rimetti in modalità training (aggiorna le statistiche)
+        env.training = True 
+        # Assicurati che la config sia coerente (nel tuo script originale norm_reward=False)
+        env.norm_reward = False
+        env.norm_obs = True
+    else:
+        print("Creating new VecNormalize...")
+        env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.)
 
-    # model = TQC(
-    #    "MlpPolicy",
-    #    env,
-    #    #device=("cuda" if torch.cuda.is_available() else "cpu"),
-    #    device="cpu",   
-    #    verbose=1,
-    #    tensorboard_log="./logs/" + training_name,  # Updated path
-    #    buffer_size=int(1e5),   
-    #    learning_rate=3e-4,
-    #    learning_starts=20_000,
-    #    batch_size=512,
-    #    gamma=0.99,
-    #    tau=0.005,
-    #    train_freq=1,
-    #    gradient_steps=3,
-    #    target_entropy=-2,
-    #    target_update_interval=1,
-    # )
-
-    policy_kwargs = dict(
-        net_arch=dict(pi=[128, 128], vf=[128, 128]),
-        log_std_init=-2,
+    # 3. Gestione Modello (Caricamento vs Nuova Creazione)
+    if LOAD_MODEL and PREV_MODEL_PATH:
+        print(f"Loading model from: {PREV_MODEL_PATH}")
+        model = SAC.load(
+            PREV_MODEL_PATH,
+            env=env,
+            device=("cuda" if torch.cuda.is_available() else "cpu"),
+            # Sovrascriviamo il path dei log per puntare al nuovo TRAINING_NAME
+            tensorboard_log="./logs/" + TRAINING_NAME, 
+            # Opzionale: Se vuoi cambiare learning rate o altro durante il fine-tuning
+            # custom_objects={"learning_rate": 1e-4} 
+        )
+    else:
+        print("Initializing new SAC model...")
+        model = SAC(
+            "MlpPolicy",
+            env,
+            verbose=1,
+            tensorboard_log="./logs/" + TRAINING_NAME,
+            buffer_size=int(1e6),
+            learning_rate=3e-4,
+            batch_size=256,
+            gamma=0.99,
+            tau=0.005,
+            train_freq=1,
+            gradient_steps=1,
+            ent_coef="auto",
+            device=("cuda" if torch.cuda.is_available() else "cpu"),
         )
 
-    # model = PPO(
-    #     "MlpPolicy",
-    #     env,
-    #     device="cpu",
-    #     verbose=1,
-    #     tensorboard_log="./logs/ppo_nav",  # Updated path
-    #     learning_rate=1e-4,
-    #     n_steps=2048,
-    #     batch_size=64,
-    #     n_epochs=10,
-    #     gamma=0.99,
-    #     gae_lambda=0.95,
-    #     clip_range=0.2,
-    #     ent_coef=0.01,
-    #     target_kl=0.03,
-    #     policy_kwargs=policy_kwargs,
-    # )
+    print(f"Starting training: {TRAINING_NAME} with {N_ENVS} envs.")
 
-    model = SAC(
-        "MlpPolicy",
-        env,
-        verbose=1,
-        tensorboard_log="./logs/" + training_name,  # Updated path
-        buffer_size=int(1e6),
-        learning_rate=3e-4,
-        batch_size=256,
-        gamma=0.99,
-        tau=0.005,
-        train_freq=1,
-        gradient_steps=1,
-        ent_coef="auto",
-        device=("cuda" if torch.cuda.is_available() else "cpu"),
-    )
+    callback = TerminationStatsCallback(training_name=TRAINING_NAME)
 
-    print(f"Training SAC with {N_ENVS} parallel envs, total_timesteps={total_timesteps}.")
-
-    callback = TerminationStatsCallback(training_name=training_name)
-
+    # 4. Avvio Training
+    # reset_num_timesteps=False fa sì che i log continuino da dove erano rimasti (es. step 25M -> 25M+1)
+    # Se vuoi ripartire da 0 nei grafici, metti True.
     model.learn(
         total_timesteps=total_timesteps,
-        tb_log_name="./logs/sac_nav" + training_name,
+        tb_log_name="./logs/sac_nav_" + TRAINING_NAME,
         callback=callback,
+        reset_num_timesteps=False 
     )
 
-    # Updated save path to checkpoints folder
-    model.save("./checkpoints/" + training_name)
-    env.save(training_name + "_vecnormalize.pkl")
+    # 5. Salvataggio finale
+    save_path = "./checkpoints/" + TRAINING_NAME
+    print(f"Saving model to {save_path}")
+    model.save(save_path)
+    env.save(TRAINING_NAME + "_vecnormalize.pkl")
 
-    print("Training completed and model saved.")
+    print("Training completed.")
 
 if __name__ == "__main__":
     main()

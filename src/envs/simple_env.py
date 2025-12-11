@@ -203,7 +203,10 @@ class Simple2DEnv:
 
         # REWARD
         reward = 0.0
-        reward -= 0.05 # Living
+        reward -= 0.1 # Living
+        if v < 0.05:
+            reward -= 0.2  # "Muoviti!"
+            
         progress = (dist_before - dist_after) 
         reward += 25.0 * progress 
         goal_angle = math.atan2(self.goal_y - self.y, self.goal_x - self.x)

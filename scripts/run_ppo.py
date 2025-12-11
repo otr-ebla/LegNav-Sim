@@ -9,7 +9,7 @@ from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
 from src.envs.gym_nav_env import GymNavEnv, NUM_PEOPLE
 from .train_ppo import NUM_RAYS, PEOPLE_SPEED   
 
-training_name = "12MSAC_jack"
+training_name = "15MSAC_jack_resume"
 
 def main():
     # Setup environment

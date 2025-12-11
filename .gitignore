@@ -21,7 +21,6 @@ wandb/
 runs/
 
 # Models (optional, if you don't want to push them)
-*.zip
 
 # Il nome specifico del tuo virtual environment
 2drlenv/
