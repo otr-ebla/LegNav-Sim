@@ -170,6 +170,58 @@ class Simple2DEnv:
     def step(self, action):
         target_v, target_w = action 
         v, w = self._apply_differential_drive_constraints(target_v, target_w)
+
+
+        # --- 1. PREDIZIONE POSIZIONE FUTURA ---
+        next_x = self.x + v * self.dt * math.cos(self.theta)
+        next_y = self.y + v * self.dt * math.sin(self.theta)
+        # (Nota: ignoriamo cambio theta per semplicità del check, o puoi calcolarlo)
+        
+        # --- 2. SAFETY LAYER (Il trucco per il 90% SR) ---
+        # Controlliamo se la PROSSIMA posizione causerebbe collisione
+        # Usiamo una funzione helper temporanea o logica inline
+        will_collide = False
+        
+        # Check Muri
+        if (next_x - self.robot_radius < 0 or next_x + self.robot_radius > self.room_width or 
+            next_y - self.robot_radius < 0 or next_y + self.robot_radius > self.room_height):
+            will_collide = True
+            
+        # Check Ostacoli Statici (Solo questi, le persone le lasciamo "morbide" o gestite dopo)
+        if not will_collide:
+            rr = self.robot_radius
+            for obs in self.obstacles:
+                if obs["type"] == "circle":
+                    if (next_x-obs["cx"])**2 + (next_y-obs["cy"])**2 < (rr+obs["radius"])**2:
+                        will_collide = True; break
+                elif obs["type"] == "rect":
+                    cx = max(obs["xmin"], min(next_x, obs["xmax"]))
+                    cy = max(obs["ymin"], min(next_y, obs["ymax"]))
+                    if (next_x-cx)**2 + (next_y-cy)**2 < rr**2:
+                        will_collide = True; break
+                    
+
+        # REWARD
+        reward = 0.0
+        reward -= 0.1 # Living
+
+        if will_collide:
+            # BLOCCA IL ROBOT: Non aggiornare self.x e self.y
+            v = 0.0 
+            # w = 0.0 # Opzionale: lasciamolo ruotare per liberarsi
+            
+            # Penalità severa ma NON terminale
+            reward -= 5.0 
+            collision_penalty = True
+        else:
+            # Movimento consentito
+            self.x = next_x
+            self.y = next_y
+            self.theta += w * self.dt
+
+        
+
+
         dist_before = math.hypot(self.x - self.goal_x, self.y - self.goal_y)
 
         # ### NEW METRICS: Accumula Jerk e Path ###
@@ -201,12 +253,18 @@ class Simple2DEnv:
         lidar = self._compute_lidar()
         obs = (self.x, self.y, self.theta, v, w, lidar)
 
-        # REWARD
-        reward = 0.0
-        reward -= 0.1 # Living
+        
+
+
+
+
+
+
+        # CONTINUE WITH THE REWARD LOGIC
+
         if v < 0.05:
             reward -= 0.2  # "Muoviti!"
-            
+
         progress = (dist_before - dist_after) 
         reward += 25.0 * progress 
         goal_angle = math.atan2(self.goal_y - self.y, self.goal_x - self.x)
