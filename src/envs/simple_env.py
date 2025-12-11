@@ -423,6 +423,85 @@ class Simple2DEnv:
         return [self._cast_ray(self.theta + i * 2*math.pi/self.num_rays) for i in range(self.num_rays)]
 
     def render(self):
-        pass 
+        """
+        Visualizza l'ambiente usando Matplotlib.
+        Include: Muri, Goal, Ostacoli, Persone, Robot e Raggi Lidar.
+        """
+        # Inizializzazione della figura se non esiste
+        if self.fig is None:
+            plt.ion() # Modalità interattiva
+            self.fig, self.ax = plt.subplots(figsize=(8, 8))
+            
+        self.ax.clear()
+        
+        # 1. Disegna i Muri (Bordi stanza)
+        # Un rettangolo vuoto che rappresenta i confini
+        self.ax.add_patch(plt.Rectangle((0, 0), self.room_width, self.room_height, fill=False, linewidth=3, color='black'))
+        
+        # 2. Disegna il Goal
+        if self.goal_x is not None:
+            goal_circle = plt.Circle((self.goal_x, self.goal_y), self.goal_radius, color='green', alpha=0.5)
+            self.ax.add_patch(goal_circle)
+            self.ax.text(self.goal_x, self.goal_y, "GOAL", color='darkgreen', weight='bold', ha='center', va='center')
+
+        # 3. Disegna gli Ostacoli Statici
+        for obs in self.obstacles:
+            if obs["type"] == "circle":
+                # Ostacolo circolare
+                self.ax.add_patch(plt.Circle((obs["cx"], obs["cy"]), obs["radius"], color='gray'))
+            elif obs["type"] == "rect":
+                # Ostacolo rettangolare
+                w = obs["xmax"] - obs["xmin"]
+                h = obs["ymax"] - obs["ymin"]
+                self.ax.add_patch(plt.Rectangle((obs["xmin"], obs["ymin"]), w, h, color='gray'))
+
+        # 4. Disegna i Raggi LIDAR (Fondamentale!)
+        # Ricalcoliamo i raggi per il rendering corrente
+        lidar_readings = self._compute_lidar()
+        angle_increment = 2 * math.pi / self.num_rays
+        
+        for i, dist in enumerate(lidar_readings):
+            # Calcolo angolo assoluto del raggio: theta robot + offset raggio
+            # Nota: l'indice 0 del lidar parte solitamente da theta corrente nel loop di _compute_lidar
+            ray_angle = self.theta + i * angle_increment
+            
+            # Coordinate fine raggio
+            rx = self.x + dist * math.cos(ray_angle)
+            ry = self.y + dist * math.sin(ray_angle)
+            
+            # Disegna linea sottile rossa/arancione
+            self.ax.plot([self.x, rx], [self.y, ry], color='orange', alpha=0.2, linewidth=0.5)
+            
+            # Disegna il punto di impatto
+            if dist < self.max_lidar_distance:
+                self.ax.plot(rx, ry, 'ro', markersize=2, alpha=0.3)
+
+        # 5. Disegna le Persone (Dinamiche)
+        for p in self.people:
+            # Cerchio blu
+            self.ax.add_patch(plt.Circle((p["x"], p["y"]), self.people_radius, color='blue', alpha=0.6))
+            # Freccia velocità
+            if self.people_speed > 0:
+                self.ax.arrow(p["x"], p["y"], p["vx"]*0.5, p["vy"]*0.5, head_width=0.1, color='white')
+
+        # 6. Disegna il Robot (Sopra a tutto)
+        robot_circle = plt.Circle((self.x, self.y), self.robot_radius, color='red', zorder=10)
+        self.ax.add_patch(robot_circle)
+        
+        # Linea nera per indicare la direzione (Heading)
+        end_x = self.x + 0.3 * math.cos(self.theta)
+        end_y = self.y + 0.3 * math.sin(self.theta)
+        self.ax.plot([self.x, end_x], [self.y, end_y], color='black', linewidth=2, zorder=11)
+
+        # Impostazioni finali grafico
+        self.ax.set_xlim(-0.5, self.room_width + 0.5)
+        self.ax.set_ylim(-0.5, self.room_height + 0.5)
+        self.ax.set_aspect('equal')
+        self.ax.set_title(f"Episode Step: {self.step_count} | People: {len(self.people)}")
+        
+        # Rendering effettivo
+        plt.draw()
+        #plt.pause(0.01) # Pausa necessaria per aggiornare la GUI
+
     def close(self):
         if self.fig: plt.close(self.fig)
