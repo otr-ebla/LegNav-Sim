@@ -16,6 +16,7 @@ class Simple2DEnv:
             num_people: int = 10,
             people_radius: float = 0.2,
             people_speed: float = 0.0,
+            num_obstacles: int = 0,
             ):
 
         self.max_steps = max_steps
@@ -59,7 +60,7 @@ class Simple2DEnv:
         self.people_speed = people_speed
         self.people = []
         self.obstacles = []
-        self.num_obstacles = 20
+        self.num_obstacles = num_obstacles
 
         # Goal
         self.goal_x = None
@@ -409,22 +410,27 @@ class Simple2DEnv:
         blind_spot_limit = self.lidar_min_distance # 0.12 m
         
         # Penalizziamo se entriamo nella zona di pericolo (< 0.5m)
-        if min_lidar < 0.5:
-            # Calcoliamo quanto siamo vicini al "baratro" del blind spot.
-            # Se min_lidar = 0.12 -> denominatore = 0.01 -> penalità alta (-5.0)
-            # Se min_lidar = 0.50 -> denominatore = 0.39 -> penalità bassa (-0.12)
-            margin = min_lidar - blind_spot_limit
-            reward -= 0.05 / (margin + 0.01)
+        # if min_lidar < 0.5:
+        #     # Calcoliamo quanto siamo vicini al "baratro" del blind spot.
+        #     # Se min_lidar = 0.12 -> denominatore = 0.01 -> penalità alta (-5.0)
+        #     # Se min_lidar = 0.50 -> denominatore = 0.39 -> penalità bassa (-0.12)
+        #     # margin = min_lidar - blind_spot_limit
+        #     # reward -= 0.05 / (margin + 0.01)
+
+        #     # Formula esponenziale: penalità esplode vicino al muro
+        #     # A 0.6m -> penalità ~0
+        #     # A 0.12m -> penalità molto alta
+        #     reward -= 0.1 * math.exp(4.0 * (0.6 - min_lidar))
         
         # C. Reward di allineamento (incentiva a guardare il goal mentre si muove)
-        goal_angle = math.atan2(self.goal_y - self.y, self.goal_x - self.x)
-        heading_error = abs((goal_angle - self.theta + math.pi) % (2 * math.pi) - math.pi)
-        if v > 0.05: # Solo se si muove
-            # Più l'errore è basso (allineato), più alto è il premio (max 1.0 * v)
-            reward += 1.0 * v * np.exp(-heading_error)
+        # goal_angle = math.atan2(self.goal_y - self.y, self.goal_x - self.x)
+        # heading_error = abs((goal_angle - self.theta + math.pi) % (2 * math.pi) - math.pi)
+        # if v > 0.05: # Solo se si muove
+        #     # Più l'errore è basso (allineato), più alto è il premio (max 1.0 * v)
+        #     reward += 1.0 * v * np.exp(-heading_error)
 
         # D. Penalità per azioni brusche (Smoothness)
-        reward -= 0.05 * abs(w - self.last_w)
+        # reward -= 0.05 * abs(w - self.last_w)
         
         # Aggiorna variabili stato precedente
         self.last_w = w
@@ -473,24 +479,22 @@ class Simple2DEnv:
         # Normalizza tra -pi e pi
         heading_error = (heading_error + math.pi) % (2 * math.pi) - math.pi
         
-        # NORMALIZZAZIONE DATI (Cruciale per Reti Neurali)
-        # 1. Distanza Goal: Normalizzata sulla diagonale della stanza (~17m)
-        max_dist = math.hypot(self.room_width, self.room_height)
-        norm_dist = dist_to_goal / max_dist
-        
         # 2. Angolo Goal: Già tra -pi e pi, dividiamo per pi per avere [-1, 1]
         norm_heading = heading_error / math.pi
         
-        # 3. Lidar: Normalizzato tra 0 e 1
-        norm_lidar = [l / self.max_lidar_distance for l in lidar]
-        
-        # 4. Velocità: Normalizzate (v su max_v, w su max_w)
-        norm_v = v / self.max_v
-        norm_w = w / self.max_w
-        
+        # 3. Lidar: inversi i lidar che siano valori tra 0 e 1, 1 quando l'ostacolo è molto vicino cioè a min_lidar_distance
+        inverse_lidar = []
+        for d in lidar:
+            if d >= self.max_lidar_distance:
+                inverse_lidar.append(0.0)
+            else:
+                inv = (self.lidar_min_distance/d)**(1/3)
+                inverse_lidar.append(min(inv, 1.0))
+                
         # Costruzione vettore finale numpy (float32 è lo standard per Pytorch/TF)
         # Struttura: [dist_goal, angle_goal, vel_lin, vel_ang, ...lidar_beams...]
-        obs_list = [norm_dist, norm_heading, norm_v, norm_w] + norm_lidar
+        obs_list = [dist_to_goal, norm_heading, v, w] + inverse_lidar
+        print(obs_list)
         return np.array(obs_list, dtype=np.float32)
 
     # --- RENDERING (MODIFICATO CON OFFSET) ---

@@ -34,6 +34,7 @@ class GymNavEnv(gym.Env):
         num_people: int = NUM_PEOPLE,
         max_steps: int = MAX_STEPS,
         stack_dim: int = STACK_DIM, # Aggiunto parametro esplicito
+        num_obstacles: int = 0,
     ):  
         super().__init__()
     
@@ -43,6 +44,7 @@ class GymNavEnv(gym.Env):
             num_people=num_people,
             room_width=12.0,
             room_height=12.0,
+            num_obstacles=num_obstacles,
             # I limiti di velocità sono interni a Simple2DEnv, ma usiamo le costanti qui per l'action space
         )
         self.render_mode = render_mode

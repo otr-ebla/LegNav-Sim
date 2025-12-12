@@ -13,10 +13,13 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 NUM_RAYS = 108
 NUM_PEOPLE = 0
-NUM_OBSTACLES = 10
+NUM_OBSTACLES = 0
 N_ENVS = 100
 PEOPLE_SPEED = 0.0
-TRAINING_NAME = "DT01_25M"
+
+TRAINING_NAME = "2_Mno_obstacles"
+TRAINING_STEPS = 2_000_000
+
 LOAD_MODEL = False  # Set to True to load existing model
 STACK_DIM = 3
 
@@ -73,6 +76,7 @@ def make_env(rank: int):
             render_mode=None,
             num_rays=NUM_RAYS,
             num_people=NUM_PEOPLE,
+            num_obstacles=NUM_OBSTACLES,
         )
         env = Monitor(env)
         return env
@@ -80,7 +84,7 @@ def make_env(rank: int):
 
 def main():
     use_subproc = True
-    total_timesteps = 25_000_000  # O quanti ne vuoi fare in più
+    total_timesteps = TRAINING_STEPS  # O quanti ne vuoi fare in più
 
     # 1. Creazione dell'ambiente base (uguale a prima)
     print("Creating environment...")

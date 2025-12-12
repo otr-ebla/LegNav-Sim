@@ -9,7 +9,7 @@ from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
 from src.envs.gym_nav_env import GymNavEnv, NUM_PEOPLE
 from .train_ppo import NUM_RAYS, PEOPLE_SPEED   
 
-training_name = "DT01"
+training_name = "1_5_Mno_obstacles"
 
 def main():
     # Setup environment
@@ -49,7 +49,7 @@ def main():
 
     while True:
         action, _ = model.predict(obs, deterministic=True)
-        print("Taking action:", action)  # Debug
+        #print("Taking action:", action)  # Debug
         print
         obs, reward, done, info = env.step(action)
         
@@ -73,7 +73,7 @@ def main():
                 total_time_to_goal += ep_time
             elif reason == "max_steps_reached":
                 timeout_count += 1
-            elif reason in ["people_collision", "obstacle_collision", "wall_collision"]:
+            elif reason in ["people_collision", "collision_static"]:
                 collision_count += 1
                 if reason == "people_collision":
                     coll_people += 1
