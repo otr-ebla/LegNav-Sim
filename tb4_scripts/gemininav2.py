@@ -85,8 +85,15 @@ class RLNavNode(Node):
         obs_dim = 4 + (NUM_RAYS_MODEL * STACK_SIZE) 
         
         # Definizione spazi per VecNormalize
-        observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
-        action_space = spaces.Box(low=np.array([0.0, -MAX_ANG_VEL]), high=np.array([MAX_LIN_VEL, MAX_ANG_VEL]), dtype=np.float32)
+        observation_space = spaces.Box(
+            low=-np.inf, 
+            high=np.inf, shape=(obs_dim,), 
+            dtype=np.float32)
+        
+        action_space = spaces.Box(
+            low=np.array([0.0, -MAX_ANG_VEL]), 
+            high=np.array([MAX_LIN_VEL, MAX_ANG_VEL]), 
+            dtype=np.float32)
 
         # Caricamento VecNormalize
         dummy_env = DummyVecEnv(observation_space, action_space)
@@ -154,15 +161,16 @@ class RLNavNode(Node):
         # Se > 15.0 -> 15.0. Se < 0.12 -> 0.12
         downsampled = np.clip(downsampled, LIDAR_MIN_DIST, MAX_LIDAR_DIST)
 
-        # 5. Normalizzazione [0, 1] usando MAX_LIDAR_DIST (15.0)
-        normalized_scan = downsampled / MAX_LIDAR_DIST
+        # 5. Inversione del valore degli scans (come in nav_env)
+        for d in range(len(downsampled)):
+            downsampled[d] = (LIDAR_MIN_DIST/downsampled[d])**(1/3)
         
         # Stacking
         if len(self.scan_stack) == 0:
-            for _ in range(STACK_SIZE): self.scan_stack.append(normalized_scan)
+            for _ in range(STACK_SIZE): self.scan_stack.append(downsampled)
         else:
-            self.scan_stack.append(normalized_scan)
-            
+            self.scan_stack.append(downsampled)
+
         self.scan_ready = True
 
     def get_obs(self):
@@ -180,17 +188,12 @@ class RLNavNode(Node):
         # Normalizzazione angolo tra -pi e pi
         heading_error = (heading_error + math.pi) % (2 * math.pi) - math.pi
 
-        # 2. Normalizzazione Scalari (Come in nav_env._get_observation)
-        
-        # Distanza: Normalizzata su diagonale stanza (~17m)
-        norm_dist = dist_to_goal / ROOM_DIAGONAL 
+    
         
         # Angolo: Normalizzato su PI -> range [-1, 1]
         norm_heading = heading_error / math.pi
         
-        # Velocità: Normalizzate sui massimi
-        norm_v = self.last_v / MAX_LIN_VEL
-        norm_w = self.last_w / MAX_ANG_VEL
+       
 
         # 3. Preparazione Lidar appiattito
         lidar_stack_flat = np.concatenate(list(self.scan_stack), axis=0).astype(np.float32)
@@ -198,7 +201,7 @@ class RLNavNode(Node):
         # 4. Concatenazione finale
         # Struttura: [dist, angle, v, w, ...lidar...]
         obs = np.concatenate([
-            [norm_dist, norm_heading, norm_v, norm_w],
+            [dist_to_goal, norm_heading, self.last_v, self.last_w],
             lidar_stack_flat
         ]).astype(np.float32)
         

@@ -13,7 +13,7 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 NUM_RAYS = 108
 NUM_PEOPLE = 0
-NUM_OBSTACLES = 10
+NUM_OBSTACLES = 10 # NOOOOOOO, questo non si cambia da qui ma si cambia in gym_nav_env.py!!!!!!
 N_ENVS = 100
 PEOPLE_SPEED = 0.0
 STACK_DIM = 3

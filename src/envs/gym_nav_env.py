@@ -12,6 +12,12 @@ NUM_RAYS = 108
 STACK_DIM = 3
 MAX_STEPS = 1000
 
+
+
+NUM_OBSTACLES = 15  # SI CAMBIA DA QUIII!!!!!!!!!!!!
+
+
+
 class GymNavEnv(gym.Env):
     """
     Gymnasium-compatible wrapper around Simple2DEnv.
@@ -34,7 +40,7 @@ class GymNavEnv(gym.Env):
         num_people: int = NUM_PEOPLE,
         max_steps: int = MAX_STEPS,
         stack_dim: int = STACK_DIM, # Aggiunto parametro esplicito
-        num_obstacles: int = 0,
+        num_obstacles: int = NUM_OBSTACLES,
     ):  
         super().__init__()
     

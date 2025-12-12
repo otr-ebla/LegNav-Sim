@@ -9,11 +9,16 @@ from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
 from src.envs.gym_nav_env import GymNavEnv, NUM_PEOPLE
 from .train_ppo import NUM_RAYS, PEOPLE_SPEED   
 
-training_name = "2_Mno_obstacles"
+training_name = "2_Mno_obstacles_part2"
+render = False
 
 def main():
     # Setup environment
-    env_fn = lambda: GymNavEnv(render_mode="human", num_rays=NUM_RAYS,
+    if render:
+        env_fn = lambda: GymNavEnv(render_mode="human", num_rays=NUM_RAYS,
+                            num_people=NUM_PEOPLE)
+    else:
+        env_fn = lambda: GymNavEnv(render_mode=None, num_rays=NUM_RAYS,
                             num_people=NUM_PEOPLE)
     env = DummyVecEnv([env_fn])
 
