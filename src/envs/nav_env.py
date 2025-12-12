@@ -6,8 +6,8 @@ import numpy as np
 class Simple2DEnv:
     def __init__(
             self, 
-            max_steps: int = 400, 
-            dt: float = 0.25,
+            max_steps: int = 1000, 
+            dt: float = 0.1,
             room_width: float = 12.0,
             room_height: float = 12.0,
             robot_radius: float = 0.2, 
@@ -319,87 +319,179 @@ class Simple2DEnv:
 
         self.last_v = 0.0; self.last_w = 0.0
         self._reset_people()
-        lidar = self._compute_lidar()
-        return (self.x, self.y, self.theta, self.last_v, self.last_w, lidar)
+        
+        # [FONDAMENTALE] Restituisce l'osservazione normalizzata (array) invece della tupla
+        return self._get_observation(self.last_v, self.last_w)
 
     def step(self, action):
         target_v, target_w = action 
-        # Applica i limiti reali (0.3 m/s)
+        
+        # 1. Applicazione limiti fisici (Clipping)
         v, w = self._apply_differential_drive_constraints(target_v, target_w)
 
-        dist_before = math.hypot(self.x - self.goal_x, self.y - self.goal_y)
-        prev_x, prev_y = self.x, self.y
-        self.episode_jerk_sum += abs((w - self.last_w) / self.dt)
+        # Calcolo distanza precedente per il reward di progresso
+        dist_to_goal_prev = math.hypot(self.x - self.goal_x, self.y - self.goal_y)
+        
+        # 2. Aggiornamento Fisica
+        # Aggiorniamo prima theta per calcolare la nuova direzione
+        self.theta += w * self.dt
+        # Normalizzazione angolo tra -pi e pi (importante per la stabilità numerica)
+        self.theta = (self.theta + math.pi) % (2 * math.pi) - math.pi
 
-        # 2. SAFETY LAYER
+        # Calcolo posizione candidata
         next_x = self.x + v * self.dt * math.cos(self.theta)
         next_y = self.y + v * self.dt * math.sin(self.theta)
+
+        # 3. Controllo Collisioni (Safety Layer)
+        collision_static = False
         
-        will_collide = False
+        # A. Check Muri
         if (next_x - self.robot_radius < 0 or next_x + self.robot_radius > self.room_width or 
-            next_y - self.robot_radius < 0 or next_y + self.robot_radius > self.room_height): will_collide = True
+            next_y - self.robot_radius < 0 or next_y + self.robot_radius > self.room_height): 
+            collision_static = True
         
-        if not will_collide:
+        # B. Check Ostacoli (Muri interni/Oggetti)
+        if not collision_static:
             rr = self.robot_radius
             for obs in self.obstacles:
                 if obs["type"] == "circle":
-                    if (next_x-obs["cx"])**2+(next_y-obs["cy"])**2 < (rr+obs["radius"])**2: will_collide=True; break
+                    if (next_x - obs["cx"])**2 + (next_y - obs["cy"])**2 < (rr + obs["radius"])**2: 
+                        collision_static = True; break
                 elif obs["type"] == "rect":
-                    cx = max(obs["xmin"], min(next_x, obs["xmax"])); cy = max(obs["ymin"], min(next_y, obs["ymax"]))
-                    if (next_x-cx)**2+(next_y-cy)**2 < rr**2: will_collide=True; break
+                    cx = max(obs["xmin"], min(next_x, obs["xmax"]))
+                    cy = max(obs["ymin"], min(next_y, obs["ymax"]))
+                    if (next_x - cx)**2 + (next_y - cy)**2 < rr**2: 
+                        collision_static = True; break
 
+        # Inizializzazione variabili di ritorno
         reward = 0.0
-        if will_collide:
-            v = 0.0
-            reward -= 5.0
-        else:
-            self.x = next_x
-            self.y = next_y
-            self.theta += w * self.dt
-
-        self.trajectory.append((self.x, self.y))
-        self._step_people() 
-        self.step_count += 1
-        self.episode_path_length += math.hypot(self.x - prev_x, self.y - prev_y)
-        
-        dist_after = math.hypot(self.x - self.goal_x, self.y - self.goal_y)
-        lidar = self._compute_lidar()
-        obs = (self.x, self.y, self.theta, v, w, lidar)
-
-        # REWARD
-        reward -= 0.1
-        if v < 0.05: reward -= 0.2
-        reward += 25.0 * (dist_before - dist_after)
-        goal_angle = math.atan2(self.goal_y - self.y, self.goal_x - self.x)
-        error_angle = (goal_angle - self.theta + math.pi) % (2 * math.pi) - math.pi
-        reward += 1.0 * v * np.exp(-abs(error_angle))
-        reward -= 0.05 * ((w - self.last_w) ** 2) 
-        reward -= 0.01 * ((v - self.last_v) ** 2)
-        
-        self.last_w = w; self.last_v = v
-
-        if min(lidar) < 0.5: reward -= 0.1 / (min(lidar) + 0.01)
-
         done = False
         info = {}
-        
-        collision_people = self._is_collision_with_people()
-        
-        if self._is_goal_reached():
-            done = True; reward += 300.0; info["termination_reason"] = "goal_reached"
-        elif collision_people:
-            done = True; reward -= 200.0; info["termination_reason"] = "people_collision"
-        elif self.step_count >= self.max_steps:
-            done = True; reward -= 10.0; info["termination_reason"] = "max_steps_reached"
 
+        # GESTIONE COLLISIONE STATICA (Muri/Oggetti)
+        # [MODIFICA CRITICA] Ora la collisione è TERMINALE.
+        # Questo impedisce al robot di "strisciare" sui muri.
+        if collision_static:
+            reward = -100.0
+            done = True
+            info["termination_reason"] = "collision_static"
+            
+            # Calcolo l'osservazione finale prima di uscire (senza muovere il robot)
+            # Nota: restituiamo lo stato corrente, non quello impossibile dentro il muro
+            obs = self._get_observation(v, w)
+            return obs, reward, done, info
+
+        # Se non c'è collisione, applica il movimento
+        self.x = next_x
+        self.y = next_y
+        self.trajectory.append((self.x, self.y))
+        
+        # Aggiornamento dinamica ambiente (persone)
+        self._step_people() 
+        self.step_count += 1
+        
+        # Calcolo metriche post-movimento
+        dist_to_goal_now = math.hypot(self.x - self.goal_x, self.y - self.goal_y)
+        self.episode_path_length += math.hypot(v * self.dt * math.cos(self.theta), v * self.dt * math.sin(self.theta))
+        self.episode_jerk_sum += abs((w - self.last_w) / self.dt)
+
+        # 4. Calcolo Reward
+        # A. Penalità temporale (incentiva a fare presto)
+        reward -= 0.05
+        
+        # B. Reward di progresso (molto forte per guidare l'apprendimento)
+        # Premia l'avvicinamento netto al goal
+        reward += 20.0 * (dist_to_goal_prev - dist_to_goal_now)
+
+        #B2 reward di sicurezza lidar 
+        lidar = self._compute_lidar()
+        min_lidar = min(lidar)
+        blind_spot_limit = self.lidar_min_distance # 0.12 m
+        
+        # Penalizziamo se entriamo nella zona di pericolo (< 0.5m)
+        if min_lidar < 0.5:
+            # Calcoliamo quanto siamo vicini al "baratro" del blind spot.
+            # Se min_lidar = 0.12 -> denominatore = 0.01 -> penalità alta (-5.0)
+            # Se min_lidar = 0.50 -> denominatore = 0.39 -> penalità bassa (-0.12)
+            margin = min_lidar - blind_spot_limit
+            reward -= 0.05 / (margin + 0.01)
+        
+        # C. Reward di allineamento (incentiva a guardare il goal mentre si muove)
+        goal_angle = math.atan2(self.goal_y - self.y, self.goal_x - self.x)
+        heading_error = abs((goal_angle - self.theta + math.pi) % (2 * math.pi) - math.pi)
+        if v > 0.05: # Solo se si muove
+            # Più l'errore è basso (allineato), più alto è il premio (max 1.0 * v)
+            reward += 1.0 * v * np.exp(-heading_error)
+
+        # D. Penalità per azioni brusche (Smoothness)
+        reward -= 0.05 * abs(w - self.last_w)
+        
+        # Aggiorna variabili stato precedente
+        self.last_w = w
+        self.last_v = v
+
+        # 5. Check Terminazione
+        collision_people = self._is_collision_with_people()
+        is_goal = self._is_goal_reached()
+        
+        if is_goal:
+            done = True
+            reward += 200.0 # Grande bonus finale
+            info["termination_reason"] = "goal_reached"
+        elif collision_people:
+            done = True
+            reward -= 200.0 # Grande penalità collisione dinamica
+            info["termination_reason"] = "people_collision"
+        elif self.step_count >= self.max_steps:
+            done = True
+            reward -= 10.0  # Penalità timeout
+            info["termination_reason"] = "max_steps_reached"
+
+        # Info finali per debugging/logging
         if done:
             self.last_termination_reason = info.get("termination_reason", "unknown")
             info["path_length"] = self.episode_path_length
             info["total_time"] = self.step_count * self.dt
             info["mean_jerk"] = self.episode_jerk_sum / self.step_count if self.step_count > 0 else 0.0
-            info["optimal_length"] = math.hypot(self.goal_x - self.start_x, self.goal_y - self.start_y)
 
+        # 6. Costruzione Osservazione
+        obs = self._get_observation(v, w)
+        
         return obs, reward, done, info
+
+    # --- [NUOVO METODO HELPER] Costruzione Osservazione Normalizzata ---
+    def _get_observation(self, v, w):
+        # Calcolo Lidar
+        lidar = self._compute_lidar()
+        
+        # Calcolo vettore Goal RELATIVO al robot
+        dist_to_goal = math.hypot(self.goal_x - self.x, self.goal_y - self.y)
+        angle_to_goal = math.atan2(self.goal_y - self.y, self.goal_x - self.x)
+        
+        # Errore di prua: differenza tra dove devo andare e dove sto guardando
+        heading_error = angle_to_goal - self.theta
+        # Normalizza tra -pi e pi
+        heading_error = (heading_error + math.pi) % (2 * math.pi) - math.pi
+        
+        # NORMALIZZAZIONE DATI (Cruciale per Reti Neurali)
+        # 1. Distanza Goal: Normalizzata sulla diagonale della stanza (~17m)
+        max_dist = math.hypot(self.room_width, self.room_height)
+        norm_dist = dist_to_goal / max_dist
+        
+        # 2. Angolo Goal: Già tra -pi e pi, dividiamo per pi per avere [-1, 1]
+        norm_heading = heading_error / math.pi
+        
+        # 3. Lidar: Normalizzato tra 0 e 1
+        norm_lidar = [l / self.max_lidar_distance for l in lidar]
+        
+        # 4. Velocità: Normalizzate (v su max_v, w su max_w)
+        norm_v = v / self.max_v
+        norm_w = w / self.max_w
+        
+        # Costruzione vettore finale numpy (float32 è lo standard per Pytorch/TF)
+        # Struttura: [dist_goal, angle_goal, vel_lin, vel_ang, ...lidar_beams...]
+        obs_list = [norm_dist, norm_heading, norm_v, norm_w] + norm_lidar
+        return np.array(obs_list, dtype=np.float32)
 
     # --- RENDERING (MODIFICATO CON OFFSET) ---
     def render(self):

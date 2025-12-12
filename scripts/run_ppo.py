@@ -9,12 +9,12 @@ from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
 from src.envs.gym_nav_env import GymNavEnv, NUM_PEOPLE
 from .train_ppo import NUM_RAYS, PEOPLE_SPEED   
 
-training_name = "10M_nocollisions"
+training_name = "DT01"
 
 def main():
     # Setup environment
     env_fn = lambda: GymNavEnv(render_mode="human", num_rays=NUM_RAYS,
-                            num_people=NUM_PEOPLE, people_speed=PEOPLE_SPEED)
+                            num_people=NUM_PEOPLE)
     env = DummyVecEnv([env_fn])
 
     # Load Normalization and Model
@@ -55,6 +55,7 @@ def main():
         
         if done[0]:
             inf = info[0] # info is a list of dicts in VecEnv
+            print( )
             reason = inf.get("termination_reason", "unknown")
             total_episodes += 1
 
