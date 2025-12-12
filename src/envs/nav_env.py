@@ -404,24 +404,14 @@ class Simple2DEnv:
         # Premia l'avvicinamento netto al goal
         reward += 20.0 * (dist_to_goal_prev - dist_to_goal_now)
 
-        #B2 reward di sicurezza lidar 
-        lidar = self._compute_lidar()
-        min_lidar = min(lidar)
-        blind_spot_limit = self.lidar_min_distance # 0.12 m
-        
-        # Penalizziamo se entriamo nella zona di pericolo (< 0.5m)
-        # if min_lidar < 0.5:
-        #     # Calcoliamo quanto siamo vicini al "baratro" del blind spot.
-        #     # Se min_lidar = 0.12 -> denominatore = 0.01 -> penalità alta (-5.0)
-        #     # Se min_lidar = 0.50 -> denominatore = 0.39 -> penalità bassa (-0.12)
-        #     # margin = min_lidar - blind_spot_limit
-        #     # reward -= 0.05 / (margin + 0.01)
+        obs = self._get_observation(v, w)
+        inv_lidar = obs[4:]  # Lidar inversi normalizzati
 
-        #     # Formula esponenziale: penalità esplode vicino al muro
-        #     # A 0.6m -> penalità ~0
-        #     # A 0.12m -> penalità molto alta
-        #     reward -= 0.1 * math.exp(4.0 * (0.6 - min_lidar))
-        
+        # reward negativo sul massimo del lidar inverso (cioè il più vicino)
+        max_inv_lidar = max(inv_lidar)
+        if max_inv_lidar > 0.6:
+            reward -= np.exp(-4.0 * (0.6 - max_inv_lidar))  # Penalità più forte per ostacoli vicini
+
         # C. Reward di allineamento (incentiva a guardare il goal mentre si muove)
         # goal_angle = math.atan2(self.goal_y - self.y, self.goal_x - self.x)
         # heading_error = abs((goal_angle - self.theta + math.pi) % (2 * math.pi) - math.pi)
@@ -430,7 +420,7 @@ class Simple2DEnv:
         #     reward += 1.0 * v * np.exp(-heading_error)
 
         # D. Penalità per azioni brusche (Smoothness)
-        # reward -= 0.05 * abs(w - self.last_w)
+        reward -= 0.05 * abs(w - self.last_w)
         
         # Aggiorna variabili stato precedente
         self.last_w = w
@@ -461,7 +451,7 @@ class Simple2DEnv:
             info["mean_jerk"] = self.episode_jerk_sum / self.step_count if self.step_count > 0 else 0.0
 
         # 6. Costruzione Osservazione
-        obs = self._get_observation(v, w)
+        
         
         return obs, reward, done, info
 
@@ -494,7 +484,6 @@ class Simple2DEnv:
         # Costruzione vettore finale numpy (float32 è lo standard per Pytorch/TF)
         # Struttura: [dist_goal, angle_goal, vel_lin, vel_ang, ...lidar_beams...]
         obs_list = [dist_to_goal, norm_heading, v, w] + inverse_lidar
-        print(obs_list)
         return np.array(obs_list, dtype=np.float32)
 
     # --- RENDERING (MODIFICATO CON OFFSET) ---

@@ -13,20 +13,20 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 NUM_RAYS = 108
 NUM_PEOPLE = 0
-NUM_OBSTACLES = 0
+NUM_OBSTACLES = 10
 N_ENVS = 100
 PEOPLE_SPEED = 0.0
-
-TRAINING_NAME = "2_Mno_obstacles"
-TRAINING_STEPS = 2_000_000
-
-LOAD_MODEL = False  # Set to True to load existing model
 STACK_DIM = 3
 
+TRAINING_NAME = "2_Mno_obstacles_part2"
+TRAINING_STEPS = 5_000_000
 
-PREV_MODEL_PATH = "checkpoints/25MSAC_jack.zip"
+
+
+LOAD_MODEL = True  # Set to True to load existing model
+PREV_MODEL_PATH = "checkpoints/2_Mno_obstacles.zip"
 # Assicurati che questo percorso sia corretto (usa il percorso assoluto se serve)
-PREV_ENV_STATS_PATH = "25MSAC_jack_vecnormalize.pkl"
+PREV_ENV_STATS_PATH = "2_Mno_obstacles_vecnormalize.pkl"
 
 
 
