@@ -18,8 +18,8 @@ except ImportError:
     raise ImportError("Installa le librerie necessarie: pip install sb3-contrib stable-baselines3 shimmy gymnasium")
 
 # --- CONFIGURAZIONE ---
-MODEL_PATH = "./DT01_25M"
-NORMALIZATION_FILE = "./DT01_25M_vecnormalize.pkl" 
+MODEL_PATH = "./checkpoints/2_Mno_obstacles_part2"
+NORMALIZATION_FILE = "./2_Mno_obstacles_part2.pkl" 
 
 # [AGGIORNATO] Parametri allineati con nav_env.py e gym_nav_env.py
 MAX_LIN_VEL = 0.3   # TurtleBot4 Limit

@@ -321,7 +321,6 @@ class Simple2DEnv:
         self.last_v = 0.0; self.last_w = 0.0
         self._reset_people()
         
-        # [FONDAMENTALE] Restituisce l'osservazione normalizzata (array) invece della tupla
         return self._get_observation(self.last_v, self.last_w)
 
     def step(self, action):

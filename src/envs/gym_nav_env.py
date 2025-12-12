@@ -65,8 +65,10 @@ class GymNavEnv(gym.Env):
         obs_dim = 4 + (self.num_rays * self.stack_dim)
 
         self.observation_space = spaces.Box(
-            low=-1.0, # Alcuni valori sono 0-1, altri -1 a 1. Il bound sicuro è -1, 1
-            high=1.0,
+            #low=-1.0, # Alcuni valori sono 0-1, altri -1 a 1. Il bound sicuro è -1, 1
+            low = -np.inf,
+            #high=1.0,
+            high=np.inf,
             shape=(obs_dim,),
             dtype=np.float32,
         )
@@ -139,7 +141,7 @@ class GymNavEnv(gym.Env):
 
     def _compose_obs(self, env_obs):
         """
-        Combina gli scalari (dist, angle, v, w) con lo stack dei lidar.
+        Combina gli scalari (dist, angle, v, w) con lo stack dei lidar inverso.
         env_obs: [dist, angle, v, w, ...lidar_corrente...]
         """
         # I primi 4 valori sono gli scalari di stato
