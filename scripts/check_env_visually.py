@@ -28,7 +28,7 @@ import time
 from src.envs.jhsfm_nav_env import SimpleNavEnv
 
 # Testiamo 'parallel' per vedere il respawn infinito (Umani scendono, Robot sale)
-env = SimpleNavEnv(scenario_type="circular") 
+env = SimpleNavEnv(scenario_type="circular", training=False) 
 obs, _ = env.reset(seed=None)
 
 print("Check: Osserva se gli umani 'teletrasportano' in alto quando arrivano in basso.")

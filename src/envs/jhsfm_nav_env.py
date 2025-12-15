@@ -28,9 +28,10 @@ except ImportError:
 class SimpleNavEnv(Simple2DEnv, gym.Env):
     metadata = {'render.modes': ['human']}
 
-    def __init__(self, scenario_type="random"):
+    def __init__(self, scenario_type="random", training = True):
         # 1. Imposta lo scenario
         self.scenario_type = scenario_type
+        self.training = training
 
         # 2. Dimensioni Dinamiche: Corridoio stretto per "parallel"
         if self.scenario_type == "parallel":
@@ -178,18 +179,46 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
         dist_before = math.hypot(self.x - self.goal_x, self.y - self.goal_y)
         
         # --- HSFM Update (Humans) ---
+        # --- HSFM Update (Humans) ---
         n_substeps = int(dt / SimConfig.HSFM_DT)
+        
+        # Prepara dati Robot (servono sempre per aggiornare la fisica del robot dopo)
         rob_state = jnp.array([self.x, self.y, v*math.cos(self.theta), v*math.sin(self.theta), self.theta, w])
         rob_goal  = jnp.array([self.goal_x, self.goal_y])
-        
-        c_states = jnp.concatenate([self.humans_state_jax, rob_state[None, :]], axis=0)
-        c_goals  = jnp.concatenate([self.humans_goal_jax, rob_goal[None, :]], axis=0)
-        
-        for _ in range(n_substeps):
-            c_states = self.hsfm_step_fn(c_states, c_goals, self.hsfm_params, self.static_obstacles_jax, SimConfig.HSFM_DT)
+
+        # LOGICA CONDIZIONALE: Robot Visibile o Invisibile
+        if not self.training:
+            # --- TESTING / VISUALIZATION (Robot Visibile) ---
+            # Il robot viene aggiunto alla simulazione: gli umani lo evitano.
+            c_states = jnp.concatenate([self.humans_state_jax, rob_state[None, :]], axis=0)
+            c_goals  = jnp.concatenate([self.humans_goal_jax, rob_goal[None, :]], axis=0)
             
-        self.humans_state_jax = c_states[:-1] # Update humans only
-        self._sync_people_list()              # Update self.people for Lidar/Render
+            # Usiamo tutti i parametri (N umani + 1 Robot)
+            c_params = self.hsfm_params 
+            # Usiamo tutti gli ostacoli (N + 1)
+            c_obs    = self.static_obstacles_jax 
+        else:
+            # --- TRAINING (Robot Invisibile / Ghost) ---
+            # Gli umani ignorano il robot. Simuliamo solo N agenti.
+            c_states = self.humans_state_jax
+            c_goals  = self.humans_goal_jax
+            
+            # Slice dei parametri: prendiamo solo i primi N (escludiamo l'ultimo che è il robot)
+            c_params = self.hsfm_params[:-1]
+            # Slice degli ostacoli: prendiamo solo i primi N layer
+            c_obs    = self.static_obstacles_jax[:-1]
+
+        # Esegui step HSFM
+        for _ in range(n_substeps):
+            c_states = self.hsfm_step_fn(c_states, c_goals, c_params, c_obs, SimConfig.HSFM_DT)
+            
+        # Aggiorna lo stato degli umani
+        if not self.training:
+            self.humans_state_jax = c_states[:-1] # Rimuovi robot dal risultato
+        else:
+            self.humans_state_jax = c_states      # Risultato contiene solo umani
+
+        self._sync_people_list()
 
         # --- Robot Update (Kinematics) ---
         self.theta += w * dt
