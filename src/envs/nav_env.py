@@ -3,6 +3,9 @@ import matplotlib.pyplot as plt
 import random
 import numpy as np
 
+MAX_LIN_VEL = 0.3  # m/s (TurtleBot4 max linear)
+MAX_ANG_VEL = 0.7  # rad/s (TurtleBot4 max angular)
+
 class Simple2DEnv:
     def __init__(
             self, 
@@ -40,8 +43,8 @@ class Simple2DEnv:
         self.last_w = 0.0
         self.wheel_separation = 0.233
         # Velocità massime imposte dall'hardware reale
-        self.max_v = 0.3  # m/s (TurtleBot4 max linear)
-        self.max_w = 2.3  # rad/s (TurtleBot4 max angular)
+        self.max_v = MAX_LIN_VEL  # m/s (TurtleBot4 max linear)
+        self.max_w = MAX_ANG_VEL  # rad/s (TurtleBot4 max angular)
 
         # Geometria Stanza
         self.room_width = room_width

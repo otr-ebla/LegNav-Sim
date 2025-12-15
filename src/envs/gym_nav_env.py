@@ -2,11 +2,10 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 
-from .nav_env import Simple2DEnv
+from .nav_env import Simple2DEnv, MAX_LIN_VEL, MAX_ANG_VEL
 
 # [MODIFICATO] Aggiornati ai limiti reali impostati in nav_env (TurtleBot4)
-MAX_LIN_VEL = 0.3   # m/s (era 0.46)
-MAX_ANG_VEL = 2.3   # rad/s (era 2.0)
+
 NUM_PEOPLE = 0      # Default
 NUM_RAYS = 108
 STACK_DIM = 3

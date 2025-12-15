@@ -10,7 +10,7 @@ from src.envs.gym_nav_env import GymNavEnv, NUM_PEOPLE
 from .train_ppo import NUM_RAYS, PEOPLE_SPEED   
 
 training_name = "2_Mno_obstacles_part2"
-render = False
+render = True
 
 def main():
     # Setup environment
