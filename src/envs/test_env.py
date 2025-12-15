@@ -1,6 +1,11 @@
 import numpy as np
 from src.envs.gym_nav_env import GymNavEnv
 
+"""
+Simple test script to verify the correct functioning of the JHSFM-based navigation environment.
+Run this script to ensure that the environment initializes correctly, resets, and steps through a few actions without errors.
+"""
+
 def test_environment():
     print("Inizializzazione Environment...")
     # Crea l'ambiente

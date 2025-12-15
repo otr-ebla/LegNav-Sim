@@ -10,9 +10,6 @@ NUM_PEOPLE = 0      # Default
 NUM_RAYS = 108
 STACK_DIM = 3
 MAX_STEPS = 1000
-
-
-
 NUM_OBSTACLES = 15  # SI CAMBIA DA QUIII!!!!!!!!!!!!
 
 
