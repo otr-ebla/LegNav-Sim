@@ -15,7 +15,7 @@ NUM_RAYS = 108
 NUM_PEOPLE = 0
 NUM_OBSTACLES = 10 # NOOOOOOO, questo non si cambia da qui ma si cambia in gym_nav_env.py!!!!!!
 N_ENVS = 100
-PEOPLE_SPEED = 0.0
+PEOPLE_SPEED = 0.7
 STACK_DIM = 3
 
 TRAINING_NAME = "2_Mno_obstacles_part2"
@@ -69,6 +69,94 @@ class TerminationStatsCallback(BaseCallback):
                 self.episode_id += 1
 
         return True
+
+
+import torch
+import torch.nn as nn
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+
+class LidarAttentionExtractor(BaseFeaturesExtractor):
+    def __init__(self, observation_space: gym.spaces.Box, features_dim: int = 256):
+        super().__init__(observation_space, features_dim)
+        # Branch LiDAR: 1 canale input (distanza), esce con 32 canali
+        self.cnn = nn.Sequential(
+            nn.Conv1d(1, 32, kernel_size=5, stride=2, padding=2),
+            nn.ReLU(),
+            nn.Conv1d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU())
+
+        # Self-Attention: permette di pesare l'importanza dei vari segmenti lidar
+        # embed_dim=64 deve corrispondere all'output della seconda Conv1d
+        self.attn = nn.MultiheadAttention(embed_dim=64, num_heads=4, batch_first=True)
+        
+        # Branch Scalari: processa (DistGoal, AngGoal, V, W)
+        self.scalar_net = nn.Sequential(nn.Linear(4, 32), nn.ReLU())
+        
+        # Fusione finale: 64 (feat lidar) * 27 (lunghezza seq) + 32 (scalari)
+        self.final_fc = nn.Linear(64 * 27 + 32, features_dim)
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        # I primi 4 valori sono scalari (Goal + Vel), il resto è Lidar
+        scalars = observations[:, :4]
+        lidar_raw = observations[:, 4:]
+        
+        # Reshape Lidar per la CNN: [Batch, Channel=1, Length=108]
+        lidar = lidar_raw.unsqueeze(1)
+        # Estrazione feature geometriche
+        cnn_out = self.cnn(lidar) # Output: [Batch, 64, 27]
+        
+        # Permute per Attention: serve [Batch, Sequence, Features] -> [B, 27, 64]
+        cnn_permuted = cnn_out.permute(0, 2, 1)
+        
+        # Applica Self-Attention (query, key, value sono lo stesso tensore)
+        attn_out, _ = self.attn(cnn_permuted, cnn_permuted, cnn_permuted)
+        # Flatten dell'output attenzione: da [B, 27, 64] a [B, 1728]
+        lidar_flat = attn_out.reshape(attn_out.size(0), -1)
+        
+        # Processamento scalari e concatenazione
+        scalar_feat = self.scalar_net(scalars)
+        combined = torch.cat((lidar_flat, scalar_feat), dim=1)
+        
+        # Output finale verso l'Actor/Critic
+        return self.final_fc(combined)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 def make_env(rank: int):
     def _init():

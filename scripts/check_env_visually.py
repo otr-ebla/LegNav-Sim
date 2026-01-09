@@ -1,44 +1,65 @@
-# import time
-# from stable_baselines3 import SAC
-# from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
-# from src.envs.jhsfm_nav_env import SimpleNavEnv
-
-# MODEL_NAME = "2_Mno_obstacles_part2" # Il nome del tuo checkpoint
-
-# # 1. Init Environment wrapper in DummyVecEnv (Required by SB3)
-# env = DummyVecEnv([lambda: SimpleNavEnv(num_people=5, scenario_type="cross")])
-# # 2. Load Stats (VecNormalize) from the trained agent
-# # This ensures the new observation (lidar/dist) is scaled exactly like the old one
-# env = VecNormalize.load(f"{MODEL_NAME}_vecnormalize.pkl", env)
-# env.training = False; env.norm_reward = False # Inference mode (no update)
-
-# # 3. Load the SAC Model
-# model = SAC.load(f"checkpoints/{MODEL_NAME}", env=env)
-# # 4. Inference Loop
-# obs = env.reset()
-# while True:
-#     action, _ = model.predict(obs, deterministic=True)
-#     obs, _, done, _ = env.step(action)
-    
-#     # Access inner env to call the custom render method
-#     env.envs[0].render() 
-#     #time.sleep(0.05)
-
 import time
+import random
 from src.envs.jhsfm_nav_env import SimpleNavEnv
 
-# Testiamo 'parallel' per vedere il respawn infinito (Umani scendono, Robot sale)
-env = SimpleNavEnv(scenario_type="circular", training=False) 
-obs, _ = env.reset(seed=None)
+# --- CONFIGURAZIONE ---
+USE_RANDOM_SCENARIO = True  # <--- Metti False per usare 'FIXED_SCENARIO'
+FIXED_SCENARIO = "static_groups" 
 
-print("Check: Osserva se gli umani 'teletrasportano' in alto quando arrivano in basso.")
+# Lista dei 6 scenari implementati
+SCENARIOS_LIST = [
+    "parallel", 
+    "perpendicular", 
+    "circular", 
+    "bottleneck", 
+    "static_groups", 
+    "intersection"
+]
 
-for i in range(2000):
-    # Robot fermo o lento in avanti ([0.1, 0.0]) per farsi sorpassare dal flusso
-    obs, reward, terminated, truncated, info = env.step([0.0, 0.0])
+def run_visual_test():
+    print("Premi FRECCIA DESTRA per saltare allo scenario successivo.")
     
-    env.render()
-    time.sleep(0.03) # 30ms per frame
-    
-    if terminated or truncated:
-        env.reset()
+    while True: # Ciclo infinito: ogni giro è un NUOVO scenario
+        
+        # 1. Scelta dello Scenario
+        if USE_RANDOM_SCENARIO:
+            selected_type = random.choice(SCENARIOS_LIST)
+            print(f"\n🎲 NUOVO EPISODIO: Caricamento scenario '{selected_type.upper()}'...")
+        else:
+            selected_type = FIXED_SCENARIO
+            print(f"\n🔒 SCENARIO FISSO: '{selected_type.upper()}'")
+
+        # 2. Creazione Environment (necessaria per resettare dimensioni e numero persone)
+        # Nota: allow_keyboard_skip=True ti permette di premere 'destra' per cambiare
+        try:
+            env = SimpleNavEnv(scenario_type=selected_type, training=False, allow_keyboard_skip=True, use_legs=True)
+            obs, _ = env.reset()
+            
+            # 3. Loop Episodio
+            running = True
+            while running:
+                # Azione nulla (robot fermo o lento)
+                obs, reward, terminated, truncated, info = env.step([0.0, 0.0])
+                
+                env.render()
+                #time.sleep(0.03) # 30ms delay
+                
+                # Check fine episodio o skip manuale
+                if terminated or truncated:
+                    running = False
+                    reason = info.get("termination_reason", "unknown")
+                    print(f"   -> Terminato: {reason}")
+
+            # Chiudiamo l'ambiente vecchio per liberare memoria/finestre prima di crearne uno nuovo
+            env.close()
+            
+        except KeyboardInterrupt:
+            print("\nInterruzione manuale. Uscita.")
+            if 'env' in locals(): env.close()
+            break
+        except Exception as e:
+            print(f"Errore: {e}")
+            break
+
+if __name__ == "__main__":
+    run_visual_test()

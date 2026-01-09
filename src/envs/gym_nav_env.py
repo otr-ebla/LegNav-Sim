@@ -6,7 +6,7 @@ from .nav_env import Simple2DEnv, MAX_LIN_VEL, MAX_ANG_VEL
 
 # [MODIFICATO] Aggiornati ai limiti reali impostati in nav_env (TurtleBot4)
 
-NUM_PEOPLE = 0      # Default
+NUM_PEOPLE = 15     # Default
 NUM_RAYS = 108
 STACK_DIM = 3
 MAX_STEPS = 1000

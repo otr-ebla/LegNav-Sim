@@ -35,11 +35,7 @@ env_cfg = StaticConfig(
     goal_reward=10.0
 )
 
-<<<<<<< HEAD
 BATCH_SIZE = 512
-=======
-BATCH_SIZE = 32
->>>>>>> e016cb0b4b32a3302ec4a837c69b73ff3fb42b54
 SEQ_LEN = 50
 
 # Vettorizziamo l'ambiente (4 ot insieme)
