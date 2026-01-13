@@ -3,14 +3,17 @@ from gymnasium import spaces
 import numpy as np
 
 from .nav_env import Simple2DEnv, MAX_LIN_VEL, MAX_ANG_VEL
+from src.config import RobotConfig, LidarConfig, SimConfig 
+
 
 # [MODIFICATO] Aggiornati ai limiti reali impostati in nav_env (TurtleBot4)
 
 NUM_PEOPLE = 15     # Default
-NUM_RAYS = 108
-STACK_DIM = 3
+NUM_RAYS = LidarConfig.NUM_RAYS
+STACK_DIM = RobotConfig.LIDAR_STACK_DIM
 MAX_STEPS = 1000
 NUM_OBSTACLES = 15  # SI CAMBIA DA QUIII!!!!!!!!!!!!
+PEOPLE_SPEED = 0.7
 
 
 
@@ -36,9 +39,10 @@ class GymNavEnv(gym.Env):
         num_people: int = NUM_PEOPLE,
         max_steps: int = MAX_STEPS,
         stack_dim: int = STACK_DIM, # Aggiunto parametro esplicito
-        num_obstacles: int = NUM_OBSTACLES,
+        render_skip: int = 1
     ):  
         super().__init__()
+
     
         self.env = Simple2DEnv(
             num_rays=num_rays,
@@ -46,7 +50,9 @@ class GymNavEnv(gym.Env):
             num_people=num_people,
             room_width=12.0,
             room_height=12.0,
-            num_obstacles=num_obstacles,
+            num_obstacles=NUM_OBSTACLES,
+            people_speed=PEOPLE_SPEED,
+            render_skip=render_skip,
             # I limiti di velocità sono interni a Simple2DEnv, ma usiamo le costanti qui per l'action space
         )
         self.render_mode = render_mode
@@ -71,8 +77,8 @@ class GymNavEnv(gym.Env):
 
         # Action space normalizzato ai limiti del robot
         self.action_space = spaces.Box(
-            low=np.array([0.0, -MAX_ANG_VEL]), 
-            high=np.array([MAX_LIN_VEL, MAX_ANG_VEL]), 
+            low=np.array([0.0, -RobotConfig.MAX_W]), 
+            high=np.array([RobotConfig.MAX_LINEAR_VEL, RobotConfig.MAX_W]), 
             dtype = np.float32,
         )
 
@@ -99,8 +105,8 @@ class GymNavEnv(gym.Env):
     def step(self, action):
         # Conversione e clipping azione (ridondante col clip interno, ma buona pratica gym)
         action = np.asarray(action, dtype=np.float32)
-        v = float(np.clip(action[0], 0.0, MAX_LIN_VEL))
-        w = float(np.clip(action[1], -MAX_ANG_VEL, MAX_ANG_VEL))
+        v = float(np.clip(action[0], 0.0, RobotConfig.MAX_LINEAR_VEL))
+        w = float(np.clip(action[1], -RobotConfig.MAX_W, RobotConfig.MAX_W))
 
         # Esegui step nell'ambiente
         # env_obs è già normalizzato

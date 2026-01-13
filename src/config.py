@@ -15,10 +15,11 @@ class LidarConfig:
     FOV = 2*np.pi
 
 class SimConfig:
-    HSFM_DT = 0.05
+    HSFM_DT = 0.01
     ROOM_SIZE = (12.0, 12.0)  # meters
-    MAX_STEPS = 400
+    MAX_STEPS = 2000
     HUMANS_RADIUS = 0.2  # meters
     HUMANS_VELOCITY = 1.0 # m/s
     NUM_OBSTACLES = 25
-    NUM_HUMANS = 15
+    NUM_HUMANS = 5
+    RADIUS_EXTENDED = 0.3

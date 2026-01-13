@@ -1,129 +1,166 @@
 import time
+import argparse
+import os
 import numpy as np
+import torch
 
 from stable_baselines3 import PPO, SAC
 from sb3_contrib import TQC
 from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
 
-# Ensure these imports point to your actual file structure
-from src.envs.gym_nav_env import GymNavEnv, NUM_PEOPLE
-from .train_ppo import NUM_RAYS, PEOPLE_SPEED   
+# Import environment e config
+from src.envs.gym_nav_env import GymNavEnv
+from src.config import LidarConfig
 
-training_name = "2_Mno_obstacles_part2"
-render = True
+"""
+COMANDO PER EVALUATION: python3 -m scripts.run_ppo --algo TQC --name New_Training_random --num_people 0
+
+
+
+"""
+
+
+
 
 def main():
-    # Setup environment
-    if render:
-        env_fn = lambda: GymNavEnv(render_mode="human", num_rays=NUM_RAYS,
-                            num_people=NUM_PEOPLE)
-    else:
-        env_fn = lambda: GymNavEnv(render_mode=None, num_rays=NUM_RAYS,
-                            num_people=NUM_PEOPLE)
-    env = DummyVecEnv([env_fn])
+    # 1. Setup Argparse
+    parser = argparse.ArgumentParser(description="Run inference for PPO/SAC/TQC agents")
+    parser.add_argument("--algo", type=str, default="TQC", choices=["PPO", "SAC", "TQC"], help="RL Algorithm")
+    parser.add_argument("--name", type=str, required=True, help="Model name (without .zip)")
+    parser.add_argument("--num_people", type=int, default=0, help="Number of humans for testing")
+    parser.add_argument("--render_skip", type=int, default=1, help="Render every N frames to speed up visualization")
 
-    # Load Normalization and Model
+    args = parser.parse_args()
+
+    # 2. Selezione Classe Modello
+    ModelClass = {"PPO": PPO, "SAC": SAC, "TQC": TQC}[args.algo]
+    print(f"--- 🚀 Setup: Algo={args.algo} | Model={args.name} | Humans={args.num_people} ---")
+
+    # 3. Setup Ambiente
+    # Usiamo DummyVecEnv per compatibilità con VecNormalize e Rendering
+    env = DummyVecEnv([lambda: GymNavEnv(
+        render_mode="human",
+        num_rays=LidarConfig.NUM_RAYS,
+        num_people=args.num_people,
+        render_skip=args.render_skip
+    )])
+
+    # 4. Caricamento Normalizzazione (VecNormalize)
+    # Cerca prima nella root, poi in checkpoints
+    pkl_filename = f"{args.name}_vecnormalize.pkl"
+    paths_to_check = [pkl_filename, f"./checkpoints/{pkl_filename}"]
+    
+    loaded_norm = False
+    for p in paths_to_check:
+        if os.path.exists(p):
+            print(f"📥 Loading VecNormalize stats from: {p}")
+            env = VecNormalize.load(p, env)
+            env.training = False     # STOP aggiornamento statistiche
+            env.norm_reward = False  # Vogliamo vedere il reward reale
+            loaded_norm = True
+            break
+    
+    if not loaded_norm:
+        print("⚠️  WARNING: VecNormalize .pkl not found! The agent might fail if trained with normalization.")
+
+    # 5. Caricamento Modello
+    model_path = f"./checkpoints/{args.name}"
+    print(f"🧠 Loading Model from: {model_path}")
+    
     try:
-        env = VecNormalize.load(training_name + "_vecnormalize.pkl", env)
-        env.training = False 
-        env.norm_reward = False
+        model = ModelClass.load(model_path, env=env)
     except Exception as e:
-        print(f"Warning: Could not load VecNormalize: {e}")
+        print(f"❌ Error loading model: {e}")
+        return
 
-    print(f"Loading model: ./checkpoints/{training_name}")
-    model = SAC.load("./checkpoints/" + training_name, env=env)
-
+    # 6. Variabili Statistiche
     obs = env.reset()
-    
-    # --- STATISTICS VARIABLES ---
-    total_episodes = 0
-    success_count = 0
-    timeout_count = 0
-    collision_count = 0 
-    
-    coll_people = 0
-    coll_obstacle = 0
+    stats = {
+        "episodes": 0, "success": 0, "timeout": 0, "collision": 0,
+        "coll_ppl": 0, "coll_obs": 0,
+        "path_len": 0.0, "time": 0.0, "jerk": 0.0, "spl": 0.0
+    }
 
-    # Accumulators for averages
-    total_path_length = 0.0
-    total_time_to_goal = 0.0 # Only for successful episodes
-    total_jerk = 0.0
-    total_spl = 0.0
+    print("\n--- 🎬 Starting Inference ---\n")
 
-    print("\n--- Starting Inference ---\n")
+    try:
+        while True:
+            # Predict deterministico
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, done, info = env.step(action)
 
-    while True:
-        action, _ = model.predict(obs, deterministic=True)
-        #print("Taking action:", action)  # Debug
-        print
-        obs, reward, done, info = env.step(action)
-        
-        if done[0]:
-            inf = info[0] # info is a list of dicts in VecEnv
-            print( )
-            reason = inf.get("termination_reason", "unknown")
-            total_episodes += 1
+            #print("Action taken:", action)
 
-            # Extract new metrics from environment
-            ep_path_len = inf.get("path_length", 0.0)
-            ep_time = inf.get("total_time", 0.0)
-            ep_jerk = inf.get("mean_jerk", 0.0)
-            opt_len = inf.get("optimal_length", 1.0) # avoid div/0
+            if done[0]:
+                inf = info[0]
+                reason = inf.get("termination_reason", "unknown")
+                
+                # [NUOVO] Gestione Skip Manuale
+                if reason == "manual_skip":
+                    print("-" * 60)
+                    print(f"⏩ EPISODE SKIPPED MANUALLY (Not counted in stats)")
+                    print("-" * 60)
+                    time.sleep(0.5)
+                    obs = env.reset()
+                    continue # <--- Salta l'aggiornamento delle statistiche sotto
 
-            # Update General Stats
-            is_success = 0
-            if reason == "goal_reached":
-                success_count += 1
-                is_success = 1
-                total_time_to_goal += ep_time
-            elif reason == "max_steps_reached":
-                timeout_count += 1
-            elif reason in ["people_collision", "collision_static"]:
-                collision_count += 1
-                if reason == "people_collision":
-                    coll_people += 1
-                else:
-                    coll_obstacle += 1
-            
-            # Update Averages
-            total_path_length += ep_path_len
-            total_jerk += ep_jerk
+                # --- DA QUI IN POI IL CODICE RIMANE PER GLI EPISODI VALIDI ---
+                stats["episodes"] += 1
 
-            # Calculate SPL (Success weighted by Path Length) for this episode
-            # SPL = Success * (Optimal_Path / max(Actual_Path, Optimal_Path))
-            current_spl = is_success * (opt_len / max(ep_path_len, opt_len))
-            total_spl += current_spl
+                # Estrazione metriche episodio
+                ep_len = inf.get("path_length", 0.0)
+                ep_time = inf.get("total_time", 0.0)
+                ep_jerk = inf.get("mean_jerk", 0.0)
+                opt_len = inf.get("optimal_length", 1.0) # Se non presente usa 1.0 per evitare div by zero
 
-            # Compute Rates
-            sr = (success_count / total_episodes) * 100
-            tr = (timeout_count / total_episodes) * 100
-            cr = (collision_count / total_episodes) * 100
-            
-            # Compute Means
-            avg_path = total_path_length / total_episodes
-            avg_jerk = total_jerk / total_episodes
-            avg_spl = total_spl / total_episodes
-            avg_time = total_time_to_goal / success_count if success_count > 0 else 0.0
+                # Aggiornamento contatori
+                is_success = 0
+                if reason == "goal_reached":
+                    stats["success"] += 1
+                    is_success = 1
+                    stats["time"] += ep_time
+                elif reason == "max_steps_reached":
+                    stats["timeout"] += 1
+                elif "collision" in reason:
+                    stats["collision"] += 1
+                    if "people" in reason: stats["coll_ppl"] += 1
+                    else: stats["coll_obs"] += 1
+                
+                # Accumulo medie
+                stats["path_len"] += ep_len
+                stats["jerk"] += ep_jerk
+                
+                # Calcolo SPL (Success weighted by Path Length)
+                # SPL = Success * (Shortest_Path / Max(Actual, Shortest))
+                # Nota: optimal_length non è calcolato in nav_env originale, 
+                # se non ce l'hai, SPL sarà approssimato o dovrai calcolarlo (distanza euclidea start-goal)
+                dist_start_goal = np.linalg.norm(np.array([inf.get("start_x",0), inf.get("start_y",0)]) - np.array([inf.get("goal_x",0), inf.get("goal_y",0)]))
+                curr_spl = is_success * (dist_start_goal / max(ep_len, dist_start_goal))
+                stats["spl"] += curr_spl
 
-            # Print Table
-            print("-" * 60)
-            print(f"EPISODE {total_episodes} ENDED: {reason.upper()}")
-            print(f"Outcomes:")
-            print(f"  > Success Rate:   {sr:.1f}%  ({success_count}/{total_episodes})")
-            print(f"  > Collision Rate: {cr:.1f}%  ({collision_count}/{total_episodes}) [Ppl: {coll_people}, Obs: {coll_obstacle}]")
-            print(f"  > Timeout Rate:   {tr:.1f}%  ({timeout_count}/{total_episodes})")
-            print(f"Metrics (Avg):")
-            print(f"  > SPL:            {avg_spl:.3f}  (0.0 = Fail, 1.0 = Optimal)")
-            print(f"  > Time to Goal:   {avg_time:.2f} s")
-            print(f"  > Path Length:    {avg_path:.2f} m")
-            print(f"  > Ang. Jerk:      {avg_jerk:.2f} rad/s³")
-            print("-" * 60)
-            print( )
+                # Stampa Report
+                tot = stats["episodes"]
+                succ_rate = (stats["success"] / tot) * 100
+                coll_rate = (stats["collision"] / tot) * 100
+                avg_spl = stats["spl"] / tot
+                avg_time = stats["time"] / stats["success"] if stats["success"] > 0 else 0.0
 
-            time.sleep(0.5)
-            obs = env.reset()
+                print("-" * 60)
+                print(f"🏁 EPISODE {tot} ENDED: {reason.upper()}")
+                print(f"📊 Stats:")
+                print(f"  > Success Rate:   {succ_rate:.1f}%")
+                print(f"  > Collision Rate: {coll_rate:.1f}% (Ppl: {stats['coll_ppl']}, Obs: {stats['coll_obs']})")
+                print(f"  > Avg SPL:        {avg_spl:.3f}")
+                print(f"  > Avg Time:       {avg_time:.2f} s")
+                print(f"  > Ang. Jerk:      {ep_jerk:.2f} rad/s³")
+                print("-" * 60)
+                
+                time.sleep(0.5)
+                obs = env.reset()
 
-    env.close()
+    except KeyboardInterrupt:
+        print("\n🛑 Inference stopped by user.")
+        env.close()
 
 if __name__ == "__main__":
     main()

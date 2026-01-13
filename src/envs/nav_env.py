@@ -3,6 +3,8 @@ import matplotlib.pyplot as plt
 import random
 import numpy as np
 
+from collections import deque
+
 MAX_LIN_VEL = 0.3  # m/s (TurtleBot4 max linear)
 MAX_ANG_VEL = 0.7  # rad/s (TurtleBot4 max angular)
 
@@ -20,6 +22,7 @@ class Simple2DEnv:
             people_radius: float = 0.2,
             people_speed: float = 0.0,
             num_obstacles: int = 0,
+            render_skip: int = 1
             ):
 
         self.max_steps = max_steps
@@ -71,9 +74,19 @@ class Simple2DEnv:
         self.goal_radius = 0.3
         self.last_termination_reason = None
 
+        # Stuck case
+        self.stuck_window = 300
+        self.stuck_threshold = 1.0
+        self.pose_history = deque(maxlen=self.stuck_window)
+
         # Rendering
         self.fig = None
         self.ax = None
+        self.render_skip = render_skip
+        self.render_counter = 0
+
+        self.manual_skip_triggered = False
+        self._listener_attached = False
 
     # --- LOGICA MOVIMENTO PERSONE ---
     def _handle_person_obstacle_collisions(self, p):
@@ -281,10 +294,16 @@ class Simple2DEnv:
         return False
 
     def reset(self):
+        
+
+        self.manual_skip_triggered = False
         self.step_count = 0
         self.last_termination_reason = None
         self.episode_path_length = 0.0
         self.episode_jerk_sum = 0.0
+
+        self.pose_history.clear()
+        self.pose_history.append((self.x, self.y))
 
         max_retries = 100
         for _ in range(max_retries):
@@ -327,33 +346,38 @@ class Simple2DEnv:
         return self._get_observation(self.last_v, self.last_w)
 
     def step(self, action):
+        # Inizializza variabili di ritorno SUBITO
+        reward = 0.0
+        done = False
+        info = {}
+
+        if self.manual_skip_triggered:
+            obs = self._get_observation(0.0, 0.0)
+            return obs, 0.0, True, {"termination_reason": "manual_skip"} 
+
         target_v, target_w = action 
         
-        # 1. Applicazione limiti fisici (Clipping)
+        # 1. Applicazione limiti fisici
         v, w = self._apply_differential_drive_constraints(target_v, target_w)
 
-        # Calcolo distanza precedente per il reward di progresso
+        # Calcolo distanza precedente
         dist_to_goal_prev = math.hypot(self.x - self.goal_x, self.y - self.goal_y)
-        
-        # 2. Aggiornamento Fisica
-        # Aggiorniamo prima theta per calcolare la nuova direzione
-        self.theta += w * self.dt
-        # Normalizzazione angolo tra -pi e pi (importante per la stabilità numerica)
-        self.theta = (self.theta + math.pi) % (2 * math.pi) - math.pi
 
-        # Calcolo posizione candidata
+        # Update History
+        self.pose_history.append((self.x, self.y))
+
+        # 2. Aggiornamento Fisica
+        self.theta += w * self.dt
+        self.theta = (self.theta + math.pi) % (2 * math.pi) - math.pi
         next_x = self.x + v * self.dt * math.cos(self.theta)
         next_y = self.y + v * self.dt * math.sin(self.theta)
 
         # 3. Controllo Collisioni (Safety Layer)
         collision_static = False
-        
-        # A. Check Muri
         if (next_x - self.robot_radius < 0 or next_x + self.robot_radius > self.room_width or 
             next_y - self.robot_radius < 0 or next_y + self.robot_radius > self.room_height): 
             collision_static = True
         
-        # B. Check Ostacoli (Muri interni/Oggetti)
         if not collision_static:
             rr = self.robot_radius
             for obs in self.obstacles:
@@ -365,95 +389,81 @@ class Simple2DEnv:
                     cy = max(obs["ymin"], min(next_y, obs["ymax"]))
                     if (next_x - cx)**2 + (next_y - cy)**2 < rr**2: 
                         collision_static = True; break
+        
+        # --- STUCK DETECTOR ---
+        if len(self.pose_history) == self.stuck_window:
+            past_x, past_y = self.pose_history[0]
+            dist_moved = math.hypot(self.x - past_x, self.y - past_y)
+            
+            if dist_moved < self.stuck_threshold:
+                reward = -200.0 # Penalità secca
+                done = True
+                info["termination_reason"] = "stuck"
+                obs = self._get_observation(v, w)
+                return obs, reward, done, info
+        # ----------------------
 
-        # Inizializzazione variabili di ritorno
-        reward = 0.0
-        done = False
-        info = {}
-
-        # GESTIONE COLLISIONE STATICA (Muri/Oggetti)
-        # [MODIFICA CRITICA] Ora la collisione è TERMINALE.
-        # Questo impedisce al robot di "strisciare" sui muri.
+        # GESTIONE COLLISIONE STATICA
         if collision_static:
             reward = -100.0
             done = True
             info["termination_reason"] = "collision_static"
-            
-            # Calcolo l'osservazione finale prima di uscire (senza muovere il robot)
-            # Nota: restituiamo lo stato corrente, non quello impossibile dentro il muro
             obs = self._get_observation(v, w)
             return obs, reward, done, info
 
-        # Se non c'è collisione, applica il movimento
+        # Se tutto ok, muovi
         self.x = next_x
         self.y = next_y
         self.trajectory.append((self.x, self.y))
         
-        # Aggiornamento dinamica ambiente (persone)
         self._step_people() 
         self.step_count += 1
         
-        # Calcolo metriche post-movimento
         dist_to_goal_now = math.hypot(self.x - self.goal_x, self.y - self.goal_y)
         self.episode_path_length += math.hypot(v * self.dt * math.cos(self.theta), v * self.dt * math.sin(self.theta))
         self.episode_jerk_sum += abs((w - self.last_w) / self.dt)
 
-        # 4. Calcolo Reward
-        # A. Penalità temporale (incentiva a fare presto)
+        # 4. Calcolo Reward (Continuo)
         reward -= 0.05
-        
-        # B. Reward di progresso (molto forte per guidare l'apprendimento)
-        # Premia l'avvicinamento netto al goal
         reward += 20.0 * (dist_to_goal_prev - dist_to_goal_now)
 
         obs = self._get_observation(v, w)
-        inv_lidar = obs[4:]  # Lidar inversi normalizzati
+        inv_lidar = obs[4:] 
 
-        # reward negativo sul massimo del lidar inverso (cioè il più vicino)
         max_inv_lidar = max(inv_lidar)
-        if max_inv_lidar > 0.6:
-            reward -= np.exp(-4.0 * (0.6 - max_inv_lidar))  # Penalità più forte per ostacoli vicini
 
-        # C. Reward di allineamento (incentiva a guardare il goal mentre si muove)
-        # goal_angle = math.atan2(self.goal_y - self.y, self.goal_x - self.x)
-        # heading_error = abs((goal_angle - self.theta + math.pi) % (2 * math.pi) - math.pi)
-        # if v > 0.05: # Solo se si muove
-        #     # Più l'errore è basso (allineato), più alto è il premio (max 1.0 * v)
-        #     reward += 1.0 * v * np.exp(-heading_error)
+        if max_inv_lidar > 0.65:
+             # Se sei vicino, la penalità è MOLTIPLICATA dalla tua velocità.
+             # Più corri vicino al muro, più il reward scende.
+             reward -= 10.0 * (max_inv_lidar - 0.7) * (v + 0.1)
 
-        # D. Penalità per azioni brusche (Smoothness)
         reward -= 0.05 * abs(w - self.last_w)
         
-        # Aggiorna variabili stato precedente
         self.last_w = w
         self.last_v = v
 
-        # 5. Check Terminazione
+        # 5. Check Terminazione (Goal / Umani / Timeout)
         collision_people = self._is_collision_with_people()
         is_goal = self._is_goal_reached()
         
         if is_goal:
             done = True
-            reward += 200.0 # Grande bonus finale
+            reward += 200.0
             info["termination_reason"] = "goal_reached"
         elif collision_people:
             done = True
-            reward -= 200.0 # Grande penalità collisione dinamica
+            reward -= 200.0
             info["termination_reason"] = "people_collision"
         elif self.step_count >= self.max_steps:
             done = True
-            reward -= 10.0  # Penalità timeout
+            reward -= 10.0
             info["termination_reason"] = "max_steps_reached"
 
-        # Info finali per debugging/logging
         if done:
             self.last_termination_reason = info.get("termination_reason", "unknown")
             info["path_length"] = self.episode_path_length
             info["total_time"] = self.step_count * self.dt
             info["mean_jerk"] = self.episode_jerk_sum / self.step_count if self.step_count > 0 else 0.0
-
-        # 6. Costruzione Osservazione
-        
         
         return obs, reward, done, info
 
@@ -487,12 +497,29 @@ class Simple2DEnv:
         # Struttura: [dist_goal, angle_goal, vel_lin, vel_ang, ...lidar_beams...]
         obs_list = [dist_to_goal, norm_heading, v, w] + inverse_lidar
         return np.array(obs_list, dtype=np.float32)
+    
+    # [NUOVO] Callback per pressione tasti
+    def _on_key_press(self, event):
+        if event.key == 'right':
+            print("\n>>> SKIP MANUALE RILEVATO <<<")
+            self.manual_skip_triggered = True
 
     # --- RENDERING (MODIFICATO CON OFFSET) ---
     def render(self):
+
+        self.render_counter += 1
+    
+        # Only proceed with heavy Matplotlib calls every N frames
+        if self.render_counter % self.render_skip != 0:
+            return
+
         if self.fig is None:
             self.fig, self.ax = plt.subplots()
             plt.ion()
+
+        if not self._listener_attached:
+            self.fig.canvas.mpl_connect('key_press_event', self._on_key_press)
+            self._listener_attached = True
 
         self.ax.clear()
 
@@ -636,7 +663,9 @@ class Simple2DEnv:
         rr = self.robot_radius
         for obs in self.obstacles:
             if obs["type"]=="circle":
-                if (self.x-obs["cx"])**2+(self.y-obs["cy"])**2 < (rr+obs["radius"])**2: return True
+                if (self.x-obs["cx"])**2+(self.y-obs["cy"])**2 < (rr+obs["radius"]+0.2)**2: 
+                    print("Collisione con l'ostacolo circolare:", obs)
+                    return True
             elif obs["type"]=="rect":
                 cx = max(obs["xmin"], min(self.x, obs["xmax"])); cy = max(obs["ymin"], min(self.y, obs["ymax"]))
                 if (self.x-cx)**2+(self.y-cy)**2 < rr**2: return True
@@ -647,9 +676,11 @@ class Simple2DEnv:
                 self.y-self.robot_radius<0 or self.y+self.robot_radius>self.room_height)
                 
     def _is_collision_with_people(self):
-        min_sq = (self.robot_radius + self.people_radius)**2
+        min_sq = (self.robot_radius + self.people_radius + 0.4)**2
         for p in self.people:
-            if (self.x-p["x"])**2+(self.y-p["y"])**2 < min_sq: return True
+            if (self.x-p["x"])**2+(self.y-p["y"])**2 < min_sq: 
+                print("Collisione con la persona:!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n\n", p)
+                return True
         return False
     
     def _is_goal_reached(self):

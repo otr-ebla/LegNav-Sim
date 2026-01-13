@@ -3,6 +3,7 @@ import os
 import gymnasium as gym
 import torch
 import numpy as np
+import random
 
 from stable_baselines3 import PPO, SAC
 from sb3_contrib import TQC
@@ -14,14 +15,29 @@ from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 # Assicurati di lanciare lo script dalla root con: python -m scripts.TrainMaster_Prime ...
 from src.envs.jhsfm_nav_env import SimpleNavEnv
 
-
 """
-COMANDO PER ESEGUIRE IL TRAINING: 
+COMANDO PER ESEGUIRE IL TRAINING (Fase 1 - Mixed Static):
+python3 -m scripts.TrainMaster_Prime \
+    --name Curriculum_Stage1_MixedStatic \
+    --scenario mixed \
+    --force_static \
+    --algo tqc \
+    --steps 500000 \
+    --n_envs 32 \
+    --use_legs
 
-COMANDO PER ESEGUIRE EVALUATION:  python3 -m scripts.TrainMaster_Prime      --eval      --render      --name eval_dt01      --scenario static_groups      --load_model checkpoints/DT01_25M.zip      --load_vecnorm DT01_vecnormalize.pkl      --eval_episodes 10      --use_legs
-
+COMANDO PER ESEGUIRE EVALUATION:  
+python3 -m scripts.TrainMaster_Prime \
+    --eval \
+    --render \
+    --name Curriculum_Stage1_Eval \
+    --scenario mixed \
+    --force_static \
+    --load_model checkpoints/Curriculum_Stage1_MixedStatic/TrainMaster_Final.zip \
+    --load_vecnorm checkpoints/Curriculum_Stage1_MixedStatic/TrainMaster_VecNorm.pkl \
+    --eval_episodes 10 \
+    --use_legs
 """
-
 
 class TrainMasterMetrics(BaseCallback):
     """Callback per monitorare le performance di TrainMaster_Prime durante il training."""
@@ -45,26 +61,27 @@ class TrainMasterMetrics(BaseCallback):
                         self.logger.record(f"train_master/{k}_rate", v / self.total)
         return True
 
-# Aggiungi force_static=False alla firma e passalo a SimpleNavEnv
-def make_env(rank, seed, scenario, num_people, use_legs, render_mode=None, force_static=False):
+def make_env(rank, seed, scenario, num_people, use_legs, is_training=True, render_mode=None, force_static=False, render_skip=1):
     def _init():
         env = SimpleNavEnv(
             scenario_type=scenario, 
             num_people=num_people, 
-            training=True, 
+            allow_keyboard_skip=True,
+            training=is_training,  # <--- USE THE ARGUMENT HERE
             use_legs=use_legs,
             render_mode=render_mode,
-            force_static=force_static  # <--- AGGIUNGI QUI
+            force_static=force_static,
+            render_skip=render_skip
         )
         env = Monitor(env)
         env.reset(seed=seed + rank)
         return env
     return _init
 
-def evaluate_master(model, env, num_episodes, render=False):
+def evaluate_master(model, env, num_episodes, render=False, name="eval"):
     """
     Esegue la valutazione del NavigatorPrime.
-    Gestisce correttamente sia ambienti vettorizzati multipli che singoli (rendering).
+    Niente GIF, solo statistiche e rendering a schermo opzionale.
     """
     print(f"\n--- 🧐 VALUTAZIONE TrainMaster_Prime ({num_episodes} episodi) ---")
     if render:
@@ -82,9 +99,14 @@ def evaluate_master(model, env, num_episodes, render=False):
         while episodes_finished < num_episodes:
             # Predizione deterministica (migliore azione possibile senza rumore)
             action, _ = model.predict(obs, deterministic=True)
-            
+            print("Azione predetta:", action)
+
             # Step nell'ambiente
             obs, rewards, dones, infos = env.step(action)
+
+            if hasattr(env.envs[0].unwrapped, 'manual_skip_triggered') and env.envs[0].unwrapped.manual_skip_triggered:
+                obs = env.reset() # Forza il reset se l'utente ha premuto 'right'
+
             steps_per_env += 1
             
             # Rendering grafico (funziona solo se env è DummyVecEnv con 1 processo)
@@ -101,7 +123,6 @@ def evaluate_master(model, env, num_episodes, render=False):
                         
                         if res == "goal_reached":
                             stats["SR"] += 1
-                            # dt = 0.1s (tempo simulato)
                             stats["Time"].append(steps_per_env[i] * 0.1) 
                         elif "collision" in res:
                             stats["CR"] += 1
@@ -140,10 +161,11 @@ def main():
     parser.add_argument("--n_envs", type=int, default=8, help="Numero di ambienti paralleli")
     
     # Parametri Ambiente
-    parser.add_argument("--scenario", type=str, default="static_groups", help="Scenario: static_groups, random, parallel, ecc.")
+    parser.add_argument("--scenario", type=str, default="static_groups", help="Scenario: static_groups, random, mixed, ecc.")
     parser.add_argument("--name", type=str, required=True, help="Nome identificativo della missione")
     parser.add_argument("--use_legs", action="store_true", help="Abilita la simulazione delle gambe nel Lidar")
     parser.add_argument("--num_people", type=int, default=None, help="Override numero persone")
+    parser.add_argument("--force_static", action="store_true", help="Congela gli umani (Velocità 0) per il Curriculum Stage 1")
 
     # Parametri Caricamento / Evaluation
     parser.add_argument("--load_model", type=str, default=None, help="Path modello .zip da caricare")
@@ -153,9 +175,8 @@ def main():
     parser.add_argument("--eval", action="store_true", help="Attiva modalità valutazione (no training)")
     parser.add_argument("--eval_episodes", type=int, default=50, help="Numero episodi di test")
     parser.add_argument("--render", action="store_true", help="Visualizza graficamente (forza 1 ambiente)")
-    parser.add_argument("--save_gif", action="store_true", help="Salva un video GIF della valutazione")
 
-    parser.add_argument("--force_static", action="store_true", help="Congela gli umani (Velocità 0) per il Curriculum Stage 1")
+    parser.add_argument("--render_skip", type=int, default=1, help="Render every N frames to speed up visualization")
 
     args = parser.parse_args()
 
@@ -166,16 +187,33 @@ def main():
 
     print(f"🛠️  TrainMaster_Prime avviato: {args.algo.upper()} | Missione: {args.name}")
     print(f"🦵 Modalità Gambe: {'ATTIVA' if args.use_legs else 'DISATTIVA (Cilindri statici)'}")
+    if args.scenario == "mixed":
+        print(f"🔄 Scenario MIXED: Randomizzazione attiva su 6 layout!")
+    if args.force_static:
+        print(f"❄️  FORCE STATIC: Umani congelati (Curriculum Stage 1)")
 
-    # 1. Setup Ambiente
-    # Se dobbiamo renderizzare, usiamo DummyVecEnv (singolo processo) altrimenti SubprocVecEnv (parallelo)
-    if args.render or args.save_gif:
-        # ... (codice dummy env)
-        env = DummyVecEnv([make_env(0, 42, args.scenario, args.num_people, args.use_legs, render_mode="human", force_static=args.force_static)])
+    is_training_env = not args.eval
+
+    random_seed_number = random.randint(0, 100)
+
+    if args.render:
+        print("📺 Modalità Visuale ATTIVA: Forzatura a singolo ambiente (DummyVecEnv)...")
+        n_envs = 1
+        env = DummyVecEnv([
+            make_env(0, random_seed_number, args.scenario, args.num_people, args.use_legs, 
+                     is_training=is_training_env, # <--- PASS FLAG
+                     render_mode="human", 
+                     force_static=args.force_static, 
+                     render_skip=args.render_skip)
+        ])
     else:
         n_envs = args.n_envs
-        # Aggiorna SubprocVecEnv
-        env = SubprocVecEnv([make_env(i, 42, args.scenario, args.num_people, args.use_legs, force_static=args.force_static) for i in range(n_envs)])
+        env = SubprocVecEnv([
+            make_env(i, random_seed_number, args.scenario, args.num_people, args.use_legs, 
+                     is_training=is_training_env, # <--- PASS FLAG
+                     force_static=args.force_static) 
+            for i in range(n_envs)
+        ])
     
     # 2. Gestione VecNormalize (Normalizzazione input Lidar)
     if args.load_vecnorm:
@@ -218,7 +256,7 @@ def main():
 
     # 4. Esecuzione: EVALUATION o TRAINING
     if args.eval:
-        evaluate_master(model, env, args.eval_episodes, render=args.render, save_gif=args.save_gif, name=args.name)
+        evaluate_master(model, env, args.eval_episodes, render=args.render, name=args.name)
     else:
         callbacks = [TrainMasterMetrics(), CheckpointCallback(save_freq=50000, save_path=base_save_path, name_prefix="tm_ckpt")]
         try:
