@@ -679,7 +679,7 @@ class Simple2DEnv:
         min_sq = (self.robot_radius + self.people_radius + 0.4)**2
         for p in self.people:
             if (self.x-p["x"])**2+(self.y-p["y"])**2 < min_sq: 
-                print("Collisione con la persona:!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n\n", p)
+                #print("Collisione con la persona:!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n\n", p)
                 return True
         return False
     
