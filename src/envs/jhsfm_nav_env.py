@@ -164,7 +164,7 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
 
         # 1. LOGICA MIXED: Scegliamo uno scenario a caso
         if self.base_scenario_type == "mixed":
-            candidates = ["parallel", "perpendicular", "intersection", "bottleneck", "circular", "random"]
+            candidates = ["parallel", "perpendicular", "intersection", "bottleneck", "circular", "random", "static_groups"]
             self.scenario_type = random.choice(candidates)
             self.room_width, self.room_height = self._get_room_size(self.scenario_type)
             
@@ -851,7 +851,6 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
             min_sq = (rr + self.people_radius + SimConfig.RADIUS_EXTENDED)**2
             for p in self.people:
                 if math.sqrt((self.x-p["x"])**2+(self.y-p["y"])**2) < math.sqrt(min_sq): 
-                    print(f"\n\nCollisione con una persona a distanza {SimConfig.RADIUS_EXTENDED}!!!!!!!!!\n\n")
                     return True
             return False
 

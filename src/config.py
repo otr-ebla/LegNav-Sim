@@ -17,7 +17,7 @@ class LidarConfig:
 class SimConfig:
     HSFM_DT = 0.01
     ROOM_SIZE = (12.0, 12.0)  # meters
-    MAX_STEPS = 2000
+    MAX_STEPS = 1000
     HUMANS_RADIUS = 0.2  # meters
     HUMANS_VELOCITY = 1.0 # m/s
     NUM_OBSTACLES = 25

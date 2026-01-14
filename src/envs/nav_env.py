@@ -664,7 +664,7 @@ class Simple2DEnv:
         for obs in self.obstacles:
             if obs["type"]=="circle":
                 if (self.x-obs["cx"])**2+(self.y-obs["cy"])**2 < (rr+obs["radius"]+0.2)**2: 
-                    print("Collisione con l'ostacolo circolare:", obs)
+                    #print("Collisione con l'ostacolo circolare:", obs)
                     return True
             elif obs["type"]=="rect":
                 cx = max(obs["xmin"], min(self.x, obs["xmax"])); cy = max(obs["ymin"], min(self.y, obs["ymax"]))
