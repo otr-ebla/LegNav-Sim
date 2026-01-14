@@ -435,7 +435,7 @@ class Simple2DEnv:
         if max_inv_lidar > 0.7:
              # Se sei vicino, la penalità è MOLTIPLICATA dalla tua velocità.
              # Più corri vicino al muro, più il reward scende.
-             reward -= 3.0 * (max_inv_lidar - 0.7) * (v + 0.1)
+             reward -= 0.3 * (max_inv_lidar - 0.7) * (v + 0.1)
 
         reward -= 0.05 * abs(w - self.last_w)
         
@@ -490,8 +490,9 @@ class Simple2DEnv:
             if d >= self.max_lidar_distance:
                 inverse_lidar.append(0.0)
             else:
-                inv = (self.lidar_min_distance/d)**(1/3)
-                inverse_lidar.append(min(inv, 1.0)) # max value = 1.0
+                max_inv_lidar = 10
+                inv = max_inv_lidar*(self.lidar_min_distance/d)**(1/2)
+                inverse_lidar.append(min(inv, max_inv_lidar))
                 
         # Costruzione vettore finale numpy (float32 è lo standard per Pytorch/TF)
         # Struttura: [dist_goal, angle_goal, vel_lin, vel_ang, ...lidar_beams...]

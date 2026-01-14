@@ -119,7 +119,7 @@ def main():
                     stats["success"] += 1
                     is_success = 1
                     stats["time"] += ep_time
-                elif reason == "max_steps_reached":
+                elif reason == "max_steps_reached" or reason == "stuck":
                     stats["timeout"] += 1
                 elif "collision" in reason:
                     stats["collision"] += 1
@@ -142,6 +142,7 @@ def main():
                 tot = stats["episodes"]
                 succ_rate = (stats["success"] / tot) * 100
                 coll_rate = (stats["collision"] / tot) * 100
+                timeout_rate = (stats["timeout"] / tot) * 100
                 avg_spl = stats["spl"] / tot
                 avg_time = stats["time"] / stats["success"] if stats["success"] > 0 else 0.0
 
@@ -150,6 +151,7 @@ def main():
                 print(f"📊 Stats:")
                 print(f"  > Success Rate:   {succ_rate:.1f}%")
                 print(f"  > Collision Rate: {coll_rate:.1f}% (Ppl: {stats['coll_ppl']}, Obs: {stats['coll_obs']})")
+                print(f"  > Timeout Rate:   {timeout_rate:.1f}%")
                 print(f"  > Avg SPL:        {avg_spl:.3f}")
                 print(f"  > Avg Time:       {avg_time:.2f} s")
                 print(f"  > Ang. Jerk:      {ep_jerk:.2f} rad/s³")

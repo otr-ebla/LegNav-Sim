@@ -11,8 +11,8 @@ from src.config import RobotConfig, LidarConfig, SimConfig
 NUM_PEOPLE = 15     # Default
 NUM_RAYS = LidarConfig.NUM_RAYS
 STACK_DIM = RobotConfig.LIDAR_STACK_DIM
-MAX_STEPS = 1000
-NUM_OBSTACLES = 15  # SI CAMBIA DA QUIII!!!!!!!!!!!!
+MAX_STEPS = SimConfig.MAX_STEPS
+NUM_OBSTACLES = 20  # SI CAMBIA DA QUIII!!!!!!!!!!!!
 PEOPLE_SPEED = 0.7
 
 
@@ -37,6 +37,7 @@ class GymNavEnv(gym.Env):
         render_mode: str | None = None,
         num_rays: int = NUM_RAYS,
         num_people: int = NUM_PEOPLE,
+        num_obstacles: int = NUM_OBSTACLES,
         max_steps: int = MAX_STEPS,
         stack_dim: int = STACK_DIM, # Aggiunto parametro esplicito
         render_skip: int = 1
@@ -50,7 +51,7 @@ class GymNavEnv(gym.Env):
             num_people=num_people,
             room_width=12.0,
             room_height=12.0,
-            num_obstacles=NUM_OBSTACLES,
+            num_obstacles=num_obstacles,
             people_speed=PEOPLE_SPEED,
             render_skip=render_skip,
             # I limiti di velocità sono interni a Simple2DEnv, ma usiamo le costanti qui per l'action space
