@@ -1,33 +1,27 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
+from collections import deque
 
 from .nav_env import Simple2DEnv, MAX_LIN_VEL, MAX_ANG_VEL
 from src.config import RobotConfig, LidarConfig, SimConfig 
 
-
-# [MODIFICATO] Aggiornati ai limiti reali impostati in nav_env (TurtleBot4)
-
-NUM_PEOPLE = 15     # Default
+NUM_PEOPLE = 15
 NUM_RAYS = LidarConfig.NUM_RAYS
 STACK_DIM = RobotConfig.LIDAR_STACK_DIM
 MAX_STEPS = SimConfig.MAX_STEPS
-NUM_OBSTACLES = 20  # SI CAMBIA DA QUIII!!!!!!!!!!!!
-PEOPLE_SPEED = 0.7
-
-
+NUM_OBSTACLES = 12
+PEOPLE_SPEED = 1.0
 
 class GymNavEnv(gym.Env):
     """
-    Gymnasium-compatible wrapper around Simple2DEnv.
+    Gymnasium-compatible wrapper con stacking temporale LIDAR.
     
-    Il nuovo Simple2DEnv restituisce già un'osservazione normalizzata:
-    [dist_goal (0-1), angle_goal (-1, 1), v (0-1), w (-1, 1), ...lidar (0-1)...]
+    Observation Space:
+        [norm_dist_goal, norm_heading, norm_v, norm_w, 
+         lidar_frame_t-2, lidar_frame_t-1, lidar_frame_t]
     
-    Questo wrapper gestisce principalmente:
-    1. La conversione delle azioni in float32
-    2. Lo stacking temporale del Lidar (se STACK_DIM > 1)
-    3. La gestione di Terminated vs Truncated
+    Tutti i valori sono normalizzati in range definiti.
     """
 
     metadata = {"render_modes": ["human"], "render_fps": 10}
@@ -36,15 +30,16 @@ class GymNavEnv(gym.Env):
         self,
         render_mode: str | None = None,
         num_rays: int = NUM_RAYS,
-        num_people: int = NUM_PEOPLE,
+        num_people: int = 0,
         num_obstacles: int = NUM_OBSTACLES,
         max_steps: int = MAX_STEPS,
-        stack_dim: int = STACK_DIM, # Aggiunto parametro esplicito
+        stack_dim: int = STACK_DIM,
+        reward_factor_progress: float = 5.0,
+        use_legs: bool = False,
         render_skip: int = 1
     ):  
         super().__init__()
 
-    
         self.env = Simple2DEnv(
             num_rays=num_rays,
             max_steps=max_steps,
@@ -52,90 +47,90 @@ class GymNavEnv(gym.Env):
             room_width=12.0,
             room_height=12.0,
             num_obstacles=num_obstacles,
+            reward_factor_progress=reward_factor_progress,
             people_speed=PEOPLE_SPEED,
+            use_legs=use_legs,
             render_skip=render_skip,
-            # I limiti di velocità sono interni a Simple2DEnv, ma usiamo le costanti qui per l'action space
         )
         self.render_mode = render_mode
         self.num_rays = num_rays
         self.stack_dim = stack_dim
         
-        # Buffer per lo stacking dei lidar
-        self.lidar_stack = []
+        # [MIGLIORATO] Usa deque per efficienza
+        self.lidar_stack = deque(maxlen=stack_dim)
 
-        # Calcolo dimensione osservazione:
-        # 4 scalari (dist, angle, v, w) + (num_rays * stack_dim)
+        # [MIGLIORATO] Observation space con bounds corretti
         obs_dim = 4 + (self.num_rays * self.stack_dim)
-
+        
+        # Bounds per scalari: [dist(0-1), heading(-1,1), v(0-1), w(-1,1)]
+        scalar_low = np.array([0.0, -1.0, 0.0, -1.0], dtype=np.float32)
+        scalar_high = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+        
+        # Bounds per LIDAR stack (tutti 0-1)
+        lidar_low = np.zeros(self.num_rays * self.stack_dim, dtype=np.float32)
+        lidar_high = np.ones(self.num_rays * self.stack_dim, dtype=np.float32)
+        
+        obs_low = np.concatenate([scalar_low, lidar_low])
+        obs_high = np.concatenate([scalar_high, lidar_high])
+        
         self.observation_space = spaces.Box(
-            #low=-1.0, # Alcuni valori sono 0-1, altri -1 a 1. Il bound sicuro è -1, 1
-            low = -np.inf,
-            #high=1.0,
-            high=np.inf,
-            shape=(obs_dim,),
+            low=obs_low,
+            high=obs_high,
             dtype=np.float32,
         )
 
-        # Action space normalizzato ai limiti del robot
+        # Action space
         self.action_space = spaces.Box(
             low=np.array([0.0, -RobotConfig.MAX_W]), 
             high=np.array([RobotConfig.MAX_LINEAR_VEL, RobotConfig.MAX_W]), 
-            dtype = np.float32,
+            dtype=np.float32,
         )
 
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         super().reset(seed=seed)
         
-        # 1. Ottieni l'osservazione iniziale dall'environment
-        # env_obs è già un np.array: [dist, angle, v, w, l1, l2, ... l108]
-        env_obs = self.env.reset() 
-
-        # 2. Inizializza lo stack
-        # Estrai la parte lidar (dal 5° elemento in poi, indice 4)
-        current_lidar = env_obs[4:] # shape (108,)
+        env_obs = self.env.reset()
         
-        if self.stack_dim > 1:
-            # Riempi lo stack con copie del primo frame
-            self.lidar_stack = [current_lidar.copy() for _ in range(self.stack_dim)]
-        else:
-            self.lidar_stack = [current_lidar]
-
-        # 3. Costruisci l'osservazione completa
-        return self._compose_obs(env_obs), {}
+        # Estrai LIDAR corrente
+        current_lidar = env_obs[4:]
+        
+        # [MIGLIORATO] Inizializza stack con deque
+        self.lidar_stack.clear()
+        for _ in range(self.stack_dim):
+            self.lidar_stack.append(current_lidar.copy())
+        
+        info = {
+            "episode_start": True,
+            "stack_dim": self.stack_dim,
+        }
+        
+        return self._compose_obs(env_obs), info
 
     def step(self, action):
-        # Conversione e clipping azione (ridondante col clip interno, ma buona pratica gym)
+        # Converti e clippa azione
         action = np.asarray(action, dtype=np.float32)
         v = float(np.clip(action[0], 0.0, RobotConfig.MAX_LINEAR_VEL))
         w = float(np.clip(action[1], -RobotConfig.MAX_W, RobotConfig.MAX_W))
 
-        # Esegui step nell'ambiente
-        # env_obs è già normalizzato
+        # Step nell'ambiente
         env_obs, reward, done, info = self.env.step((v, w))
         
-        # Aggiorna lo stack Lidar
+        # [MIGLIORATO] Aggiorna stack (auto-pop con maxlen)
         current_lidar = env_obs[4:]
-        if self.stack_dim > 1:
-            self.lidar_stack.pop(0) # Rimuovi il più vecchio
-            self.lidar_stack.append(current_lidar) # Aggiungi il nuovo
-        else:
-            self.lidar_stack = [current_lidar]
-
-        # Costruisci l'osservazione finale per la rete
+        self.lidar_stack.append(current_lidar)
+        
         obs = self._compose_obs(env_obs)
 
-        # Gestione Terminated vs Truncated (Standard Gymnasium API)
+        # Gestione terminazione
         terminated = False
         truncated = False
         
         reason = info.get("termination_reason", "unknown")
-
         if done:
             if reason == "max_steps_reached":
                 truncated = True
             else:
-                # goal_reached, collision_static, people_collision
-                terminated = True 
+                terminated = True
 
         if self.render_mode == "human":
             self.env.render()
@@ -144,21 +139,21 @@ class GymNavEnv(gym.Env):
 
     def _compose_obs(self, env_obs):
         """
-        Combina gli scalari (dist, angle, v, w) con lo stack dei lidar inverso.
-        env_obs: [dist, angle, v, w, ...lidar_corrente...]
+        Combina scalari + stack LIDAR.
+        
+        Returns:
+            Array shape: (4 + num_rays * stack_dim,)
         """
-        # I primi 4 valori sono gli scalari di stato
-        scalars = env_obs[:4] 
+        scalars = env_obs[:4]  # [norm_dist, norm_heading, norm_v, norm_w]
         
-        # Concatena lo stack dei lidar in un unico array piatto
-        # Se stack_dim=3 e rays=108, flat_lidar avrà dimensione 324
-        flat_lidar = np.concatenate(self.lidar_stack, axis=0)
+        # Concatena stack in ordine cronologico [oldest → newest]
+        flat_lidar = np.concatenate(list(self.lidar_stack), axis=0)
         
-        # Unisci tutto
         return np.concatenate([scalars, flat_lidar]).astype(np.float32)
     
     def render(self):
-        self.env.render()   
+        if self.render_mode == "human":
+            self.env.render()
 
     def close(self):
         self.env.close()
