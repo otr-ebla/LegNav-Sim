@@ -75,8 +75,11 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
         elif self.scenario_type == "perpendicular":
             eff_width, eff_height = 8.0, 9.0 
         elif self.scenario_type == "circular":
-            eff_width, eff_height = 12.0, 12.0 
-        elif self.scenario_type in ["bottleneck", "static_groups", "intersection"]:
+            eff_width, eff_height = 12.0, 12.0
+        elif self.scenario_type == "static_groups":
+            eff_width, eff_height = 10.0, 10.0
+            self.num_people = 15  # Fisso a 15 per static groups
+        elif self.scenario_type in ["bottleneck", "intersection"]:
             eff_width, eff_height = 10.0, 10.0
         else:
             eff_width, eff_height = SimConfig.ROOM_SIZE[0], SimConfig.ROOM_SIZE[1]
@@ -134,6 +137,9 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
         # Render options
         self.render_skip = render_skip
         self.render_counter = 0
+
+        self.last_v = 0.0
+        self.last_w = 0.0
         
         # Spazi Gym
         self.max_v = RobotConfig.MAX_LINEAR_VEL # Assicurati che importi MAX_LIN_VEL
@@ -146,13 +152,34 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
         
         # Spazi Gym (Coerenti con nav_env + Stacking)
         # 4 scalari (Dist, Angle, V, W) + Lidar * Stack
-        obs_dim = 4 + self.num_rays * self.n_stack
+        # Spazi Gym (Coerenti con gym_nav_env - GOLD STANDARD)
+        # 4 scalari (Dist, Angle, V, W) + Lidar * Stack
+        self.n_stack = RobotConfig.LIDAR_STACK_DIM
+        self.lidar_stack = deque(maxlen=self.n_stack)
+
+        # La dimensione deve essere esattamente 4 (scalari) + (raggi * stack)
+        obs_dim = 4 + (self.num_rays * self.n_stack)
+
+        # Forziamo np.float32 per evitare errori di precisione/broadcasting
+        scalar_low = np.array([0.0, -1.0, 0.0, -1.0], dtype=np.float32)
+        scalar_high = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+
+        lidar_low = np.zeros(self.num_rays * self.n_stack, dtype=np.float32)
+        lidar_high = np.ones(self.num_rays * self.n_stack, dtype=np.float32)
+
         self.observation_space = gym.spaces.Box(
-            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
+            low=np.concatenate([scalar_low, lidar_low]), 
+            high=np.concatenate([scalar_high, lidar_high]), 
+            dtype=np.float32
         )
+
+        # Action Space: v parte da 0.0 (NO RETROMARCIA)
+        low_action = np.array([0.0, -self.max_w], dtype=np.float32)
+        high_action = np.array([self.max_v, self.max_w], dtype=np.float32)
+
         self.action_space = gym.spaces.Box(
-            low=np.array([-self.max_v, -self.max_w]), 
-            high=np.array([self.max_v, self.max_w]), 
+            low=low_action, 
+            high=high_action, 
             dtype=np.float32
         )
 
@@ -167,71 +194,127 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
         elif s_type in ["bottleneck", "static_groups", "intersection"]: return 10.0, 10.0
         else: return SimConfig.ROOM_SIZE[0], SimConfig.ROOM_SIZE[1]
 
+    def _is_safe_point(self, x, y, margin=0.4):
+        """Verifica se un punto è dentro la stanza e fuori dagli ostacoli."""
+        w, h = self.room_width, self.room_height
+        
+        # 1. Check room bounds (with margin)
+        if x < margin or x > w - margin or y < margin or y > h - margin:
+            return False
+        
+        # 2. Check obstacles (with margin)
+        for obs in self.obstacles:
+            if obs["type"] == "circle":
+                dist_sq = (x - obs["cx"])**2 + (y - obs["cy"])**2
+                min_dist = obs["radius"] + margin
+                if dist_sq < min_dist**2: return False
+            elif obs["type"] == "rect":
+                # Expand rect by margin for safety check
+                if (obs["xmin"] - margin <= x <= obs["xmax"] + margin) and \
+                   (obs["ymin"] - margin <= y <= obs["ymax"] + margin):
+                    return False
+        return True
+
     def reset(self, seed=None, options=None):
+        # 1. Reset variabili di stato e statistiche
         self.manual_skip_triggered = False
         self.step_count = 0
         self.episode_path_length = 0.0
         self.trajectory = []
         self.last_v, self.last_w = 0.0, 0.0
         self.last_termination_reason = None
+        self.episode_jerk_sum = 0.0
+        self.progress_reward = 0.0
+        self._yield_violations = 0
+        self._time_stopped_in_zone = 0
 
+        # Gestione seed (Gymnasium standard)
         if seed is not None:
             random.seed(seed)
             np.random.seed(seed)
 
-        # 1. LOGICA MIXED: Scegliamo uno scenario a caso
+        # 2. Logica Scenari "mixed" (se abilitata)
         if self.base_scenario_type == "mixed":
             candidates = ["parallel", "perpendicular", "intersection", "bottleneck", "circular", "random", "static_groups"]
             self.scenario_type = random.choice(candidates)
             self.room_width, self.room_height = self._get_room_size(self.scenario_type)
             
-            # [MODIFICA IMPORTANTE] Se l'utente ha chiesto 0 umani, forza 0.
-            # Altrimenti usa i default degli scenari.
+            # Adattamento numero persone allo scenario
             if self.zero_humans_mode:
                 self.num_people = 0
             else:
                 if self.scenario_type == "bottleneck": self.num_people = 5
                 elif self.scenario_type == "intersection": self.num_people = 6
+                elif self.scenario_type == "static_groups": self.num_people = 15
                 else: self.num_people = SimConfig.NUM_HUMANS
             
-            # Re-inizializza HSFM (necessario se num_people cambia, anche per tornare a 0)
+            # Re-inizializzazione parametri HSFM se il numero persone è cambiato
             if len(self.hsfm_params) != self.num_people + 1:
                 self.hsfm_params = get_standard_humans_parameters(self.num_people + 1)
         else:
             self.scenario_type = self.base_scenario_type
 
-        # 2. Reset Variabili
+        # 3. Reset Motore Fisico e Ostacoli
         self.smooth_v = [0.0] * self.num_people
         self.humans_leg_phase = [0.0] * self.num_people
 
         self._generate_static_obstacles()
-        self._setup_scenario()
+        self._setup_scenario() # Posiziona robot e umani
         self.static_obstacles_jax = self._convert_obs_to_jax()
 
-        # 3. LOGICA FORCE STATIC (Curriculum Phase 1)
-        # Resetta ai parametri standard
-        self.hsfm_params = get_standard_humans_parameters(self.num_people + 1)
-        
+        # Update HSFM Params basato sullo scenario scelto
         if self.force_static:
-            # Forza velocità a 0.0 per tutti gli umani
-            self.hsfm_params = self.hsfm_params.at[:-1, 1].set(0.0)
+            self.hsfm_params = self.hsfm_params.at[:-1, 1].set(0.05)
         elif self.scenario_type == "static_groups":
-            self.hsfm_params = self.hsfm_params.at[:-1, 1].set(0.0)
+            self.hsfm_params = self.hsfm_params.at[:-1, 1].set(0.2)
 
         self.start_x, self.start_y = self.x, self.y
         self.trajectory.append((self.x, self.y))
         
+        # Sincronizzazione posizione iniziale per calcolo velocità umani
         current_states = np.array(self.humans_state_jax)
         self.last_human_pos = current_states[:, :2]
 
-        return self._get_obs(reset_stack=True), {}
+        self.last_v, self.last_w = 0.0, 0.0 
+
+        # 4. RITORNO OSSERVAZIONE INIZIALE CON STACK COMPLETO
+        # Passiamo reset_stack=True per inizializzare correttamente la deque
+        return self._get_obs(self.last_v, self.last_w, reset_stack=True), {}
     
 
 
 
 
-    def _get_obs(self, reset_stack=False):
-        # 1. GOAL (Normalizzato [0, 1] e [-1, 1])
+    def _get_obs(self, v, w, reset_stack=False):
+        """
+        Returns observation with Frame Stacking.
+        Shape: (4 + num_rays * n_stack,) -> e.g. 328
+        """
+        lidar = self._compute_lidar()
+        
+        # 3. LIDAR NORMALIZATION
+        SENSING_HORIZON = self.max_possible_dist
+        denominator = SENSING_HORIZON - self.lidar_min_distance
+        current_inv_lidar = []
+        
+        for d in lidar:
+            inv = (SENSING_HORIZON - d) / denominator
+            current_inv_lidar.append(max(0.0, min(1.0, inv)))
+        
+        # --- STACKING LOGIC ---
+        # If reset, fill the buffer with the current frame N times
+        if reset_stack:
+            self.lidar_stack.clear()
+            for _ in range(self.n_stack):
+                self.lidar_stack.append(current_inv_lidar)
+        else:
+            # Append new frame (automatically removes oldest due to deque maxlen)
+            self.lidar_stack.append(current_inv_lidar)
+            
+        # Flatten the stack
+        stacked_lidar = np.array(self.lidar_stack).flatten()
+        
+        # 1. GOAL (Normalized)
         dist_to_goal = math.hypot(self.goal_x - self.x, self.goal_y - self.y)
         norm_dist = dist_to_goal / self.max_possible_dist
         
@@ -240,36 +323,14 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
         heading_error = (heading_error + math.pi) % (2 * math.pi) - math.pi
         norm_heading = heading_error / math.pi
         
-        # 2. VELOCITÀ (Normalizzate [0, 1] e [-1, 1])
-        norm_v = self.last_v / self.max_v
-        norm_w = self.last_w / self.max_w
+        # 2. VELOCITY (Normalized)
+        norm_v = v / self.max_v
+        norm_w = w / self.max_w
         
-        # 3. LIDAR (Normalizzazione LINEARE identica a nav_env)
-        raw_lidar = self._compute_lidar()
+        # Combine: 4 Scalars + Stacked Lidar
+        obs_list = np.concatenate(([norm_dist, norm_heading, norm_v, norm_w], stacked_lidar))
         
-        SENSING_HORIZON = self.max_lidar_distance
-        denominator = SENSING_HORIZON - self.lidar_min_distance
-        
-        lidar_processed = []
-        for d in raw_lidar:
-            # 1.0 = Vicino, 0.0 = Lontano
-            inv = (SENSING_HORIZON - d) / denominator
-            lidar_processed.append(max(0.0, min(1.0, inv)))
-        
-        lidar_array = np.array(lidar_processed, dtype=np.float32)
-
-        # 4. Stacking (Specifica di JHSFM, manteniamo la logica ma con i dati corretti)
-        if reset_stack:
-            self.lidar_stack.clear()
-            for _ in range(self.n_stack):
-                self.lidar_stack.append(lidar_array)
-        else:
-            self.lidar_stack.append(lidar_array)
-            
-        scalars = np.array([norm_dist, norm_heading, norm_v, norm_w], dtype=np.float32)
-        stacked_lidar = np.concatenate(list(self.lidar_stack))
-        
-        return np.concatenate([scalars, stacked_lidar])
+        return np.array(obs_list, dtype=np.float32)
 
     
     def _apply_robot_action(self, action: np.ndarray, dt):
@@ -309,10 +370,13 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
         # In Gymnasium: 'terminated' è per successo/fallimento, 'truncated' per limiti di tempo
         terminated = False
         truncated = False
+        done = False
         info = {}
 
+        v, w = float(action[0]), float(action[1])
+
         if self.manual_skip_triggered:
-            obs = self._get_obs(reset_stack=False)
+            obs = self._get_obs(v, w, reset_stack=False)
             # Ritorna 5 valori
             return obs, 0.0, True, False, {"termination_reason": "manual_skip"}
 
@@ -357,7 +421,7 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
             reward = -200.0
             terminated = True # Collisione = Episodio Terminato
             info["termination_reason"] = "collision_static"
-            obs = self._get_obs(reset_stack=False)
+            obs = self._get_obs(v, w)
             # Ritorna 5 valori
             return obs, reward, terminated, truncated, info
 
@@ -376,9 +440,9 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
         self.episode_jerk_sum += abs((w - self.last_w) / self.dt)
 
         # ==========================================
-        # === REWARD SYSTEM (Identico a nav_env) ===
+        # === REWARD SYSTEM ===
         # ==========================================
-        
+
         # 1. TIME PENALTY
         reward -= 0.01
 
@@ -388,63 +452,98 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
         self.progress_reward += 5.0 * progress
 
         # 3. SMOOTHNESS
-        reward -= 0.05 * abs(w - self.last_w)
+        jerk_penalty = 0.05 * abs(w - self.last_w)
+        reward -= jerk_penalty
 
-        # 4. YIELDING LOGIC
+        # === YIELDING LOGIC (Directional) ===
+        # Calcoliamo l'angolo dell'umano PIÙ VICINO per capire se è davanti o dietro
         closest_human_dist = float('inf')
+        closest_human_angle = 0.0
+        
         for p in self.people:
             d = math.hypot(p["x"] - self.x, p["y"] - self.y)
-            if d < closest_human_dist: closest_human_dist = d
-        
+            if d < closest_human_dist:
+                closest_human_dist = d
+                global_angle = math.atan2(p["y"] - self.y, p["x"] - self.x)
+                rel_angle = global_angle - self.theta
+                closest_human_angle = (rel_angle + math.pi) % (2 * math.pi) - math.pi
+
+        # Yield Parameters
         YIELD_DIST = 1.5
-        if closest_human_dist < YIELD_DIST:
+        # FOV ristretto per Yielding: consideriamo solo il cono frontale (+/- 60 gradi)
+        # Se l'umano è fuori da questo cono (es. dietro), il robot NON deve rallentare.
+        YIELD_FOV = math.radians(120) / 2  
+        
+        human_in_yield_zone = (closest_human_dist < YIELD_DIST and 
+                            abs(closest_human_angle) < YIELD_FOV)
+
+        # 4. YIELD REWARD/PENALTY
+        if human_in_yield_zone:
             urgency = (YIELD_DIST - closest_human_dist) / YIELD_DIST
-            if v > 0.07:
-                reward -= 15.0 * urgency * (v / self.max_v)
+            
+            # Penalità se ci muoviamo veloce CONTRO qualcuno davanti
+            if v > 0.1:
+                yield_violation_penalty = 15.0 * urgency * (v / self.max_v)
+                reward -= yield_violation_penalty
+                if not hasattr(self, '_yield_violations'): self._yield_violations = 0
                 self._yield_violations += 1
-            else:
+            
+            # Reward se aspettiamo
+            elif v <= 0.1:
+                if not hasattr(self, '_time_stopped_in_zone'): self._time_stopped_in_zone = 0
                 self._time_stopped_in_zone += 1
-                decay = max(0.0, 1.0 - (self._time_stopped_in_zone / 50.0))
-                reward += 0.2 * urgency * decay
+                decay_factor = max(0.0, 1.0 - (self._time_stopped_in_zone / 50.0))
+                reward += 0.2 * urgency * decay_factor
         else:
             self._time_stopped_in_zone = 0
 
         # === TERMINATION CONDITIONS ===
         collision_people = self._is_collision_with_people()
-        is_goal = (dist_to_goal_now <= self.goal_radius)
+        is_goal = self._is_goal_reached()
 
         if is_goal:
-            terminated = True
-            time_eff = 1.0 - (self.step_count / self.max_steps)
-            reward = 200.0 + (100.0 * max(0.0, time_eff))
+            done = True
+            base_goal_reward = 200.0
+            time_efficiency = 1.0 - (self.step_count / self.max_steps)
+            time_bonus = 100.0 * max(0.0, time_efficiency)
+            reward = base_goal_reward + time_bonus
             info["termination_reason"] = "goal_reached"
 
         elif collision_people:
-            terminated = True
-            if v <= 0.07 and abs(w) < 0.1:
+            done = True
+            
+            
+            if v <= 0.1 and abs(w) < 0.1:
+                    # Robot fermo: Passive Collision (Sfortuna)
                 reward = -20.0
                 info["collision_type"] = "passive"
             else:
+                # Robot in movimento: Active Collision (Grave)
                 speed_factor = v / self.max_v
                 reward = -(150.0 * speed_factor)
                 info["collision_type"] = "active"
-            info["termination_reason"] = "collision_people"
+           
+            
+            info["termination_reason"] = "people_collision"
 
         elif self.step_count >= self.max_steps:
-            # Timeout è Truncated, non Terminated (secondo standard moderni)
-            # MA SB3 spesso tratta entrambi come 'done'. Per sicurezza usiamo truncated=True.
-            truncated = True 
-            dist_penalty = -50.0 * (dist_to_goal_now / self.max_possible_dist)
+            done = True
+            remaining_dist = dist_to_goal_now
+            dist_penalty = -50.0 * (remaining_dist / self.max_possible_dist)
             reward = -50.0 + dist_penalty
-            info["termination_reason"] = "timeout"
+            info["termination_reason"] = "max_steps_reached"
 
-        # Finalizza
-        self.last_v, self.last_w = v, w
-        obs = self._get_obs(reset_stack=False)
-        
-        if terminated or truncated:
-             info["path_length"] = self.episode_path_length
-             info["total_time"] = self.step_count * self.dt
+        if done:
+            self.last_termination_reason = info.get("termination_reason", "unknown")
+            info["path_length"] = self.episode_path_length
+            info["total_time"] = self.step_count * self.dt
+            info["mean_jerk"] = self.episode_jerk_sum / self.step_count if self.step_count > 0 else 0.0
+            info["progress_reward_total"] = self.progress_reward
+
+        self.last_w = w
+        self.last_v = v
+
+        obs = self._get_obs(v, w)
         
         # RITORNA 5 VALORI (Fix per ValueError)
         return obs, reward, terminated, truncated, info
@@ -506,7 +605,9 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
             dist = math.hypot(s[0]-target_pos[0], s[1]-target_pos[1])
             
             if dist < 0.6: 
+                # ... (Gestione Bottleneck uguale a prima) ...
                 if self.scenario_type == "bottleneck":
+                    # ... (lasciare codice bottleneck esistente) ...
                     if current_idx == 1: 
                         new_idx = 2
                         self.humans_goal_indices = self.humans_goal_indices.at[i].set(new_idx)
@@ -518,10 +619,39 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
                         new_idx = 1
                         self.humans_goal_indices = self.humans_goal_indices.at[i].set(new_idx)
                         self.humans_goal_jax = self.humans_goal_jax.at[i].set(self.humans_goals_mem_jax[i, new_idx])
-                elif self.scenario_type in ["parallel", "perpendicular"]:
+
+                # >>> MODIFICA QUI PER PARALLEL E PERPENDICULAR <<<
+                elif self.scenario_type == "parallel":
+                    # Genera nuova posizione random in ALTO, evitando ostacoli
+                    found_new_pos = False
+                    new_rx, new_ry = 0.0, 0.0
+                    
+                    # Tentativi per trovare punto libero
+                    for _ in range(20):
+                        # Zona alta stanza (H-3.0 a H-1.0)
+                        tx = random.uniform(1.0, self.room_width - 1.0)
+                        ty = random.uniform(self.room_height - 3.0, self.room_height - 1.0)
+                        if self._is_safe_point(tx, ty, margin=0.4):
+                            new_rx, new_ry = tx, ty
+                            found_new_pos = True
+                            break
+                    
+                    if not found_new_pos:
+                        # Fallback: usa il punto originale in memoria se non trova spazio
+                        start_pos = goals_mem[i, 0]
+                        new_rx, new_ry = start_pos[0], start_pos[1]
+
+                    # Reset: Posizione Nuova, Velocità 0, Angolo verso il basso (-pi/2)
+                    new_s = jnp.array([new_rx, new_ry, 0.0, 0.0, -1.57, 0.0])
+                    self.humans_state_jax = self.humans_state_jax.at[i].set(new_s)
+                
+                elif self.scenario_type == "perpendicular":
+                    # Per perpendicular possiamo mantenere il ciclo semplice o randomizzare anche qui
+                    # Manteniamo semplice per ora (back to start)
                     start_pos = goals_mem[i, 0]
                     new_s = jnp.array([start_pos[0], start_pos[1], 0.0, 0.0, s[4], 0.0])
                     self.humans_state_jax = self.humans_state_jax.at[i].set(new_s)
+
                 elif self.scenario_type not in ["static_groups"]:
                     target_idx = 1 if current_idx == 0 else 0
                     self.humans_goal_indices = self.humans_goal_indices.at[i].set(target_idx)
@@ -691,42 +821,31 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
 
     def _setup_scenario(self):
         w, h = self.room_width, self.room_height
-        states, raw_goals = [], [] # raw_goals può contenere punti singoli o liste
         
-        # --- Helper: Check Valid Point with Margin ---
-        def is_safe_point(x, y, margin=0.4):
-            # 1. Check room bounds (with margin)
-            if x < margin or x > w - margin or y < margin or y > h - margin:
-                return False
-            
-            # 2. Check obstacles (with margin)
-            for obs in self.obstacles:
-                if obs["type"] == "circle":
-                    dist_sq = (x - obs["cx"])**2 + (y - obs["cy"])**2
-                    min_dist = obs["radius"] + margin
-                    if dist_sq < min_dist**2: return False
-                elif obs["type"] == "rect":
-                    # Expand rect by margin for safety check
-                    if (obs["xmin"] - margin <= x <= obs["xmax"] + margin) and \
-                       (obs["ymin"] - margin <= y <= obs["ymax"] + margin):
-                        return False
-                
-            return True
-
+        # --- Helper: Find Valid Point with Retry ---
         def get_valid_point(x, y, search_radius=2.0, margin=0.4):
             """If (x,y) is unsafe, find a neighbor point that is safe."""
-            if is_safe_point(x, y, margin):
+            # Usa il metodo della classe che controlla gli ostacoli correnti
+            if self._is_safe_point(x, y, margin):
                 return x, y
             
-            # Retry loop: search for a safe spot nearby
+            # Retry loop 1: cerca un punto sicuro nelle vicinanze
             for _ in range(100):
                 nx = x + random.uniform(-search_radius, search_radius)
                 ny = y + random.uniform(-search_radius, search_radius)
-                if is_safe_point(nx, ny, margin):
+                if self._is_safe_point(nx, ny, margin):
                     return nx, ny
-            return x, y # Fallback (should be extremely rare)
+            
+            # Retry loop 2: Fallback (cerca ovunque nella stanza se il raggio fallisce)
+            for _ in range(100):
+                 nx = random.uniform(margin, w-margin)
+                 ny = random.uniform(margin, h-margin)
+                 if self._is_safe_point(nx, ny, margin):
+                    return nx, ny
 
-        #1. Chiamata a Scenarios
+            return x, y # Fallback disperato (ritorna il punto originale se tutto fallisce)
+
+        # 1. Chiamata a Scenarios
         if self.scenario_type == "bottleneck":
             # Passiamo il gap dinamico calcolato in _generate_static_obstacles
             r_s, r_g, states, raw_goals = Scenarios.bottleneck(w, h, self.num_people, getattr(self, 'bottleneck_gap_x', w/2))
@@ -751,15 +870,15 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
         gx, gy = get_valid_point(gx, gy, margin=0.35)
         self.goal_x, self.goal_y = gx, gy
 
-        # 3. Setup Umani e Memoria Waypoints (Standardizzazione a 3 stadi)
+        # 3. Setup Umani e Memoria Waypoints
         # Struttura Memoria: [START, TARGET_1, TARGET_2]
         goals_mem = []
-        
         safe_margin = 0.4
+        
         for i in range(len(states)):
             # Validazione Start Position (Umano)
             states[i][0], states[i][1] = get_valid_point(states[i][0], states[i][1], margin=safe_margin)
-            s_pos = states[i][:2] # Start effettivo (middle)
+            s_pos = states[i][:2] # Start effettivo (dopo validazione)
             
             g_data = raw_goals[i]
             
@@ -774,12 +893,7 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
                 # g_data è [Estremo_A, Estremo_B]
                 pt_a = list(get_valid_point(g_data[0][0], g_data[0][1], margin=safe_margin))
                 pt_b = list(get_valid_point(g_data[1][0], g_data[1][1], margin=safe_margin))
-                
-                # Memoria: [Estremo_A, Estremo_B, Estremo_B]
-                # Nota: Non usiamo s_pos qui, perché in patrol si rimbalza tra A e B
                 goals_mem.append([pt_a, pt_b, pt_b])
-
-                
 
             # --- CASO C: ALTRI (Start -> End) ---
             else:
@@ -793,7 +907,14 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
                 goals_mem.append([s_pos, final_pt, final_pt])
 
                 if self.scenario_type == "parallel":
-                    states[i][1] = random.uniform(4.0, h-1.0)
+                    # Assicuriamoci che non sia spawnato troppo in basso per errore durante la validazione
+                    # Se y è troppo basso (< metà stanza), rispediscilo su
+                    if states[i][1] < self.room_height / 2:
+                        states[i][1] = random.uniform(self.room_height - 3.0, self.room_height - 1.0)
+                        states[i][0], states[i][1] = get_valid_point(states[i][0], states[i][1], margin=safe_margin)
+                        # Aggiorna anche s_pos in memoria per coerenza
+                        s_pos = states[i][:2]
+                        goals_mem[-1][0] = s_pos 
 
         if self.num_people > 0:
             self.humans_goals_mem_jax = jnp.array(goals_mem, dtype=jnp.float32)
@@ -802,7 +923,6 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
             self.humans_goal_jax = self.humans_goals_mem_jax[:, 1]
             self.humans_state_jax = jnp.array(states, dtype=jnp.float32)
         else:
-            # Array vuoti con le dimensioni corrette per evitare errori di indicizzazione
             self.humans_goals_mem_jax = jnp.zeros((0, 3, 2), dtype=jnp.float32)
             self.humans_goal_indices = jnp.zeros((0,), dtype=jnp.int32)
             self.humans_goal_jax = jnp.zeros((0, 2), dtype=jnp.float32)

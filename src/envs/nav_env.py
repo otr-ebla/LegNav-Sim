@@ -305,7 +305,7 @@ class Simple2DEnv:
     def _apply_differential_drive_constraints(self, v, w):
         # [MODIFICATO] Sostituita logica ruote con clamping diretto ai limiti del robot
         # Questo assicura che il robot non superi MAI 0.3 m/s e 2.3 rad/s
-        v = max(-self.max_v, min(v, self.max_v))
+        v = max(0.0, min(v, self.max_v))
         w = max(-self.max_w, min(w, self.max_w))
         return v, w
 

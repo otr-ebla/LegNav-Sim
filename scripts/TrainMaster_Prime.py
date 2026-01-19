@@ -37,6 +37,58 @@ python3 -m scripts.TrainMaster_Prime \
     --use_legs
 """
 
+class SaveBestSuccessCallback(BaseCallback):
+    """
+    Callback personalizzata per valutare l'agente periodicamente
+    e salvare il modello SOLO se il Success Rate migliora.
+    """
+    def __init__(self, eval_env, eval_freq=20000, save_path="./checkpoints/", name_prefix="best_model", verbose=1):
+        super().__init__(verbose)
+        self.eval_env = eval_env
+        self.eval_freq = eval_freq
+        self.save_path = save_path
+        self.name_prefix = name_prefix
+        self.best_success_rate = -np.inf
+        
+    def _on_step(self) -> bool:
+        if self.n_calls % self.eval_freq == 0:
+            print(f"\n--- 🔍 Auto-Evaluating at step {self.num_timesteps} ---")
+            
+            # 1. Sincronizza VecNormalize (Fondamentale!)
+            # Copia le statistiche (media/var) dall'env di training a quello di eval
+            # altrimenti l'agente vede "numeri sbagliati".
+            if isinstance(self.training_env, VecNormalize) and isinstance(self.eval_env, VecNormalize):
+                self.eval_env.training = False # Non aggiornare stats durante eval
+                self.eval_env.norm_reward = False 
+                self.eval_env.obs_rms = self.training_env.obs_rms
+            
+            # 2. Esegui valutazione usando la tua funzione esistente
+            # Usiamo un numero ridotto di episodi (es. 20) per non rallentare troppo il training
+            current_sr, current_spl = evaluate_master(
+                self.model, 
+                self.eval_env, 
+                num_episodes=20, 
+                render=False, 
+                name="AutoEval"
+            )
+            
+            # 3. Confronta e Salva
+            if current_sr > self.best_success_rate:
+                if self.verbose > 0:
+                    print(f"🔥 NEW RECORD! Success Rate: {current_sr:.2%} (Was: {self.best_success_rate:.2%})")
+                    print(f"💾 Saving model to {self.save_path}/{self.name_prefix}_BEST.zip")
+                
+                self.best_success_rate = current_sr
+                self.model.save(os.path.join(self.save_path, f"{self.name_prefix}_BEST"))
+                
+                # Salviamo anche il VecNormalize associato al miglior modello
+                if isinstance(self.eval_env, VecNormalize):
+                    self.eval_env.save(os.path.join(self.save_path, f"{self.name_prefix}_BEST_vecnormalize.pkl"))
+            else:
+                print(f"❄️  No improvement (Current: {current_sr:.2%} <= Best: {self.best_success_rate:.2%})")
+                
+        return True
+
 class TrainMasterMetrics(BaseCallback):
     """Callback to monitor TrainMaster_Prime performance during training."""
     def __init__(self, verbose=0):
@@ -284,14 +336,63 @@ def main():
         if args.eval:
             evaluate_master(model, env, args.eval_episodes, render=args.render, name=f"{args.name}_{current_scenario}")
         else:
-            # Training Mode (Solo se scenario singolo, non ha senso trainare su "all" in loop sequenziale qui)
-            callbacks = [TrainMasterMetrics(), CheckpointCallback(save_freq=50000, save_path=base_save_path, name_prefix="tm_ckpt")]
-            model.learn(total_timesteps=args.steps, callback=callbacks, reset_num_timesteps=(args.load_model is None))
-            model.save(f"{base_save_path}/TrainMaster_Final")
-            env.save(f"{base_save_path}/TrainMaster_VecNorm.pkl")
+            # --- SETUP CALLBACKS ---
+            # A. Creiamo un Env separato per la validazione
+            val_env = SubprocVecEnv([
+                make_env(999, random_seed+999, current_scenario, curr_people, args.use_legs, 
+                        is_training=False, 
+                        force_static=args.force_static,
+                        distraction_prob=args.distraction_prob)
+            ])
+            
+            if args.load_vecnorm:
+                val_env = VecNormalize.load(args.load_vecnorm, val_env)
+            else:
+                val_env = VecNormalize(val_env, norm_obs=True, norm_reward=False)
+            
+            val_env.training = False     
+            val_env.norm_reward = False 
+
+            save_best_cb = SaveBestSuccessCallback(
+                eval_env=val_env,
+                eval_freq=20000,
+                save_path=base_save_path,
+                name_prefix=args.name
+            )
+            
+            checkpoint_cb = CheckpointCallback(save_freq=50000, save_path=base_save_path, name_prefix="tm_ckpt")
+            metrics_cb = TrainMasterMetrics()
+            
+            print(f"🚀 Training Started... (Press Ctrl+C to save and exit)")
+            
+            # --- BLOCCO TRY-EXCEPT PER GESTIRE CTRL+C ---
+            try:
+                model.learn(
+                    total_timesteps=args.steps, 
+                    callback=[metrics_cb, checkpoint_cb, save_best_cb], 
+                    reset_num_timesteps=(args.load_model is None)
+                )
+                
+                # Salvataggio standard se finisce i passi
+                print("✅ Training Completed. Saving final model...")
+                model.save(f"{base_save_path}/TrainMaster_Final")
+                if isinstance(env, VecNormalize):
+                    env.save(f"{base_save_path}/TrainMaster_VecNorm.pkl")
+
+            except KeyboardInterrupt:
+                print("\n\n⚠️  INTERRUPTED MANUALLY! Saving current state before exiting...")
+                
+                # Salvataggio di emergenza
+                model.save(f"{base_save_path}/TrainMaster_INTERRUPTED")
+                
+                if isinstance(env, VecNormalize):
+                    env.save(f"{base_save_path}/TrainMaster_VecNorm_INTERRUPTED.pkl")
+                
+                print(f"💾 Emergency save completed at: {base_save_path}/TrainMaster_INTERRUPTED")
+            
+            val_env.close() 
         
         env.close()
-        
         # Se siamo in training, usciamo dopo il primo scenario (la logica "all" è solo per eval)
         if not args.eval:
             break

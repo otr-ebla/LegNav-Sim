@@ -222,7 +222,7 @@ class Scenarios:
 
             # Fallback se la stanza è troppo affollata: piazza comunque ma avvisa
             if not valid_center:
-                print("\n\nWarning: Centro valido non trovato, usando fallback.\n\n")
+                #print("\n\nWarning: Centro valido non trovato, usando fallback.\n\n")
                 cx, cy = random.uniform(0.7, w-0.7), random.uniform(0.7, h-0.7)
 
             group_centers.append((cx, cy))
