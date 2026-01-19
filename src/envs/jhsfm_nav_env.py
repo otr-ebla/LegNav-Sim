@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 from src.config import RobotConfig, LidarConfig, SimConfig 
 
 # Importiamo la classe padre per riutilizzare render e matematica
-from src.envs.nav_env import Simple2DEnv
+from src.envs.nav_env import Simple2DEnv, GAP_PEOPLE, GAP_STATIC
 from src.envs.scenarios import Scenarios
 
 # --- IMPORT JAX/HSFM ---
@@ -27,6 +27,9 @@ except ImportError:
     from jhsfm_utils.JHSFM.jhsfm.hsfm import step as hsfm_step
     from jhsfm_utils.JHSFM.jhsfm.utils import get_standard_humans_parameters
 
+GAP_PEOPLE = 0.0    
+
+
 class SimpleNavEnv(Simple2DEnv, gym.Env):
     metadata = {'render_modes': ['human', 'rgb_array'], 'render_fps': 30} # Aggiorna metadata
 
@@ -38,7 +41,8 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
                 use_legs=True,
                 render_mode=None,
                 force_static=False,
-                render_skip=1):
+                render_skip=1,
+                distraction_prob=0.0):
         # 1. Configurazione Scenario
         self.base_scenario_type = scenario_type
         self.scenario_type = scenario_type
@@ -89,7 +93,10 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
             num_people=self.num_people,
             people_radius=SimConfig.HUMANS_RADIUS, 
             people_speed=self.current_people_speed, # Passiamo la velocità (utile per debug/render)
+            human_distraction_prob=distraction_prob,
         )
+
+        self.human_distraction_prob = distraction_prob
         
         # Override parametri fisici robot
         self.max_v = RobotConfig.MAX_LINEAR_VEL
@@ -299,11 +306,14 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
 
     def step(self, action):
         reward = 0.0
-        done = False
+        # In Gymnasium: 'terminated' è per successo/fallimento, 'truncated' per limiti di tempo
+        terminated = False
+        truncated = False
         info = {}
 
         if self.manual_skip_triggered:
             obs = self._get_obs(reset_stack=False)
+            # Ritorna 5 valori
             return obs, 0.0, True, False, {"termination_reason": "manual_skip"}
 
         # 1. Action Processing
@@ -315,14 +325,15 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
         # 2. Physics Update (Robot & Humans via JHSFM)
         prev_x, prev_y, prev_theta = self.x, self.y, self.theta
         
-        # --- Robot Update (Manual Kinematics per calcolare next_x prima di confermare) ---
+        # Calcolo next_x per collisioni
         next_theta = self.theta + w * self.dt
         next_theta = (next_theta + math.pi) % (2 * math.pi) - math.pi
         next_x = self.x + v * self.dt * math.cos(next_theta)
         next_y = self.y + v * self.dt * math.sin(next_theta)
 
         # 3. Collision Check Statico (Prima di muovere)
-        GAP_STATIC = 0.0
+        # Usa GAP_STATIC definito nel file o ereditato (0.0)
+        GAP_STATIC = getattr(self, 'GAP_STATIC', 0.0) 
         eff_radius = self.robot_radius + GAP_STATIC
         collision_static = False
 
@@ -343,19 +354,19 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
                         collision_static = True; break
 
         if collision_static:
-            # Terminazione Immediata come nav_env
             reward = -200.0
-            done = True
+            terminated = True # Collisione = Episodio Terminato
             info["termination_reason"] = "collision_static"
             obs = self._get_obs(reset_stack=False)
-            return obs, reward, done, False, info
+            # Ritorna 5 valori
+            return obs, reward, terminated, truncated, info
 
         # Conferma Movimento
         if self.training:
              self.x, self.y, self.theta = next_x, next_y, next_theta
              self.trajectory.append((self.x, self.y))
         
-        # Aggiornamento Umani JAX (Mantiene la logica speciale di JHSFM)
+        # Aggiornamento Umani JAX
         self._update_humans_simulation(action, prev_x, prev_y, prev_theta)
         self._sync_people_list()
         
@@ -400,17 +411,16 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
 
         # === TERMINATION CONDITIONS ===
         collision_people = self._is_collision_with_people()
-        is_goal = (dist_to_goal_now <= self.goal_radius) # o self._is_goal_reached()
+        is_goal = (dist_to_goal_now <= self.goal_radius)
 
         if is_goal:
-            done = True
+            terminated = True
             time_eff = 1.0 - (self.step_count / self.max_steps)
             reward = 200.0 + (100.0 * max(0.0, time_eff))
             info["termination_reason"] = "goal_reached"
 
         elif collision_people:
-            done = True
-            # Active vs Passive Logic
+            terminated = True
             if v <= 0.07 and abs(w) < 0.1:
                 reward = -20.0
                 info["collision_type"] = "passive"
@@ -421,7 +431,9 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
             info["termination_reason"] = "collision_people"
 
         elif self.step_count >= self.max_steps:
-            done = True
+            # Timeout è Truncated, non Terminated (secondo standard moderni)
+            # MA SB3 spesso tratta entrambi come 'done'. Per sicurezza usiamo truncated=True.
+            truncated = True 
             dist_penalty = -50.0 * (dist_to_goal_now / self.max_possible_dist)
             reward = -50.0 + dist_penalty
             info["termination_reason"] = "timeout"
@@ -430,12 +442,12 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
         self.last_v, self.last_w = v, w
         obs = self._get_obs(reset_stack=False)
         
-        if done:
-             # Aggiungi metriche extra a info come in nav_env
+        if terminated or truncated:
              info["path_length"] = self.episode_path_length
              info["total_time"] = self.step_count * self.dt
         
-        return obs, reward, done, False, info
+        # RITORNA 5 VALORI (Fix per ValueError)
+        return obs, reward, terminated, truncated, info
     
 
     def _update_humans_simulation(self, robot_action, prev_x, prev_y, prev_theta):

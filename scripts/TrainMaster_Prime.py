@@ -4,6 +4,7 @@ import gymnasium as gym
 import torch
 import numpy as np
 import random
+import time
 
 from stable_baselines3 import PPO, SAC
 from sb3_contrib import TQC
@@ -14,26 +15,25 @@ from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 # Import custom environment
 # Run from root with: python -m scripts.TrainMaster_Prime ...
 from src.envs.jhsfm_nav_env import SimpleNavEnv
+from src.config import LidarConfig
+
+# Import Custom Architectures (per caricare modelli da train_ppo)
+try:
+    from models.hybrid_cnn_mlp import HybridCnnMlp
+except ImportError:
+    print("⚠️ Warning: Could not import HybridCnnMlp. Custom NN loading might fail.")
+    HybridCnnMlp = None
 
 """
-COMMAND FOR CURRICULUM STAGE 2 (Mixed Scenarios + Load Pre-trained):
-python3 -m scripts.TrainMaster_Prime \
-    --name Curriculum_Stage2_Mixed \
-    --scenario mixed \
-    --algo tqc \
-    --steps 1000000 \
-    --n_envs 16 \
-    --use_legs \
-    --load_model checkpoints/Curriculum_Stage1_MixedStatic/TrainMaster_Final.zip \
-    --load_vecnorm checkpoints/Curriculum_Stage1_MixedStatic/TrainMaster_VecNorm.pkl
-
-COMMAND FOR EVALUATION:  
+COMMAND FOR FULL EVALUATION (All Scenarios) using a Train_PPO model:
 python3 -m scripts.TrainMaster_Prime \
     --eval --render \
-    --name Eval_Stage2 \
-    --scenario mixed \
-    --load_model checkpoints/Curriculum_Stage2_Mixed/TrainMaster_Final.zip \
-    --load_vecnorm checkpoints/Curriculum_Stage2_Mixed/TrainMaster_VecNorm.pkl \
+    --name Eval_Global_Test \
+    --scenario all \
+    --algo tqc \
+    --custom_nn \
+    --load_model checkpoints/Stage2_Model_BEST.zip \
+    --load_vecnorm checkpoints/Stage2_Model_BEST_vecnormalize.pkl \
     --use_legs
 """
 
@@ -59,7 +59,7 @@ class TrainMasterMetrics(BaseCallback):
                         self.logger.record(f"train_master/{k}_rate", v / self.total)
         return True
 
-def make_env(rank, seed, scenario, num_people, use_legs, is_training=True, render_mode=None, force_static=False, render_skip=1):
+def make_env(rank, seed, scenario, num_people, use_legs, is_training=True, render_mode=None, force_static=False, render_skip=1, distraction_prob=0.0):
     def _init():
         env = SimpleNavEnv(
             scenario_type=scenario, 
@@ -69,10 +69,11 @@ def make_env(rank, seed, scenario, num_people, use_legs, is_training=True, rende
             use_legs=use_legs,
             render_mode=render_mode,
             force_static=force_static,
-            render_skip=render_skip
+            render_skip=render_skip,
+            distraction_prob=distraction_prob
         )
         env = Monitor(env)
-        env.reset(seed=seed + rank)
+        env.reset(seed=seed + rank + int(time.time()))
         return env
     return _init
 
@@ -80,11 +81,12 @@ def evaluate_master(model, env, num_episodes, render=False, name="eval"):
     """
     Executes evaluation of NavigatorPrime.
     """
-    print(f"\n--- 🧐 EVALUATION TrainMaster_Prime ({num_episodes} episodes) ---")
-    if render:
-        print("📺 Rendering ACTIVE (Press Ctrl+C in terminal to stop)")
-
-    stats = {"SR": 0, "CR": 0, "TR": 0, "Time": []}
+    print(f"\n--- 🧐 EVALUATION: {name} ({num_episodes} episodes) ---")
+    
+    stats = {
+        "SR": 0, "CR": 0, "TR": 0, "Time": [], "SPL": [], "Jerk": [], 
+        "Coll_Ppl": 0, "Coll_Obs": 0
+    }
     episodes_finished = 0
     
     obs = env.reset()
@@ -96,6 +98,7 @@ def evaluate_master(model, env, num_episodes, render=False, name="eval"):
 
             obs, rewards, dones, infos = env.step(action)
 
+            # Supporto per skip manuale da tastiera (definito in jhsfm_nav_env)
             if hasattr(env.envs[0].unwrapped, 'manual_skip_triggered') and env.envs[0].unwrapped.manual_skip_triggered:
                 obs = env.reset()
 
@@ -103,43 +106,76 @@ def evaluate_master(model, env, num_episodes, render=False, name="eval"):
             
             if render:
                 env.render()
+                # time.sleep(0.01) # Scommentare per rallentare il render
 
             for i, done in enumerate(dones):
                 if done:
+                    # Raccogliamo i dati solo se non abbiamo finito i test richiesti
                     if episodes_finished < num_episodes:
                         episodes_finished += 1
-                        res = infos[i].get("termination_reason", "none")
                         
+                        # Parsing Info
+                        inf = infos[i]
+                        res = inf.get("termination_reason", "none")
+                        ep_len = inf.get("path_length", 0.0)
+                        
+                        # Stats Base
                         if res == "goal_reached":
                             stats["SR"] += 1
-                            stats["Time"].append(steps_per_env[i] * 0.1) 
+                            stats["Time"].append(inf.get("total_time", 0.0))
+                            
+                            # SPL Calculation
+                            start_goal_dist = np.linalg.norm(np.array([inf.get("start_x",0), inf.get("start_y",0)]) - np.array([inf.get("goal_x",0), inf.get("goal_y",0)]))
+                            denom = max(ep_len, start_goal_dist)
+                            if denom > 0: stats["SPL"].append(start_goal_dist / denom)
+
                         elif "collision" in res:
                             stats["CR"] += 1
+                            if "people" in res: stats["Coll_Ppl"] += 1
+                            else: stats["Coll_Obs"] += 1
+                            stats["SPL"].append(0.0)
                         else:
                             stats["TR"] += 1
+                            stats["SPL"].append(0.0)
                         
-                        if episodes_finished % 10 == 0:
-                            print(f"   -> Episodes completed: {episodes_finished}/{num_episodes}")
+                        stats["Jerk"].append(inf.get("mean_jerk", 0.0))
+                        
+                        # Print Progress
+                        if episodes_finished % 5 == 0 or render:
+                            icon = "✅" if res=="goal_reached" else "💥" if "collision" in res else "⏳"
+                            print(f"   -> Ep {episodes_finished}/{num_episodes}: {icon} {res} (SPL: {stats['SPL'][-1]:.2f})")
 
                     steps_per_env[i] = 0
                     
     except KeyboardInterrupt:
         print("\n⚠️ Evaluation interrupted manually.")
 
+    # Report Finale
     if episodes_finished > 0:
-        print(f"\n--- 📊 EVALUATION REPORT ({episodes_finished} EPISODES) ---")
-        print(f"Success Rate (SR): {stats['SR']/episodes_finished:.2%}")
-        print(f"Collision Rate (CR): {stats['CR']/episodes_finished:.2%}")
-        if stats['Time']: 
-            print(f"Mean Time: {np.mean(stats['Time']):.2f}s")
-        else:
-            print("Mean Time: N/A")
+        sr = stats['SR']/episodes_finished
+        cr = stats['CR']/episodes_finished
+        tr = stats['TR']/episodes_finished
+        mean_time = np.mean(stats['Time']) if stats['Time'] else 0.0
+        mean_spl = np.mean(stats['SPL']) if stats['SPL'] else 0.0
+        
+        print(f"\n" + "="*50)
+        print(f"📊 REPORT: {name}")
+        print(f"="*50)
+        print(f"✅ Success Rate:   {sr:.2%}")
+        print(f"💥 Collision Rate: {cr:.2%}")
+        print(f"   ├─ People:      {stats['Coll_Ppl']}")
+        print(f"   └─ Obstacles:   {stats['Coll_Obs']}")
+        print(f"⏳ Timeout Rate:   {tr:.2%}")
+        print(f"📏 Mean SPL:       {mean_spl:.3f}")
+        print(f"⏱️  Mean Time:      {mean_time:.2f} s")
+        print(f"="*50 + "\n")
+        return sr, mean_spl
     else:
         print("\n⚠️ No episodes completed.")
-    print("-------------------------------------------\n")
+        return 0.0, 0.0
 
 def main():
-    parser = argparse.ArgumentParser(description="TrainMaster_Prime: Advanced RL Training Suite")
+    parser = argparse.ArgumentParser(description="TrainMaster_Prime: Universal Evaluator")
     
     # Training Params
     parser.add_argument("--algo", type=str, default="tqc", choices=["ppo", "sac", "tqc"], help="RL Algorithm")
@@ -147,20 +183,22 @@ def main():
     parser.add_argument("--n_envs", type=int, default=8, help="Number of parallel environments")
     
     # Environment Params
-    parser.add_argument("--scenario", type=str, default="static_groups", help="Scenario: static_groups, random, mixed, etc.")
+    parser.add_argument("--scenario", type=str, default="static_groups", help="Scenario: 'all', 'mixed', 'bottleneck', 'intersection', etc.")
     parser.add_argument("--name", type=str, required=True, help="Experiment Name")
     parser.add_argument("--use_legs", action="store_true", help="Enable legs simulation in Lidar")
     parser.add_argument("--num_people", type=int, default=None, help="Override number of people")
     parser.add_argument("--force_static", action="store_true", help="Freeze humans (Stage 1)")
+    parser.add_argument("--distraction_prob", type=float, default=0.0, help="Probability humans are distracted")
 
     # Load / Resume Params
     parser.add_argument("--load_model", type=str, default=None, help="Path to .zip model to load")
     parser.add_argument("--load_vecnorm", type=str, default=None, help="Path to .pkl stats to load")
-    parser.add_argument("--continue_training", action="store_true", help="If set, continues tensorboard step counter. If not, resets steps to 0 (New Stage).")
+    parser.add_argument("--continue_training", action="store_true", help="If set, continues tensorboard step counter.")
+    parser.add_argument("--custom_nn", action="store_true", help="Set if model uses HybridCnnMlp")
     
     # Evaluation / Render Params
     parser.add_argument("--eval", action="store_true", help="Evaluation mode")
-    parser.add_argument("--eval_episodes", type=int, default=50, help="Number of test episodes")
+    parser.add_argument("--eval_episodes", type=int, default=50, help="Number of test episodes per scenario")
     parser.add_argument("--render", action="store_true", help="Visual render (forces 1 env)")
     parser.add_argument("--render_skip", type=int, default=1, help="Render skip frames")
 
@@ -171,110 +209,98 @@ def main():
     os.makedirs(base_save_path, exist_ok=True)
 
     print(f"🛠️  TrainMaster_Prime Started: {args.algo.upper()} | Mission: {args.name}")
-    print(f"🦵 Legs Mode: {'ACTIVE' if args.use_legs else 'INACTIVE'}")
-    
-    if args.scenario == "mixed":
-        print(f"🔄 Scenario MIXED: Randomization active (including static groups)!")
 
-    is_training_env = not args.eval
-    random_seed_number = random.randint(0, 100)
-
-    # 1. Environment Setup
-    if args.render:
-        print("📺 Visual Mode: Forcing single environment...")
-        n_envs = 1
-        env = DummyVecEnv([
-            make_env(0, random_seed_number, args.scenario, args.num_people, args.use_legs, 
-                     is_training=is_training_env, 
-                     render_mode="human", 
-                     force_static=args.force_static, 
-                     render_skip=args.render_skip)
-        ])
+    # Determina lista scenari
+    if args.scenario == "all":
+        scenarios_to_run = ["parallel", "intersection", "bottleneck", "static_groups", "random"]
+        print(f"🌍 Mode: GLOBAL EVALUATION (Running on: {scenarios_to_run})")
     else:
-        n_envs = args.n_envs
-        env = SubprocVecEnv([
-            make_env(i, random_seed_number, args.scenario, args.num_people, args.use_legs, 
-                     is_training=is_training_env,
-                     force_static=args.force_static) 
-            for i in range(n_envs)
-        ])
+        scenarios_to_run = [args.scenario]
+
+    # Parametri modello
+    ModelClass = {"ppo": PPO, "sac": SAC, "tqc": TQC}[args.algo]
     
-    # 2. VecNormalize Handling
-    if args.load_vecnorm:
-        print(f"📥 Loading VecNormalize from {args.load_vecnorm}...")
-        env = VecNormalize.load(args.load_vecnorm, env)
+    # Preparazione Custom Objects per caricamento
+    custom_objects = {}
+    if args.custom_nn and HybridCnnMlp:
+        custom_objects["HybridCnnMlp"] = HybridCnnMlp
+        # Fix per parametri scheduler salvati
+        custom_objects["learning_rate"] = 0.0 
+        custom_objects["lr_schedule"] = lambda _: 0.0
+        custom_objects["clip_range"] = lambda _: 0.0
+
+    # --- CICLO SCENARI ---
+    for current_scenario in scenarios_to_run:
+        print(f"\n🔄 SETUP SCENARIO: {current_scenario.upper()}")
         
-        if args.eval or args.render:
-            print("   -> Mode: EVAL (Stats frozen)")
-            env.training = False 
-            env.norm_reward = False 
+        # 1. Configurazione Env
+        is_training_env = not args.eval
+        random_seed = random.randint(0, 1000)
+        
+        # Override num_people per scenario se non forzato
+        curr_people = args.num_people
+        if curr_people is None:
+            if current_scenario == "bottleneck": curr_people = 5
+            elif current_scenario == "intersection": curr_people = 6
+            elif current_scenario == "parallel": curr_people = 7
+            else: curr_people = 10 # Default
+
+        if args.render:
+            n_envs = 1
+            env = DummyVecEnv([
+                make_env(0, random_seed, current_scenario, curr_people, args.use_legs, 
+                        is_training=is_training_env, render_mode="human", 
+                        force_static=args.force_static, render_skip=args.render_skip,
+                        distraction_prob=args.distraction_prob)
+            ])
         else:
-            print("   -> Mode: TRAINING (Stats will continue to update)")
-            env.training = True 
-            env.norm_reward = True
-    else:
+            n_envs = args.n_envs
+            env = SubprocVecEnv([
+                make_env(i, random_seed, current_scenario, curr_people, args.use_legs, 
+                        is_training=is_training_env, force_static=args.force_static,
+                        distraction_prob=args.distraction_prob) 
+                for i in range(n_envs)
+            ])
+
+        # 2. Caricamento VecNormalize (Cruciale!)
+        if args.load_vecnorm:
+            # print(f"📥 Loading VecNormalize stats...")
+            env = VecNormalize.load(args.load_vecnorm, env)
+            env.training = not args.eval # Stop updating stats in eval
+            env.norm_reward = not args.eval
+        else:
+            if args.eval: print("⚠️ WARNING: Eval without VecNormalize!")
+            env = VecNormalize(env, norm_obs=True, norm_reward=True)
+
+        # 3. Caricamento/Creazione Modello
+        if args.load_model:
+            model = ModelClass.load(args.load_model, env=env, custom_objects=custom_objects)
+        else:
+            # Init nuovo modello (solo training mode)
+            policy_kwargs = dict(net_arch=[256, 256])
+            model = ModelClass("MlpPolicy", env, verbose=1, tensorboard_log=log_path, policy_kwargs=policy_kwargs)
+
+        # 4. Esecuzione (Training o Eval)
         if args.eval:
-            print("⚠️ WARNING: Evaluation without loading VecNormalize! Performance might be poor.")
-        print("🆕 Creating new VecNormalize...")
-        env = VecNormalize(env, norm_obs=True, norm_reward=True)
-
-    # 3. Model Setup
-    model_cls = {"ppo": PPO, "sac": SAC, "tqc": TQC}[args.algo]
-    policy_kwargs = dict(net_arch=[256, 256])
-
-    if args.load_model:
-        print(f"🧠 Loading Brain from: {args.load_model}")
-        
-        # When moving to Stage 2, we usually reset the Learning Rate to the default
-        custom_objects = {"learning_rate": 3e-4} 
-        
-        model = model_cls.load(
-            args.load_model, 
-            env=env, 
-            tensorboard_log=log_path,
-            custom_objects=custom_objects
-        )
-    else:
-        print(f"✨ Initializing NEW {args.algo.upper()} model...")
-        use_sde = (args.algo != "ppo")
-        if args.algo == "ppo":
-             model = PPO("MlpPolicy", env, verbose=1, tensorboard_log=log_path, policy_kwargs=policy_kwargs)
+            evaluate_master(model, env, args.eval_episodes, render=args.render, name=f"{args.name}_{current_scenario}")
         else:
-             model = model_cls(
-                 "MlpPolicy", env, verbose=1, tensorboard_log=log_path, 
-                 use_sde=use_sde, policy_kwargs=policy_kwargs
-             )
-
-    # 4. Execution
-    if args.eval:
-        evaluate_master(model, env, args.eval_episodes, render=args.render, name=args.name)
-    else:
-        callbacks = [TrainMasterMetrics(), CheckpointCallback(save_freq=50000, save_path=base_save_path, name_prefix="tm_ckpt")]
+            # Training Mode (Solo se scenario singolo, non ha senso trainare su "all" in loop sequenziale qui)
+            callbacks = [TrainMasterMetrics(), CheckpointCallback(save_freq=50000, save_path=base_save_path, name_prefix="tm_ckpt")]
+            model.learn(total_timesteps=args.steps, callback=callbacks, reset_num_timesteps=(args.load_model is None))
+            model.save(f"{base_save_path}/TrainMaster_Final")
+            env.save(f"{base_save_path}/TrainMaster_VecNorm.pkl")
         
-        # Determine whether to reset timesteps (New Stage) or continue (Resume)
-        reset_timesteps = True
-        if args.load_model is not None and args.continue_training:
-            reset_timesteps = False
-            print("⏩ Resuming training (Timesteps continued)...")
-        else:
-            print("🆕 Starting NEW Training Stage (Timesteps reset to 0)...")
-
-        try:
-            model.learn(
-                total_timesteps=args.steps, 
-                callback=callbacks, 
-                reset_num_timesteps=reset_timesteps
-            )
-        except KeyboardInterrupt:
-            print("\n🛑 Training interrupted manually.")
-
-        # 5. Save
-        print(f"💾 Saving model to {base_save_path}...")
-        model.save(f"{base_save_path}/TrainMaster_Final")
-        env.save(f"{base_save_path}/TrainMaster_VecNorm.pkl")
-        print("✅ Done.")
-
-    env.close()
+        env.close()
+        
+        # Se siamo in training, usciamo dopo il primo scenario (la logica "all" è solo per eval)
+        if not args.eval:
+            break
 
 if __name__ == "__main__":
+    # Fix multiprocessing start method
+    import multiprocessing
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
     main()
