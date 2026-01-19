@@ -982,7 +982,6 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
     
         rr = self.robot_radius  
         pr = self.people_radius 
-        GAP_PEOPLE = 0.2 # Definisci o importa
         
         unified_threshold = rr + pr + GAP_PEOPLE
         min_sq = unified_threshold**2
