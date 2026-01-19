@@ -28,6 +28,7 @@ class Simple2DEnv:
             num_obstacles: int = 0,
             render_skip: int = 1,
             use_legs: bool = False,
+            human_distraction_prob: float = 0.0,
             ):
 
         self.max_steps = max_steps
@@ -96,6 +97,9 @@ class Simple2DEnv:
 
         self.manual_skip_triggered = False
         self._listener_attached = False
+
+        # Human distraction
+        self.human_distraction_prob = human_distraction_prob
 
         # Use legs for rendering humans
         self.use_legs = use_legs  # <--- SALVA STATO
@@ -412,7 +416,7 @@ class Simple2DEnv:
 
             urgency = (REACTION_DIST - dist) / REACTION_DIST
             
-            rep_force_mag = 1.5 * urgency**2 
+            rep_force_mag = 13.0 * urgency**2 
 
             nx = dx / dist
             ny = dy / dist
@@ -801,33 +805,17 @@ class Simple2DEnv:
         elif collision_people:
             done = True
             
-            # [MODIFICATO] Analisi Direzionale della Collisione
-            # Capire se l'urto arriva da DAVANTI o da DIETRO
-            is_front_collision = abs(closest_human_angle) < math.radians(90) # Emisfero frontale
             
-            if is_front_collision:
-                # Caso A: Urto frontale.
-                if v < 0.05 and abs(w) < 0.1:
-                     # Robot fermo: Passive Collision (Sfortuna)
-                    reward = -20.0
-                    info["collision_type"] = "passive_front"
-                else:
-                    # Robot in movimento: Active Collision (Grave)
-                    speed_factor = v / self.max_v
-                    reward = -100.0 - (100.0 * speed_factor)
-                    info["collision_type"] = "active_front"
+            if v <= 0.1 and abs(w) < 0.1:
+                    # Robot fermo: Passive Collision (Sfortuna)
+                reward = -20.0
+                info["collision_type"] = "passive"
             else:
-                # Caso B: Urto posteriore (Tamponamento subito)
-                if v >= 0:
-                    # Stavo andando avanti (o fermo) e mi hanno colpito da dietro.
-                    # NON è colpa mia. Penalità minima simbolica.
-                    reward = -10.0 
-                    info["collision_type"] = "passive_rear"
-                else:
-                    # Stavo facendo retromarcia (v < 0) e ho investito qualcuno dietro.
-                    # Colpa mia grave (blind reversing).
-                    reward = -150.0 
-                    info["collision_type"] = "active_reverse"
+                # Robot in movimento: Active Collision (Grave)
+                speed_factor = v / self.max_v
+                reward = -(150.0 * speed_factor)
+                info["collision_type"] = "active"
+           
             
             info["termination_reason"] = "people_collision"
 
@@ -1176,7 +1164,8 @@ class Simple2DEnv:
                 py = random.uniform(margin, self.room_height-margin)
             angle = random.uniform(0, 2*math.pi)
             vx = self.people_speed * math.cos(angle); vy = self.people_speed * math.sin(angle)
-            is_distracted = random.random() < 0.6 
+            
+            is_distracted = random.random() < self.human_distraction_prob 
             
             self.people.append({
                 "x": px, "y": py, 
@@ -1199,14 +1188,15 @@ class Simple2DEnv:
         
     def _is_collision_with_obstacles(self):
         rr = self.robot_radius
+        reff = rr + GAP_STATIC
         for obs in self.obstacles:
             if obs["type"]=="circle":
-                if (self.x-obs["cx"])**2+(self.y-obs["cy"])**2 < (rr+obs["radius"]+0.2)**2: 
+                if (self.x-obs["cx"])**2+(self.y-obs["cy"])**2 < (reff+obs["radius"])**2: 
                     #print("Collisione con l'ostacolo circolare:", obs)
                     return True
             elif obs["type"]=="rect":
                 cx = max(obs["xmin"], min(self.x, obs["xmax"])); cy = max(obs["ymin"], min(self.y, obs["ymax"]))
-                if (self.x-cx)**2+(self.y-cy)**2 < rr**2: return True
+                if (self.x-cx)**2+(self.y-cy)**2 < reff**2: return True
         return False
     
     def _is_collision_with_walls(self):
@@ -1214,35 +1204,54 @@ class Simple2DEnv:
                 self.y-self.robot_radius<0 or self.y+self.robot_radius>self.room_height)
                 
     def _is_collision_with_people(self):
-        rr = self.robot_radius
+        # rr = self.robot_radius
         
-        # CASO STANDARD (Cerchio)
-        if not self.use_legs:
-            # Usa GAP_PEOPLE definito globalmente
-            min_sq = (rr + self.people_radius + GAP_PEOPLE)**2
-            for p in self.people:
-                if (self.x-p["x"])**2+(self.y-p["y"])**2 < min_sq: 
-                    return True
-            return False
+        # # CASO STANDARD (Cerchio)
+        # if not self.use_legs:
+        #     # Usa GAP_PEOPLE definito globalmente
+        #     min_sq = (rr + self.people_radius + GAP_PEOPLE)**2
+        #     for p in self.people:
+        #         if (self.x-p["x"])**2+(self.y-p["y"])**2 < min_sq: 
+        #             return True
+        #     return False
 
-        # CASO AVANZATO (Gambe + Piedi)
-        LEG_R, FOOT_L = 0.09, 0.30
-        for p in self.people:
-            # 1. Check Ghost Body (Sicurezza per non passare ATTRAVERSO la pancia)
-            if math.hypot(self.x-p["x"], self.y-p["y"]) < (rr + 0.15): return True
+        # # CASO AVANZATO (Gambe + Piedi)
+        # LEG_R, FOOT_L = 0.09, 0.30
+        # for p in self.people:
+        #     # 1. Check Ghost Body (Sicurezza per non passare ATTRAVERSO la pancia)
+        #     if math.hypot(self.x-p["x"], self.y-p["y"]) < (rr + 0.15): return True
             
-            # 2. Check Gambe
-            if "legs" in p:
-                ct, st = math.cos(p["angle"]), math.sin(p["angle"])
-                for lx, ly in p["legs"]:
-                    # Collisione Stinco
-                    if math.hypot(self.x-lx, self.y-ly) < (rr + LEG_R): return True
-                    # Collisione Piede (Segmento)
-                    x_s, y_s = lx - LEG_R*ct, ly - LEG_R*st
-                    x_e, y_e = lx + (FOOT_L-LEG_R)*ct, ly + (FOOT_L-LEG_R)*st
-                    if self._dist_point_to_segment(self.x, self.y, x_s, y_s, x_e, y_e) < (rr + 0.05):
-                        return True
-        return False
+        #     # 2. Check Gambe
+        #     if "legs" in p:
+        #         ct, st = math.cos(p["angle"]), math.sin(p["angle"])
+        #         for lx, ly in p["legs"]:
+        #             # Collisione Stinco
+        #             if math.hypot(self.x-lx, self.y-ly) < (rr + LEG_R): return True
+        #             # Collisione Piede (Segmento)
+        #             x_s, y_s = lx - LEG_R*ct, ly - LEG_R*st
+        #             x_e, y_e = lx + (FOOT_L-LEG_R)*ct, ly + (FOOT_L-LEG_R)*st
+        #             if self._dist_point_to_segment(self.x, self.y, x_s, y_s, x_e, y_e) < (rr + 0.05):
+        #                 return True
+        # return False
+
+
+        """
+        Simplified collision check: 
+        Treats every person as a cylinder with a fixed safety radius.
+        Unified for both simple and leg rendering modes.
+        """
+        # UNIFIED THRESHOLD: Robot (0.2) + Person (0.2) + GAP (0.2) = 0.6m
+        # This is the 'hard limit' that terminates the episode.
+        rr = self.robot_radius  # 0.2
+        pr = self.people_radius # 0.2
+        unified_threshold = rr + pr + GAP_PEOPLE # 0.6m
+        min_sq = unified_threshold**2
+
+        for p in self.people:
+            # Simple Euclidean distance check between centers
+            dist_sq = (self.x - p["x"])**2 + (self.y - p["y"])**2
+            if dist_sq < min_sq:
+                return True
     
     def _is_goal_reached(self):
         if self.goal_x is None: return False

@@ -22,7 +22,7 @@ COMMAND FOR FAST PARALLEL EVALUATION:
 python3 -m scripts.run_ppo --name Stage2_Model --num_people 10 --eval_episodes 1000 --n_envs 10
 """
 
-def make_env_factory(num_people, num_obstacles, render_mode, use_legs, render_skip, rank):
+def make_env_factory(num_people, num_obstacles, render_mode, use_legs, render_skip, distraction_prob, rank):
     """Factory function for creating environments in parallel processes."""
     def _init():
         env = GymNavEnv(
@@ -32,6 +32,7 @@ def make_env_factory(num_people, num_obstacles, render_mode, use_legs, render_sk
             num_obstacles=num_obstacles,
             render_skip=render_skip,
             use_legs=use_legs,
+            distraction_prob=distraction_prob,
             # Importante: seed diversi per ogni processo per evitare episodi identici
         )
         env.reset(seed=rank + int(time.time())) 
@@ -43,10 +44,12 @@ def main():
     parser.add_argument("--algo", type=str, default="TQC", choices=["PPO", "SAC", "TQC"], help="RL Algorithm")
     parser.add_argument("--name", type=str, required=True, help="Model name (without .zip)")
     parser.add_argument("--num_people", type=int, default=0, help="Number of humans")
-    parser.add_argument("--num_obstacles", type=int, default=15, help="Number of static obstacles") # Aggiunto per completezza
+    parser.add_argument("--num_obstacles", type=int, default=15, help="Number of static obstacles")
     parser.add_argument("--render_skip", type=int, default=1, help="Skip N frames in render mode")
     parser.add_argument("--custom_nn", action="store_true", default=False, help="Use custom Hybrid CNN architecture")
     parser.add_argument("--use_legs", action="store_true", default=False, help="Use leg detection in LIDAR simulation")
+
+    parser.add_argument("--distraction_prob", type=float, default=0.6, help="Prob. humans are distracted (0.0=All Cooperative, 1.0=All Blind)")
     
     # Flags Evaluation
     parser.add_argument("--eval_episodes", type=int, default=0, help="If > 0, runs fast evaluation without rendering")
@@ -55,6 +58,15 @@ def main():
     args = parser.parse_args()
     
     FAST_EVAL = args.eval_episodes > 0
+    
+    # --- MODIFICA RICHIESTA ---
+    # Se FAST_EVAL è True, usa il numero passato da riga di comando.
+    # Se è False (rendering attivo), impostiamo il limite fisso a 300.
+    if FAST_EVAL:
+        target_episodes = args.eval_episodes
+    else:
+        target_episodes = 300
+    # --------------------------
     
     # Forziamo n_envs a 1 se dobbiamo renderizzare (non si può renderizzare in parallelo facilmente)
     if not FAST_EVAL and args.n_envs > 1:
@@ -65,13 +77,22 @@ def main():
     
     print(f"--- 🚀 Setup: Algo={args.algo} | Model={args.name} | Humans={args.num_people} ---")
     if FAST_EVAL:
-        print(f"⚡ FAST PARALLEL EVAL: {args.eval_episodes} Episodes on {args.n_envs} CPU Cores")
+        print(f"⚡ FAST PARALLEL EVAL: {target_episodes} Episodes on {args.n_envs} CPU Cores")
+    else:
+        print(f"📺 RENDER EVAL: Running {target_episodes} episodes with visualization.")
 
     # 1. Selezione Classe Modello
     ModelClass = {"PPO": PPO, "SAC": SAC, "TQC": TQC}[args.algo]
 
     # 2. Setup Ambiente (Vectorized)
-    env_fns = [make_env_factory(args.num_people, args.num_obstacles, render_mode, args.use_legs, args.render_skip, i) for i in range(args.n_envs)]
+    env_fns = [make_env_factory(
+        args.num_people,
+        args.num_obstacles, 
+        render_mode, 
+        args.use_legs,
+        args.render_skip, 
+        args.distraction_prob, 
+        i) for i in range(args.n_envs)]
     
     if args.n_envs > 1:
         # Usa SubprocVecEnv per vero parallelismo su CPU multiple
@@ -121,12 +142,16 @@ def main():
     }
 
     obs = env.reset()
-    pbar = tqdm(total=args.eval_episodes) if FAST_EVAL else None
+    
+    # Progress bar solo se fast eval, altrimenti sporca il render output
+    pbar = tqdm(total=target_episodes) if FAST_EVAL else None
 
     try:
         while True:
-            if FAST_EVAL and stats["episodes"] >= args.eval_episodes:
+            # --- MODIFICA: Controllo universale sul numero di episodi ---
+            if stats["episodes"] >= target_episodes:
                 break
+            # ------------------------------------------------------------
 
             # Predict (su N ambienti contemporaneamente)
             action, _ = model.predict(obs, deterministic=True)
@@ -135,7 +160,7 @@ def main():
             # Rendering (Solo Single Core)
             if not FAST_EVAL:
                 env.render()
-                time.sleep(0.01)
+                time.sleep(0.001)
 
             # Gestione Parallelizzata dei risultati
             # 'dones' è un array di booleans [True, False, True...]
@@ -193,10 +218,10 @@ def main():
 
                     # Print solo in single mode
                     if not FAST_EVAL:
-                        print(f"🏁 Ep {stats['episodes']}: {reason} | SPL: {curr_spl:.2f}")
+                        print(f"🏁 Ep {stats['episodes']}/{target_episodes}: {reason} | SPL: {curr_spl:.2f}")
 
-                    # Se abbiamo raggiunto il target durante questo ciclo for, usciamo
-                    if FAST_EVAL and stats["episodes"] >= args.eval_episodes:
+                    # Se abbiamo raggiunto il target durante questo ciclo for (dovuto a env paralleli), usciamo
+                    if stats["episodes"] >= target_episodes:
                         break
 
         # --- REPORT FINALE ---

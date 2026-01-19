@@ -37,13 +37,18 @@ N_ENVS = 100 # [CONSIGLIO] Riduci a 64 o 32 se usi la CNN, 100 potrebbe saturare
 
 class TerminationStatsCallback(BaseCallback):
     """
-    Custom callback to log stats and optionally stop training early if success rate is high.
+    Custom callback to log stats, save the best model based on success rate,
+    and optionally stop training early.
     """
-    def __init__(self, verbose=0, window_size=100, stop_at_success_rate=None):
+    def __init__(self, verbose=0, window_size=100, stop_at_success_rate=None, best_model_save_path=None):
         super().__init__(verbose)
         self.window_size = window_size
         self.stop_at_success_rate = stop_at_success_rate
         self.history = deque(maxlen=window_size)
+        
+        # Variabili per il salvataggio del modello migliore
+        self.best_model_save_path = best_model_save_path
+        self.best_success_rate = -1.0 # Inizializzato a un valore basso
 
     def _on_step(self) -> bool:
         dones = self.locals["dones"]
@@ -55,6 +60,7 @@ class TerminationStatsCallback(BaseCallback):
                 reason = info.get("termination_reason", "unknown")
                 self.history.append(reason)
 
+        # Calcoliamo le statistiche solo se abbiamo un po' di storico
         if len(self.history) > 0:
             total = len(self.history)
             
@@ -76,8 +82,23 @@ class TerminationStatsCallback(BaseCallback):
             self.logger.record("metrics/collision_rate", total_collision_rate)
             self.logger.record("metrics/human_only_rate", human_coll_rate)
 
+            # --- BEST MODEL SAVING ---
+            # Salviamo solo se la finestra è piena (per avere una statistica affidabile)
+            if self.best_model_save_path is not None and len(self.history) >= self.window_size:
+                if success_rate > self.best_success_rate:
+                    self.best_success_rate = success_rate
+                    if self.verbose > 0:
+                        print(f"\n🔥 NEW BEST MODEL FOUND! Success Rate: {success_rate:.2f} (Prev: {self.best_success_rate:.2f})")
+                        print(f"💾 Saving best model to {self.best_model_save_path}...")
+                    
+                    # Salva il modello
+                    self.model.save(self.best_model_save_path)
+                    
+                    # Salva anche VecNormalize (CRUCIALE per far funzionare il modello dopo il caricamento)
+                    if self.training_env is not None:
+                        self.training_env.save(f"{self.best_model_save_path}_vecnormalize.pkl")
+
             # --- EARLY STOPPING CHECK ---
-            # Only check if we have enough data (history full) to be statistically significant
             if self.stop_at_success_rate is not None and len(self.history) >= self.window_size:
                 if success_rate >= self.stop_at_success_rate:
                     if self.verbose > 0:
@@ -219,9 +240,12 @@ def main():
         save_path=f"./checkpoints/{args.training_name}_ckpts",
         name_prefix="ckpt"
     )
+    best_model_path = f"./checkpoints/{args.training_name}_BEST"
+
     stats_callback = TerminationStatsCallback(
         window_size=200, 
         stop_at_success_rate=args.early_stop,
+        best_model_save_path=best_model_path, # <--- Passiamo il percorso qui
         verbose=1 
     )
 
@@ -232,6 +256,7 @@ def main():
             callback=[stats_callback, checkpoint_callback],
             reset_num_timesteps=(args.load_model is None)
         )
+
     except KeyboardInterrupt:
         print("\n🛑 Training interrotto manualmente (CTRL+C).")
     except Exception as e:

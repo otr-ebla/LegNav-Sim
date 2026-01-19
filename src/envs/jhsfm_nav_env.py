@@ -129,6 +129,16 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
         self.render_counter = 0
         
         # Spazi Gym
+        self.max_v = RobotConfig.MAX_LINEAR_VEL # Assicurati che importi MAX_LIN_VEL
+        self.max_w = RobotConfig.MAX_W          # Assicurati che importi MAX_ANG_VEL
+        
+        # Variabili di stato per Yielding (Necessarie per il reward system di nav_env)
+        self._yield_violations = 0
+        self._time_stopped_in_zone = 0
+        self.progress_reward = 0
+        
+        # Spazi Gym (Coerenti con nav_env + Stacking)
+        # 4 scalari (Dist, Angle, V, W) + Lidar * Stack
         obs_dim = 4 + self.num_rays * self.n_stack
         self.observation_space = gym.spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
@@ -214,40 +224,46 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
 
 
     def _get_obs(self, reset_stack=False):
-        # 1. Calcoli scalari
-        dist = math.hypot(self.goal_x - self.x, self.goal_y - self.y)
-        angle = (math.atan2(self.goal_y - self.y, self.goal_x - self.x) - self.theta + math.pi) % (2 * math.pi) - math.pi
-        norm_angle = angle / math.pi # Normalizziamo tra -1 e 1 come nav_env.py
+        # 1. GOAL (Normalizzato [0, 1] e [-1, 1])
+        dist_to_goal = math.hypot(self.goal_x - self.x, self.goal_y - self.y)
+        norm_dist = dist_to_goal / self.max_possible_dist
         
-        # 2. Calcolo Lidar Inverso (Logic from nav_env.py)
+        angle_to_goal = math.atan2(self.goal_y - self.y, self.goal_x - self.x)
+        heading_error = angle_to_goal - self.theta
+        heading_error = (heading_error + math.pi) % (2 * math.pi) - math.pi
+        norm_heading = heading_error / math.pi
+        
+        # 2. VELOCITÀ (Normalizzate [0, 1] e [-1, 1])
+        norm_v = self.last_v / self.max_v
+        norm_w = self.last_w / self.max_w
+        
+        # 3. LIDAR (Normalizzazione LINEARE identica a nav_env)
         raw_lidar = self._compute_lidar()
+        
+        SENSING_HORIZON = self.max_lidar_distance
+        denominator = SENSING_HORIZON - self.lidar_min_distance
+        
         lidar_processed = []
         for d in raw_lidar:
-            if d >= self.max_lidar_distance:
-                lidar_processed.append(0.0)
-            else:
-                # Inversa cubica come nel tuo nav_env
-                inv = (self.lidar_min_distance / d) ** (1/3)
-                lidar_processed.append(min(inv, 1.0))
+            # 1.0 = Vicino, 0.0 = Lontano
+            inv = (SENSING_HORIZON - d) / denominator
+            lidar_processed.append(max(0.0, min(1.0, inv)))
         
         lidar_array = np.array(lidar_processed, dtype=np.float32)
 
-        # 3. Gestione Stacking
+        # 4. Stacking (Specifica di JHSFM, manteniamo la logica ma con i dati corretti)
         if reset_stack:
-            # Riempie la coda con lo stesso frame iniziale
             self.lidar_stack.clear()
             for _ in range(self.n_stack):
                 self.lidar_stack.append(lidar_array)
         else:
-            # Aggiunge nuovo frame, il più vecchio viene rimosso automaticamente
             self.lidar_stack.append(lidar_array)
             
-        # 4. Concatenazione finale
-        # [Inv_Dist, Angle, V, W, Lidar_t, Lidar_t-1, Lidar_t-2]
-        scalars = np.array([dist, norm_angle, self.last_v, self.last_w], dtype=np.float32)
+        scalars = np.array([norm_dist, norm_heading, norm_v, norm_w], dtype=np.float32)
         stacked_lidar = np.concatenate(list(self.lidar_stack))
         
         return np.concatenate([scalars, stacked_lidar])
+
     
     def _apply_robot_action(self, action: np.ndarray, dt):
         lin_vel = float(action[0]) 
@@ -282,63 +298,144 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
         self.x, self.y, self.theta = x, y, theta
 
     def step(self, action):
-        # 1. Unpack & Clamp Action
-        v_cmd, w_cmd = float(action[0]), float(action[1])
-        v_cmd, w_cmd = self._apply_differential_drive_constraints(v_cmd, w_cmd)
-        v = np.clip(v_cmd, -self.max_v, self.max_v)
-        w = np.clip(w_cmd, -self.max_w, self.max_w)
+        reward = 0.0
+        done = False
+        info = {}
+
+        if self.manual_skip_triggered:
+            obs = self._get_obs(reset_stack=False)
+            return obs, 0.0, True, False, {"termination_reason": "manual_skip"}
+
+        # 1. Action Processing
+        target_v, target_w = float(action[0]), float(action[1])
+        v, w = self._apply_differential_drive_constraints(target_v, target_w)
         
-        # 2. Physics Logic 
-        dt = self.dt
-        prev_x, prev_y = self.x, self.y
-        prev_theta = self.theta
+        dist_to_goal_prev = math.hypot(self.x - self.goal_x, self.y - self.goal_y)
 
-        dist_before = math.hypot(self.x - self.goal_x, self.y - self.goal_y)
+        # 2. Physics Update (Robot & Humans via JHSFM)
+        prev_x, prev_y, prev_theta = self.x, self.y, self.theta
+        
+        # --- Robot Update (Manual Kinematics per calcolare next_x prima di confermare) ---
+        next_theta = self.theta + w * self.dt
+        next_theta = (next_theta + math.pi) % (2 * math.pi) - math.pi
+        next_x = self.x + v * self.dt * math.cos(next_theta)
+        next_y = self.y + v * self.dt * math.sin(next_theta)
 
-        # --- Robot Update (Kinematics FIRST) ---
+        # 3. Collision Check Statico (Prima di muovere)
+        GAP_STATIC = 0.0
+        eff_radius = self.robot_radius + GAP_STATIC
+        collision_static = False
+
+        if (next_x - eff_radius < 0 or next_x + eff_radius > self.room_width or 
+            next_y - eff_radius < 0 or next_y + eff_radius > self.room_height):
+            collision_static = True
+
+        if not collision_static:
+            rr = eff_radius
+            for obs in self.obstacles:
+                if obs["type"] == "circle":
+                    if (next_x - obs["cx"])**2 + (next_y - obs["cy"])**2 < (rr + obs["radius"])**2:
+                        collision_static = True; break
+                elif obs["type"] == "rect":
+                    cx = max(obs["xmin"], min(next_x, obs["xmax"]))
+                    cy = max(obs["ymin"], min(next_y, obs["ymax"]))
+                    if (next_x - cx)**2 + (next_y - cy)**2 < rr**2:
+                        collision_static = True; break
+
+        if collision_static:
+            # Terminazione Immediata come nav_env
+            reward = -200.0
+            done = True
+            info["termination_reason"] = "collision_static"
+            obs = self._get_obs(reset_stack=False)
+            return obs, reward, done, False, info
+
+        # Conferma Movimento
         if self.training:
-            self._apply_robot_action(np.array([v, w]), dt)
-
+             self.x, self.y, self.theta = next_x, next_y, next_theta
+             self.trajectory.append((self.x, self.y))
+        
+        # Aggiornamento Umani JAX (Mantiene la logica speciale di JHSFM)
         self._update_humans_simulation(action, prev_x, prev_y, prev_theta)
-
-        self.last_v, self.last_w = v, w 
-
-        # Collision Handling
-        if self._is_collision_with_walls() or self._is_collision_with_obstacles():
-             self.x, self.y = prev_x, prev_y
-             v_eff = 0.0 
-        else:
-             v_eff = v
-
-
         self._sync_people_list()
         
-        # 3. Compute Return Values
         self.step_count += 1
-        dist_after = math.hypot(self.x - self.goal_x, self.y - self.goal_y)
+        dist_to_goal_now = math.hypot(self.x - self.goal_x, self.y - self.goal_y)
         self.episode_path_length += math.hypot(self.x - prev_x, self.y - prev_y)
+        self.episode_jerk_sum += abs((w - self.last_w) / self.dt)
+
+        # ==========================================
+        # === REWARD SYSTEM (Identico a nav_env) ===
+        # ==========================================
         
+        # 1. TIME PENALTY
+        reward -= 0.01
+
+        # 2. PROGRESS REWARD
+        progress = dist_to_goal_prev - dist_to_goal_now
+        reward += 5.0 * progress
+        self.progress_reward += 5.0 * progress
+
+        # 3. SMOOTHNESS
+        reward -= 0.05 * abs(w - self.last_w)
+
+        # 4. YIELDING LOGIC
+        closest_human_dist = float('inf')
+        for p in self.people:
+            d = math.hypot(p["x"] - self.x, p["y"] - self.y)
+            if d < closest_human_dist: closest_human_dist = d
+        
+        YIELD_DIST = 1.5
+        if closest_human_dist < YIELD_DIST:
+            urgency = (YIELD_DIST - closest_human_dist) / YIELD_DIST
+            if v > 0.07:
+                reward -= 15.0 * urgency * (v / self.max_v)
+                self._yield_violations += 1
+            else:
+                self._time_stopped_in_zone += 1
+                decay = max(0.0, 1.0 - (self._time_stopped_in_zone / 50.0))
+                reward += 0.2 * urgency * decay
+        else:
+            self._time_stopped_in_zone = 0
+
+        # === TERMINATION CONDITIONS ===
+        collision_people = self._is_collision_with_people()
+        is_goal = (dist_to_goal_now <= self.goal_radius) # o self._is_goal_reached()
+
+        if is_goal:
+            done = True
+            time_eff = 1.0 - (self.step_count / self.max_steps)
+            reward = 200.0 + (100.0 * max(0.0, time_eff))
+            info["termination_reason"] = "goal_reached"
+
+        elif collision_people:
+            done = True
+            # Active vs Passive Logic
+            if v <= 0.07 and abs(w) < 0.1:
+                reward = -20.0
+                info["collision_type"] = "passive"
+            else:
+                speed_factor = v / self.max_v
+                reward = -(150.0 * speed_factor)
+                info["collision_type"] = "active"
+            info["termination_reason"] = "collision_people"
+
+        elif self.step_count >= self.max_steps:
+            done = True
+            dist_penalty = -50.0 * (dist_to_goal_now / self.max_possible_dist)
+            reward = -50.0 + dist_penalty
+            info["termination_reason"] = "timeout"
+
+        # Finalizza
+        self.last_v, self.last_w = v, w
         obs = self._get_obs(reset_stack=False)
-
-        reward = self._compute_reward_custom(dist_before, dist_after, v, w, obs[4:]) 
-
-        terminated, info = self._check_termination_custom(obs[4:4+self.num_rays])
         
-        # 3. Applicazione Reward Terminali (Esattamente come nav_env.py)
-        if terminated:
-            reason = info.get("termination_reason", "none")
-            
-            if reason == "goal_reached":
-                reward += 200.0
-            elif reason == "collision_people":
-                reward -= 200.0
-            elif reason == "collision_lidar":
-                reward -= 100.0 # Equivalente a collision_static di nav_env
-            elif reason == "timeout": # max_steps_reached
-                reward -= 10.0
+        if done:
+             # Aggiungi metriche extra a info come in nav_env
+             info["path_length"] = self.episode_path_length
+             info["total_time"] = self.step_count * self.dt
         
-        truncated = False 
-        return obs, reward, terminated, truncated, info
+        return obs, reward, done, False, info
     
 
     def _update_humans_simulation(self, robot_action, prev_x, prev_y, prev_theta):
@@ -846,29 +943,42 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
         return math.hypot(px - closest_x, py - closest_y)
     
     def _is_collision_with_people(self):
-        rr = self.robot_radius
-        if not self.use_legs: # Caso Standard (Padre)
-            min_sq = (rr + self.people_radius + SimConfig.RADIUS_EXTENDED)**2
-            for p in self.people:
-                if math.sqrt((self.x-p["x"])**2+(self.y-p["y"])**2) < math.sqrt(min_sq): 
-                    return True
-            return False
+        # rr = self.robot_radius
+        # if not self.use_legs: # Caso Standard (Padre)
+        #     min_sq = (rr + self.people_radius + SimConfig.RADIUS_EXTENDED)**2
+        #     for p in self.people:
+        #         if math.sqrt((self.x-p["x"])**2+(self.y-p["y"])**2) < math.sqrt(min_sq): 
+        #             return True
+        #     return False
 
-        # Caso Avanzato (Gambe + Piedi)
-        LEG_R, FOOT_L = 0.09, 0.30
+        # # Caso Avanzato (Gambe + Piedi)
+        # LEG_R, FOOT_L = 0.09, 0.30
+        # for p in self.people:
+        #     # Check sicurezza corpo (Ghost)
+        #     if math.hypot(self.x-p["x"], self.y-p["y"]) < (rr + 0.15): return True
+        #     if "legs" in p:
+        #         ct, st = math.cos(p["angle"]), math.sin(p["angle"])
+        #         for lx, ly in p["legs"]:
+        #             # Collisione Stinco
+        #             if math.hypot(self.x-lx, self.y-ly) < (rr + LEG_R): return True
+        #             # Collisione Piede (Segmento asse scarpa)
+        #             x_s, y_s = lx - LEG_R*ct, ly - LEG_R*st
+        #             x_e, y_e = lx + (FOOT_L-LEG_R)*ct, ly + (FOOT_L-LEG_R)*st
+        #             if self._dist_point_to_segment(self.x, self.y, x_s, y_s, x_e, y_e) < (rr + 0.05):
+        #                 return True
+        # return False
+    
+        rr = self.robot_radius  
+        pr = self.people_radius 
+        GAP_PEOPLE = 0.2 # Definisci o importa
+        
+        unified_threshold = rr + pr + GAP_PEOPLE
+        min_sq = unified_threshold**2
+
         for p in self.people:
-            # Check sicurezza corpo (Ghost)
-            if math.hypot(self.x-p["x"], self.y-p["y"]) < (rr + 0.15): return True
-            if "legs" in p:
-                ct, st = math.cos(p["angle"]), math.sin(p["angle"])
-                for lx, ly in p["legs"]:
-                    # Collisione Stinco
-                    if math.hypot(self.x-lx, self.y-ly) < (rr + LEG_R): return True
-                    # Collisione Piede (Segmento asse scarpa)
-                    x_s, y_s = lx - LEG_R*ct, ly - LEG_R*st
-                    x_e, y_e = lx + (FOOT_L-LEG_R)*ct, ly + (FOOT_L-LEG_R)*st
-                    if self._dist_point_to_segment(self.x, self.y, x_s, y_s, x_e, y_e) < (rr + 0.05):
-                        return True
+            dist_sq = (self.x - p["x"])**2 + (self.y - p["y"])**2
+            if dist_sq < min_sq:
+                return True
         return False
     
 

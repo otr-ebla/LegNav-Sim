@@ -36,6 +36,7 @@ class GymNavEnv(gym.Env):
         stack_dim: int = STACK_DIM,
         reward_factor_progress: float = 5.0,
         use_legs: bool = False,
+        distraction_prob: float = 0.0,  
         render_skip: int = 1
     ):  
         super().__init__()
@@ -50,6 +51,7 @@ class GymNavEnv(gym.Env):
             reward_factor_progress=reward_factor_progress,
             people_speed=PEOPLE_SPEED,
             use_legs=use_legs,
+            human_distraction_prob=distraction_prob,
             render_skip=render_skip,
         )
         self.render_mode = render_mode
