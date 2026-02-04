@@ -15,7 +15,7 @@ from src.envs.gym_nav_env import GymNavEnv
 from src.config import LidarConfig
 
 # Importazione per Custom NN
-from models.hybrid_cnn_mlp import HybridCnnMlp
+from models.hybrid_cnn_mlp_previous import HybridCnnMlp
 
 """
 COMMAND FOR FAST PARALLEL EVALUATION:
