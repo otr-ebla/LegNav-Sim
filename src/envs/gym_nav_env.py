@@ -3,7 +3,8 @@ from gymnasium import spaces
 import numpy as np
 from collections import deque
 
-from .nav_env import Simple2DEnv, MAX_LIN_VEL, MAX_ANG_VEL
+# Assicurati che l'import punti al file corretto dove hai fatto le modifiche
+from .nav_env import Simple2DEnv 
 from src.config import RobotConfig, LidarConfig, SimConfig 
 
 NUM_PEOPLE = 15
@@ -21,7 +22,7 @@ class GymNavEnv(gym.Env):
         [norm_dist_goal, norm_heading, norm_v, norm_w, 
          lidar_frame_t-2, lidar_frame_t-1, lidar_frame_t]
     
-    Tutti i valori sono normalizzati in range definiti.
+    Se real_lidar_specs=True, la dimensione del lidar aumenta drasticamente (1080 raggi).
     """
 
     metadata = {"render_modes": ["human"], "render_fps": 10}
@@ -37,12 +38,26 @@ class GymNavEnv(gym.Env):
         reward_factor_progress: float = 5.0,
         use_legs: bool = False,
         distraction_prob: float = 0.0,  
-        render_skip: int = 1
+        render_skip: int = 1,
+        lidar_noise_enable: bool = False,
+        real_lidar_specs: bool = False,  # <--- [NUOVO PARAMETRO]
     ):  
         super().__init__()
 
+        # --- [LOGICA DIMENSIONALE] ---
+        # Se attiviamo il Lidar Reale, dobbiamo ignorare num_rays della config
+        # e forzare 1080, altrimenti gym andrà in crash per mismatch di dimensioni.
+        if real_lidar_specs:
+            self.num_rays = 1080
+        else:
+            self.num_rays = num_rays
+
+        self.stack_dim = stack_dim
+        self.render_mode = render_mode
+
+        # Inizializzazione Ambiente Base
         self.env = Simple2DEnv(
-            num_rays=num_rays,
+            num_rays=self.num_rays, # Passiamo il numero corretto aggiornato
             max_steps=max_steps,
             num_people=num_people,
             room_width=12.0,
@@ -53,15 +68,16 @@ class GymNavEnv(gym.Env):
             use_legs=use_legs,
             human_distraction_prob=distraction_prob,
             render_skip=render_skip,
+            lidar_noise_enable=lidar_noise_enable,
+            real_lidar_specs=real_lidar_specs, # <--- Passaggio al motore fisico
         )
-        self.render_mode = render_mode
-        self.num_rays = num_rays
-        self.stack_dim = stack_dim
         
         # [MIGLIORATO] Usa deque per efficienza
         self.lidar_stack = deque(maxlen=stack_dim)
 
-        # [MIGLIORATO] Observation space con bounds corretti
+        # [CALCOLO SPAZIO OSSERVAZIONI]
+        # Dimensione totale = 4 scalari + (Raggi * Stack)
+        # Esempio Reale: 4 + (1080 * 3) = 3244 float
         obs_dim = 4 + (self.num_rays * self.stack_dim)
         
         # Bounds per scalari: [dist(0-1), heading(-1,1), v(0-1), w(-1,1)]
@@ -91,12 +107,20 @@ class GymNavEnv(gym.Env):
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         super().reset(seed=seed)
         
+        # Nota: Simple2DEnv.reset() ora restituisce solo 'obs' (array numpy)
+        # Se hai modificato Simple2DEnv per restituire (obs, info), adatta questa riga.
+        # Basandomi sull'ultimo codice che mi hai dato, restituiva solo obs.
         env_obs = self.env.reset()
         
-        # Estrai LIDAR corrente
+        # Estrai LIDAR corrente (gli ultimi N elementi sono il lidar)
+        # env_obs è: [dist, head, v, w, ...lidar...]
         current_lidar = env_obs[4:]
         
-        # [MIGLIORATO] Inizializza stack con deque
+        # Check di sicurezza per evitare bug silenziosi sulle dimensioni
+        if len(current_lidar) != self.num_rays:
+            raise ValueError(f"Lidar dimension mismatch! Expected {self.num_rays}, got {len(current_lidar)}. Check real_lidar_specs flag.")
+
+        # Inizializza stack con deque
         self.lidar_stack.clear()
         for _ in range(self.stack_dim):
             self.lidar_stack.append(current_lidar.copy())
@@ -115,15 +139,16 @@ class GymNavEnv(gym.Env):
         w = float(np.clip(action[1], -RobotConfig.MAX_W, RobotConfig.MAX_W))
 
         # Step nell'ambiente
+        # Simple2DEnv.step restituisce: obs, reward, done, info
         env_obs, reward, done, info = self.env.step((v, w))
         
-        # [MIGLIORATO] Aggiorna stack (auto-pop con maxlen)
+        # Aggiorna stack (auto-pop con maxlen)
         current_lidar = env_obs[4:]
         self.lidar_stack.append(current_lidar)
         
         obs = self._compose_obs(env_obs)
 
-        # Gestione terminazione
+        # Gestione terminazione (Gymnasium API: terminated vs truncated)
         terminated = False
         truncated = False
         
@@ -142,9 +167,7 @@ class GymNavEnv(gym.Env):
     def _compose_obs(self, env_obs):
         """
         Combina scalari + stack LIDAR.
-        
-        Returns:
-            Array shape: (4 + num_rays * stack_dim,)
+        Returns: Array shape: (4 + num_rays * stack_dim,)
         """
         scalars = env_obs[:4]  # [norm_dist, norm_heading, norm_v, norm_w]
         

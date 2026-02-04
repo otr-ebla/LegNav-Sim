@@ -146,7 +146,7 @@ class Scenarios:
         # Robot parte in basso, goal in alto
         # Nota: Il robot deve capire da solo come passare, gli diamo solo il goal finale
         rob_start = [w/2, 1.5, 1.57]
-        rob_goal  = [w/2, h-1.5]
+        rob_goal  = [gap_center_x, h-1.5]
         
         states, goals = [], []
         for i in range(n_humans):

@@ -17,6 +17,7 @@ from src.config import RobotConfig, LidarConfig
 
 from models.custon_cnn import Lidar1DCNN
 from models.hybrid_cnn_mlp import HybridCnnMlp   
+from models.slot_attention import LidarSlotAttentionExtractor
 
 from typing import Callable
     
@@ -65,22 +66,30 @@ class TerminationStatsCallback(BaseCallback):
             total = len(self.history)
             
             # Counts
-            success_count = self.history.count("goal_reached")
+            # [MODIFICATION] Success now includes goal reached AND passive collisions
+            success_count = sum(1 for r in self.history if r in ["goal_reached", "people_collision_passive"])
+            
             timeout_count = self.history.count("max_steps_reached")
             obstacle_count = self.history.count("collision_static")
-            human_count = sum(1 for r in self.history if "people_collision" in r)
+            
+            # We track active human collisions as failures
+            active_human_crash = self.history.count("people_collision_active")
             
             # Rates
             success_rate = success_count / total
             timeout_rate = timeout_count / total
-            total_collision_rate = (obstacle_count + human_count) / total
-            human_coll_rate = human_count / total
+            
+            # Metric for dangerous collisions only
+            collision_rate = (obstacle_count + active_human_crash) / total
 
             # Logging
             self.logger.record("metrics/success_rate", success_rate)
             self.logger.record("metrics/timeout_rate", timeout_rate)
-            self.logger.record("metrics/collision_rate", total_collision_rate)
-            self.logger.record("metrics/human_only_rate", human_coll_rate)
+            self.logger.record("metrics/collision_rate", collision_rate)
+            
+            # If you want to track specifically how many were "passive" successes
+            passive_rate = self.history.count("people_collision_passive") / total
+            self.logger.record("metrics/passive_success_rate", passive_rate)
 
             # --- BEST MODEL SAVING ---
             # Salviamo solo se la finestra è piena (per avere una statistica affidabile)
@@ -120,6 +129,9 @@ def main():
     parser.add_argument("--use_legs", action="store_true", default=False, help="Enable realistic leg physics for humans") # <--- NUOVO FLAG    
     # [CORREZIONE 2] Usa store_true per i flag booleani
     parser.add_argument("--custom_nn", action="store_true", default=False, help="Use custom NN architecture")
+    parser.add_argument("--lidar_noise", action="store_true", default=False, help="Enable LIDAR noise in the environment")  # <--- NUOVO FLAG
+    parser.add_argument("--real_lidar", action="store_true", default=False, help="Enable 1080 rays (Real Specs)")
+    parser.add_argument("--distraction_prob", type=float, default=0.3, help="Probability of human distraction behavior")  # <--- NUOVO PARAMETRO
     
     args = parser.parse_args()
 
@@ -136,14 +148,20 @@ def main():
         print("🧠 ARCHITETTURA: Standard MLP")
 
     # Define environment factory
+    # Define environment factory
     def make_env(rank: int):
         def _init():
             env = GymNavEnv(
                 num_rays=NUM_RAYS, 
                 num_people=args.num_people, 
                 num_obstacles=args.num_obstacles,
-                reward_factor_progress=args.rew_progress,  # [CORREZIONE 3]
-                use_legs=args.use_legs,  # <--- NUOVO PARAMETRO
+                reward_factor_progress=args.rew_progress,
+                use_legs=args.use_legs,
+                distraction_prob=args.distraction_prob,
+                render_skip=1,
+                lidar_noise_enable=args.lidar_noise,
+                # --- AGGIUNGI QUESTA RIGA ---
+                real_lidar_specs=args.real_lidar 
             )
             return Monitor(env, os.path.join(log_dir, str(rank)))
         return _init
@@ -185,14 +203,18 @@ def main():
         # Configurazione Policy Keywords
         policy_kwargs = {}
         if args.custom_nn:
+            print("🧠 ARCHITETTURA: Slot Attention (Object-Centric)")
             policy_kwargs = dict(
-            features_extractor_class=HybridCnnMlp,
-            features_extractor_kwargs=dict(
-                num_rays=108,
-                stack_dim=3,
-                hidden_dim=128,
-            ),
-        )
+                #features_extractor_class=LidarSlotAttentionExtractor,
+                features_extractor_class=HybridCnnMlp,
+                features_extractor_kwargs=dict(
+                    num_rays=1080,   # Prende 1080 dal tuo config
+                    stack_dim=5,   # Passa il valore 5 dello stacking
+                    hidden_dim=256,      # Dimensione dello strato di fusione
+                ),
+                # Riduciamo la dimensione della rete successiva perché gli slot sono già molto densi di info
+                net_arch=[256, 128] 
+            )
                 
         print(f"✨ Initializing NEW {args.algo} Agent")
         

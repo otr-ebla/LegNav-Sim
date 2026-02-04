@@ -42,7 +42,8 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
                 render_mode=None,
                 force_static=False,
                 render_skip=1,
-                distraction_prob=0.0):
+                distraction_prob=0.0,
+                ):
         # 1. Configurazione Scenario
         self.base_scenario_type = scenario_type
         self.scenario_type = scenario_type
@@ -149,6 +150,7 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
         self._yield_violations = 0
         self._time_stopped_in_zone = 0
         self.progress_reward = 0
+
         
         # Spazi Gym (Coerenti con nav_env + Stacking)
         # 4 scalari (Dist, Angle, V, W) + Lidar * Stack
@@ -503,6 +505,7 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
 
         if is_goal:
             done = True
+            terminated = True
             base_goal_reward = 200.0
             time_efficiency = 1.0 - (self.step_count / self.max_steps)
             time_bonus = 100.0 * max(0.0, time_efficiency)
@@ -511,6 +514,7 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
 
         elif collision_people:
             done = True
+            terminated = True
             
             
             if v <= 0.1 and abs(w) < 0.1:
@@ -528,6 +532,7 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
 
         elif self.step_count >= self.max_steps:
             done = True
+            truncated = True
             remaining_dist = dist_to_goal_now
             dist_penalty = -50.0 * (remaining_dist / self.max_possible_dist)
             reward = -50.0 + dist_penalty
@@ -730,7 +735,7 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
         # --- SCENARIO 4: Bottleneck (Muro con buco centrale) ---
         elif self.scenario_type == "bottleneck":
             wall_y = self.room_height / 2
-            gap_size = 1.5
+            gap_size = 1.8
             
             # Posizione random del varco (con margine dai bordi laterali)
             # Salviamo in self per passarlo dopo a _setup_scenario
@@ -807,9 +812,11 @@ class SimpleNavEnv(Simple2DEnv, gym.Env):
 
         # --- SCENARIO DEFAULT: Random (Generazione procedurale classica) ---
         else:
-            while len(self.obstacles) < self.n_obstacles:
+            target_num_obstacles = random.randint(10, 15)
+
+            while len(self.obstacles) < target_num_obstacles:
                 cx, cy = random.uniform(1, self.room_width-1), random.uniform(1, self.room_height-1)
-                # Protezione zona start robot
+                # Protection for robot start zone
                 if math.hypot(cx-2, cy-2) < 2.5: continue 
                 
                 if random.random() < 0.5: 

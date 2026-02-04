@@ -5,11 +5,12 @@ import numpy as np
 
 from collections import deque
 import matplotlib
+import pygame
 
 MAX_LIN_VEL = 0.3  # m/s (TurtleBot4 max linear)
 MAX_ANG_VEL = 0.7  # rad/s (TurtleBot4 max angular)
 GAP_STATIC = 0.0  # meters di sicurezza extra tra robot e persone
-GAP_PEOPLE = 0.2  # meters di sicurezza extra tra robot e persone
+GAP_PEOPLE = 0.0  # meters di sicurezza extra tra robot e persone
 
 class Simple2DEnv:
     def __init__(
@@ -29,6 +30,8 @@ class Simple2DEnv:
             render_skip: int = 1,
             use_legs: bool = False,
             human_distraction_prob: float = 0.0,
+            lidar_noise_enable: bool = False,
+            real_lidar_specs: bool = False,
             ):
 
         self.max_steps = max_steps
@@ -54,6 +57,8 @@ class Simple2DEnv:
         # Velocità massime imposte dall'hardware reale
         self.max_v = MAX_LIN_VEL  # m/s (TurtleBot4 max linear)
         self.max_w = MAX_ANG_VEL  # rad/s (TurtleBot4 max angular)
+        self.v = 0.0
+        self.w = 0.0
 
         self.reward_factor_progress = reward_factor_progress
 
@@ -63,8 +68,37 @@ class Simple2DEnv:
         self.robot_radius = robot_radius
         self.max_possible_dist = math.sqrt(room_width**2 + room_height**2)
 
-        # [MODIFICATO] Sensori (Specifiche RPLIDAR / TBot4)
-        self.num_rays = num_rays
+        self.real_lidar_specs = real_lidar_specs
+        
+        if self.real_lidar_specs:
+            # --- REAL TURTLEBOT4 CONFIGURATION ---
+            self.num_rays = 1080
+            
+            # ORIENTATION FIX: 
+            # User noted: "The first ray is to the right of the robot, not in front".
+            # In ROS body frame: Front=0, Left=+pi/2, Right=-pi/2.
+            # So we shift the starting angle by -90 degrees (-pi/2).
+            self.lidar_start_angle_offset = -math.pi / 2.0
+            
+            # NOISE MODEL (From your 'lidar_static_test2' analysis):
+            self.lidar_noise_std = 0.027  # Global Std Dev ~2.7cm
+            
+            # BLIND SPOTS (From your analysis):
+            # You found rays 93-94 were hitting poles. We map them directly.
+            self.simulated_blind_indices = [93, 94] 
+            self.structural_obstacle_dist = 0.22 # Distance to the pole
+            
+            # BAD SECTORS (From your analysis):
+            # You found instability around indices 580-608.
+            self.noisy_sector_indices = list(range(580, 609)) 
+            self.noisy_sector_multiplier = 3.0 # Increase noise in this sector
+            
+            self.lidar_dropout_prob = 0.01 # 1% chance of random max range (glitch)
+        else:
+            self.lidar_start_angle_offset = 0.0
+            self.num_rays = num_rays
+
+
         self.max_lidar_distance = max_lidar_distance
         self.lidar_min_distance = 0.12  # Minima distanza rilevabile (blind spot)
         self.lidar_offset = -0.05       # 5cm indietro rispetto al centro
@@ -89,8 +123,16 @@ class Simple2DEnv:
         # self.pose_history = deque(maxlen=self.stuck_window)
 
         # Rendering
-        self.fig = None
-        self.ax = None
+        # self.fig = None
+        # self.ax = None
+
+        # --- RENDERING CONFIG (PYGAME) ---
+        self.window_size = 800  # Dimensione finestra in pixel
+        self.sidebar_width = 350 # <--- NUOVA COLONNA LATERALE
+        self.scale = self.window_size / max(self.room_width, self.room_height) # Pixel per metro
+        self.screen = None
+        self.clock = None
+
         self.render_skip = render_skip
         self.render_counter = 0
         self.progress_reward = 0
@@ -105,6 +147,11 @@ class Simple2DEnv:
         self.use_legs = use_legs  # <--- SALVA STATO
         self.humans_leg_phase = [] 
         self.smooth_v = []
+
+        # Lidar noise config
+        self.lidar_noise_enable = lidar_noise_enable
+        self.lidar_noise_std = 0.03  # Standard deviation del rumore
+        self.lidar_dropout_prob = 0.03  # Probabilità di dropout per ogni raggio
 
     # --- LOGICA MOVIMENTO PERSONE ---
     def _handle_person_obstacle_collisions(self, p):
@@ -291,15 +338,97 @@ class Simple2DEnv:
         return real_dist
 
     # [MODIFICATO] Calcolo posizione Lidar spostata
+    # def _compute_lidar(self):
+    #     # Calcola la posizione assoluta del sensore lidar (traslato di lidar_offset lungo l'orientamento)
+    #     lidar_x = self.x + self.lidar_offset * math.cos(self.theta)
+    #     lidar_y = self.y + self.lidar_offset * math.sin(self.theta)
+        
+    #     angles = [self.theta + i * (2 * math.pi / self.num_rays) for i in range(self.num_rays)]
+
+    #     # 1. Calcolo raggi "perfetti" (Ground Truth)
+    #     raw_distances = [self._cast_ray(a, lidar_x, lidar_y) for a in angles]
+
+    #     # 2. Applicazione Rumore (se abilitato)
+    #     if self.lidar_noise_enable:
+    #         noisy_distances = []
+    #         for d in raw_distances:
+    #             # A. Rumore "Dropout" (3% probabilità di leggere MAX_DIST)
+    #             # Simula raggi persi, assorbiti o riflessi male
+    #             if random.random() < self.lidar_dropout_prob:
+    #                 noisy_distances.append(self.max_lidar_distance)
+    #                 continue
+
+    #             # B. Rumore Additivo Gaussiano
+    #             # Rumore gaussiano centrato in 0 con deviazione standard configurata
+    #             noise = random.gauss(0.0, self.lidar_noise_std)
+    #             new_d = d + noise
+
+    #             # C. Clamping sui limiti fisici del sensore
+    #             # Non possiamo leggere meno del minimo o più del massimo
+    #             new_d = max(self.lidar_min_distance, min(new_d, self.max_lidar_distance))
+                
+    #             noisy_distances.append(new_d)
+            
+    #         return noisy_distances
+        
+    #     # Passiamo le coordinate del Lidar invece di quelle del centro robot
+    #     return [self._cast_ray(a, lidar_x, lidar_y) for a in angles]
+
     def _compute_lidar(self):
-        # Calcola la posizione assoluta del sensore lidar (traslato di lidar_offset lungo l'orientamento)
+        # Calculate absolute sensor position
         lidar_x = self.x + self.lidar_offset * math.cos(self.theta)
         lidar_y = self.y + self.lidar_offset * math.sin(self.theta)
         
-        angles = [self.theta + i * (2 * math.pi / self.num_rays) for i in range(self.num_rays)]
+        # [MODIFIED] Apply Angular Offset
+        # If real_lidar_specs is True, start_angle is (theta - 90 deg).
+        # This makes index 0 point RIGHT, index ~270 point FRONT, index ~540 point LEFT.
+        start_angle = self.theta + self.lidar_start_angle_offset
         
-        # Passiamo le coordinate del Lidar invece di quelle del centro robot
-        return [self._cast_ray(a, lidar_x, lidar_y) for a in angles]
+        # Generate angles (CCW rotation standard)
+        angles = [start_angle + i * (2 * math.pi / self.num_rays) for i in range(self.num_rays)]
+
+        # 1. Geometry Pass (Perfect Ray Casting)
+        raw_distances = [self._cast_ray(a, lidar_x, lidar_y) for a in angles]
+
+        final_readings = []
+
+        for i, d in enumerate(raw_distances):
+            
+            # --- A. STRUCTURAL OBSTACLES (The Poles) ---
+            # If we are in "Real Mode", index 93 is physically blocked by a pole.
+            # We override the ray cast result with the pole distance.
+            if self.real_lidar_specs and i in self.simulated_blind_indices:
+                # The sensor sees the pole (approx 0.22m) unless a wall is even closer
+                d = min(d, self.structural_obstacle_dist)
+
+            if not self.lidar_noise_enable:
+                # Clamp and return
+                final_readings.append(max(self.lidar_min_distance, min(d, self.max_lidar_distance)))
+                continue
+
+            # --- B. NOISE MODEL ---
+            
+            # B1. Dropout (Random Glitches)
+            if random.random() < self.lidar_dropout_prob:
+                final_readings.append(self.max_lidar_distance)
+                continue
+
+            # B2. Gaussian Noise (Sector-Dependent)
+            sigma = self.lidar_noise_std
+            
+            # If this ray is in the "Bad Sector" (back of robot), increase noise
+            if self.real_lidar_specs and i in self.noisy_sector_indices:
+                sigma *= self.noisy_sector_multiplier
+            
+            noise = random.gauss(0.0, sigma)
+            noisy_d = d + noise
+
+            # --- C. SENSOR LIMITS ---
+            noisy_d = max(self.lidar_min_distance, min(noisy_d, self.max_lidar_distance))
+            
+            final_readings.append(noisy_d)
+            
+        return final_readings
 
     # --- LOGICA FISICA E SAFETY (MODIFICATA PER TBOT4) ---
     def _apply_differential_drive_constraints(self, v, w):
@@ -681,15 +810,15 @@ class Simple2DEnv:
             return obs, 0.0, True, {"termination_reason": "manual_skip"}
 
         target_v, target_w = action
-        v, w = self._apply_differential_drive_constraints(target_v, target_w)
+        self.v, self.w = self._apply_differential_drive_constraints(target_v, target_w)
 
         dist_to_goal_prev = math.hypot(self.x - self.goal_x, self.y - self.goal_y)
 
         # Update Physics
-        self.theta += w * self.dt
+        self.theta += self.w * self.dt
         self.theta = (self.theta + math.pi) % (2 * math.pi) - math.pi
-        next_x = self.x + v * self.dt * math.cos(self.theta)
-        next_y = self.y + v * self.dt * math.sin(self.theta)
+        next_x = self.x + self.v * self.dt * math.cos(self.theta)
+        next_y = self.y + self.v * self.dt * math.sin(self.theta)
 
         # Collision Check (Safety Layer - Static Obstacles)
         eff_radius = self.robot_radius + GAP_STATIC
@@ -717,7 +846,7 @@ class Simple2DEnv:
             reward = -200.0
             done = True
             info["termination_reason"] = "collision_static"
-            obs = self._get_observation(v, w)
+            obs = self._get_observation(self.v, self.w)
             return obs, reward, done, info
 
         self.x = next_x
@@ -728,9 +857,9 @@ class Simple2DEnv:
         self.step_count += 1
 
         dist_to_goal_now = math.hypot(self.x - self.goal_x, self.y - self.goal_y)
-        self.episode_path_length += math.hypot(v * self.dt * math.cos(self.theta), 
-                                            v * self.dt * math.sin(self.theta))
-        self.episode_jerk_sum += abs((w - self.last_w) / self.dt)
+        self.episode_path_length += math.hypot(self.v * self.dt * math.cos(self.theta), 
+                                            self.v * self.dt * math.sin(self.theta))
+        self.episode_jerk_sum += abs((self.w - self.last_w) / self.dt)
 
         # ==========================================
         # === REWARD SYSTEM ===
@@ -745,7 +874,7 @@ class Simple2DEnv:
         self.progress_reward += 5.0 * progress
 
         # 3. SMOOTHNESS
-        jerk_penalty = 0.05 * abs(w - self.last_w)
+        jerk_penalty = 0.05 * abs(self.w - self.last_w)
         reward -= jerk_penalty
 
         # === YIELDING LOGIC (Directional) ===
@@ -775,14 +904,14 @@ class Simple2DEnv:
             urgency = (YIELD_DIST - closest_human_dist) / YIELD_DIST
             
             # Penalità se ci muoviamo veloce CONTRO qualcuno davanti
-            if v > 0.1:
-                yield_violation_penalty = 15.0 * urgency * (v / self.max_v)
+            if self.v > 0.1:
+                yield_violation_penalty = 15.0 * urgency * (self.v / self.max_v)
                 reward -= yield_violation_penalty
                 if not hasattr(self, '_yield_violations'): self._yield_violations = 0
                 self._yield_violations += 1
             
             # Reward se aspettiamo
-            elif v <= 0.1:
+            elif self.v <= 0.1:
                 if not hasattr(self, '_time_stopped_in_zone'): self._time_stopped_in_zone = 0
                 self._time_stopped_in_zone += 1
                 decay_factor = max(0.0, 1.0 - (self._time_stopped_in_zone / 50.0))
@@ -806,18 +935,20 @@ class Simple2DEnv:
             done = True
             
             
-            if v <= 0.1 and abs(w) < 0.1:
+            if self.v <= 0.1 and abs(self.w) < 0.1:
                     # Robot fermo: Passive Collision (Sfortuna)
                 reward = -20.0
                 info["collision_type"] = "passive"
+                info["termination_reason"] = "people_collision_passive" # <--- CHANGED
             else:
                 # Robot in movimento: Active Collision (Grave)
-                speed_factor = v / self.max_v
+                speed_factor = self.v / self.max_v
                 reward = -(150.0 * speed_factor)
                 info["collision_type"] = "active"
+                info["termination_reason"] = "people_collision_active" # <--- CHANGED
            
             
-            info["termination_reason"] = "people_collision"
+            #info["termination_reason"] = "people_collision"
 
         elif self.step_count >= self.max_steps:
             done = True
@@ -833,10 +964,10 @@ class Simple2DEnv:
             info["mean_jerk"] = self.episode_jerk_sum / self.step_count if self.step_count > 0 else 0.0
             info["progress_reward_total"] = self.progress_reward
 
-        self.last_w = w
-        self.last_v = v
+        self.last_w = self.w
+        self.last_v = self.v
 
-        obs = self._get_observation(v, w)
+        obs = self._get_observation(self.v, self.w)
         return obs, reward, done, info
     
 
@@ -888,152 +1019,391 @@ class Simple2DEnv:
             self.manual_skip_triggered = True
 
     # --- RENDERING (MODIFICATO CON OFFSET) ---
+    # def render(self):
+    #     self.render_counter += 1
+    
+    #     if self.render_counter % self.render_skip != 0:
+    #         return
+
+    #     if self.fig is None:
+    #         self.fig, self.ax = plt.subplots()
+    #         plt.ion()
+
+    #     if not self._listener_attached:
+    #         self.fig.canvas.mpl_connect('key_press_event', self._on_key_press)
+    #         self._listener_attached = True
+
+    #     self.ax.clear()
+
+    #     # 1. Muri
+    #     self.ax.plot([0, self.room_width, self.room_width, 0, 0], [0, 0, self.room_height, self.room_height, 0], 'k-')
+
+    #     # 2. Ostacoli
+    #     for obs in self.obstacles:
+    #         if obs["type"] == "circle":
+    #             circle = plt.Circle((obs["cx"], obs["cy"]), obs["radius"], color='gray', alpha=0.7, fill=True)
+    #             self.ax.add_patch(circle)
+    #         elif obs["type"] == "rect":
+    #             rect = plt.Rectangle((obs["xmin"], obs["ymin"]), obs["xmax"] - obs["xmin"], obs["ymax"] - obs["ymin"], color='gray', alpha=0.7, fill=True)
+    #             self.ax.add_patch(rect)
+
+    #     # 3. Robot
+    #     robot_circle = plt.Circle((self.x, self.y), self.robot_radius, color='blue', fill=True)
+    #     collision_circle = plt.Circle((self.x, self.y), self.robot_radius + GAP_PEOPLE, color='black', fill=False, linestyle='--', linewidth=1, alpha=0.2)
+    #     self.ax.add_patch(robot_circle)
+    #     self.ax.add_patch(collision_circle)
+
+    #     # Freccia direzione
+    #     arrow_len = self.robot_radius * 1.5
+    #     x_head = self.x + arrow_len * math.cos(self.theta)
+    #     y_head = self.y + arrow_len * math.sin(self.theta)
+    #     self.ax.plot([self.x, x_head], [self.y, y_head], 'b-', linewidth=2)
+
+    #     # 4. Persone
+    #     LEG_RADIUS = 0.09
+    #     for p in self.people:
+    #         if self.use_legs and "legs" in p:
+    #             foot_len = 0.30
+    #             foot_width = LEG_RADIUS * 2.0
+    #             foot_theta = p["angle"]
+    #             cos_t = math.cos(foot_theta)
+    #             sin_t = math.sin(foot_theta)
+
+    #             for lx, ly in p["legs"]:
+    #                 local_x, local_y = -LEG_RADIUS, -LEG_RADIUS
+    #                 anchor_x = lx + (local_x * cos_t - local_y * sin_t)
+    #                 anchor_y = ly + (local_x * sin_t + local_y * cos_t)
+    #                 rect = matplotlib.patches.Rectangle(
+    #                     (anchor_x, anchor_y), width=foot_len, height=foot_width,
+    #                     angle=math.degrees(foot_theta),
+    #                     fill=True, facecolor='#D3D3D3', edgecolor='black',
+    #                     linewidth=0.5, alpha=0.9
+    #                 )
+    #                 self.ax.add_patch(rect)
+    #                 leg_circle = plt.Circle((lx, ly), LEG_RADIUS, color='black', fill=True)
+    #                 self.ax.add_patch(leg_circle)
+    #         else:
+    #             person = plt.Circle((p["x"], p["y"]), self.people_radius, color='green', fill=True)
+    #             self.ax.add_patch(person)
+
+    #     # 5. LIDAR FIX (VISUALIZZAZIONE)
+    #     lidar = self._compute_lidar()
+        
+    #     # [FIX 1] Applicare lo STESSO offset usato nel calcolo fisico
+    #     start_angle = self.theta + self.lidar_start_angle_offset
+    #     angles = [start_angle + i * (2 * math.pi / self.num_rays) for i in range(self.num_rays)]
+        
+    #     lidar_x_origin = self.x + self.lidar_offset * math.cos(self.theta)
+    #     lidar_y_origin = self.y + self.lidar_offset * math.sin(self.theta)
+
+    #     # [FIX 2] OTTIMIZZAZIONE GRAFICA
+    #     # Se usiamo il lidar reale (1080 raggi), disegniamone solo 1 ogni 10 (Stride)
+    #     # Questo riduce il carico grafico da 1080 oggetti a 108, rendendo tutto fluido.
+    #     VISUAL_STRIDE = 1 if self.real_lidar_specs else 1
+
+    #     for i in range(0, self.num_rays, VISUAL_STRIDE):
+    #         dist = lidar[i]
+    #         ang = angles[i]
+            
+    #         x_end = lidar_x_origin + dist * math.cos(ang)
+    #         y_end = lidar_y_origin + dist * math.sin(ang)
+
+    #         # Colorazione
+    #         color_ray_dist = 5.0
+    #         norm_d = min(dist, color_ray_dist) / color_ray_dist
+    #         proximity = (1.0 - norm_d) 
+    #         rgba = (0.6 + 0.4*proximity, 0.6 - 0.6*proximity, 0.6 - 0.6*proximity, 0.9 * proximity)
+            
+    #         # Linea sottile
+    #         self.ax.plot([lidar_x_origin, x_end], [lidar_y_origin, y_end], color=rgba, linewidth=0.5)
+    #         # Pallino finale
+    #         self.ax.plot(x_end, y_end, marker='o', markersize=1, color=rgba)
+
+    #     # Disegna SEMPRE il raggio 0 per debug (per vedere dove "guarda" l'indice 0)
+    #     dist0 = lidar[0]
+    #     ang0 = angles[0]
+    #     self.ax.plot(
+    #         [lidar_x_origin, lidar_x_origin + dist0*math.cos(ang0)], 
+    #         [lidar_y_origin, lidar_y_origin + dist0*math.sin(ang0)], 
+    #         color='cyan', linewidth=2.0, label='Ray 0'
+    #     )
+
+    #     # 6. Goal
+    #     if self.goal_x is not None:
+    #         self.ax.plot(self.goal_x, self.goal_y, marker='*', markersize=7, color='orange')
+
+    #     self.ax.set_xlim(-1, self.room_width + 1)
+    #     self.ax.set_ylim(-1, self.room_height + 1)
+    #     self.ax.set_aspect('equal', adjustable='box')
+        
+    #     plt.pause(0.0001)
+
+
+
+
+    # def close(self):
+    #     if self.fig: plt.close(self.fig); self.fig=None
+
+    def _to_screen(self, x, y):
+        """Converte coordinate Mondo (metri) -> Schermo (pixel)"""
+        # PyGame ha l'origine (0,0) in alto a sinistra.
+        # Il nostro mondo ha l'origine in basso a sinistra.
+        # Quindi la Y va invertita: screen_y = height - (world_y * scale)
+        sx = int(x * self.scale)
+        sy = int(self.window_size - (y * self.scale))
+        return sx, sy
+
     def render(self):
         self.render_counter += 1
-    
-        # Renderizza solo ogni N frame per velocità
         if self.render_counter % self.render_skip != 0:
             return
 
-        if self.fig is None:
-            self.fig, self.ax = plt.subplots()
-            plt.ion()
+        # --- Inizializzazione PyGame (Dimensioni Aumentate) ---
+        if self.screen is None:
+            pygame.init()
+            pygame.display.init()
+            pygame.font.init()
+            
+            # Larghezza totale = Stanza + Sidebar
+            total_width = self.window_size + self.sidebar_width
+            total_height = self.window_size
+            
+            self.screen = pygame.display.set_mode((total_width, total_height))
+            pygame.display.set_caption("Turtlebot4 Simulation - Stats Monitor")
+            self.clock = pygame.time.Clock()
+            
+            # La superficie LIDAR resta grande solo quanto la stanza (per efficienza)
+            self.lidar_surface = pygame.Surface((self.window_size, self.window_size), pygame.SRCALPHA)
+            
+            # Font
+            self.font_title = pygame.font.SysFont("Arial", 24, bold=True)
+            self.font_text = pygame.font.SysFont("Consolas", 18) # Consolas è monospaced, allinea meglio i numeri
 
-        if not self._listener_attached:
-            self.fig.canvas.mpl_connect('key_press_event', self._on_key_press)
-            self._listener_attached = True
+        # Gestione eventi
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.close()
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_RIGHT:
+                    print("\n>>> SKIP MANUALE RILEVATO <<<")
+                    self.manual_skip_triggered = True
 
-        self.ax.clear()
+        # 1. Pulisci lo schermo
+        self.screen.fill((255, 255, 255)) # Bianco per la stanza
+        
+        # --- DISEGNO SIDEBAR ---
+        # Rettangolo grigio sulla destra
+        sidebar_rect = pygame.Rect(self.window_size, 0, self.sidebar_width, self.window_size)
+        pygame.draw.rect(self.screen, (240, 240, 240), sidebar_rect) 
+        # Linea divisoria nera
+        pygame.draw.line(self.screen, (0, 0, 0), (self.window_size, 0), (self.window_size, self.window_size), 3)
 
-        # 1. Disegno Stanza
-        self.ax.plot([0, self.room_width, self.room_width, 0, 0], [0, 0, self.room_height, self.room_height, 0], 'k-')
+        # 2. Pulisci la superficie LIDAR
+        self.lidar_surface.fill((0, 0, 0, 0))
 
-        # 2. Disegno Ostacoli Statici
+        # 3. Disegna Muri (Solo nell'area stanza)
+        pygame.draw.rect(self.screen, (0, 0, 0), (0, 0, self.window_size, self.window_size), 2)
+
+        # 4. Disegna Ostacoli
         for obs in self.obstacles:
             if obs["type"] == "circle":
-                circle = plt.Circle((obs["cx"], obs["cy"]), obs["radius"], color='gray', alpha=0.7, fill=True)
-                self.ax.add_patch(circle)
+                cx, cy = self._to_screen(obs["cx"], obs["cy"])
+                r = int(obs["radius"] * self.scale)
+                pygame.draw.circle(self.screen, (150, 150, 150), (cx, cy), r)
             elif obs["type"] == "rect":
-                rect = plt.Rectangle((obs["xmin"], obs["ymin"]), obs["xmax"] - obs["xmin"], obs["ymax"] - obs["ymin"], color='gray', alpha=0.7, fill=True)
-                self.ax.add_patch(rect)
+                x_screen, y_screen = self._to_screen(obs["xmin"], obs["ymax"])
+                w_screen = int((obs["xmax"] - obs["xmin"]) * self.scale)
+                h_screen = int((obs["ymax"] - obs["ymin"]) * self.scale)
+                pygame.draw.rect(self.screen, (150, 150, 150), (x_screen, y_screen, w_screen, h_screen))
 
-        # 3. Disegno Robot
-        robot_circle = plt.Circle((self.x, self.y), self.robot_radius, color='blue', fill=True)
-        # Cerchio tratteggiato per visualizzare il raggio di collisione esteso (Debug)
-        collision_circle = plt.Circle((self.x, self.y), self.robot_radius + GAP_PEOPLE, color='black', fill=False, linestyle='--', linewidth=1, alpha=0.2)
-
-        self.ax.add_patch(robot_circle)
-        self.ax.add_patch(collision_circle)
-
-        # Freccia direzione robot
-        arrow_len = self.robot_radius * 1.5
-        x_head = self.x + arrow_len * math.cos(self.theta)
-        y_head = self.y + arrow_len * math.sin(self.theta)
-        self.ax.plot([self.x, x_head], [self.y, y_head], 'b-', linewidth=2)
-
-        # 4. DISEGNO PERSONE (Logica Gambe vs Standard)
-        LEG_RADIUS = 0.09
+        # 5. Calcolo LIDAR
+        lidar_readings = self._compute_lidar()
         
-        for p in self.people:
-            # --- MODALITÀ GAMBE ---
-            if self.use_legs and "legs" in p:
-                # Disegna un "corpo fantasma" trasparente per capire dove si trova il baricentro
-                ghost_body = plt.Circle((p["x"], p["y"]), self.people_radius, fill=False, color='green', linestyle=':', alpha=0.4)
-                self.ax.add_patch(ghost_body)
-
-                # Parametri Scarpa
-                foot_len = 0.30
-                foot_width = LEG_RADIUS * 2.0
-                foot_theta = p["angle"]
-                cos_t = math.cos(foot_theta)
-                sin_t = math.sin(foot_theta)
-
-                for lx, ly in p["legs"]:
-                    # Calcolo vertice in basso a sinistra del rettangolo scarpa (ruotato)
-                    # L'ancoraggio locale è (-R, -R) rispetto al centro della gamba
-                    local_x = -LEG_RADIUS
-                    local_y = -LEG_RADIUS
-                    
-                    # Rotazione 2D + Traslazione
-                    anchor_x = lx + (local_x * cos_t - local_y * sin_t)
-                    anchor_y = ly + (local_x * sin_t + local_y * cos_t)
-
-                    # 1. Disegna Scarpa (Rettangolo)
-                    rect = matplotlib.patches.Rectangle(
-                        (anchor_x, anchor_y), width=foot_len, height=foot_width,
-                        angle=math.degrees(foot_theta),
-                        fill=True, facecolor='#D3D3D3', edgecolor='black', # Grigio chiaro con bordo nero
-                        linewidth=0.5, alpha=0.9
-                    )
-                    self.ax.add_patch(rect)
-
-                    # 2. Disegna Tibia (Cerchio Nero)
-                    leg_circle = plt.Circle((lx, ly), LEG_RADIUS, color='black', fill=True)
-                    self.ax.add_patch(leg_circle)
-
-            # --- MODALITÀ STANDARD (Cerchio Verde) ---
-            else:
-                person = plt.Circle((p["x"], p["y"]), self.people_radius, color='green', fill=True)
-                self.ax.add_patch(person)
-            
-            # Vettore direzione (comune)
-            x_people_head = p["x"] + 0.3*math.cos(p["angle"])
-            y_people_head = p["y"] + 0.3*math.sin(p["angle"])
-            self.ax.plot([p["x"], x_people_head], [p["y"], y_people_head], 'g-', linewidth=2)
-
-        # 5. Disegno Lidar
-        lidar = self._compute_lidar()
-        angles = [self.theta + i * (2 * math.pi / self.num_rays) for i in range(self.num_rays)]
         lidar_x_origin = self.x + self.lidar_offset * math.cos(self.theta)
         lidar_y_origin = self.y + self.lidar_offset * math.sin(self.theta)
+        sx_origin, sy_origin = self._to_screen(lidar_x_origin, lidar_y_origin)
 
-        if len(self.trajectory) >= 2:
-            traj_xs, traj_ys = zip(*self.trajectory)
-            self.ax.plot(traj_xs, traj_ys, 'b--', linewidth=1)
+        start_angle = self.theta + self.lidar_start_angle_offset
+        angles = [start_angle + i * (2 * math.pi / self.num_rays) for i in range(self.num_rays)]
 
-        base_grey = (0.6, 0.6, 0.6)
-        base_red = (1.0, 0.0, 0.0)
-
-        for i, (dist, ang) in enumerate(zip(lidar, angles)): 
+        # --- DISEGNO RAGGI (Fix Alpha + Visibilità) ---
+        # --- DISEGNO RAGGI (Logica: Rosso Vicino / Invisibile Medio / Giallo Noise) ---
+        # --- DISEGNO RAGGI (Logica: Rosso Vicino / Invisibile Medio / VIOLA Fondoscala) ---
+        for i in range(self.num_rays):
+            dist = lidar_readings[i]
+            ang = angles[i]
+            
             x_end = lidar_x_origin + dist * math.cos(ang)
             y_end = lidar_y_origin + dist * math.sin(ang)
+            sx_end, sy_end = self._to_screen(x_end, y_end)
 
-            color_ray_dist = 5.0
-            norm_d = min(dist, color_ray_dist) / color_ray_dist
-            proximity = (1.0 - norm_d) 
+            if i == 0:
+                color = (0, 0, 255, 255) # Blue opaco
+                thickness = 2
+                pygame.draw.line(self.lidar_surface, color, (sx_origin, sy_origin), (sx_end, sy_end), thickness)
+                continue # Passa al prossimo raggio
 
-            r = base_grey[0] + proximity * (base_red[0] - base_grey[0])
-            g = base_grey[1] + proximity * (base_red[1] - base_grey[1])
-            b = base_grey[2] + proximity * (base_red[2] - base_grey[2])
+            # --- CASO 1: FONDOSCALA (Rumore o Fuori Range) ---
+            if dist >= self.max_lidar_distance - 0.1:
+                # VIOLA ACCESO (R=180, G=0, B=255)
+                # Alpha=180 (Ben visibile)
+                color = (180, 0, 255, 180) 
+                thickness = 1 # <--- Raggi più spessi come richiesto
+                
+                pygame.draw.line(self.lidar_surface, color, (sx_origin, sy_origin), (sx_end, sy_end), thickness)
             
-            alpha = 0.9 * proximity
-            rgba = (r, g, b, alpha)
-            
-            if i == 0: 
-                rgba = (0.5, 0.7, 1.0, 1.0)
-                linewidth = 1.0             
+            # --- CASO 2: MISURA VALIDA (Muro o Ostacolo) ---
             else:
-                linewidth = 0.5
+                color_ray_dist = 5.0
+                norm_d = min(dist, color_ray_dist) / color_ray_dist 
+                proximity = (1.0 - norm_d)                          
+                
+                r = int(255 * (0.6 + 0.4 * proximity))
+                g = int(255 * (0.6 - 0.6 * proximity))
+                b = int(255 * (0.6 - 0.6 * proximity))
+                a = int(255 * (0.9 * proximity))
+                
+                color = (r, g, b, a)
 
-            self.ax.plot([lidar_x_origin, x_end], [lidar_y_origin, y_end], color=rgba, linewidth=linewidth)
-            if i != 0:
-                self.ax.plot(x_end, y_end, marker='o', markersize=2, color=rgba)
+                if color[3] > 0:
+                    # Raggi normali sottili (spessore 1)
+                    pygame.draw.line(self.lidar_surface, color, (sx_origin, sy_origin), (sx_end, sy_end), 1)
 
-        # 6. Disegno Goal
+        # Sovrapponi il LIDAR (Solo sulla parte stanza)
+        self.screen.blit(self.lidar_surface, (0, 0))
+
+        # 6. Disegna Robot
+        rx, ry = self._to_screen(self.x, self.y)
+        rr = int(self.robot_radius * self.scale)
+        pygame.draw.circle(self.screen, (0, 0, 255), (rx, ry), rr) 
+        
+        head_x = self.x + (self.robot_radius * 1.5) * math.cos(self.theta)
+        head_y = self.y + (self.robot_radius * 1.5) * math.sin(self.theta)
+        hx, hy = self._to_screen(head_x, head_y)
+        pygame.draw.line(self.screen, (0, 0, 100), (rx, ry), (hx, hy), 3)
+
+        # 7. Disegna Persone
+        for p in self.people:
+            # Gambe
+            if self.use_legs and "legs" in p:
+                LEG_RADIUS = 0.09
+                foot_len = 0.30
+                foot_width = LEG_RADIUS * 2.0
+                
+                color_shoe_fill = (211, 211, 211) 
+                color_shoe_edge = (0, 0, 0)
+                color_leg_circle = (0, 0, 0)
+                foot_theta = p["angle"]
+                cos_t = math.cos(foot_theta); sin_t = math.sin(foot_theta)
+
+                for lx, ly in p["legs"]:
+                    x1, y1 = -LEG_RADIUS, -LEG_RADIUS
+                    x2, y2 = -LEG_RADIUS + foot_len, -LEG_RADIUS
+                    x3, y3 = -LEG_RADIUS + foot_len, -LEG_RADIUS + foot_width
+                    x4, y4 = -LEG_RADIUS, -LEG_RADIUS + foot_width
+                    local_verts = [(x1, y1), (x2, y2), (x3, y3), (x4, y4)]
+                    screen_verts = []
+                    for loc_x, loc_y in local_verts:
+                        rot_x = loc_x * cos_t - loc_y * sin_t
+                        rot_y = loc_x * sin_t + loc_y * cos_t
+                        screen_verts.append(self._to_screen(lx + rot_x, ly + rot_y))
+
+                    pygame.draw.polygon(self.screen, color_shoe_fill, screen_verts)
+                    pygame.draw.polygon(self.screen, color_shoe_edge, screen_verts, 1)
+                    slx, sly = self._to_screen(lx, ly)
+                    pygame.draw.circle(self.screen, color_leg_circle, (slx, sly), int(LEG_RADIUS * self.scale))
+
+            # Corpo
+            px, py = self._to_screen(p["x"], p["y"])
+            pr = int(self.people_radius * self.scale)
+            color_p = (0, 255, 0) 
+            if p.get("distracted", False): color_p = (200, 200, 0) 
+            
+            if not (self.use_legs and "legs" in p):
+                pygame.draw.circle(self.screen, color_p, (px, py), pr)
+
+        # 8. Disegna Goal
         if self.goal_x is not None:
-            self.ax.plot(self.goal_x, self.goal_y, marker='*', markersize=7, color='orange')
+            gx, gy = self._to_screen(self.goal_x, self.goal_y)
+            num_points = 5
+            radius_ext = int(0.15 * self.scale)
+            radius_int = int(0.06 * self.scale)
+            star_points = []
+            for i in range(num_points * 2):
+                radius = radius_ext if i % 2 == 0 else radius_int
+                angle = i * math.pi / num_points - math.pi / 2
+                px = gx + radius * math.cos(angle)
+                py = gy + radius * math.sin(angle)
+                star_points.append((px, py))
+            pygame.draw.polygon(self.screen, (255, 165, 0), star_points)
+            pygame.draw.polygon(self.screen, (200, 100, 0), star_points, 2)
 
-        self.ax.set_xlim(-1, self.room_width + 1)
-        self.ax.set_ylim(-1, self.room_height + 1)
-        self.ax.set_aspect('equal', adjustable='box')
 
-        status_text = f"Step: {self.step_count} | Mode: {'LEGS' if self.use_legs else 'SIMPLE'}"
-        self.ax.text(0.01, 0.99, status_text, verticalalignment='top', fontsize=8, bbox=dict(facecolor='white', alpha=0.6, edgecolor='none'))
+        # --- 9. STATISTICHE NELLA COLONNA DESTRA (SIDEBAR) ---
+        
+        # Coordinate di base per la sidebar
+        x_text = self.window_size + 20
+        y_text = 20
+        line_spacing = 30
 
-        plt.pause(0.0001)
+        # Calcolo Dati
+        dist_to_goal = math.hypot(self.x - self.goal_x, self.y - self.goal_y) if self.goal_x is not None else 0.0
+        min_laser_dist = min(lidar_readings) if (lidar_readings and len(lidar_readings) > 0) else 0.0
+        last_reason = self.last_termination_reason if self.last_termination_reason else "N/A"
+
+        # Titolo
+        title = self.font_title.render("SIMULATION STATS", True, (0, 0, 0))
+        self.screen.blit(title, (x_text, y_text))
+        y_text += 50 # Spazio dopo titolo
+
+        # Funzione helper per scrivere righe
+        # Funzione helper ALTERNATIVA (Allineamento a destra)
+        def draw_stat_line(label, value, color=(0,0,0)):
+            label_surf = self.font_text.render(f"{label}:", True, (80, 80, 80))
+            value_surf = self.font_text.render(str(value), True, color)
+            
+            # Disegna etichetta a sinistra
+            self.screen.blit(label_surf, (x_text, y_text))
+            
+            # Calcola posizione X per allineare il valore a DESTRA della colonna
+            # Larghezza colonna = 300, Padding = 20 -> x_max = window_size + 280
+            val_w = value_surf.get_width()
+            val_x = (self.window_size + self.sidebar_width) - val_w - 20
+            
+            self.screen.blit(value_surf, (val_x, y_text))
+            return line_spacing
+
+        # Stampa Righe
+        y_text += draw_stat_line("Goal Distance", f"{dist_to_goal:.2f} m")
+        y_text += draw_stat_line("Linear Vel (V)", f"{self.v:.2f} m/s")
+        y_text += draw_stat_line("Angular Vel (W)", f"{self.w:.2f} rad/s")
+        
+        # Min Laser con allarme rosso
+        laser_color = (200, 0, 0) if min_laser_dist < 0.5 else (0, 100, 0)
+        y_text += draw_stat_line("Lidar Min", f"{min_laser_dist:.2f} m", laser_color)
+
+        y_text += 20 # Spaziatore
+        
+        # Last Outcome con colori
+        outcome_color = (0, 0, 0)
+        if "goal" in str(last_reason).lower(): outcome_color = (0, 150, 0)
+        elif "collision" in str(last_reason).lower(): outcome_color = (200, 0, 0)
+        elif "timeout" in str(last_reason).lower(): outcome_color = (150, 100, 0)
+        
+        self.screen.blit(self.font_text.render("Last Episode:", True, (0,0,0)), (x_text, y_text))
+        y_text += 25
+        # Scriviamo il motivo sotto perché può essere lungo
+        outcome_surf = self.font_title.render(str(last_reason).upper(), True, outcome_color)
+        self.screen.blit(outcome_surf, (x_text, y_text))
+
+        self.clock.tick(60)
+        pygame.display.flip()
 
     def close(self):
-        if self.fig: plt.close(self.fig); self.fig=None
+        if self.screen is not None:
+            pygame.display.quit()
+            pygame.quit()
+            self.screen = None
 
     # --- METODI HELPER RESET ---
     def _reset_obstacles(self):
