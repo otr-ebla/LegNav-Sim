@@ -127,6 +127,9 @@ class Simple2DEnv:
         # self.ax = None
 
         # --- RENDERING CONFIG (PYGAME) ---
+        self.global_jerk_sum = 0.0
+        self.global_step_count = 0
+        self.persistent_outcome = "N/A" # Per mantenere la scritta tra episodi
         self.window_size = 800  # Dimensione finestra in pixel
         self.sidebar_width = 350 # <--- NUOVA COLONNA LATERALE
         self.scale = self.window_size / max(self.room_width, self.room_height) # Pixel per metro
@@ -801,166 +804,180 @@ class Simple2DEnv:
     #     return obs, reward, done, info
 
     def step(self, action):
+        # 0. Inizializzazione
         reward = 0.0
         done = False
         info = {}
+        dt = self.dt
 
+        # 1. Skip Manuale (Exit Rapido)
         if self.manual_skip_triggered:
             obs = self._get_observation(0.0, 0.0)
             return obs, 0.0, True, {"termination_reason": "manual_skip"}
 
+        # 2. Cinematica & Fisica
         target_v, target_w = action
         self.v, self.w = self._apply_differential_drive_constraints(target_v, target_w)
+        
+        # Pre-calcolo distanze goal (per reward progress)
+        dx_goal_prev = self.x - self.goal_x
+        dy_goal_prev = self.y - self.goal_y
+        dist_to_goal_prev = math.hypot(dx_goal_prev, dy_goal_prev)
 
-        dist_to_goal_prev = math.hypot(self.x - self.goal_x, self.y - self.goal_y)
+        # Aggiornamento Posizione
+        self.theta = (self.theta + self.w * dt + math.pi) % (2 * math.pi) - math.pi
+        
+        # Ottimizzazione: Calcolo sin/cos una volta sola
+        sin_t, cos_t = math.sin(self.theta), math.cos(self.theta)
+        step_dist = self.v * dt
+        next_x = self.x + step_dist * cos_t
+        next_y = self.y + step_dist * sin_t
 
-        # Update Physics
-        self.theta += self.w * self.dt
-        self.theta = (self.theta + math.pi) % (2 * math.pi) - math.pi
-        next_x = self.x + self.v * self.dt * math.cos(self.theta)
-        next_y = self.y + self.v * self.dt * math.sin(self.theta)
-
-        # Collision Check (Safety Layer - Static Obstacles)
+        # 3. Collision Check Statici (Ottimizzato)
         eff_radius = self.robot_radius + GAP_STATIC
+        eff_radius_sq = eff_radius**2
         collision_static = False
 
-        if (next_x - eff_radius < 0 or next_x + eff_radius > self.room_width or 
-            next_y - eff_radius < 0 or next_y + eff_radius > self.room_height):
+        # A. Check Muri (Bounds Check Rapido)
+        if not (eff_radius < next_x < self.room_width - eff_radius and 
+                eff_radius < next_y < self.room_height - eff_radius):
             collision_static = True
-
-        if not collision_static:
-            rr = eff_radius
+        else:
+            # B. Check Ostacoli
             for obs in self.obstacles:
                 if obs["type"] == "circle":
-                    if (next_x - obs["cx"])**2 + (next_y - obs["cy"])**2 < (rr + obs["radius"])**2:
-                        collision_static = True
-                        break
+                    # Distanza euclidea al quadrato
+                    dx_obs = next_x - obs["cx"]
+                    dy_obs = next_y - obs["cy"]
+                    if (dx_obs*dx_obs + dy_obs*dy_obs) < (eff_radius + obs["radius"])**2:
+                        collision_static = True; break
                 elif obs["type"] == "rect":
+                    # Nearest Point su rettangolo
                     cx = max(obs["xmin"], min(next_x, obs["xmax"]))
                     cy = max(obs["ymin"], min(next_y, obs["ymax"]))
-                    if (next_x - cx)**2 + (next_y - cy)**2 < rr**2:
-                        collision_static = True
-                        break
+                    if (next_x - cx)**2 + (next_y - cy)**2 < eff_radius_sq:
+                        collision_static = True; break
 
         if collision_static:
-            reward = -200.0
-            done = True
-            info["termination_reason"] = "collision_static"
-            obs = self._get_observation(self.v, self.w)
-            return obs, reward, done, info
+            return self._get_observation(self.v, self.w), -200.0, True, {"termination_reason": "collision_static"}
 
-        self.x = next_x
-        self.y = next_y
+        # 4. Commit dello Stato
+        self.x, self.y = next_x, next_y
         self.trajectory.append((self.x, self.y))
-
+        
         self._step_people()
         self.step_count += 1
 
+        # 5. Metriche
         dist_to_goal_now = math.hypot(self.x - self.goal_x, self.y - self.goal_y)
-        self.episode_path_length += math.hypot(self.v * self.dt * math.cos(self.theta), 
-                                            self.v * self.dt * math.sin(self.theta))
-        self.episode_jerk_sum += abs((self.w - self.last_w) / self.dt)
+        self.episode_path_length += step_dist
+        
+        current_jerk = abs((self.w - self.last_w) / dt)
+        self.episode_jerk_sum += current_jerk
+        self.global_jerk_sum += current_jerk # [FIX] Era duplicato nel tuo codice originale
+        self.global_step_count += 1
 
-        # ==========================================
-        # === REWARD SYSTEM ===
-        # ==========================================
-
-        # 1. TIME PENALTY
-        reward -= 0.01
-
-        # 2. PROGRESS REWARD
+        # 6. Reward Base
+        reward -= 0.01 # Time Penalty
+        
         progress = dist_to_goal_prev - dist_to_goal_now
         reward += 5.0 * progress
         self.progress_reward += 5.0 * progress
+        
+        reward -= 0.05 * abs(self.w - self.last_w) # Smoothness Penalty
 
-        # 3. SMOOTHNESS
-        jerk_penalty = 0.05 * abs(self.w - self.last_w)
-        reward -= jerk_penalty
-
-        # === YIELDING LOGIC (Directional) ===
-        # Calcoliamo l'angolo dell'umano PIÙ VICINO per capire se è davanti o dietro
-        closest_human_dist = float('inf')
-        closest_human_angle = 0.0
+        # 7. LOGICA UNIFICATA PERSONE (Yielding + Collision + Active/Passive)
+        # Ottimizzazione: Iteriamo una sola volta per trovare l'umano più vicino.
+        # Questo dato serve sia per il Yielding che per le Collisioni.
+        
+        closest_dist_sq = float('inf')
+        closest_dx = 0.0
+        closest_dy = 0.0
         
         for p in self.people:
-            d = math.hypot(p["x"] - self.x, p["y"] - self.y)
-            if d < closest_human_dist:
-                closest_human_dist = d
-                global_angle = math.atan2(p["y"] - self.y, p["x"] - self.x)
-                rel_angle = global_angle - self.theta
-                closest_human_angle = (rel_angle + math.pi) % (2 * math.pi) - math.pi
-
-        # Yield Parameters
-        YIELD_DIST = 1.5
-        # FOV ristretto per Yielding: consideriamo solo il cono frontale (+/- 60 gradi)
-        # Se l'umano è fuori da questo cono (es. dietro), il robot NON deve rallentare.
-        YIELD_FOV = math.radians(120) / 2  
+            dx = p["x"] - self.x
+            dy = p["y"] - self.y
+            d_sq = dx*dx + dy*dy
+            if d_sq < closest_dist_sq:
+                closest_dist_sq = d_sq
+                closest_dx = dx
+                closest_dy = dy
         
-        human_in_yield_zone = (closest_human_dist < YIELD_DIST and 
-                            abs(closest_human_angle) < YIELD_FOV)
+        closest_dist = math.sqrt(closest_dist_sq)
 
-        # 4. YIELD REWARD/PENALTY
-        if human_in_yield_zone:
-            urgency = (YIELD_DIST - closest_human_dist) / YIELD_DIST
+        # Calcolo Angolo Relativo (Serve sia per Yielding che per Active Collision)
+        global_angle = math.atan2(closest_dy, closest_dx)
+        rel_angle = (global_angle - self.theta + math.pi) % (2 * math.pi) - math.pi
+        
+        # --- A. YIELDING LOGIC ---
+        YIELD_DIST = 1.5
+        # FOV +/- 60 gradi
+        YIELD_FOV_LIMIT = math.radians(60) 
+        
+        if closest_dist < YIELD_DIST and abs(rel_angle) < YIELD_FOV_LIMIT:
+            urgency = (YIELD_DIST - closest_dist) / YIELD_DIST
             
-            # Penalità se ci muoviamo veloce CONTRO qualcuno davanti
             if self.v > 0.1:
-                yield_violation_penalty = 15.0 * urgency * (self.v / self.max_v)
-                reward -= yield_violation_penalty
+                # Penalità movimento veloce verso umano
+                reward -= 15.0 * urgency * (self.v / self.max_v)
                 if not hasattr(self, '_yield_violations'): self._yield_violations = 0
                 self._yield_violations += 1
-            
-            # Reward se aspettiamo
             elif self.v <= 0.1:
+                # Reward attesa
                 if not hasattr(self, '_time_stopped_in_zone'): self._time_stopped_in_zone = 0
                 self._time_stopped_in_zone += 1
-                decay_factor = max(0.0, 1.0 - (self._time_stopped_in_zone / 50.0))
-                reward += 0.2 * urgency * decay_factor
+                decay = max(0.0, 1.0 - (self._time_stopped_in_zone / 50.0))
+                reward += 0.2 * urgency * decay
         else:
             self._time_stopped_in_zone = 0
 
-        # === TERMINATION CONDITIONS ===
-        collision_people = self._is_collision_with_people()
-        is_goal = self._is_goal_reached()
-
-        if is_goal:
+        # --- B. TERMINATION CHECKS ---
+        
+        # Goal Reached
+        if dist_to_goal_now <= self.goal_radius:
             done = True
-            base_goal_reward = 200.0
-            time_efficiency = 1.0 - (self.step_count / self.max_steps)
-            time_bonus = 100.0 * max(0.0, time_efficiency)
-            reward = base_goal_reward + time_bonus
+            time_eff = 1.0 - (self.step_count / self.max_steps)
+            reward = 200.0 + (100.0 * max(0.0, time_eff))
             info["termination_reason"] = "goal_reached"
 
-        elif collision_people:
-            done = True
+        # People Collision Check
+        else:
+            # Soglia unificata (Robot + Persona + Gap)
+            unified_threshold = self.robot_radius + self.people_radius + GAP_PEOPLE
             
-            
-            if self.v <= 0.1 and abs(self.w) < 0.1:
-                    # Robot fermo: Passive Collision (Sfortuna)
-                reward = -20.0
-                info["collision_type"] = "passive"
-                info["termination_reason"] = "people_collision_passive" # <--- CHANGED
-            else:
-                # Robot in movimento: Active Collision (Grave)
-                speed_factor = self.v / self.max_v
-                reward = -(150.0 * speed_factor)
-                info["collision_type"] = "active"
-                info["termination_reason"] = "people_collision_active" # <--- CHANGED
-           
-            
-            #info["termination_reason"] = "people_collision"
+            if closest_dist_sq < unified_threshold**2:
+                done = True
+                
+                # Active vs Passive Classification
+                # Riutilizziamo rel_angle calcolato sopra!
+                is_in_front = abs(rel_angle) < YIELD_FOV_LIMIT
+                is_moving_fast = self.v >= 0.1
+                
+                if is_moving_fast and is_in_front:
+                    # Active Collision
+                    speed_factor = self.v / self.max_v
+                    reward = -(150.0 * speed_factor)
+                    info["termination_reason"] = "people_collision_active"
+                    info["collision_type"] = "active"
+                else:
+                    # Passive Collision
+                    reward = -20.0
+                    info["termination_reason"] = "people_collision_passive"
+                    info["collision_type"] = "passive"
 
-        elif self.step_count >= self.max_steps:
-            done = True
-            remaining_dist = dist_to_goal_now
-            dist_penalty = -50.0 * (remaining_dist / self.max_possible_dist)
-            reward = -50.0 + dist_penalty
-            info["termination_reason"] = "max_steps_reached"
+            # Max Steps Timeout
+            elif self.step_count >= self.max_steps:
+                done = True
+                dist_pen = -50.0 * (dist_to_goal_now / self.max_possible_dist)
+                reward = -50.0 + dist_pen
+                info["termination_reason"] = "max_steps_reached"
 
+        # 8. Finalizzazione Info
         if done:
             self.last_termination_reason = info.get("termination_reason", "unknown")
+            self.persistent_outcome = self.last_termination_reason
             info["path_length"] = self.episode_path_length
-            info["total_time"] = self.step_count * self.dt
+            info["total_time"] = self.step_count * dt
             info["mean_jerk"] = self.episode_jerk_sum / self.step_count if self.step_count > 0 else 0.0
             info["progress_reward_total"] = self.progress_reward
 
@@ -1341,62 +1358,117 @@ class Simple2DEnv:
 
         # --- 9. STATISTICHE NELLA COLONNA DESTRA (SIDEBAR) ---
         
-        # Coordinate di base per la sidebar
         x_text = self.window_size + 20
         y_text = 20
-        line_spacing = 30
+        line_spacing = 25
 
-        # Calcolo Dati
+        # Dati Calcolati
         dist_to_goal = math.hypot(self.x - self.goal_x, self.y - self.goal_y) if self.goal_x is not None else 0.0
         min_laser_dist = min(lidar_readings) if (lidar_readings and len(lidar_readings) > 0) else 0.0
-        last_reason = self.last_termination_reason if self.last_termination_reason else "N/A"
+        
+        # Calcolo Total Average Jerk
+        total_avg_jerk = 0.0
+        if self.global_step_count > 0:
+            total_avg_jerk = self.global_jerk_sum / self.global_step_count
 
-        # Titolo
-        title = self.font_title.render("SIMULATION STATS", True, (0, 0, 0))
+        # --- TITOLO ---
+        title = self.font_title.render("TELEMETRY", True, (0, 0, 0))
         self.screen.blit(title, (x_text, y_text))
-        y_text += 50 # Spazio dopo titolo
+        y_text += 40
 
-        # Funzione helper per scrivere righe
-        # Funzione helper ALTERNATIVA (Allineamento a destra)
+        # Funzione helper per righe
         def draw_stat_line(label, value, color=(0,0,0)):
             label_surf = self.font_text.render(f"{label}:", True, (80, 80, 80))
             value_surf = self.font_text.render(str(value), True, color)
-            
-            # Disegna etichetta a sinistra
             self.screen.blit(label_surf, (x_text, y_text))
-            
-            # Calcola posizione X per allineare il valore a DESTRA della colonna
-            # Larghezza colonna = 300, Padding = 20 -> x_max = window_size + 280
             val_w = value_surf.get_width()
             val_x = (self.window_size + self.sidebar_width) - val_w - 20
-            
             self.screen.blit(value_surf, (val_x, y_text))
             return line_spacing
 
-        # Stampa Righe
-        y_text += draw_stat_line("Goal Distance", f"{dist_to_goal:.2f} m")
-        y_text += draw_stat_line("Linear Vel (V)", f"{self.v:.2f} m/s")
-        y_text += draw_stat_line("Angular Vel (W)", f"{self.w:.2f} rad/s")
+        # --- DATI EPISODIO ---
+        y_text += draw_stat_line("Ep. Step", f"{self.step_count}")
+        y_text += draw_stat_line("Goal Dist", f"{dist_to_goal:.2f} m")
         
-        # Min Laser con allarme rosso
         laser_color = (200, 0, 0) if min_laser_dist < 0.5 else (0, 100, 0)
         y_text += draw_stat_line("Lidar Min", f"{min_laser_dist:.2f} m", laser_color)
+        
+        y_text += 10 # Spacer
+        
+        # --- DATI GLOBALI ---
+        y_text += draw_stat_line("Avg Jerk (Tot)", f"{total_avg_jerk:.2f}")
 
-        y_text += 20 # Spaziatore
+        # --- GRAFICO V/W (ACTION PLOT) ---
+        y_text += 40
         
-        # Last Outcome con colori
+        # Configurazione Grafico
+        plot_w = 200
+        plot_h = 150
+        plot_x = x_text + (self.sidebar_width - 20 - plot_w) // 2 # Centrato
+        plot_y = y_text
+        
+        # Sfondo Grafico
+        pygame.draw.rect(self.screen, (230, 230, 230), (plot_x, plot_y, plot_w, plot_h))
+        pygame.draw.rect(self.screen, (0, 0, 0), (plot_x, plot_y, plot_w, plot_h), 2)
+        
+        # Assi
+        # Asse W=0 (Orizzontale, a metà altezza)
+        mid_y = plot_y + plot_h / 2
+        pygame.draw.line(self.screen, (150, 150, 150), (plot_x, mid_y), (plot_x + plot_w, mid_y), 1)
+        # Asse V=0 (Verticale, a sinistra)
+        pygame.draw.line(self.screen, (150, 150, 150), (plot_x, plot_y), (plot_x, plot_y + plot_h), 1)
+
+        # Etichette Assi
+        font_small = pygame.font.SysFont("Arial", 12)
+        lbl_w_max = font_small.render(f"+{self.max_w}", True, (0,0,0)); self.screen.blit(lbl_w_max, (plot_x - 25, plot_y))
+        lbl_w_min = font_small.render(f"-{self.max_w}", True, (0,0,0)); self.screen.blit(lbl_w_min, (plot_x - 25, plot_y + plot_h - 10))
+        lbl_v_max = font_small.render(f"{self.max_v} m/s", True, (0,0,0)); self.screen.blit(lbl_v_max, (plot_x + plot_w - 30, plot_y + plot_h + 5))
+        lbl_chart = font_small.render("V / W Space", True, (0,0,0)); self.screen.blit(lbl_chart, (plot_x + 5, plot_y + 5))
+
+        # Calcolo Posizione Pallino (Current Action)
+        # X = V (0 a Max)
+        dot_x_norm = self.v / self.max_v
+        dot_screen_x = plot_x + int(dot_x_norm * plot_w)
+        
+        # Y = W (-Max a +Max). Nota: Y cresce verso il basso in Pygame
+        # Normalize W to [-1, 1]
+        dot_y_norm = self.w / self.max_w 
+        # Invertiamo il segno perché Y in pygame va giù, ma noi vogliamo +W in alto
+        dot_screen_y = mid_y - int(dot_y_norm * (plot_h / 2))
+        
+        # Disegna Pallino
+        pygame.draw.circle(self.screen, (255, 0, 0), (dot_screen_x, dot_screen_y), 6)
+        
+        # Linee di proiezione (opzionali, per bellezza)
+        pygame.draw.line(self.screen, (255, 100, 100), (plot_x, dot_screen_y), (dot_screen_x, dot_screen_y), 1)
+        pygame.draw.line(self.screen, (255, 100, 100), (dot_screen_x, mid_y), (dot_screen_x, dot_screen_y), 1)
+
+        y_text = plot_y + plot_h + 30
+
+        # --- LAST EPISODE OUTCOME (PERSISTENTE) ---
         outcome_color = (0, 0, 0)
-        if "goal" in str(last_reason).lower(): outcome_color = (0, 150, 0)
-        elif "collision" in str(last_reason).lower(): outcome_color = (200, 0, 0)
-        elif "timeout" in str(last_reason).lower(): outcome_color = (150, 100, 0)
+        txt = str(self.persistent_outcome).lower()
         
-        self.screen.blit(self.font_text.render("Last Episode:", True, (0,0,0)), (x_text, y_text))
-        y_text += 25
-        # Scriviamo il motivo sotto perché può essere lungo
-        outcome_surf = self.font_title.render(str(last_reason).upper(), True, outcome_color)
+        # Logica Colori Aggiornata
+        if "goal" in txt: 
+            outcome_color = (0, 150, 0)   # Verde
+        elif "passive" in txt: 
+            outcome_color = (0, 150, 0)   # Verde (Collisione Passiva è OK)
+        elif "collision" in txt: 
+            outcome_color = (200, 0, 0)   # Rosso (Collisione Attiva/Statica)
+        elif "timeout" in txt: 
+            outcome_color = (150, 100, 0) # Arancione
+        
+        # Etichetta
+        self.screen.blit(self.font_text.render("Last Outcome:", True, (0,0,0)), (x_text, y_text))
+        y_text += 20 # Riduco leggermente lo spazio verticale
+        
+        # Scritta Outcome rimpicciolita (Arial 16 Bold invece di 24)
+        font_outcome_small = pygame.font.SysFont("Arial", 16, bold=True)
+        outcome_surf = font_outcome_small.render(self.persistent_outcome.upper(), True, outcome_color)
         self.screen.blit(outcome_surf, (x_text, y_text))
 
-        self.clock.tick(60)
+        self.clock.tick(120)
         pygame.display.flip()
 
     def close(self):

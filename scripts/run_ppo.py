@@ -22,7 +22,7 @@ COMMAND FOR FAST PARALLEL EVALUATION:
 python3 -m scripts.run_ppo --name Stage2_Model --num_people 10 --eval_episodes 1000 --n_envs 10
 """
 
-def make_env_factory(num_people, num_obstacles, render_mode, use_legs, render_skip, distraction_prob, rank):
+def make_env_factory(num_people, num_obstacles, render_mode, use_legs, render_skip, distraction_prob, real_lidar, lidar_noise, rank):
     """Factory function for creating environments in parallel processes."""
     def _init():
         env = GymNavEnv(
@@ -34,6 +34,10 @@ def make_env_factory(num_people, num_obstacles, render_mode, use_legs, render_sk
             use_legs=use_legs,
             distraction_prob=distraction_prob,
             # Importante: seed diversi per ogni processo per evitare episodi identici
+            real_lidar_specs=real_lidar,  # <--- FONDAMENTALE: Attiva i 1080 raggi
+            lidar_noise_enable=lidar_noise,  # Se stiamo usando il lidar reale, attiviamo anche il noise
+            # Forziamo stack_dim a 5 se siamo in real_lidar mode (come nel training)
+            stack_dim=5 if real_lidar else 3
         )
         env.reset(seed=rank + int(time.time())) 
         return env
@@ -54,6 +58,8 @@ def main():
     # Flags Evaluation
     parser.add_argument("--eval_episodes", type=int, default=0, help="If > 0, runs fast evaluation without rendering")
     parser.add_argument("--n_envs", type=int, default=1, help="Number of parallel environments for fast eval")
+    parser.add_argument("--real_lidar", action="store_true", default=False, help="Enable 1080 rays (Real Specs)")
+    parser.add_argument("--lidar_noise", action="store_true", default=False, help="Enable LIDAR noise (Purple rays)") # <--- [NUOVO ARGOMENTO]
 
     args = parser.parse_args()
     
@@ -92,6 +98,8 @@ def main():
         args.use_legs,
         args.render_skip, 
         args.distraction_prob, 
+        args.real_lidar,
+        args.lidar_noise,
         i) for i in range(args.n_envs)]
     
     if args.n_envs > 1:

@@ -123,31 +123,28 @@ def main():
     parser.add_argument("--training_name", type=str, required=True, help="Stage Name")
     parser.add_argument("--num_people", type=int, default=0)
     parser.add_argument("--num_obstacles", type=int, default=20)
-    parser.add_argument("--rew_progress", type=float, default=5.0, help="Reward factor for progress towards goal")  # [CORREZIONE 1]
+    parser.add_argument("--rew_progress", type=float, default=5.0, help="Reward factor for progress towards goal")
     parser.add_argument("--steps", type=int, default=1000000)
-    parser.add_argument("--early_stop", type=float, default=0.95, help="Stop training if success rate reaches this value (e.g., 0.95)")
-    parser.add_argument("--use_legs", action="store_true", default=False, help="Enable realistic leg physics for humans") # <--- NUOVO FLAG    
-    # [CORREZIONE 2] Usa store_true per i flag booleani
+    parser.add_argument("--early_stop", type=float, default=0.95, help="Stop training if success rate reaches this value")
+    parser.add_argument("--use_legs", action="store_true", default=False, help="Enable realistic leg physics for humans")
     parser.add_argument("--custom_nn", action="store_true", default=False, help="Use custom NN architecture")
-    parser.add_argument("--lidar_noise", action="store_true", default=False, help="Enable LIDAR noise in the environment")  # <--- NUOVO FLAG
+    parser.add_argument("--lidar_noise", action="store_true", default=False, help="Enable LIDAR noise")
     parser.add_argument("--real_lidar", action="store_true", default=False, help="Enable 1080 rays (Real Specs)")
-    parser.add_argument("--distraction_prob", type=float, default=0.3, help="Probability of human distraction behavior")  # <--- NUOVO PARAMETRO
+    parser.add_argument("--distraction_prob", type=float, default=0.3, help="Probability of human distraction behavior")
     
     args = parser.parse_args()
 
-    # Create logs directory specifically for this stage
+    # Create logs directory
     log_dir = f"./logs/{args.training_name}"
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(f"./checkpoints", exist_ok=True)
 
     print(f"🛠️  ENV SETUP: {args.num_obstacles} Obstacles | {args.num_people} Humans")
     if args.custom_nn:
-        #print("🧠 ARCHITETTURA: Custom 1D-CNN (Lidar Processing)")
         print("🧠 ARCHITETTURA: Hybrid CNN-MLP")
     else:
         print("🧠 ARCHITETTURA: Standard MLP")
 
-    # Define environment factory
     # Define environment factory
     def make_env(rank: int):
         def _init():
@@ -160,7 +157,6 @@ def main():
                 distraction_prob=args.distraction_prob,
                 render_skip=1,
                 lidar_noise_enable=args.lidar_noise,
-                # --- AGGIUNGI QUESTA RIGA ---
                 real_lidar_specs=args.real_lidar 
             )
             return Monitor(env, os.path.join(log_dir, str(rank)))
@@ -188,72 +184,97 @@ def main():
         print("🆕 Creating NEW VecNormalize.")
         env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.)
 
-    # Setup Model
+    # Setup Model Class
     ModelClass = TQC if args.algo == "TQC" else SAC
     
-    if args.load_model:
-        print(f"🧠 Loading Weights from: {args.load_model}")
-        custom_objects = {
-            "learning_rate": 3e-4, 
-            "lr_schedule": lambda _: 3e-4,
-            "clip_range": lambda _: 0.2
-        }
-        model = ModelClass.load(args.load_model, env=env, custom_objects=custom_objects)
-    else:
-        # Configurazione Policy Keywords
-        policy_kwargs = {}
-        if args.custom_nn:
-            print("🧠 ARCHITETTURA: Slot Attention (Object-Centric)")
-            policy_kwargs = dict(
-                #features_extractor_class=LidarSlotAttentionExtractor,
-                features_extractor_class=HybridCnnMlp,
-                features_extractor_kwargs=dict(
-                    num_rays=1080,   # Prende 1080 dal tuo config
-                    stack_dim=5,   # Passa il valore 5 dello stacking
-                    hidden_dim=256,      # Dimensione dello strato di fusione
-                ),
-                # Riduciamo la dimensione della rete successiva perché gli slot sono già molto densi di info
-                net_arch=[256, 128] 
-            )
-                
-        print(f"✨ Initializing NEW {args.algo} Agent")
-        
-        # Inizializzazione unica
-        model = ModelClass(
-            "MlpPolicy",
-            env,
-            buffer_size=1_000_000,
-            learning_rate=3e-4,
-            batch_size=256,
-            train_freq=1,
-            gradient_steps=4,  # ⬅️ IMPORTANTE
-            gamma=0.99,
-            tau=0.005,
-            top_quantiles_to_drop_per_net=2,
-            policy_kwargs=policy_kwargs,
-            tensorboard_log=log_dir + "_tb",
-            verbose=1,
-            device="cuda"
+    # 1. CONFIGURAZIONE ARCHITETTURA (Sempre Nuova)
+    policy_kwargs = {}
+    if args.custom_nn:
+        print("🧠 ARCHITETTURA: Hybrid CNN-MLP (Unified)")
+        policy_kwargs = dict(
+            features_extractor_class=HybridCnnMlp,
+            features_extractor_kwargs=dict(
+                # Usa 1080 se real_lidar è attivo, altrimenti 108
+                num_rays=1080 if getattr(args, "real_lidar", False) else LidarConfig.NUM_RAYS,
+                stack_dim=5 if getattr(args, "real_lidar", False) else 3,
+                hidden_dim=256,
+            ),
+            net_arch=[256, 128] 
         )
 
-        if args.algo == "SAC":
-            model = SAC(
-                    "MlpPolicy",
-                    env,
-                    tensorboard_log=log_dir,
-                    learning_rate=3e-4,
-                    buffer_size=int(1e6),
-                    batch_size=256,
-                    tau=0.005,
-                    gamma=0.99,
-                    train_freq=1,
-                    gradient_steps=1,
-                    ent_coef="auto",
-                    target_update_interval=1,
-                    policy_kwargs=policy_kwargs,
-                    verbose=1,
-                    device="cuda" if torch.cuda.is_available() else "cpu",
-                )
+    # 2. INIZIALIZZA NUOVO AGENTE (Fresh Optimizer)
+    print(f"✨ Initializing NEW {args.algo} Agent (Fresh Optimizer)")
+    
+    # Parametri comuni
+    common_args = dict(
+        policy="MlpPolicy",
+        env=env,
+        learning_rate=3e-4,
+        buffer_size=1_000_000,
+        batch_size=256,
+        tau=0.005,
+        gamma=0.99,
+        train_freq=1,
+        gradient_steps=4 if args.algo == "TQC" else 1, # TQC usa più gradient steps solitamente
+        policy_kwargs=policy_kwargs,
+        tensorboard_log=log_dir + "_tb",
+        verbose=1,
+        device="cuda"
+    )
+    
+    # Aggiungi parametri specifici per TQC
+    if args.algo == "TQC":
+        common_args["top_quantiles_to_drop_per_net"] = 2
+        
+    # Istanzia il modello
+    model = ModelClass(**common_args)
+
+    # 3. CARICAMENTO PESI (Curriculum Learning - FRESH OPTIMIZER MODE)
+    if args.load_model:
+        print(f"📥 Curriculum Learning: Injecting Weights from {args.load_model}")
+        print("🛡️  Safe Mode: Loading weights ONLY (discarding old optimizer state)...")
+        
+        try:
+            # 1. Carichiamo il vecchio modello in memoria (solo per leggere i pesi)
+            old_model = ModelClass.load(args.load_model, device="cuda")
+            
+            # 2. Copiamo i pesi della Policy (Actor)
+            # Questo include: Feature Extractor (CNN), Latent layers, Mean/LogStd heads
+            model.policy.load_state_dict(old_model.policy.state_dict())
+            print("   ✅ Policy (Actor) weights transferred.")
+            
+            # 3. Copiamo i pesi del Critic e del Target
+            # Per TQC/SAC è fondamentale trasferire anche la "critica" allenata
+            if hasattr(model, "critic") and hasattr(old_model, "critic"):
+                model.critic.load_state_dict(old_model.critic.state_dict())
+                print("   ✅ Critic weights transferred.")
+            
+            if hasattr(model, "critic_target") and hasattr(old_model, "critic_target"):
+                model.critic_target.load_state_dict(old_model.critic_target.state_dict())
+                print("   ✅ Critic Target weights transferred.")
+                
+            print("🚀 Ready to train! Optimizer is fresh (Learning Rate reset).")
+
+        except Exception as e:
+            print(f"❌ Error during manual weight transfer: {e}")
+            print("🔄 Attempting Surgical Load (Partial Match)...")
+            
+            # FALLBACK: Se la copia esatta fallisce (es. architettura diversa),
+            # usiamo il filtro chirurgico che avevamo scritto prima.
+            try:
+                current_state = model.policy.state_dict()
+                old_state = old_model.policy.state_dict()
+                
+                compatible_state = {
+                    k: v for k, v in old_state.items() 
+                    if k in current_state and v.shape == current_state[k].shape
+                }
+                
+                model.policy.load_state_dict(compatible_state, strict=False)
+                print(f"   ✅ Surgical Load: {len(compatible_state)} layers transferred.")
+            except Exception as e2:
+                print(f"   ❌ Surgical load failed too: {e2}")
+                print("   ⚠️  WARNING: Starting from SCRATCH.")
 
     print(f"🚀 Launching Training: {args.training_name}")
     
@@ -267,7 +288,7 @@ def main():
     stats_callback = TerminationStatsCallback(
         window_size=200, 
         stop_at_success_rate=args.early_stop,
-        best_model_save_path=best_model_path, # <--- Passiamo il percorso qui
+        best_model_save_path=best_model_path, 
         verbose=1 
     )
 
@@ -283,25 +304,23 @@ def main():
         print("\n🛑 Training interrotto manualmente (CTRL+C).")
     except Exception as e:
         print(f"\n❌ Errore durante il training: {e}")
-        raise e  # Rilancia l'errore per vedere il traceback
+        raise e 
     finally:
-        # Controlliamo che il modello esista prima di salvare
         if 'model' in locals() and model is not None:
             save_path = f"./checkpoints/{args.training_name}"
             print(f"💾 Salvataggio di emergenza in corso su: {save_path}")
             model.save(save_path)
             
-            # Salviamo anche la normalizzazione se esiste
             if 'env' in locals() and env is not None:
                 env.save(f"{save_path}_vecnormalize.pkl")
                 try:
                     env.close()
                 except Exception:
-                    pass # Ignora errori di chiusura processi se già morti
+                    pass 
             
             print("✅ Salvataggio completato.")
         else:
-            print("⚠️ Nessun modello da salvare (interruzione avvenuta prima dell'inizializzazione).")
+            print("⚠️ Nessun modello da salvare.")
 
 if __name__ == "__main__":
     main()
