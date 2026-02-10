@@ -11,7 +11,7 @@ class RobotConfig:
 
 class SimConfig:
     HSFM_DT = 0.01
-    ROOM_SIDE_LENGTH = 8.0  # meters
+    ROOM_SIDE_LENGTH = 7.0  # meters
     ROOM_SIZE = (ROOM_SIDE_LENGTH, ROOM_SIDE_LENGTH)  # meters
     MAX_STEPS = 1000
     HUMANS_RADIUS = 0.2  # meters

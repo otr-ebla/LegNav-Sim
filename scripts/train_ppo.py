@@ -15,8 +15,9 @@ from collections import deque
 from src.envs.gym_nav_env import GymNavEnv
 from src.config import RobotConfig, LidarConfig
 
-from models.custon_cnn import Lidar1DCNN
-from models.hybrid_cnn_mlp import HybridCnnMlp   
+#from models.hybrid_cnn_mlp import HybridCnnMlp   
+from models.custom_cnn import RobustHybridCnnMlp as HybridCnnMlp # <--- IMPORTA LA TUA NUOVA RETE
+from models.adaptive_tqc import AdaptiveTQC
 from models.slot_attention import LidarSlotAttentionExtractor
 
 from typing import Callable
@@ -108,17 +109,17 @@ class TerminationStatsCallback(BaseCallback):
                         self.training_env.save(f"{self.best_model_save_path}_vecnormalize.pkl")
 
             # --- EARLY STOPPING CHECK ---
-            if self.stop_at_success_rate is not None and len(self.history) >= self.window_size:
-                if success_rate >= self.stop_at_success_rate:
-                    if self.verbose > 0:
-                        print(f"\n🛑 EARLY STOPPING TRIGGERED: Success Rate ({success_rate:.2f}) reached threshold ({self.stop_at_success_rate})!")
-                    return False  # returning False stops the training loop
+            # if self.stop_at_success_rate is not None and len(self.history) >= self.window_size:
+            #     if success_rate >= self.stop_at_success_rate:
+            #         if self.verbose > 0:
+            #             print(f"\n🛑 EARLY STOPPING TRIGGERED: Success Rate ({success_rate:.2f}) reached threshold ({self.stop_at_success_rate})!")
+            #         return False  # returning False stops the training loop
 
         return True
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--algo", default="TQC", choices=["SAC", "TQC", "PPO"])
+    parser.add_argument("--algo", default="TQC", choices=["SAC", "TQC", "PPO", "AR_TQC"])
     parser.add_argument("--load_model", type=str, default=None, help="Model to resume from")
     parser.add_argument("--training_name", type=str, required=True, help="Stage Name")
     parser.add_argument("--num_people", type=int, default=0)
@@ -185,7 +186,17 @@ def main():
         env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.)
 
     # Setup Model Class
-    ModelClass = TQC if args.algo == "TQC" else SAC
+    if args.algo == "TQC":
+        ModelClass = TQC
+    elif args.algo == "AR-TQC":
+        print("🛡️  USING ADAPTIVE RISK-AVERSE TQC (Major Contribution Mode)")
+        ModelClass = AdaptiveTQC
+    elif args.algo == "SAC":
+        ModelClass = SAC
+    elif args.algo == "PPO":
+        ModelClass = PPO
+    else:
+        ModelClass = TQC # Fallback
     
     # 1. CONFIGURAZIONE ARCHITETTURA (Sempre Nuova)
     policy_kwargs = {}

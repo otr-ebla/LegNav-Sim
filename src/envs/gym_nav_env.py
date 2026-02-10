@@ -60,8 +60,8 @@ class GymNavEnv(gym.Env):
             num_rays=self.num_rays, # Passiamo il numero corretto aggiornato
             max_steps=max_steps,
             num_people=num_people,
-            room_width=12.0,
-            room_height=12.0,
+            room_width=SimConfig.ROOM_SIDE_LENGTH,
+            room_height=SimConfig.ROOM_SIDE_LENGTH,
             num_obstacles=num_obstacles,
             reward_factor_progress=reward_factor_progress,
             people_speed=PEOPLE_SPEED,
