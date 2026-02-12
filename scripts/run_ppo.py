@@ -53,7 +53,7 @@ def main():
     parser.add_argument("--custom_nn", action="store_true", default=False, help="Use custom Hybrid CNN architecture")
     parser.add_argument("--use_legs", action="store_true", default=False, help="Use leg detection in LIDAR simulation")
 
-    parser.add_argument("--distraction_prob", type=float, default=0.6, help="Prob. humans are distracted (0.0=All Cooperative, 1.0=All Blind)")
+    parser.add_argument("--distraction_prob", type=float, default=0.3, help="Prob. humans are distracted (0.0=All Cooperative, 1.0=All Blind)")
     
     # Flags Evaluation
     parser.add_argument("--eval_episodes", type=int, default=0, help="If > 0, runs fast evaluation without rendering")

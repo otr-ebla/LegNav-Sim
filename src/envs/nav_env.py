@@ -12,6 +12,8 @@ MAX_ANG_VEL = 0.7  # rad/s (TurtleBot4 max angular)
 GAP_STATIC = 0.0  # meters di sicurezza extra tra robot e persone
 GAP_PEOPLE = 0.0  # meters di sicurezza extra tra robot e persone
 
+LEG_RADIUS = 0.07  # Raggio per rappresentare le gambe (se use_legs=True)
+
 class Simple2DEnv:
     def __init__(
             self, 
@@ -295,7 +297,6 @@ class Simple2DEnv:
         # Persone
         # Persone
         if self.use_legs:
-            LEG_RADIUS = 0.09
             for p in self.people:
                 if "legs" in p:
                     # Gamba Sinistra
@@ -822,6 +823,8 @@ class Simple2DEnv:
                         collision_static = True; break
 
         if collision_static:
+            self.last_termination_reason = "collision_static"
+            self.persistent_outcome = "collision_static"
             return self._get_observation(self.v, self.w), -200.0, True, {"termination_reason": "collision_static"}
 
         # 4. Commit dello Stato
@@ -1138,44 +1141,56 @@ class Simple2DEnv:
         pygame.draw.line(self.screen, (0, 0, 100), (rx, ry), (hx, hy), 3)
 
         # 7. Disegna Persone
+        # 7. Draw People
         for p in self.people:
-            # Gambe
+            # Legs / Shoes Rendering
             if self.use_legs and "legs" in p:
-                LEG_RADIUS = 0.09
                 foot_len = 0.30
-                foot_width = LEG_RADIUS * 2.0
                 
-                color_shoe_fill = (211, 211, 211) 
-                color_shoe_edge = (0, 0, 0)
-                color_leg_circle = (0, 0, 0)
+                # Colors
+                color_shoe_fill = (169, 169, 169) # Darker Grey
+                color_shoe_edge = (50, 50, 50)    # Almost Black
+                color_leg_circle = (0, 0, 0)      # Black (Ankle)
+
                 foot_theta = p["angle"]
-                cos_t = math.cos(foot_theta); sin_t = math.sin(foot_theta)
+                cos_t = math.cos(foot_theta)
+                sin_t = math.sin(foot_theta)
 
                 for lx, ly in p["legs"]:
-                    x1, y1 = -LEG_RADIUS, -LEG_RADIUS
-                    x2, y2 = -LEG_RADIUS + foot_len, -LEG_RADIUS
-                    x3, y3 = -LEG_RADIUS + foot_len, -LEG_RADIUS + foot_width
-                    x4, y4 = -LEG_RADIUS, -LEG_RADIUS + foot_width
-                    local_verts = [(x1, y1), (x2, y2), (x3, y3), (x4, y4)]
+                    # [MODIFIED] Polygon definition for a "Shoe" shape
+                    # Coordinates are local to the ankle (0,0)
+                    # Format: (forward_offset, side_offset)
+                    local_verts = [
+                        (-LEG_RADIUS, -LEG_RADIUS),           # 1. Back Left (Heel)
+                        (-LEG_RADIUS, LEG_RADIUS),            # 2. Back Right (Heel)
+                        (foot_len * 0.65, LEG_RADIUS),        # 3. Ball of foot Right (Widest point)
+                        (foot_len, LEG_RADIUS * 0.35),        # 4. Toe Tip Right (Tapered)
+                        (foot_len, -LEG_RADIUS * 0.35),       # 5. Toe Tip Left (Tapered)
+                        (foot_len * 0.65, -LEG_RADIUS)        # 6. Ball of foot Left (Widest point)
+                    ]
+
                     screen_verts = []
                     for loc_x, loc_y in local_verts:
+                        # Apply Rotation Matrix (Body Frame -> World Frame)
                         rot_x = loc_x * cos_t - loc_y * sin_t
                         rot_y = loc_x * sin_t + loc_y * cos_t
+                        
+                        # Convert to Screen Pixels
                         screen_verts.append(self._to_screen(lx + rot_x, ly + rot_y))
 
+                    # Draw the shoe polygon
                     pygame.draw.polygon(self.screen, color_shoe_fill, screen_verts)
                     pygame.draw.polygon(self.screen, color_shoe_edge, screen_verts, 1)
+                    
+                    # Draw the ankle circle
                     slx, sly = self._to_screen(lx, ly)
                     pygame.draw.circle(self.screen, color_leg_circle, (slx, sly), int(LEG_RADIUS * self.scale))
 
-            # Corpo
-            px, py = self._to_screen(p["x"], p["y"])
-            pr = int(self.people_radius * self.scale)
-            color_p = (0, 255, 0) 
-            if p.get("distracted", False): color_p = (200, 200, 0) 
-            
-            if not (self.use_legs and "legs" in p):
-                pygame.draw.circle(self.screen, color_p, (px, py), pr)
+            else:
+                # [FIX] FALLBACK: Disegna cerchio verde per il corpo
+                cx, cy = self._to_screen(p["x"], p["y"])
+                r = int(self.people_radius * self.scale)
+                pygame.draw.circle(self.screen, (0, 255, 0), (cx, cy), r)
 
         # 8. Disegna Goal
         if self.goal_x is not None:
@@ -1306,7 +1321,7 @@ class Simple2DEnv:
         outcome_surf = font_outcome_small.render(self.persistent_outcome.upper(), True, outcome_color)
         self.screen.blit(outcome_surf, (x_text, y_text))
 
-        self.clock.tick(120)
+        self.clock.tick(30)
         pygame.display.flip()
 
     def close(self):

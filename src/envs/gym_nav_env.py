@@ -5,6 +5,8 @@ from collections import deque
 
 # Assicurati che l'import punti al file corretto dove hai fatto le modifiche
 from .nav_env import Simple2DEnv 
+# Importiamo la versione veloce
+#from .fast_nav_env import Simple2DEnv
 from src.config import RobotConfig, LidarConfig, SimConfig 
 
 NUM_PEOPLE = 15
@@ -60,6 +62,7 @@ class GymNavEnv(gym.Env):
             num_rays=self.num_rays, # Passiamo il numero corretto aggiornato
             max_steps=max_steps,
             num_people=num_people,
+            robot_radius=RobotConfig.RADIUS,
             room_width=SimConfig.ROOM_SIDE_LENGTH,
             room_height=SimConfig.ROOM_SIDE_LENGTH,
             num_obstacles=num_obstacles,

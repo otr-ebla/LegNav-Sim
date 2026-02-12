@@ -35,7 +35,7 @@ def linear_schedule(initial_value: float) -> Callable[[float], float]:
 
 # --- COSTANTI DEFAULT ---
 NUM_RAYS = LidarConfig.NUM_RAYS
-N_ENVS = 100 # [CONSIGLIO] Riduci a 64 o 32 se usi la CNN, 100 potrebbe saturare la CPU
+N_ENVS = 300 # [CONSIGLIO] Riduci a 64 o 32 se usi la CNN, 100 potrebbe saturare la CPU
 
 class TerminationStatsCallback(BaseCallback):
     """
@@ -188,7 +188,7 @@ def main():
     # Setup Model Class
     if args.algo == "TQC":
         ModelClass = TQC
-    elif args.algo == "AR-TQC":
+    elif args.algo == "AR_TQC":
         print("🛡️  USING ADAPTIVE RISK-AVERSE TQC (Major Contribution Mode)")
         ModelClass = AdaptiveTQC
     elif args.algo == "SAC":

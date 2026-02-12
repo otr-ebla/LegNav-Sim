@@ -7,7 +7,7 @@ class RobotConfig:
     MAX_W = 0.8
     DT = 0.1 # 0.25
     LIDAR_OFFSET = -0.05  # meters
-    LIDAR_STACK_DIM = 5 #3
+    LIDAR_STACK_DIM = 3 #3
 
 class SimConfig:
     HSFM_DT = 0.01
