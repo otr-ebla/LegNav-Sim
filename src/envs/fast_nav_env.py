@@ -3,12 +3,13 @@ import random
 import numpy as np
 import pygame
 from numba import njit, float32, int32, boolean
+from src.config import RobotConfig, LidarConfig, SimConfig
 
 # =============================================================================
 # 🚀 KERNEL NUMBA (MOTORE FISICO VELOCE)
 # =============================================================================
 
-LEG_RADIUS = 0.07
+LEG_RADIUS = 0.07 # Costante usata sia in fisica che render
 
 @njit(fastmath=True)
 def intersect_circle_robust(lx, ly, dx, dy, cx, cy, r):
@@ -74,17 +75,16 @@ def fast_ray_intersect_static(x0, y0, angle, obs_arr, num_obs, room_w, room_h, m
     return min_dist
 
 @njit(fastmath=True, parallel=False)
-def fast_compute_lidar_core(x, y, theta, num_rays, start_angle, max_dist, 
+def fast_compute_lidar_core(x, y, theta, num_rays, start_angle, fov, max_dist, 
                             obs_arr, num_obs, room_w, room_h, 
                             people_arr, num_people, 
-                            use_legs, legs_coords): # <--- NUOVI PARAMETRI
-    """
-    Calcola i raggi Lidar. 
-    Se use_legs=True, calcola collisione con le GAMBE (r=0.09).
-    Altrimenti con il CORPO (r=0.2).
-    """
+                            use_legs, legs_coords):
     ranges = np.zeros(num_rays, dtype=np.float32)
-    angle_inc = 2 * math.pi / num_rays
+    
+    # Calculate increment to span exactly 'fov' across 'num_rays'
+    # Dividing by (num_rays - 1) ensures the first ray is at -90 deg and the last is at +90 deg
+    angle_inc = fov / (num_rays - 1) if num_rays > 1 else 0.0
+    
     lx = x + (-0.05) * math.cos(theta)
     ly = y + (-0.05) * math.sin(theta)
     
@@ -95,26 +95,26 @@ def fast_compute_lidar_core(x, y, theta, num_rays, start_angle, max_dist,
         dx = math.cos(ang)
         dy = math.sin(ang)
         
-        # 1. Statici (Muri + Ostacoli)
+        # 1. Static obstacles (Walls + Obstacles)
         d = fast_ray_intersect_static(lx, ly, ang, obs_arr, num_obs, room_w, room_h, max_dist)
         
-        # 2. Dinamici (Persone)
+        # 2. Dynamic obstacles (People)
         if use_legs:
-            # Check intersezione con le coordinate delle GAMBE
+            # Check intersection with LEG coordinates
             for p in range(num_people):
-                # Gamba 1 (Left) - coordinate pre-calcolate
+                # Leg 1 (Left)
                 l1x = legs_coords[p, 0, 0]
                 l1y = legs_coords[p, 0, 1]
                 t1 = intersect_circle_robust(lx, ly, dx, dy, l1x, l1y, LEG_RADIUS)
                 if t1 < d: d = t1
                 
-                # Gamba 2 (Right)
+                # Leg 2 (Right)
                 l2x = legs_coords[p, 1, 0]
                 l2y = legs_coords[p, 1, 1]
                 t2 = intersect_circle_robust(lx, ly, dx, dy, l2x, l2y, LEG_RADIUS)
                 if t2 < d: d = t2
         else:
-            # Check intersezione con CORPO (Cilindro classico)
+            # Check intersection with BODY
             for p in range(num_people):
                 px, py = people_arr[p, 0], people_arr[p, 1]
                 t = intersect_circle_robust(lx, ly, dx, dy, px, py, BODY_RADIUS)
@@ -166,10 +166,8 @@ def fast_grid_bfs(start_x, start_y, goal_x, goal_y, room_w, room_h, obs_arr, num
     q_y = np.zeros(rows * cols, dtype=np.int32)
     head = 0; tail = 0
     q_x[tail] = sx; q_y[tail] = sy; tail += 1; visited[sy, sx] = 1
-    
     dx = np.array([0, 0, -1, 1], dtype=np.int32)
     dy = np.array([-1, 1, 0, 0], dtype=np.int32)
-    
     while head < tail:
         cx = q_x[head]; cy = q_y[head]; head += 1
         if cx == gx and cy == gy: return True
@@ -261,33 +259,150 @@ def fast_move_people(people_arr, obs_arr, num_people, num_obs, room_w, room_h, d
         people_arr[i, 4] = math.atan2(vy, vx)
 
 @njit(fastmath=True)
-def fast_get_legs(x, y, v, theta, leg_phase):
-    """Calcolo coordinate gambe (Left/Right) per una persona"""
+def fast_update_legs_batch(people_arr, legs_coords, humans_leg_phase, num_people, dt):
+    """
+    Aggiorna la posizione delle gambe per TUTTE le persone in un colpo solo.
+    Scrive direttamente nel buffer `legs_coords` pre-allocato.
+    """
     HIP_SPACING = 0.20
     K_PHASE = 6.0
     target_amp = math.pi / (2 * K_PHASE)
-    stride_amp = 0.0
-    if v >= 0.05:
-        ratio = v / 0.2
-        if ratio > 1.0: ratio = 1.0
-        stride_amp = target_amp * ratio
 
-    phi_l = leg_phase % (2 * math.pi)
-    off_l = 1.0 - (2.0 * phi_l / math.pi) if phi_l < math.pi else -math.cos(phi_l - math.pi)
+    for i in range(num_people):
+        px = people_arr[i, 0]
+        py = people_arr[i, 1]
+        vx = people_arr[i, 2]
+        vy = people_arr[i, 3]
+        theta = people_arr[i, 4]
+        
+        v_mag = math.sqrt(vx*vx + vy*vy)
+        
+        # Update Phase
+        humans_leg_phase[i] += v_mag * dt * 4.0
+        leg_phase = humans_leg_phase[i]
 
-    phi_r = (leg_phase + math.pi) % (2 * math.pi)
-    off_r = 1.0 - (2.0 * phi_r / math.pi) if phi_r < math.pi else -math.cos(phi_r - math.pi)
+        stride_amp = 0.0
+        if v_mag >= 0.05:
+            ratio = v_mag / 0.2
+            if ratio > 1.0: ratio = 1.0
+            stride_amp = target_amp * ratio
 
-    cos_t = math.cos(theta); sin_t = math.sin(theta)
-    px = -sin_t; py = cos_t
+        # Offset L
+        phi_l = leg_phase % (2 * math.pi)
+        off_l = 1.0 - (2.0 * phi_l / math.pi) if phi_l < math.pi else -math.cos(phi_l - math.pi)
+
+        # Offset R
+        phi_r = (leg_phase + math.pi) % (2 * math.pi)
+        off_r = 1.0 - (2.0 * phi_r / math.pi) if phi_r < math.pi else -math.cos(phi_r - math.pi)
+
+        cos_t = math.cos(theta); sin_t = math.sin(theta)
+        
+        # Vector perpendicolare alla direzione (Spalle)
+        # Se direzione è (cos, sin), perpendicolare (-sin, cos)
+        sh_x = -sin_t 
+        sh_y = cos_t
+        
+        # Left Leg
+        l1x = px - (sh_x * HIP_SPACING * 0.5) + (cos_t * stride_amp * off_l)
+        l1y = py - (sh_y * HIP_SPACING * 0.5) + (sin_t * stride_amp * off_l)
+        
+        # Right Leg
+        l2x = px + (sh_x * HIP_SPACING * 0.5) + (cos_t * stride_amp * off_r)
+        l2y = py + (sh_y * HIP_SPACING * 0.5) + (sin_t * stride_amp * off_r)
+        
+        # Store in array [NumPeople, 2, 2]
+        legs_coords[i, 0, 0] = l1x
+        legs_coords[i, 0, 1] = l1y
+        legs_coords[i, 1, 0] = l2x
+        legs_coords[i, 1, 1] = l2y
+
+@njit(fastmath=True)
+def fast_scan_closest_human(people_arr, num_people, robot_x, robot_y, robot_theta):
+    """
+    Trova la distanza e l'angolo relativo dell'umano più vicino in O(N) puro C.
+    Ritorna (closest_dist, rel_angle)
+    """
+    min_dist_sq = 1e9
+    closest_idx = -1
     
-    lx = x - (px * HIP_SPACING * 0.5) + (cos_t * stride_amp * off_l)
-    ly = y - (py * HIP_SPACING * 0.5) + (sin_t * stride_amp * off_l)
+    for i in range(num_people):
+        dx = people_arr[i, 0] - robot_x
+        dy = people_arr[i, 1] - robot_y
+        d2 = dx*dx + dy*dy
+        if d2 < min_dist_sq:
+            min_dist_sq = d2
+            closest_idx = i
+            
+    if closest_idx == -1:
+        return 999.0, 0.0
+        
+    closest_dist = math.sqrt(min_dist_sq)
     
-    rx = x + (px * HIP_SPACING * 0.5) + (cos_t * stride_amp * off_r)
-    ry = y + (py * HIP_SPACING * 0.5) + (sin_t * stride_amp * off_r)
+    # Calcolo angolo relativo
+    # people_arr[closest] -> x, y
+    p_x = people_arr[closest_idx, 0]
+    p_y = people_arr[closest_idx, 1]
     
-    return np.array([[lx, ly], [rx, ry]], dtype=np.float32)
+    global_angle = math.atan2(p_y - robot_y, p_x - robot_x)
+    rel_angle = (global_angle - robot_theta + math.pi) % (2 * math.pi) - math.pi
+    
+    return closest_dist, rel_angle
+
+@njit(fastmath=True)
+def fast_update_human_states(people_arr, num_people, dt, stop_prob, min_stop_time, max_stop_time):
+    """
+    Gestisce la macchina a stati degli umani (Waiting vs Walking).
+    Se il timer > 0, forza la velocità a 0.
+    Se il timer scade, ripristina la velocità target.
+    """
+    for i in range(num_people):
+        # Estrai stato corrente
+        timer = people_arr[i, 6]
+        target_speed = people_arr[i, 7]
+        angle = people_arr[i, 4]
+        
+        # Aggiorna il timer
+        timer -= dt
+        
+        if timer > 0:
+            # --- STATO: FERMO (WAITING) ---
+            # Azzera la velocità corrente (ma mantieni angle e target_speed per dopo)
+            people_arr[i, 2] = 0.0 # vx
+            people_arr[i, 3] = 0.0 # vy
+            
+        else:
+            # --- STATO: CAMMINANDO (WALKING) ---
+            
+            # 1. Check Probabilità di fermarsi (random event)
+            # La probabilità è scalata per dt per renderla indipendente dagli FPS
+            # Esempio: se stop_prob è 0.5 (50% al secondo), calcoliamo la chance per frame
+            if random.random() < (stop_prob * dt):
+                # START WAITING: Genera un tempo di attesa casuale
+                wait_time = min_stop_time + random.random() * (max_stop_time - min_stop_time)
+                timer = wait_time # Imposta il timer
+                
+                # Ferma subito
+                people_arr[i, 2] = 0.0
+                people_arr[i, 3] = 0.0
+            
+            else:
+                # CONTINUA A CAMMINARE
+                # Se la velocità attuale è zero (perché eravamo fermi o per collisione),
+                # la ripristiniamo verso la direzione target.
+                # Nota: Non sovrascriviamo brutalmente se c'è inerzia, ma assicuriamo il "motore" acceso.
+                
+                # Calcola la velocità desiderata base
+                des_vx = math.cos(angle) * target_speed
+                des_vy = math.sin(angle) * target_speed
+                
+                # Semplice assegnazione "motore": resetta la velocità base
+                # La repulsione (chiamata dopo) si occuperà di deviare questa velocità se necessario
+                people_arr[i, 2] = des_vx
+                people_arr[i, 3] = des_vy
+        
+        # Salva il timer aggiornato
+        people_arr[i, 6] = timer
+
 
 # =============================================================================
 # CLASSE AMBIENTE
@@ -319,29 +434,31 @@ class Simple2DEnv:
         self.max_steps = max_steps
         self.room_width = room_width
         self.room_height = room_height
-        self.num_rays = 1080 if real_lidar_specs else num_rays
+        self.num_rays = LidarConfig.NUM_RAYS
+        self.fov = LidarConfig.FOV
         self.real_lidar_specs = real_lidar_specs
-        self.lidar_start_angle_offset = -math.pi / 2.0 if real_lidar_specs else 0.0
+        self.lidar_start_angle_offset = -self.fov/2.0
         self.max_lidar_distance = max_lidar_distance
         self.lidar_noise_enable = lidar_noise_enable
         self.lidar_offset = -0.05
         
         self.x = 0.0; self.y = 0.0; self.theta = 0.0
         self.v = 0.0; self.w = 0.0
-        self.max_v = 0.3; self.max_w = 0.7
+        self.max_v = RobotConfig.MAX_LINEAR_VEL
+        self.max_w = RobotConfig.MAX_W
         self.robot_radius = robot_radius
         self.trajectory = []
 
-        # --- Dati Ibridi ---
+        # --- Dati Ibridi (Lists rimosse per ottimizzazione) ---
         self.max_obstacles = 50 
         self.obstacles_arr = np.zeros((self.max_obstacles, 5), dtype=np.float32)
         self.num_active_obstacles = 0
-        self.obstacles = [] 
         self.num_obstacles = num_obstacles
+        # (self.obstacles list è mantenuta per il rendering degli ostacoli statici)
+        self.obstacles = [] 
 
         self.num_people = num_people
-        self.people_arr = np.zeros((self.num_people, 6), dtype=np.float32)
-        self.people = [] 
+        self.people_arr = np.zeros((self.num_people, 8), dtype=np.float32)
         self.people_speed = people_speed
         self.people_radius = people_radius
         self.human_distraction_prob = human_distraction_prob
@@ -375,16 +492,24 @@ class Simple2DEnv:
         self.persistent_outcome = "N/A"
         self.manual_skip_triggered = False
 
-        # Legs Animation
+        # Legs Animation (Arrays Numpy invece di liste)
         self.use_legs = use_legs
-        self.humans_leg_phase = [0.0] * num_people
-        self.smooth_v = [0.0] * num_people
+        self.humans_leg_phase = np.zeros(self.num_people, dtype=np.float32)
 
         # NOISE CONFIG
         if self.real_lidar_specs:
             self.lidar_noise_std = 0.027
         else:
             self.lidar_noise_std = 0.03
+
+        self.prev_dist_to_goal = 0.0
+
+        # Global episode counters for telemetry statistics
+        self.episodes_total = 0
+        self.episodes_success = 0
+        self.episodes_collision = 0
+        self.episodes_passive = 0
+        self.episodes_timeout = 0
 
     def reset(self):
         self.step_count = 0
@@ -393,6 +518,8 @@ class Simple2DEnv:
         self.episode_jerk_sum = 0
         self.last_v = 0; self.last_w = 0
         self.manual_skip_triggered = False
+
+        self.max_v = random.uniform(0.2, 2.0)
 
         while True:
             self._reset_obstacles()
@@ -403,6 +530,7 @@ class Simple2DEnv:
             for _ in range(50):
                 rx = random.uniform(margin, self.room_width - margin)
                 ry = random.uniform(margin, self.room_height - margin)
+                # USE FAST CHECK
                 if not fast_check_static_collision(rx, ry, self.robot_radius + 0.05, self.obstacles_arr, self.num_active_obstacles, self.room_width, self.room_height):
                     self.x = rx; self.y = ry; valid_robot = True; break
             
@@ -423,7 +551,6 @@ class Simple2DEnv:
             if valid_goal: break
 
         # Inizializza Persone
-        self.people = []
         for i in range(self.num_people):
             while True:
                 px = random.uniform(1, self.room_width - 1)
@@ -432,12 +559,24 @@ class Simple2DEnv:
                     if not fast_check_static_collision(px, py, self.people_radius, self.obstacles_arr, self.num_active_obstacles, self.room_width, self.room_height): break
             
             angle = random.uniform(0, 2*math.pi)
-            speed = self.people_speed
+            speed = self.people_speed 
+            
+            # Velocità Iniziale
             vx = speed * math.cos(angle); vy = speed * math.sin(angle)
             is_distracted = 1.0 if random.random() < self.human_distraction_prob else 0.0
             
-            self.people_arr[i] = [px, py, vx, vy, angle, is_distracted]
-            self.people.append({"x": px, "y": py, "vx": vx, "vy": vy, "angle": angle, "distracted": bool(is_distracted)})
+            # --- MODIFICA QUI ---
+            # Col 6: Timer iniziale (partono tutti in movimento, timer <= 0)
+            wait_timer = -1.0 
+            # Col 7: Salviamo la velocità target per quando ripartiranno
+            target_speed = speed 
+
+            self.people_arr[i] = [px, py, vx, vy, angle, is_distracted, wait_timer, target_speed]
+            self.humans_leg_phase[i] = random.uniform(0, 2*math.pi)
+
+        self.prev_dist_to_goal = math.hypot(self.goal_x - self.x, self.goal_y - self.y)        # [FIX] Force lidar update on reset
+
+        self.lidar_readings = self._compute_lidar_fast()
 
         return self._get_observation(0, 0)
 
@@ -446,6 +585,7 @@ class Simple2DEnv:
             return self._get_observation(0,0), 0.0, True, {"termination_reason": "manual_skip"}
 
         target_v, target_w = action
+        # Clipping azioni
         self.v = max(0.0, min(target_v, self.max_v))
         self.w = max(-self.max_w, min(target_w, self.max_w))
 
@@ -461,115 +601,146 @@ class Simple2DEnv:
         self.global_step_count += 1
         self.episode_path_length += (self.v * dt)
 
-        # Collisioni Statiche
+        # --- 1. COLLISIONI STATICHE ---
         if fast_check_static_collision(next_x, next_y, self.robot_radius - 0.02, self.obstacles_arr, self.num_active_obstacles, self.room_width, self.room_height):
             self.persistent_outcome = "collision_static"
-            return self._get_observation(self.v, self.w), -200.0, True, {"termination_reason": "collision_static"}
+            
+            # [FIX] Update lidar before return
+            self.lidar_readings = self._compute_lidar_fast()
+            
+            # === NUOVO CODICE PER FIX STATISTICHE ===
+            self.episodes_total += 1
+            self.episodes_collision += 1
+            self.last_termination_reason = "collision_static"
+            # ========================================
+
+            return self._get_observation(self.v, self.w), -70.0, True, {"termination_reason": "collision_static"}
 
         self.x = next_x
         self.y = next_y
         self.step_count += 1
         
-        # 1. Repulsione Umani
+        # === NUOVA LOGICA UMANI (STOP & GO) ===
+        # Parametri di configurazione (puoi metterli in __init__ se vuoi parametrizzarli)
+        STOP_PROBABILITY = 0.15   # 15% di probabilità al secondo di fermarsi
+        MIN_STOP_TIME = 1.0       # Minimo 1 secondo di stop
+        MAX_STOP_TIME = 5.0       # Massimo 5 secondi di stop
+        
+        fast_update_human_states(
+            self.people_arr, self.num_people, dt, 
+            STOP_PROBABILITY, MIN_STOP_TIME, MAX_STOP_TIME
+        )
+        # ======================================
+        
+        # --- 2. FISICA UMANI (Repulsione + Movimento) ---
+        # La repulsione ora lavorerà su velocità che potrebbero essere 0 (se fermi).
+        # Se sono fermi, la repulsione li sposterà solo se il robot gli va addosso (realistico).
         fast_apply_repulsion(self.people_arr, self.num_people, self.x, self.y, self.theta, self.last_v, self.people_speed)
-
-        # 2. Fisica Umani
+        
         fast_move_people(self.people_arr, self.obstacles_arr, self.num_people, self.num_active_obstacles, self.room_width, self.room_height, dt, self.people_radius)
 
-        # 3. Sync Python + Animazione Gambe
-        for i in range(self.num_people):
-            px, py = self.people_arr[i, 0], self.people_arr[i, 1]
-            vx, vy = self.people_arr[i, 2], self.people_arr[i, 3]
-            angle = self.people_arr[i, 4]
-            p = self.people[i]
-            p["x"] = px; p["y"] = py; p["vx"] = vx; p["vy"] = vy; p["angle"] = angle
-            
-            # Calcolo gambe SEMPRE, perché servono al Lidar
-            if self.use_legs:
-                v_mag = math.hypot(vx, vy)
-                self.humans_leg_phase[i] += v_mag * dt * 4.0
-                legs_arr = fast_get_legs(px, py, v_mag, angle, self.humans_leg_phase[i])
-                
-                # Salva per Lidar Numba
-                self.legs_coords[i, 0, 0] = legs_arr[0,0]
-                self.legs_coords[i, 0, 1] = legs_arr[0,1]
-                self.legs_coords[i, 1, 0] = legs_arr[1,0]
-                self.legs_coords[i, 1, 1] = legs_arr[1,1]
-                
-                # Salva per Rendering Pygame
-                p["legs"] = [(legs_arr[0,0], legs_arr[0,1]), (legs_arr[1,0], legs_arr[1,1])]
+        if self.use_legs:
+            # Le gambe si aggiorneranno automaticamente: se vx,vy=0, la fase non avanza e le gambe restano ferme.
+            fast_update_legs_batch(self.people_arr, self.legs_coords, self.humans_leg_phase, self.num_people, dt)
 
-        # 4. Lidar (Core + Noise)
-        self.lidar_readings = self._compute_lidar_fast()
-
-        # Rewards & Logic
-        dx_goal = self.x - self.goal_x; dy_goal = self.y - self.goal_y
+        # --- 3. REWARD CALCULATION ---
+        dx_goal = self.x - self.goal_x
+        dy_goal = self.y - self.goal_y
         dist_goal = math.hypot(dx_goal, dy_goal)
+        
+        prev_x = self.x - self.v * dt * math.cos(self.theta)
+        prev_y = self.y - self.v * dt * math.sin(self.theta)
+        prev_dist = math.hypot(prev_x - self.goal_x, prev_y - self.goal_y)
+        
+        reward = 2.5 * (prev_dist - dist_goal)
+        self.progress_reward += reward
+        reward -= 0.005
+
+        # JERK PENALTY
+        #reward -= 0.05 * abs(self.w - self.last_w)
+        jerk_cost_weight = 1.5  # Puoi alzare a 2.0 o 3.0 se vibra ancora
+        reward -= jerk_cost_weight * ((self.w - self.last_w) ** 2)
+
+        closest_dist, closest_rel_angle = fast_scan_closest_human(self.people_arr, self.num_people, self.x, self.y, self.theta)
+        
         done = False
-        reward = -0.1 
-
-        prev_dist = math.hypot(self.x - self.v*dt*math.cos(self.theta) - self.goal_x, self.y - self.v*dt*math.sin(self.theta) - self.goal_y)
-        reward += 5.0 * (prev_dist - dist_goal)
-        self.progress_reward += 5.0 * (prev_dist - dist_goal)
-        reward -= 0.05 * abs(self.w - self.last_w)
-
-        # Yielding Logic
-        closest_dist = float('inf'); closest_rel_angle = 0.0
-        for p in self.people:
-            d = math.hypot(p["x"] - self.x, p["y"] - self.y)
-            if d < closest_dist:
-                closest_dist = d
-                glob_angle = math.atan2(p["y"] - self.y, p["x"] - self.x)
-                closest_rel_angle = (glob_angle - self.theta + math.pi) % (2 * math.pi) - math.pi
+        info = {}
         
-        YIELD_DIST = 1.5; YIELD_FOV = math.radians(60)
-        if closest_dist < YIELD_DIST and abs(closest_rel_angle) < YIELD_FOV:
-            urgency = (YIELD_DIST - closest_dist) / YIELD_DIST
-            if self.v > 0.1: reward -= 15.0 * urgency * (self.v / self.max_v)
-            elif self.v <= 0.1: reward += 0.2 * urgency
-        
+        COLLISION_THRESH = self.robot_radius + self.people_radius
+        SOCIAL_THRESH = 1.25
+
         if dist_goal <= self.goal_radius:
-            done = True; reward = 200.0; info = {"termination_reason": "goal_reached"}
+            done = True
+            reward = 200.0
+            info = {"termination_reason": "goal_reached"}
             self.persistent_outcome = "goal"
-        else:
-            coll_thresh = self.robot_radius + self.people_radius + 0.0 
-            if closest_dist < coll_thresh:
-                done = True
-                is_front = abs(closest_rel_angle) < YIELD_FOV
-                if self.v >= 0.1 and is_front:
-                    reward = -150.0 * (self.v/self.max_v)
-                    info = {"termination_reason": "people_collision_active", "collision_type": "active"}
-                    self.persistent_outcome = "collision_people"
-                else:
-                    reward = -20.0
-                    info = {"termination_reason": "people_collision_passive", "collision_type": "passive"}
-                    self.persistent_outcome = "collision_passive"
-            elif self.step_count >= self.max_steps:
-                done = True; reward = -50.0; info = {"termination_reason": "max_steps_reached"}
-                self.persistent_outcome = "timeout"
+            
+        elif closest_dist < COLLISION_THRESH:
+            done = True
+            
+            # The FOV is 180 degrees, spanning from -90 to +90 radians (-pi/2 to pi/2)
+            is_in_fov = abs(closest_rel_angle) <= (math.pi / 2.0)
+            
+            # Active collision strictly requires the human to be visible AND the robot to be moving fast
+            if is_in_fov and self.v > 0.1:
+                reward = -70.0
+                info = {"termination_reason": "people_collision_active", "collision_type": "active"}
+                self.persistent_outcome = "collision_people"
             else:
-                info = {}
+                # Passive collision automatically catches:
+                # 1. Human outside FOV (regardless of robot speed)
+                # 2. Human inside FOV but robot speed <= 0.1 m/s (robot yielded)
+                reward = -40.0 
+                info = {"termination_reason": "people_collision_passive", "collision_type": "passive"}
+                self.persistent_outcome = "collision_passive"
+                
+        elif self.step_count >= self.max_steps:
+            done = True
+            reward = -5.0
+            info = {"termination_reason": "max_steps_reached"}
+            self.persistent_outcome = "timeout"
+            
+        else:
+            if closest_dist < SOCIAL_THRESH:
+                intrusion = (SOCIAL_THRESH - closest_dist) / (SOCIAL_THRESH - COLLISION_THRESH)
+                speed_factor = self.v / self.max_v
+                social_penalty = intrusion * speed_factor
+                reward -= social_penalty
 
+        # Inside step(), replace the existing `if done:` block with this:
         if done:
+            self.episodes_total += 1
+            if self.persistent_outcome == "goal": 
+                self.episodes_success += 1
+            elif self.persistent_outcome in ["collision_static", "collision_people"]: 
+                self.episodes_collision += 1
+            elif self.persistent_outcome == "collision_passive": 
+                self.episodes_passive += 1
+            elif self.persistent_outcome == "timeout": 
+                self.episodes_timeout += 1
+
             self.last_termination_reason = info.get("termination_reason", "unknown")
             info["path_length"] = self.episode_path_length
             info["total_time"] = self.step_count * dt
             info["mean_jerk"] = self.episode_jerk_sum / self.step_count if self.step_count > 0 else 0.0
 
         self.last_v = self.v; self.last_w = self.w
+        
+        # [FIX] Force Lidar Update
+        self.lidar_readings = self._compute_lidar_fast()
+        
         return self._get_observation(self.v, self.w), reward, done, info
 
     def _compute_lidar_fast(self):
         start_angle = self.theta + self.lidar_start_angle_offset
         
-        # Chiamata aggiornata con supporto gambe
         raw = fast_compute_lidar_core(
             self.x, self.y, self.theta, 
-            self.num_rays, start_angle, self.max_lidar_distance,
+            self.num_rays, start_angle, self.fov, self.max_lidar_distance,
             self.obstacles_arr, self.num_active_obstacles,
             self.room_width, self.room_height,
             self.people_arr, self.num_people,
-            self.use_legs, self.legs_coords # <--- PASSAGGIO COORDINATE GAMBE
+            self.use_legs, self.legs_coords 
         )
         
         if not self.lidar_noise_enable:
@@ -584,7 +755,8 @@ class Simple2DEnv:
         return final.astype(np.float32)
 
     def _get_observation(self, v, w):
-        if not hasattr(self, 'lidar_readings') or self.lidar_readings is None:
+        # [FIX] Simply use the updated readings
+        if self.lidar_readings is None:
              self.lidar_readings = self._compute_lidar_fast()
         
         norm_dist = math.hypot(self.goal_x - self.x, self.goal_y - self.y) / self.max_possible_dist
@@ -618,7 +790,7 @@ class Simple2DEnv:
                 self.obstacles.append({"type": "rect", "xmin": cx-w/2, "xmax": cx+w/2, "ymin": cy-h/2, "ymax": cy+h/2})
 
     # =========================================================================
-    # 🎨 RENDERING
+    # 🎨 RENDERING (CORRETTO - NO CRASH)
     # =========================================================================
     
     def _to_screen(self, x, y):
@@ -638,7 +810,7 @@ class Simple2DEnv:
             total_width = self.window_size + self.sidebar_width
             total_height = self.window_size
             self.screen = pygame.display.set_mode((total_width, total_height))
-            pygame.display.set_caption("Turtlebot4 Simulation - Stats Monitor")
+            pygame.display.set_caption("FastEnv - Ultimate Optimization")
             self.clock = pygame.time.Clock()
             self.lidar_surface = pygame.Surface((self.window_size, self.window_size), pygame.SRCALPHA)
             self.font_title = pygame.font.SysFont("Arial", 24, bold=True)
@@ -660,6 +832,7 @@ class Simple2DEnv:
         self.lidar_surface.fill((0, 0, 0, 0))
         pygame.draw.rect(self.screen, (0, 0, 0), (0, 0, self.window_size, self.window_size), 2)
 
+        # 1. OSTACOLI (Usiamo lista mantenuta per rendering)
         for obs in self.obstacles:
             if obs["type"] == "circle":
                 cx, cy = self._to_screen(obs["cx"], obs["cy"])
@@ -671,44 +844,58 @@ class Simple2DEnv:
                 h_screen = int((obs["ymax"] - obs["ymin"]) * self.scale)
                 pygame.draw.rect(self.screen, (150, 150, 150), (x_screen, y_screen, w_screen, h_screen))
 
+        # 2. LIDAR (FIX: Aggiornamento forzato e colori visibili)
         lidar_readings = self.lidar_readings
         lidar_x_origin = self.x + self.lidar_offset * math.cos(self.theta)
         lidar_y_origin = self.y + self.lidar_offset * math.sin(self.theta)
         sx_origin, sy_origin = self._to_screen(lidar_x_origin, lidar_y_origin)
         start_angle = self.theta + self.lidar_start_angle_offset
-        angles = [start_angle + i * (2 * math.pi / self.num_rays) for i in range(self.num_rays)]
+        angles = [start_angle + i * (self.fov / (self.num_rays - 1)) for i in range(self.num_rays)] 
 
         for i in range(self.num_rays):
             dist = lidar_readings[i]
             ang = angles[i]
+            
             x_end = lidar_x_origin + dist * math.cos(ang)
             y_end = lidar_y_origin + dist * math.sin(ang)
             sx_end, sy_end = self._to_screen(x_end, y_end)
 
             if i == 0:
-                color = (0, 0, 255, 255)
+                color = (0, 0, 255, 255) # Blue opaco
                 thickness = 2
                 pygame.draw.line(self.lidar_surface, color, (sx_origin, sy_origin), (sx_end, sy_end), thickness)
-                continue
+                continue # Passa al prossimo raggio
 
+            # --- CASO 1: FONDOSCALA (Rumore o Fuori Range) ---
             if dist >= self.max_lidar_distance - 0.1:
+                # VIOLA ACCESO (R=180, G=0, B=255)
+                # Alpha=180 (Ben visibile)
                 color = (180, 0, 255, 180) 
-                thickness = 1
+                thickness = 1 # <--- Raggi più spessi come richiesto
+                
                 pygame.draw.line(self.lidar_surface, color, (sx_origin, sy_origin), (sx_end, sy_end), thickness)
+            
+            # --- CASO 2: MISURA VALIDA (Muro o Ostacolo) ---
             else:
                 color_ray_dist = 5.0
                 norm_d = min(dist, color_ray_dist) / color_ray_dist 
-                proximity = (1.0 - norm_d)
+                proximity = (1.0 - norm_d)                          
+                
                 r = int(255 * (0.6 + 0.4 * proximity))
                 g = int(255 * (0.6 - 0.6 * proximity))
                 b = int(255 * (0.6 - 0.6 * proximity))
                 a = int(255 * (0.9 * proximity))
+                
                 color = (r, g, b, a)
+
                 if color[3] > 0:
+                    # Raggi normali sottili (spessore 1)
                     pygame.draw.line(self.lidar_surface, color, (sx_origin, sy_origin), (sx_end, sy_end), 1)
 
+        # Sovrapponi il LIDAR (Solo sulla parte stanza)
         self.screen.blit(self.lidar_surface, (0, 0))
 
+        # 3. ROBOT
         rx, ry = self._to_screen(self.x, self.y)
         rr = int(self.robot_radius * self.scale)
         pygame.draw.circle(self.screen, (0, 0, 255), (rx, ry), rr) 
@@ -717,40 +904,32 @@ class Simple2DEnv:
         hx, hy = self._to_screen(head_x, head_y)
         pygame.draw.line(self.screen, (0, 0, 100), (rx, ry), (hx, hy), 3)
 
-        for p in self.people:
-            if self.use_legs and "legs" in p:
-                foot_len = 0.30
-                color_shoe_fill = (169, 169, 169)
-                color_shoe_edge = (50, 50, 50)
-                color_leg_circle = (0, 0, 0)
-                foot_theta = p["angle"]
-                cos_t = math.cos(foot_theta)
-                sin_t = math.sin(foot_theta)
-
-                for lx, ly in p["legs"]:
-                    local_verts = [
-                        (-LEG_RADIUS, -LEG_RADIUS),
-                        (-LEG_RADIUS, LEG_RADIUS),
-                        (foot_len * 0.65, LEG_RADIUS),
-                        (foot_len, LEG_RADIUS * 0.35),
-                        (foot_len, -LEG_RADIUS * 0.35),
-                        (foot_len * 0.65, -LEG_RADIUS)
-                    ]
-                    screen_verts = []
-                    for loc_x, loc_y in local_verts:
-                        rot_x = loc_x * cos_t - loc_y * sin_t
-                        rot_y = loc_x * sin_t + loc_y * cos_t
-                        screen_verts.append(self._to_screen(lx + rot_x, ly + rot_y))
-                    pygame.draw.polygon(self.screen, color_shoe_fill, screen_verts)
-                    pygame.draw.polygon(self.screen, color_shoe_edge, screen_verts, 1)
-                    slx, sly = self._to_screen(lx, ly)
-                    pygame.draw.circle(self.screen, color_leg_circle, (slx, sly), int(LEG_RADIUS * self.scale))
+        # 4. PERSONE (Iterazione su ARRAY, non su lista)
+        for i in range(self.num_people):
+            px, py = self.people_arr[i, 0], self.people_arr[i, 1]
+            angle = self.people_arr[i, 4]
+            
+            if self.use_legs:
+                # [FIX] Disegna SOLO le gambe se attive, niente corpo verde
+                l1x, l1y = self.legs_coords[i, 0, 0], self.legs_coords[i, 0, 1]
+                l2x, l2y = self.legs_coords[i, 1, 0], self.legs_coords[i, 1, 1]
+                
+                sl1x, sl1y = self._to_screen(l1x, l1y)
+                sl2x, sl2y = self._to_screen(l2x, l2y)
+                
+                # Scarpe
+                pygame.draw.circle(self.screen, (50, 50, 50), (sl1x, sl1y), int(0.09 * self.scale))
+                pygame.draw.circle(self.screen, (50, 50, 50), (sl2x, sl2y), int(0.09 * self.scale))
+                
+                # Opzionale: Linea sottile che unisce le gambe per debug visivo (spalle)
+                pygame.draw.line(self.screen, (200, 200, 200), (sl1x, sl1y), (sl2x, sl2y), 1)
             else:
-                # [FIX] FALLBACK: Disegna cerchio verde per il corpo se use_legs=False
-                cx, cy = self._to_screen(p["x"], p["y"])
+                # Fallback corpo verde solo se use_legs=False
+                cx, cy = self._to_screen(px, py)
                 r = int(self.people_radius * self.scale)
                 pygame.draw.circle(self.screen, (0, 200, 0), (cx, cy), r)
 
+        # 5. GOAL
         if self.goal_x is not None:
             gx, gy = self._to_screen(self.goal_x, self.goal_y)
             num_points = 5
@@ -766,16 +945,12 @@ class Simple2DEnv:
             pygame.draw.polygon(self.screen, (255, 165, 0), star_points)
             pygame.draw.polygon(self.screen, (200, 100, 0), star_points, 2)
 
+        # 6. TELEMETRY
         x_text = self.window_size + 20
         y_text = 20
         line_spacing = 25
         dist_to_goal = math.hypot(self.x - self.goal_x, self.y - self.goal_y) if self.goal_x is not None else 0.0
-        
-        if lidar_readings is not None and len(lidar_readings) > 0:
-            min_laser_dist = np.min(lidar_readings)
-        else:
-            min_laser_dist = 0.0
-
+        min_laser_dist = np.min(lidar_readings) if len(lidar_readings) > 0 else 0.0
         total_avg_jerk = 0.0
         if self.global_step_count > 0:
             total_avg_jerk = self.global_jerk_sum / self.global_step_count
@@ -799,6 +974,20 @@ class Simple2DEnv:
         y_text += draw_stat_line("Lidar Min", f"{min_laser_dist:.2f} m", laser_color)
         y_text += 10
         y_text += draw_stat_line("Avg Jerk (Tot)", f"{total_avg_jerk:.2f}")
+
+        # --- NEW: Episode Rates Statistics ---
+        sr = (self.episodes_success / self.episodes_total * 100.0) if self.episodes_total > 0 else 0.0
+        cr = (self.episodes_collision / self.episodes_total * 100.0) if self.episodes_total > 0 else 0.0
+        pr = (self.episodes_passive / self.episodes_total * 100.0) if self.episodes_total > 0 else 0.0
+        tr = (self.episodes_timeout / self.episodes_total * 100.0) if self.episodes_total > 0 else 0.0
+
+        y_text += 15 # Add spacing
+        y_text += draw_stat_line("Success Rate", f"{sr:.1f}%", (0, 150, 0))     # Green
+        y_text += draw_stat_line("Collision Rate", f"{cr:.1f}%", (200, 0, 0))   # Red
+        y_text += draw_stat_line("Passive Coll.", f"{pr:.1f}%", (150, 100, 0))  # Orange
+        y_text += draw_stat_line("Timeout Rate", f"{tr:.1f}%", (200, 100, 0))   # Dark Orange
+        y_text += draw_stat_line("Total Episodes", f"{self.episodes_total}")
+
 
         y_text += 40
         plot_w = 200; plot_h = 150
@@ -839,7 +1028,7 @@ class Simple2DEnv:
         outcome_surf = font_outcome_small.render(self.persistent_outcome.upper(), True, outcome_color)
         self.screen.blit(outcome_surf, (x_text, y_text))
 
-        self.clock.tick(30)
+        self.clock.tick(10)
         pygame.display.flip()
 
     def close(self):

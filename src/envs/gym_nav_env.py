@@ -1,32 +1,18 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-from collections import deque
+import math
 
-# Assicurati che l'import punti al file corretto dove hai fatto le modifiche
-from .nav_env import Simple2DEnv 
-# Importiamo la versione veloce
-#from .fast_nav_env import Simple2DEnv
+from .fast_nav_env import Simple2DEnv
 from src.config import RobotConfig, LidarConfig, SimConfig 
 
-NUM_PEOPLE = 15
-NUM_RAYS = LidarConfig.NUM_RAYS
+NUM_RAYS = LidarConfig.NUM_RAYS # Assicurati che in config sia 108
 STACK_DIM = RobotConfig.LIDAR_STACK_DIM
 MAX_STEPS = SimConfig.MAX_STEPS
 NUM_OBSTACLES = 12
 PEOPLE_SPEED = 1.0
 
 class GymNavEnv(gym.Env):
-    """
-    Gymnasium-compatible wrapper con stacking temporale LIDAR.
-    
-    Observation Space:
-        [norm_dist_goal, norm_heading, norm_v, norm_w, 
-         lidar_frame_t-2, lidar_frame_t-1, lidar_frame_t]
-    
-    Se real_lidar_specs=True, la dimensione del lidar aumenta drasticamente (1080 raggi).
-    """
-
     metadata = {"render_modes": ["human"], "render_fps": 10}
 
     def __init__(
@@ -42,24 +28,22 @@ class GymNavEnv(gym.Env):
         distraction_prob: float = 0.0,  
         render_skip: int = 1,
         lidar_noise_enable: bool = False,
-        real_lidar_specs: bool = False,  # <--- [NUOVO PARAMETRO]
+        real_lidar_specs: bool = False,
     ):  
         super().__init__()
-
-        # --- [LOGICA DIMENSIONALE] ---
-        # Se attiviamo il Lidar Reale, dobbiamo ignorare num_rays della config
-        # e forzare 1080, altrimenti gym andrà in crash per mismatch di dimensioni.
-        if real_lidar_specs:
-            self.num_rays = 1080
-        else:
-            self.num_rays = num_rays
+        
+        self.render_mode = render_mode
+        self.real_lidar_specs = real_lidar_specs
+        
+        # Fissiamo il numero di raggi a quello definito (108)
+        self.num_rays = num_rays 
 
         self.stack_dim = stack_dim
-        self.render_mode = render_mode
+        self.max_steps = max_steps
 
-        # Inizializzazione Ambiente Base
+        # Inizializzazione Ambiente Fisico
         self.env = Simple2DEnv(
-            num_rays=self.num_rays, # Passiamo il numero corretto aggiornato
+            num_rays=self.num_rays, # Passiamo il numero coerente
             max_steps=max_steps,
             num_people=num_people,
             robot_radius=RobotConfig.RADIUS,
@@ -72,116 +56,92 @@ class GymNavEnv(gym.Env):
             human_distraction_prob=distraction_prob,
             render_skip=render_skip,
             lidar_noise_enable=lidar_noise_enable,
-            real_lidar_specs=real_lidar_specs, # <--- Passaggio al motore fisico
+            real_lidar_specs=real_lidar_specs,
         )
         
-        # [MIGLIORATO] Usa deque per efficienza
-        self.lidar_stack = deque(maxlen=stack_dim)
+        # Observation Space (Aggiornato a 108)
+        self.observation_space = spaces.Dict({
+            "lidar": spaces.Box(low=0.0, high=1.0, shape=(self.num_rays,), dtype=np.float32),
+            "pose": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32), 
+            # State vector is strictly 5 elements: [v_t, omega_t, v_max, dist, alignment]
+            "state": spaces.Box(low=-np.inf, high=np.inf, shape=(5,), dtype=np.float32)
+        })
 
-        # [CALCOLO SPAZIO OSSERVAZIONI]
-        # Dimensione totale = 4 scalari + (Raggi * Stack)
-        # Esempio Reale: 4 + (1080 * 3) = 3244 float
-        obs_dim = 4 + (self.num_rays * self.stack_dim)
-        
-        # Bounds per scalari: [dist(0-1), heading(-1,1), v(0-1), w(-1,1)]
-        scalar_low = np.array([0.0, -1.0, 0.0, -1.0], dtype=np.float32)
-        scalar_high = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
-        
-        # Bounds per LIDAR stack (tutti 0-1)
-        lidar_low = np.zeros(self.num_rays * self.stack_dim, dtype=np.float32)
-        lidar_high = np.ones(self.num_rays * self.stack_dim, dtype=np.float32)
-        
-        obs_low = np.concatenate([scalar_low, lidar_low])
-        obs_high = np.concatenate([scalar_high, lidar_high])
-        
-        self.observation_space = spaces.Box(
-            low=obs_low,
-            high=obs_high,
-            dtype=np.float32,
-        )
-
-        # Action space
         self.action_space = spaces.Box(
             low=np.array([0.0, -RobotConfig.MAX_W]), 
             high=np.array([RobotConfig.MAX_LINEAR_VEL, RobotConfig.MAX_W]), 
             dtype=np.float32,
         )
+        
+        self.last_v = 0.0
+        self.last_w = 0.0
+
+    def _process_obs(self, env_obs, v, w):
+        # 1. Extract raw lidar safely from the end of the array
+        lidar_proc = env_obs[-self.num_rays:]
+
+        # 2. Normalized Pose
+        s_x = self.env.x / SimConfig.ROOM_SIDE_LENGTH
+        s_y = self.env.y / SimConfig.ROOM_SIDE_LENGTH
+        s_theta = self.env.theta / math.pi
+        pose_vec = np.array([s_x, s_y, s_theta], dtype=np.float32)
+
+        # 3. Exact 5-element State Vector from flowchart
+        dx = self.env.goal_x - self.env.x
+        dy = self.env.goal_y - self.env.y
+        goal_distance = math.hypot(dx, dy)
+
+        # Calculate relative alignment error in radians [-pi, pi]
+        angle_to_goal = math.atan2(dy, dx)
+        goal_error_alignment = (angle_to_goal - self.env.theta + math.pi) % (2 * math.pi) - math.pi
+
+        # Create the state vector exactly as requested
+        state_vec = np.array([
+            v,                    # v_t
+            w,                    # omega_t
+            self.env.max_v,       # v_max
+            goal_distance,        # goal_distance
+            goal_error_alignment  # goal_error_alignment
+        ], dtype=np.float32)
+
+        return {
+            "lidar": lidar_proc.astype(np.float32),
+            "pose": pose_vec,
+            "state": state_vec
+        }
 
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         super().reset(seed=seed)
+        self.last_v = 0.0
+        self.last_w = 0.0
         
-        # Nota: Simple2DEnv.reset() ora restituisce solo 'obs' (array numpy)
-        # Se hai modificato Simple2DEnv per restituire (obs, info), adatta questa riga.
-        # Basandomi sull'ultimo codice che mi hai dato, restituiva solo obs.
         env_obs = self.env.reset()
-        
-        # Estrai LIDAR corrente (gli ultimi N elementi sono il lidar)
-        # env_obs è: [dist, head, v, w, ...lidar...]
-        current_lidar = env_obs[4:]
-        
-        # Check di sicurezza per evitare bug silenziosi sulle dimensioni
-        if len(current_lidar) != self.num_rays:
-            raise ValueError(f"Lidar dimension mismatch! Expected {self.num_rays}, got {len(current_lidar)}. Check real_lidar_specs flag.")
-
-        # Inizializza stack con deque
-        self.lidar_stack.clear()
-        for _ in range(self.stack_dim):
-            self.lidar_stack.append(current_lidar.copy())
-        
-        info = {
-            "episode_start": True,
-            "stack_dim": self.stack_dim,
-        }
-        
-        return self._compose_obs(env_obs), info
+        return self._process_obs(env_obs, 0.0, 0.0), {}
 
     def step(self, action):
-        # Converti e clippa azione
         action = np.asarray(action, dtype=np.float32)
         v = float(np.clip(action[0], 0.0, RobotConfig.MAX_LINEAR_VEL))
         w = float(np.clip(action[1], -RobotConfig.MAX_W, RobotConfig.MAX_W))
 
-        # Step nell'ambiente
-        # Simple2DEnv.step restituisce: obs, reward, done, info
         env_obs, reward, done, info = self.env.step((v, w))
         
-        # Aggiorna stack (auto-pop con maxlen)
-        current_lidar = env_obs[4:]
-        self.lidar_stack.append(current_lidar)
-        
-        obs = self._compose_obs(env_obs)
-
-        # Gestione terminazione (Gymnasium API: terminated vs truncated)
         terminated = False
         truncated = False
-        
         reason = info.get("termination_reason", "unknown")
         if done:
-            if reason == "max_steps_reached":
-                truncated = True
-            else:
-                terminated = True
+            if reason == "max_steps_reached": truncated = True
+            else: terminated = True
 
-        if self.render_mode == "human":
-            self.env.render()
-
-        return obs, reward, terminated, truncated, info
-
-    def _compose_obs(self, env_obs):
-        """
-        Combina scalari + stack LIDAR.
-        Returns: Array shape: (4 + num_rays * stack_dim,)
-        """
-        scalars = env_obs[:4]  # [norm_dist, norm_heading, norm_v, norm_w]
+        if self.render_mode == "human": self.env.render()
         
-        # Concatena stack in ordine cronologico [oldest → newest]
-        flat_lidar = np.concatenate(list(self.lidar_stack), axis=0)
-        
-        return np.concatenate([scalars, flat_lidar]).astype(np.float32)
-    
+        processed_obs = self._process_obs(env_obs, v, w)
+        self.last_v = v
+        self.last_w = w
+
+        return processed_obs, reward, terminated, truncated, info
+
     def render(self):
-        if self.render_mode == "human":
-            self.env.render()
+        if self.render_mode == "human": self.env.render()
 
     def close(self):
         self.env.close()
