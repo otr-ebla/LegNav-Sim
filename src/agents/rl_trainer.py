@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 from typing import NamedTuple, Tuple
 
 # Import envs
-from envs.jax_env import (
+from src.jax_env.jax_env import (
     EnvState, StaticConfig, reset, Obstacles, RectObstacles, 
     auto_reset_step, 
     step, render 
