@@ -123,18 +123,29 @@ class Scenarios:
         """
         Robot: Random valid point.
         Humans: Random valid points.
+        Obstacles: Rettangoli casuali.
         """
-        # Placeholders, actual validation is done in env._setup_scenario
-        rob_start = [2.0, 2.0, 0.0]
+        rob_start = [2.0, 2.0, 1.57]
         rob_goal  = [w-2.0, h-2.0]
         
         states, goals = [], []
         for _ in range(n_humans):
             states.append([random.uniform(1, w-1), random.uniform(1, h-1), 0,0,0,0])
             goals.append([random.uniform(1, w-1), random.uniform(1, h-1)])
+        
+        # Generazione ostacoli rettangolari invece di circolari
+        obs_list = []
+        for _ in range(5):
+            cx, cy = random.uniform(2, w-2), random.uniform(2, h-2)
+            rw, rh = random.uniform(0.4, 1.0), random.uniform(0.4, 1.0)
+            obs_list.append({
+                "type": "rect", 
+                "xmin": cx - rw/2, "xmax": cx + rw/2, 
+                "ymin": cy - rh/2, "ymax": cy + rh/2
+            })
             
-        return rob_start, rob_goal, states, goals
-    
+        return rob_start, rob_goal, states, goals, obs_list
+        
     @staticmethod
     def bottleneck(w, h, n_humans, gap_center_x=None):
         """

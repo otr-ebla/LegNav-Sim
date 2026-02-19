@@ -351,10 +351,12 @@ def fast_scan_closest_human(people_arr, num_people, robot_x, robot_y, robot_thet
 @njit(fastmath=True)
 def fast_update_human_states(people_arr, num_people, dt, stop_prob, min_stop_time, max_stop_time):
     """
-    Gestisce la macchina a stati degli umani (Waiting vs Walking).
-    Se il timer > 0, forza la velocità a 0.
-    Se il timer scade, ripristina la velocità target.
+    Gestisce la macchina a stati degli umani (Waiting vs Walking) E aggiunge il Wandering.
     """
+    # Parametro per rendere il movimento naturale (non robotico)
+    # Radianti al secondo di deviazione massima
+    WANDER_STRENGTH = 0.8 
+
     for i in range(num_people):
         # Estrai stato corrente
         timer = people_arr[i, 6]
@@ -366,43 +368,43 @@ def fast_update_human_states(people_arr, num_people, dt, stop_prob, min_stop_tim
         
         if timer > 0:
             # --- STATO: FERMO (WAITING) ---
-            # Azzera la velocità corrente (ma mantieni angle e target_speed per dopo)
             people_arr[i, 2] = 0.0 # vx
             people_arr[i, 3] = 0.0 # vy
             
         else:
             # --- STATO: CAMMINANDO (WALKING) ---
             
-            # 1. Check Probabilità di fermarsi (random event)
-            # La probabilità è scalata per dt per renderla indipendente dagli FPS
-            # Esempio: se stop_prob è 0.5 (50% al secondo), calcoliamo la chance per frame
             if random.random() < (stop_prob * dt):
-                # START WAITING: Genera un tempo di attesa casuale
+                # START WAITING
                 wait_time = min_stop_time + random.random() * (max_stop_time - min_stop_time)
-                timer = wait_time # Imposta il timer
-                
-                # Ferma subito
+                people_arr[i, 6] = wait_time # Set timer
                 people_arr[i, 2] = 0.0
                 people_arr[i, 3] = 0.0
             
             else:
-                # CONTINUA A CAMMINARE
-                # Se la velocità attuale è zero (perché eravamo fermi o per collisione),
-                # la ripristiniamo verso la direzione target.
-                # Nota: Non sovrascriviamo brutalmente se c'è inerzia, ma assicuriamo il "motore" acceso.
+                # --- WANDERING (La correzione magica) ---
+                # Aggiunge una piccola variazione casuale all'angolo corrente.
+                # Questo impedisce che l'angolo si blocchi su 0.0 o 3.14 (orizzontale perfetto).
+                noise = (random.random() - 0.5) * 2.0 * WANDER_STRENGTH * dt
+                angle += noise
                 
-                # Calcola la velocità desiderata base
+                # Normalizza l'angolo tra -pi e pi (opzionale ma pulito)
+                angle = (angle + math.pi) % (2 * math.pi) - math.pi
+                
+                # Salva il nuovo angolo "sporcato" nell'array, così persiste al prossimo frame
+                people_arr[i, 4] = angle
+
+                # Calcola la velocità desiderata base con il nuovo angolo
                 des_vx = math.cos(angle) * target_speed
                 des_vy = math.sin(angle) * target_speed
                 
-                # Semplice assegnazione "motore": resetta la velocità base
-                # La repulsione (chiamata dopo) si occuperà di deviare questa velocità se necessario
                 people_arr[i, 2] = des_vx
                 people_arr[i, 3] = des_vy
         
-        # Salva il timer aggiornato
-        people_arr[i, 6] = timer
-
+        # (Il timer viene salvato solo se era > 0 o se è stato appena settato, 
+        # altrimenti rimane negativo, che va bene)
+        if timer > 0:
+            people_arr[i, 6] = timer
 
 # =============================================================================
 # CLASSE AMBIENTE
@@ -587,6 +589,7 @@ class Simple2DEnv:
         target_v, target_w = action
         # Clipping azioni
         self.v = max(0.0, min(target_v, self.max_v))
+        #self.v = 0.7
         self.w = max(-self.max_w, min(target_w, self.max_w))
 
         dt = self.dt
@@ -605,14 +608,12 @@ class Simple2DEnv:
         if fast_check_static_collision(next_x, next_y, self.robot_radius - 0.02, self.obstacles_arr, self.num_active_obstacles, self.room_width, self.room_height):
             self.persistent_outcome = "collision_static"
             
-            # [FIX] Update lidar before return
             self.lidar_readings = self._compute_lidar_fast()
             
-            # === NUOVO CODICE PER FIX STATISTICHE ===
+            # Fix Statistiche
             self.episodes_total += 1
             self.episodes_collision += 1
             self.last_termination_reason = "collision_static"
-            # ========================================
 
             return self._get_observation(self.v, self.w), -70.0, True, {"termination_reason": "collision_static"}
 
@@ -620,30 +621,24 @@ class Simple2DEnv:
         self.y = next_y
         self.step_count += 1
         
-        # === NUOVA LOGICA UMANI (STOP & GO) ===
-        # Parametri di configurazione (puoi metterli in __init__ se vuoi parametrizzarli)
-        STOP_PROBABILITY = 0.15   # 15% di probabilità al secondo di fermarsi
-        MIN_STOP_TIME = 1.0       # Minimo 1 secondo di stop
-        MAX_STOP_TIME = 5.0       # Massimo 5 secondi di stop
+        # === LOGICA UMANI (STOP & GO) ===
+        STOP_PROBABILITY = 0.15
+        MIN_STOP_TIME = 1.0
+        MAX_STOP_TIME = 5.0
         
         fast_update_human_states(
             self.people_arr, self.num_people, dt, 
             STOP_PROBABILITY, MIN_STOP_TIME, MAX_STOP_TIME
         )
-        # ======================================
         
-        # --- 2. FISICA UMANI (Repulsione + Movimento) ---
-        # La repulsione ora lavorerà su velocità che potrebbero essere 0 (se fermi).
-        # Se sono fermi, la repulsione li sposterà solo se il robot gli va addosso (realistico).
+        # --- 2. FISICA UMANI ---
         fast_apply_repulsion(self.people_arr, self.num_people, self.x, self.y, self.theta, self.last_v, self.people_speed)
-        
         fast_move_people(self.people_arr, self.obstacles_arr, self.num_people, self.num_active_obstacles, self.room_width, self.room_height, dt, self.people_radius)
 
         if self.use_legs:
-            # Le gambe si aggiorneranno automaticamente: se vx,vy=0, la fase non avanza e le gambe restano ferme.
             fast_update_legs_batch(self.people_arr, self.legs_coords, self.humans_leg_phase, self.num_people, dt)
 
-        # --- 3. REWARD CALCULATION ---
+        # --- 3. REWARD CALCULATION BASE ---
         dx_goal = self.x - self.goal_x
         dy_goal = self.y - self.goal_y
         dist_goal = math.hypot(dx_goal, dy_goal)
@@ -656,18 +651,48 @@ class Simple2DEnv:
         self.progress_reward += reward
         reward -= 0.005
 
-        # JERK PENALTY
-        #reward -= 0.05 * abs(self.w - self.last_w)
-        jerk_cost_weight = 1.5  # Puoi alzare a 2.0 o 3.0 se vibra ancora
+        # JERK PENALTY (Quadratica)
+        jerk_cost_weight = 1.5 
         reward -= jerk_cost_weight * ((self.w - self.last_w) ** 2)
 
         closest_dist, closest_rel_angle = fast_scan_closest_human(self.people_arr, self.num_people, self.x, self.y, self.theta)
         
         done = False
         info = {}
-        
+
+        # --- 4. REWARD SOCIALE AVANZATO ---
+        DIST_INTIMATE = 0.45
+        DIST_PERSONAL = 1.2
+        DIST_SOCIAL = 2.0  
+
+        social_reward = 0.0
+
+        if closest_dist < DIST_SOCIAL:
+            # A. Penalità Spazio Personale (Esponenziale)
+            if self.v > 0.1:
+                safety_margin = max(0.0, closest_dist - self.people_radius - self.robot_radius)
+                proxemic_penalty = 2.0 * math.exp(-2.0 * safety_margin)
+                social_reward -= proxemic_penalty
+
+            # B. Penalità Velocità Eccessiva
+            if closest_dist < DIST_PERSONAL:
+                safe_speed = 0.3 + (closest_dist - DIST_INTIMATE) * 0.8
+                if self.v > safe_speed:
+                    overspeed = self.v - safe_speed
+                    social_reward -= 5.0 * (overspeed ** 2)
+
+            # C. Penalità "Puntamento"
+            if abs(closest_rel_angle) < 0.5 and self.v > 0.2:
+                aim_penalty = 0.5 * (1.0 - (closest_dist / DIST_SOCIAL))
+                social_reward -= aim_penalty
+
+        # Applica il reward sociale calcolato
+        reward += social_reward
+
+        # --- 5. TERMINATION CHECKS ---
         COLLISION_THRESH = self.robot_radius + self.people_radius
-        SOCIAL_THRESH = 1.25
+        
+        # [NOTA] Ho rimosso SOCIAL_THRESH da qui perché è gestito sopra
 
         if dist_goal <= self.goal_radius:
             done = True
@@ -677,19 +702,13 @@ class Simple2DEnv:
             
         elif closest_dist < COLLISION_THRESH:
             done = True
-            
-            # The FOV is 180 degrees, spanning from -90 to +90 radians (-pi/2 to pi/2)
             is_in_fov = abs(closest_rel_angle) <= (math.pi / 2.0)
             
-            # Active collision strictly requires the human to be visible AND the robot to be moving fast
             if is_in_fov and self.v > 0.1:
                 reward = -70.0
                 info = {"termination_reason": "people_collision_active", "collision_type": "active"}
                 self.persistent_outcome = "collision_people"
             else:
-                # Passive collision automatically catches:
-                # 1. Human outside FOV (regardless of robot speed)
-                # 2. Human inside FOV but robot speed <= 0.1 m/s (robot yielded)
                 reward = -40.0 
                 info = {"termination_reason": "people_collision_passive", "collision_type": "passive"}
                 self.persistent_outcome = "collision_passive"
@@ -700,14 +719,10 @@ class Simple2DEnv:
             info = {"termination_reason": "max_steps_reached"}
             self.persistent_outcome = "timeout"
             
-        else:
-            if closest_dist < SOCIAL_THRESH:
-                intrusion = (SOCIAL_THRESH - closest_dist) / (SOCIAL_THRESH - COLLISION_THRESH)
-                speed_factor = self.v / self.max_v
-                social_penalty = intrusion * speed_factor
-                reward -= social_penalty
+        # [FIX CRITICO] Il blocco 'else' finale è stato rimosso.
+        # La penalità sociale continua è già stata applicata nel punto 4.
 
-        # Inside step(), replace the existing `if done:` block with this:
+        # --- UPDATE STATS FINALI ---
         if done:
             self.episodes_total += 1
             if self.persistent_outcome == "goal": 
@@ -726,7 +741,6 @@ class Simple2DEnv:
 
         self.last_v = self.v; self.last_w = self.w
         
-        # [FIX] Force Lidar Update
         self.lidar_readings = self._compute_lidar_fast()
         
         return self._get_observation(self.v, self.w), reward, done, info
