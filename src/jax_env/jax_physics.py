@@ -109,7 +109,7 @@ def get_ray_circles_intersections(x0: jnp.float32, y0: jnp.float32, angles: jnp.
     
     return min_distances
 
-@jax.jit
+@jax.jit(static_argnames=["num_rays"])
 def compute_lidar(x: jnp.float32, y: jnp.float32, theta: jnp.float32, circles: jnp.ndarray, num_rays: int, fov: float, max_dist: float, room_w: float, room_h: float) -> jnp.ndarray:
     """
     Full Lidar sweep computation.

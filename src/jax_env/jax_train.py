@@ -24,8 +24,8 @@ vmap_step = jax.vmap(step_auto, in_axes=(0, 0, 0))
 # THE GPU ROLLOUT LOOP
 # =============================================================================
 
-@jax.jit
-def collect_rollouts(rng_key: jnp.ndarray, policy_params: dict):
+@jax.jit(static_argnums=2)
+def collect_rollouts(rng_key: jnp.ndarray, params: dict, apply_fn):
     """
     Collects a full batch of experience (NUM_ENVS * ROLLOUT_STEPS) entirely on the GPU.
     """
