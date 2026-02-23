@@ -52,7 +52,7 @@ GPU_DEVICE = _verify_gpu()
 
 # Config
 NUM_ENVS      = 4096
-ROLLOUT_STEPS = 64     # was 256 — shorter rollouts for more frequent PPO updates
+ROLLOUT_STEPS = 100     # was 256 — shorter rollouts for more frequent PPO updates
 
 # OBS_SIZE updated: 9 (pose×3) + 9 (state_vec) + 324 (lidar×3) = 342
 OBS_SIZE = 3 * 3 + 9 + 108 * 3    # 342

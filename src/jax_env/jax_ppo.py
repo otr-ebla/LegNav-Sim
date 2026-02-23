@@ -83,8 +83,8 @@ TOTAL_UPDATES  = 400     # was 600
 
 # Batch config
 BATCH_SIZE      = NUM_ENVS * ROLLOUT_STEPS
-N_MINIBATCHES   = 8      # was 8 — larger minibatches
-MINI_BATCH_SIZE = BATCH_SIZE // N_MINIBATCHES
+N_MINIBATCHES   = 200     # was 8 — larger minibatches
+MINI_BATCH_SIZE = 2000
 
 assert BATCH_SIZE % N_MINIBATCHES == 0, (
     f"BATCH_SIZE={BATCH_SIZE} not divisible by N_MINIBATCHES={N_MINIBATCHES}."
@@ -97,9 +97,10 @@ network = EndToEndActorCritic(action_dim=2)
 # Stages advance monotonically as the agent improves.
 CURRICULUM_STAGES = [
     (15.0, 1.0),   # avanza già a 15% — non aspettare 30%
-    (40.0, 2.5),
-    (60.0, 4.5),
-    (101., 6.0),
+    (15.0, 2.5),
+    (40.0, 5.0),
+    (60.0, 6.5),
+    (101., 8.0),
 ]
 
 def curriculum_min_goal_dist(suc_pct: float) -> float:
