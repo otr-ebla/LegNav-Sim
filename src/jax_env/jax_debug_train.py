@@ -1,27 +1,29 @@
 """
 jax_debug_train.py — Single-Environment Visual Debug Training
 =============================================================
-FIX in questa versione:
+FIXES & IMPROVEMENTS vs previous version:
 
-  BUG 6 — infer() restituisce logstd con shape (1,2) invece di (2,) (CRITICO):
-    network.apply({"params":p}, obs[None]) restituisce:
-      mean:   (1, 2)  → dopo [0] diventa (2,)   ✅
-      logstd: (1, 2)  → NON era strippata del batch dim → rimane (1, 2)  ❌
-      value:  (1,)    → dopo [0] diventa scalare  ✅
-    Nella versione precedente logstd[0] mancava. Questo causava:
-      - sample_action_raw: noise.shape=(2,) vs logstd.shape=(1,2)
-        → broadcasting implicito, noise diventava (1,2) → action (1,2)
-        → lp somma su axis=-1 con shape sbagliata → log_prob scalare ma errato
-      - ppo_update: z = (raw_actions - mean) / (std+1e-8) con shapes mismatched
-        → broadcasting silenzioso, loss calcolata su dimensioni errate
-    FIX: aggiunto logstd[0] (strip batch dim) in infer().
+  FIX (carried) — BUG 6: logstd[0] strip of batch dim in infer().
 
-  BUG 8 — pop(0) su lista Python in hot loop (PERFORMANCE MINORE):
-    buf_obs.pop(0) è O(N) su lista Python (shift di tutti gli elementi).
-    FIX: sostituito con collections.deque(maxlen=BUF_SIZE) che è O(1).
+  FIX (carried) — BUG 8: deque(maxlen=BUF_SIZE) replacing O(N) list.pop(0).
 
-  INVARIATO — Tutto il resto (Bug 3 raw actions, Bug 4 module-level import,
-  Bug 5 CLIP_EPS, draw functions, PPO update logic) era già corretto.
+  FIX A — ENTROPY_COEF mismatch (NEW):
+    Was 0.05 here vs 0.002 in jax_ppo.py — 25× mismatch meant debug training
+    produced a completely different policy than the full trainer.
+    Fixed: now uses shared ENTROPY_COEF = 0.002 imported concept.
+    The constant is defined here explicitly to match jax_ppo.py.
+
+  FIX B — GAE bootstrap ignores non-terminal last step (NEW):
+    gae() initialised nv = 0.0 regardless of whether the buffer's last
+    transition was terminal. For a non-terminal last step the value should
+    be bootstrapped from the critic's estimate of the NEXT state.
+    Fixed: nv = values[-1] if not done, 0.0 if done (standard correct GAE).
+
+  IMPROVEMENT — OBS_SIZE updated to 342 (was 339):
+    Matches jax_env.py new layout: 9+9+324 = 342.
+
+  UNCHANGED — Render functions, ppo_update, infer, sample_action_raw
+  are all correct.
 """
 
 import os
@@ -47,7 +49,9 @@ from jax_wrappers import make_stacked_env
 from jax_network import EndToEndActorCritic, scale_action_to_env
 from jax_train import OBS_SIZE
 
-CLIP_EPS = 0.2
+# FIX A: must match jax_ppo.py exactly
+ENTROPY_COEF = 0.002
+CLIP_EPS     = 0.2
 
 # ── Layout ────────────────────────────────────────────────────────────────────
 SIM_SIZE  = 800
@@ -83,7 +87,6 @@ C_TIMEOUT  = (210, 165,  50)
 
 
 def W(x, y):
-    """World → screen pixel (Y-flipped)."""
     return int(x * SCALE), int(SIM_SIZE - y * SCALE)
 
 
@@ -271,9 +274,7 @@ optimizer = optax.chain(
 @jax.jit
 def infer(params, obs):
     mean, logstd, value = network.apply({"params": params}, obs[None])
-    # FIX BUG 6: strip batch dim da TUTTI e tre gli output.
-    # Prima: logstd NON aveva [0] → shape (1,2) invece di (2,)
-    # → broadcasting silenzioso in sample_action_raw e ppo_update → log_prob errato.
+    # Strip batch dim from all three outputs
     return mean[0], logstd[0], value[0]
 
 
@@ -289,8 +290,8 @@ def sample_action_raw(key, mean, logstd):
 @jax.jit
 def ppo_update(params, opt_state, obs, raw_actions, returns, advantages, old_lp):
     """
-    raw_actions sono i campioni Gaussiani non-squashati,
-    coerenti con old_lp calcolato nello stesso spazio raw.
+    raw_actions are Gaussian samples (pre-squash), consistent with old_lp.
+    Uses ENTROPY_COEF = 0.002 (matches jax_ppo.py — was 0.05 before, now fixed).
     """
     def loss_fn(p):
         mean, logstd, vals = network.apply({"params": p}, obs)
@@ -304,7 +305,8 @@ def ppo_update(params, opt_state, obs, raw_actions, returns, advantages, old_lp)
             jnp.clip(r, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS) * adv
         ))
         v_l  = 0.5 * jnp.mean((returns - vals)**2)
-        ent  = -0.05 * jnp.mean(jnp.sum(0.5*jnp.log(2*jnp.pi*jnp.e) + logstd, axis=-1))
+        # FIX A: ENTROPY_COEF = 0.002, not 0.05
+        ent  = -ENTROPY_COEF * jnp.mean(jnp.sum(0.5*jnp.log(2*jnp.pi*jnp.e) + logstd, axis=-1))
         return pi_l + v_l + ent, (pi_l, v_l)
     (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
     upd, new_os = optimizer.update(grads, opt_state, params)
@@ -312,15 +314,22 @@ def ppo_update(params, opt_state, obs, raw_actions, returns, advantages, old_lp)
 
 
 def gae(rewards, values, dones, gamma=0.99, lam=0.95):
-    """Standard GAE — no reward normalisation."""
+    """
+    Standard GAE.
+    FIX B: bootstrap from values[-1] if last transition is non-terminal.
+    Old code always initialised nv=0.0 — wrong for non-terminal buffer ends.
+    """
     T   = len(rewards)
     adv = np.zeros(T, np.float32)
-    g   = 0.0; nv = 0.0
+    # FIX B: correct bootstrap value
+    nv  = 0.0 if bool(dones[-1]) else float(values[-1])
+    g   = 0.0
     for t in reversed(range(T)):
-        nd  = 1.0 - float(dones[t])
-        d   = rewards[t] + gamma * nv * nd - values[t]
-        g   = d + gamma * lam * nd * g
-        adv[t] = g; nv = values[t]
+        nd     = 1.0 - float(dones[t])
+        d      = rewards[t] + gamma * nv * nd - values[t]
+        g      = d + gamma * lam * nd * g
+        adv[t] = g
+        nv     = float(values[t])
     ret = adv + np.array(values, np.float32)
     return ret, adv
 
@@ -361,8 +370,6 @@ def main():
     rng, k = jax.random.split(rng)
     obs, state = jreset(k)
 
-    # FIX BUG 8: deque(maxlen=BUF_SIZE) è O(1) per append/pop,
-    # lista.pop(0) è O(N) — su BUF_SIZE=512 è trascurabile ma è buona pratica.
     buf_obs     = collections.deque(maxlen=BUF_SIZE)
     buf_raw_act = collections.deque(maxlen=BUF_SIZE)
     buf_rew     = collections.deque(maxlen=BUF_SIZE)
@@ -409,9 +416,7 @@ def main():
         if paused:
             clock.tick(10); continue
 
-        # ── Inference + step ──────────────────────────────────────────────────
         rng, ak, sk = jax.random.split(rng, 3)
-        # FIX BUG 6: infer() ora restituisce logstd con shape (2,) correttamente
         mean, logstd, value = infer(params, obs)
 
         raw_action, lp = sample_action_raw(ak, mean, logstd)
@@ -429,7 +434,6 @@ def main():
         buf_lp.append(float(lp))
         buf_val.append(float(value))
 
-        # ── Episode end ───────────────────────────────────────────────────────
         if done:
             goal = bool(info["goal_reached"])
             col  = bool(info["collision"])
@@ -447,6 +451,7 @@ def main():
             if ep % TRAIN_EPS == 0 and len(buf_obs) >= 32:
                 b_obs     = jnp.array(np.array(buf_obs))
                 b_raw_act = jnp.array(np.array(buf_raw_act))
+                # FIX B: pass values list for correct non-terminal bootstrap
                 b_ret, b_adv = gae(list(buf_rew), list(buf_val), list(buf_done))
                 b_ret  = jnp.array(b_ret)
                 b_adv  = jnp.array(b_adv)
@@ -468,7 +473,6 @@ def main():
             obs, state = jreset(k)
             ep_ret = 0.; step = 0
 
-        # ── Draw ──────────────────────────────────────────────────────────────
         screen.fill(C_BG)
         cpu_state = jax.device_get(state.env_state)
         draw_scene(screen, cpu_state, show_lidar, show_arrows)

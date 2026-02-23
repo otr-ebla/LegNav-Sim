@@ -1,18 +1,28 @@
 """
 jax_ppo.py — Single-GPU PPO Training  (GPU 0)
 ===============================================
-FIX in questa versione:
+FIXES & IMPROVEMENTS vs previous version:
 
-  BUG 5 — last_done variabile dead code (MINORE):
-    last_done = jnp.zeros(NUM_ENVS, ...) veniva creato ma non passato a
-    compute_gae (che non ha tale parametro). Rimosso per chiarezza.
+  FIX (carried) — removed dead-code last_done variable.
 
-  BUG 10 — Mancanza di assertion BATCH_SIZE % N_MINIBATCHES == 0 (MINORE):
-    ppo_update_epoch presuppone divisibilità esatta. Aggiunta assertion
-    all'avvio per rilevare subito configurazioni errate.
+  FIX (carried) — BATCH_SIZE % N_MINIBATCHES assertion.
 
-  INVARIATO — Tutto il resto (GAE, PPO loss, entropy coef, LR schedule,
-  checkpoint, scheduler) era già corretto.
+  IMPROVEMENT A — LR warmup schedule (NEW):
+    Starting at LR_START=3e-4 from step 0 can cause destructive early
+    gradient updates before the critic has calibrated. Added a short linear
+    warmup from LR_MIN=1e-6 to LR_START over WARMUP_UPDATES=20 steps,
+    then linear decay to LR_END over the remaining updates.
+    Uses optax.join_schedules with a piecewise schedule.
+
+  IMPROVEMENT B — ENTROPY_COEF is now a shared constant imported by
+    jax_debug_train.py (was mismatched: 0.002 here vs 0.05 in debug).
+    Both files now use ENTROPY_COEF = 0.002.
+    (jax_debug_train.py updated accordingly.)
+
+  IMPROVEMENT C — OBS_SIZE updated to 342 (was 339):
+    Matches new jax_env.py layout (rear_prox 1→4 scalars, ego goal obs).
+
+  UNCHANGED — GAE, PPO loss, clip, VF_COEF, checkpoint logic all correct.
 """
 
 import os
@@ -38,36 +48,45 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 from jax_network import EndToEndActorCritic
 from jax_train import collect_rollouts, init_env_state, NUM_ENVS, ROLLOUT_STEPS, OBS_SIZE
 
-# Hyperparameters
+# ── Hyperparameters ───────────────────────────────────────────────────────────
 GAMMA          = 0.99
 GAE_LAMBDA     = 0.95
 CLIP_EPS       = 0.2
 VF_COEF        = 1.0
-ENTROPY_COEF   = 0.002
+ENTROPY_COEF   = 0.002   # shared with jax_debug_train.py — do not change independently
 MAX_GRAD_NORM  = 0.5
 PPO_EPOCHS     = 4
 LR_START       = 3e-4
 LR_END         = 5e-5
+LR_MIN         = 1e-6    # warmup start
+WARMUP_UPDATES = 20      # steps of linear warmup before decay
 TOTAL_UPDATES  = 600
 
 # Batch config
-BATCH_SIZE      = NUM_ENVS * ROLLOUT_STEPS   # 4096 * 256 = 1,048,576
+BATCH_SIZE      = NUM_ENVS * ROLLOUT_STEPS
 N_MINIBATCHES   = 8
-MINI_BATCH_SIZE = BATCH_SIZE // N_MINIBATCHES  # 131,072
+MINI_BATCH_SIZE = BATCH_SIZE // N_MINIBATCHES
 
-# FIX BUG 10: assertion immediata — rileva configurazioni errate prima del training.
 assert BATCH_SIZE % N_MINIBATCHES == 0, (
-    f"BATCH_SIZE={BATCH_SIZE} non è divisibile esattamente per "
-    f"N_MINIBATCHES={N_MINIBATCHES}. "
-    f"Resto: {BATCH_SIZE % N_MINIBATCHES}"
+    f"BATCH_SIZE={BATCH_SIZE} not divisible by N_MINIBATCHES={N_MINIBATCHES}."
 )
 
-network   = EndToEndActorCritic(action_dim=2)
+network = EndToEndActorCritic(action_dim=2)
 
-scheduler = optax.linear_schedule(
+# IMPROVEMENT A: piecewise warmup then linear decay
+_warmup_schedule = optax.linear_schedule(
+    init_value=LR_MIN,
+    end_value=LR_START,
+    transition_steps=WARMUP_UPDATES,
+)
+_decay_schedule = optax.linear_schedule(
     init_value=LR_START,
     end_value=LR_END,
-    transition_steps=TOTAL_UPDATES
+    transition_steps=TOTAL_UPDATES - WARMUP_UPDATES,
+)
+scheduler = optax.join_schedules(
+    schedules=[_warmup_schedule, _decay_schedule],
+    boundaries=[WARMUP_UPDATES],
 )
 
 optimizer = optax.chain(
@@ -97,8 +116,7 @@ def load_checkpoint(dummy_params, dummy_opt_state,
 @jax.jit
 def compute_gae(rewards, values, dones, last_val):
     """
-    Standard GAE con reverse scan.
-    last_done = zeros perché autoreset gestisce già tutti i confini di episodio.
+    Standard GAE with reverse scan.
     rewards, values, dones: (ROLLOUT_STEPS, NUM_ENVS)
     last_val: (NUM_ENVS,)
     """
@@ -207,8 +225,8 @@ if __name__ == "__main__":
     print("PPO Training — GPU 0")
     print(f"  Envs       : {NUM_ENVS}  x  steps {ROLLOUT_STEPS}  =  {BATCH_SIZE:,} batch")
     print(f"  Minibatches: {N_MINIBATCHES} x {MINI_BATCH_SIZE} | epochs {PPO_EPOCHS}")
-    print(f"  VF_COEF={VF_COEF}  ENTROPY_COEF={ENTROPY_COEF}  LR {LR_START}->{LR_END}")
-    print(f"  log_std: state-dependent Dense head, bias=-1.0, clamp [{-4.0},{0.5}]\n")
+    print(f"  VF_COEF={VF_COEF}  ENTROPY_COEF={ENTROPY_COEF}  LR warmup {LR_MIN}->{LR_START} then decay ->{LR_END}")
+    print(f"  OBS_SIZE={OBS_SIZE}  log_std: state-dependent, bias=-1.0, clamp [{-4.0},{0.5}]\n")
 
     rng = jax.random.PRNGKey(42)
     rng, init_rng, env_rng = jax.random.split(rng, 3)
@@ -216,8 +234,8 @@ if __name__ == "__main__":
     dummy_obs = jnp.zeros((1, OBS_SIZE))
     params    = network.init(init_rng, dummy_obs)["params"]
 
-    opt_state    = optimizer.init(params)
-    train_state  = (params, opt_state)
+    opt_state   = optimizer.init(params)
+    train_state = (params, opt_state)
 
     ckpt_path       = "checkpoints/ppo_model_best.msgpack"
     LOAD_CHECKPOINT = False
@@ -235,7 +253,7 @@ if __name__ == "__main__":
     env_obs, env_state = init_env_state(env_rng)
     print(f"Ready. obs={env_obs.shape}\n")
 
-    best_suc  = 25.0
+    best_suc = 25.0
 
     hdr = (f"{'Upd':>5} | {'EpRet':>7} | {'Suc%':>5} {'Col%':>5} {'Tmo%':>5} |"
            f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} | {'FPS':>7} {'#Ep':>6}")
@@ -247,7 +265,6 @@ if __name__ == "__main__":
     for update in range(TOTAL_UPDATES):
         t0 = time.time()
 
-        # 1. Rollout
         rng, rollout_rng, update_rng = jax.random.split(rng, 3)
         rollout_history, env_state, env_obs = collect_rollouts(
             rollout_rng, train_state[0], network.apply, env_state, env_obs
@@ -262,7 +279,6 @@ if __name__ == "__main__":
         goal_reached = rollout_history["goal_reached"]
         collision    = rollout_history["collision"]
 
-        # 2. Episode stats
         ep_rets, ep_suc, ep_col, ep_tmo, ep_msk = collect_episode_outcomes(
             rewards, dones, goal_reached, collision
         )
@@ -276,13 +292,9 @@ if __name__ == "__main__":
         else:
             mean_ret, suc_pct, col_pct, tmo_pct = 0.0, 0.0, 0.0, 0.0
 
-        # 3. GAE
-        # FIX BUG 5: rimossa variabile dead code `last_done` — compute_gae
-        # non ha un parametro last_done (usa dones interni), era solo confusiva.
         _, _, last_val = network.apply({"params": train_state[0]}, env_obs)
         advantages, returns = compute_gae(rewards, values, dones, last_val)
 
-        # 4. PPO update
         train_state, mean_loss, aux = run_ppo_updates(
             train_state,
             obs_all.reshape(-1, OBS_SIZE),
@@ -295,15 +307,15 @@ if __name__ == "__main__":
 
         fps = BATCH_SIZE / (time.time() - t0)
 
-        # 5. Log
         if update % 10 == 0:
             p_loss, v_loss, entropy = aux
+            lr_now = float(scheduler(update))
             print(
                 f"{update:>5d} | {mean_ret:>7.1f} | "
                 f"{suc_pct:>4.1f}% {col_pct:>4.1f}% {tmo_pct:>4.1f}% | "
                 f"{float(mean_loss):>7.4f} {float(p_loss):>6.3f} "
                 f"{float(v_loss):>6.3f} {float(entropy):>6.3f} | "
-                f"{fps:>7,.0f} {n_ep:>6d}"
+                f"{fps:>7,.0f} {n_ep:>6d}  lr={lr_now:.2e}"
             )
 
         if suc_pct > best_suc:

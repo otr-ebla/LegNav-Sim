@@ -2,20 +2,16 @@
 jax_train.py — Rollout Collection
 ===================================
 CHANGES vs previous version:
-  NUM_ENVS      16384 -> 4096   (same batch size, 4x longer horizon)
-  ROLLOUT_STEPS    64 -> 256    (episodes are 15-1000 steps; 64 was too short)
 
-FIX in questa versione:
+  OBS_SIZE: 339 → 342
+    Matches jax_env.py new layout: 9 + 9 + 324 = 342
+    (pose_stack=9, state_vec=9, lidar_stack=324)
 
-  BUG 7 — init_env_state ricompila il JIT ad ogni chiamata (PERFORMANCE):
-    _vmap_reset era definita a livello modulo ma poi wrappata in jax.jit()
-    DENTRO init_env_state ad ogni invocazione. Ogni chiamata a init_env_state
-    ricreava un nuovo oggetto JIT compilato (cache miss garantito).
-    FIX: il JIT di _vmap_reset è applicato a livello modulo, una volta sola,
-    e init_env_state usa direttamente la versione già compilata.
+  FIX (carried) — _vmap_reset JIT applied once at module level.
 
-  INVARIATO — collect_rollouts, batched_sample_action, OBS_SIZE, NUM_ENVS,
-  ROLLOUT_STEPS erano tutti corretti.
+  IMPROVEMENT — LR warmup in PPO (see jax_ppo.py, not here).
+
+  UNCHANGED — collect_rollouts, NUM_ENVS, ROLLOUT_STEPS, all correct.
 """
 
 import os
@@ -45,16 +41,17 @@ def _verify_gpu():
 GPU_DEVICE = _verify_gpu()
 
 # Config
-NUM_ENVS      = 4096    # was 16384
-ROLLOUT_STEPS = 256     # was 64
-OBS_SIZE      = 3 * 3 + 6 + 108 * 3    # 339
+NUM_ENVS      = 4096
+ROLLOUT_STEPS = 256
+
+# OBS_SIZE updated: 9 (pose×3) + 9 (state_vec) + 324 (lidar×3) = 342
+OBS_SIZE = 3 * 3 + 9 + 108 * 3    # 342
 
 # Environment setup
 reset_stacked, step_stacked = make_stacked_env(reset_env, step_env, stack_dim=3)
 step_auto   = make_autoreset_env(reset_stacked, step_stacked)
 
-# FIX BUG 7: JIT applicato a livello modulo, UNA VOLTA SOLA.
-# Prima era: jax.jit(_vmap_reset) chiamato dentro init_env_state ogni volta → cache miss.
+# JIT applied at module level — one compilation only
 _vmap_reset = jax.jit(jax.vmap(reset_stacked))
 _vmap_step  = jax.jit(jax.vmap(step_auto, in_axes=(0, 0, 0)))
 
@@ -62,7 +59,6 @@ _vmap_step  = jax.jit(jax.vmap(step_auto, in_axes=(0, 0, 0)))
 def init_env_state(rng_key):
     """Initialise all NUM_ENVS environments once before the training loop."""
     reset_keys = jax.random.split(rng_key, NUM_ENVS)
-    # FIX: usa direttamente _vmap_reset già JIT-compilato (nessuna ricompilazione)
     obs, state = _vmap_reset(reset_keys)
     return obs, state
 
@@ -98,7 +94,7 @@ def collect_rollouts(rng_key, params, apply_fn, env_state, env_obs):
 
         transition = {
             "obs":          current_obs,
-            "actions":      raw_actions,      # RAW — must match log_prob space
+            "actions":      raw_actions,
             "log_probs":    log_probs,
             "values":       values,
             "rewards":      rewards,

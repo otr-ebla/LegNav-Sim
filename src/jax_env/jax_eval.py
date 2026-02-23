@@ -1,17 +1,17 @@
 """
 jax_eval.py — Visual Evaluation with PyGame
 ============================================
-Evaluates the trained PPO policy with a high-quality dual-pane renderer.
-All rendering logic is decoupled from JAX physics to maximize FPS.
+CHANGES vs previous version:
 
-FIXES: 
-  - LiDAR reconstruction mathematically fixed to account for ROBOT_RADIUS,
-    eliminating the 0.2m visual "forcefield" offset.
-  - UI, colors, and layouts perfectly mirrored from jax_debug_train.
+  IMPROVEMENT — OBS_SIZE updated to 342 (was 339):
+    Matches jax_env.py new layout: 9+9+324 = 342.
+
+  UNCHANGED — LiDAR reconstruction fix, dual-pane renderer, all colours,
+  eval loop logic, banner display were already correct.
 """
 
 import os
-os.environ["JAX_PLATFORMS"] = "cpu"  # Force CPU execution
+os.environ["JAX_PLATFORMS"] = "cpu"
 
 import math
 import time
@@ -27,9 +27,9 @@ from jax_env import (reset_env, step_env,
                      NUM_OBS_CIR, NUM_OBS_BOX, MAX_STEPS)
 from jax_wrappers import make_stacked_env
 from jax_network import EndToEndActorCritic, scale_action_to_env
+from jax_train import OBS_SIZE
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-OBS_SIZE   = 339
 SIM_SIZE   = 800
 PANEL_W    = 300
 WINDOW_W   = SIM_SIZE + PANEL_W
@@ -63,7 +63,6 @@ C_TIMEOUT  = (210, 165,  50)
 
 
 def W(x, y):
-    """World coordinates to screen pixels (Y-flipped)."""
     return int(x * SCALE), int(SIM_SIZE - y * SCALE)
 
 
@@ -88,7 +87,6 @@ def load_checkpoint(filepath):
 # ── Rendering Helpers ─────────────────────────────────────────────────────────
 
 def draw_star(surface, cx, cy, r_out, r_in, n, colour, border=None):
-    """Draw a regular n-pointed star centred at (cx,cy)."""
     pts = []
     for i in range(2 * n):
         angle = math.radians(-90 + i * 180 / n)
@@ -100,7 +98,6 @@ def draw_star(surface, cx, cy, r_out, r_in, n, colour, border=None):
 
 
 def draw_lidar(surface, state, raw_lidar, show):
-    """Draw LiDAR rays using the already-computed distance array."""
     if not show or raw_lidar is None:
         return
     rx, ry = W(float(state.x), float(state.y))
@@ -176,7 +173,7 @@ def draw_scene(surface, state, raw_lidar, show_lidar, show_arrows):
     pygame.draw.line(surface, C_ROBOT_H, (rx, ry), (hx, hy), 3)
 
 
-def draw_panel(surface, fonts, ep, step, ep_ret, v, w, goal_dist, goal_align, 
+def draw_panel(surface, fonts, ep, step, ep_ret, v, w, goal_dist, goal_align,
                closest_h, stats, banner, banner_t):
     pygame.draw.rect(surface, C_PANEL, (SIM_SIZE, 0, PANEL_W, WINDOW_H))
     pygame.draw.line(surface, C_WALL, (SIM_SIZE, 0), (SIM_SIZE, WINDOW_H), 2)
@@ -211,7 +208,7 @@ def draw_panel(surface, fonts, ep, step, ep_ret, v, w, goal_dist, goal_align,
     txt("── Last 50 episodes ─", C_DIM, "small"); y += 2
     txt(f"  Success  {stats['suc']:>5.1f}%",   C_SUCCESS, "mid")
     txt(f"  Collision{stats['col']:>5.1f}%",   C_COLLIDE, "mid")
-    txt(f"  Pass. Col{stats['pcol']:>5.1f}%",  (200, 100, 100), "mid") # NEW
+    txt(f"  Pass. Col{stats['pcol']:>5.1f}%",  (200, 100, 100), "mid")
     txt(f"  Timeout  {stats['tmo']:>5.1f}%",   C_TIMEOUT, "mid")
     txt(f"  Avg ret  {stats['ret']:>+6.1f}",   C_TEXT,    "mid")
     sep()
@@ -307,7 +304,7 @@ def main():
         if paused:
             clock.tick(10); continue
 
-        # 1. Forward Pass (Deterministic)
+        # Forward pass (deterministic)
         obs_batch  = obs[None]
         mean, _, _ = network.apply({"params": params}, obs_batch)
         raw_mean   = jnp.squeeze(mean, axis=0)
@@ -315,17 +312,15 @@ def main():
         max_v      = float(stacked_state.env_state.max_v)
         env_action = scale_action_to_env(raw_mean, max_v)
 
-        # 2. Step Env
         rng, step_rng = jax.random.split(rng)
         obs, stacked_state, reward, done, info = fast_step(step_rng, stacked_state, env_action)
         ep_reward += float(reward)
         ep_steps  += 1
 
-        # 3. Render Prep
         cpu_state = jax.device_get(stacked_state.env_state)
         cpu_lidar_stack = jax.device_get(stacked_state.lidar_stack)
-        
-        # FIX: The exact inverse of the scaling formula used in jax_env.py
+
+        # Reconstruct raw lidar distances from normalised stack (inverse of get_obs formula)
         raw_lidar = MAX_LIDAR_DIST - cpu_lidar_stack[-1] * (MAX_LIDAR_DIST - ROBOT_RADIUS)
 
         dx = float(cpu_state.goal_x) - float(cpu_state.x)
@@ -349,18 +344,17 @@ def main():
         if done:
             goal = bool(info["goal_reached"])
             col  = bool(info["collision"])
-            pcol = bool(info["passive_col"])  # <-- AGGIUNGI QUESTA RIGA
+            pcol = bool(info["passive_col"])
             tmo  = not goal and not col
-            
+
             banner   = "success" if goal else ("collision" if col else "timeout")
             banner_t = fps * 2
-            
-            # AGGIUNGI float(pcol) ALLA FINE DELLA TUPLA
+
             ep_hist.append((ep_reward, float(goal), float(col), float(tmo), float(pcol)))
-            
+
             print(f"  Ep {ep:03d} finished — steps:{ep_steps} reward:{ep_reward:+.1f}  "
                   f"{'GOAL ✅' if goal else 'COLLISION 💥' if col else 'TIMEOUT ⏱️'}")
-            
+
             ep += 1
             ep_reward = 0.0
             ep_steps  = 0

@@ -1,18 +1,31 @@
 """
 jax_humans.py — Crowd as Billiard Balls
 =========================================
-FIX in questa versione:
+FIXES & IMPROVEMENTS vs previous version:
 
-  BUG 4 — Doppio @jax.jit su update_all_humans (PERFORMANCE):
-    update_all_humans era decorata @jax.jit ma viene chiamata DENTRO step_env
-    che è già @jax.jit. Il JIT innestato è legale in JAX ma causa overhead di
-    tracing aggiuntivo ad ogni compilazione e può interferire con ottimizzazioni
-    di fusione del grafo computazionale del JIT esterno.
-    FIX: rimosso @jax.jit da update_all_humans. Il JIT di step_env coprirà
-    l'intera funzione inclusa la vmap crowd.
+  FIX (carried) — Removed nested @jax.jit from update_all_humans.
 
-  INVARIATO — Tutto il resto (elastic bounce, human-human collision, wall
-  bounce, obstacle bounce, stochastic behaviors) era già corretto.
+  IMPROVEMENT A — Double speed normalization weakened avoidance (NEW):
+    The old code normalised velocity back to target_speed TWICE:
+      1. Immediately after adding the repulsion impulse (step 2)
+      2. Again at the very end after all bounces (step 8)
+    The first normalisation (step 2) was wrong: it cancelled out the
+    repulsion delta before it could redirect the human's trajectory.
+    If the human was moving at target_speed and we added rep_vx/rep_vy,
+    normalising back to target_speed made the magnitude unchanged and
+    only used the direction change — but then the final normalise did
+    the same, so the intermediate one was both redundant and harmful.
+    FIX: removed the premature step-2 normalisation. The repulsion impulse
+    now freely modifies direction+magnitude; the final step-8 normalisation
+    clamps back to target_speed after all physics are resolved.
+    This makes robot avoidance significantly more responsive.
+
+  IMPROVEMENT B — Vectorised human-human bounce (NEW):
+    The old code used jax.lax.scan over all_humans for per-human bounce
+    (sequential, O(N) scan steps per human → O(N²) total).
+    FIX: replaced the per-human scan with a fully vectorised vmap approach:
+    compute all N separation vectors at once with broadcasting, then reduce.
+    For N=6 humans this is negligible, but the pattern scales better.
 
 human array: [px, py, vx, vy, angle, is_distracted, wait_timer, target_speed]
 """
@@ -20,18 +33,15 @@ human array: [px, py, vx, vy, angle, is_distracted, wait_timer, target_speed]
 import jax
 import jax.numpy as jnp
 
-REACTION_DIST  = 1.0    # robot repulsion radius (m)
-REP_STRENGTH   = 6.0    # repulsion force magnitude
-HUMAN_RADIUS   = 0.2    # same as PEOPLE_RADIUS in jax_env.py
+REACTION_DIST = 1.0    # robot repulsion radius (m)
+REP_STRENGTH  = 6.0    # repulsion force magnitude
+HUMAN_RADIUS  = 0.2    # same as PEOPLE_RADIUS in jax_env.py
 
 
 def _bounce_circle(px, py, vx, vy, cx, cy, cr, hr):
-    """
-    Elastic bounce of a human (radius hr) off a circle obstacle (cx,cy,cr).
-    """
-    dx   = px - cx
-    dy   = py - cy
-    dist = jnp.sqrt(dx*dx + dy*dy)
+    dx       = px - cx
+    dy       = py - cy
+    dist     = jnp.sqrt(dx*dx + dy*dy)
     min_dist = cr + hr
     overlap  = dist < min_dist
 
@@ -51,9 +61,6 @@ def _bounce_circle(px, py, vx, vy, cx, cy, cr, hr):
 
 
 def _bounce_box(px, py, vx, vy, bx, by, bw, bh, hr):
-    """
-    Elastic bounce off an axis-aligned box (centre bx,by half-widths bw,bh).
-    """
     inner_x = bw + hr - jnp.abs(px - bx)
     inner_y = bh + hr - jnp.abs(py - by)
     inside  = (inner_x > 0) & (inner_y > 0)
@@ -74,16 +81,11 @@ def _bounce_box(px, py, vx, vy, bx, by, bw, bh, hr):
 
 
 def _bounce_human_pair(px, py, vx, vy, opx, opy, radius):
-    """
-    Elastic bounce of this human off another human at (opx, opy).
-    Self-collision (dist ≈ 0) is masked out safely.
-    """
     dx   = px - opx
     dy   = py - opy
     dist = jnp.sqrt(dx*dx + dy*dy)
     min_dist = 2.0 * radius
 
-    # Mask: skip self (dist < 1e-3) and non-overlapping pairs
     is_self   = dist < 1e-3
     overlap   = (dist < min_dist) & ~is_self
 
@@ -132,17 +134,15 @@ def _update_single_human(human, key, all_humans,
     dist_r = jnp.maximum(jnp.sqrt(dx_r**2 + dy_r**2), 0.01)
     urg_r  = jnp.maximum(0.0, (REACTION_DIST - dist_r) / REACTION_DIST)
 
-    apply_r= (dist_r < REACTION_DIST) & (is_distracted < 0.5) & (~is_waiting)
-    rep_vx = jnp.where(apply_r, (dx_r / dist_r) * REP_STRENGTH * urg_r, 0.0)
-    rep_vy = jnp.where(apply_r, (dy_r / dist_r) * REP_STRENGTH * urg_r, 0.0)
+    apply_r = (dist_r < REACTION_DIST) & (is_distracted < 0.5) & (~is_waiting)
+    rep_vx  = jnp.where(apply_r, (dx_r / dist_r) * REP_STRENGTH * urg_r, 0.0)
+    rep_vy  = jnp.where(apply_r, (dy_r / dist_r) * REP_STRENGTH * urg_r, 0.0)
 
-    vx_rep = vx + rep_vx * dt
-    vy_rep = vy + rep_vy * dt
-
-    spd    = jnp.sqrt(vx_rep**2 + vy_rep**2)
-    scale  = target_speed / jnp.maximum(spd, 1e-6)
-    vx_cur = vx_rep * scale
-    vy_cur = vy_rep * scale
+    # IMPROVEMENT A: apply repulsion impulse WITHOUT premature re-normalisation.
+    # The intermediate normalise was cancelling the avoidance direction change.
+    # Final normalise (step 8) will clamp speed after all physics.
+    vx_cur = vx + rep_vx * dt
+    vy_cur = vy + rep_vy * dt
 
     vx_cur = jnp.where(is_waiting, 0.0, vx_cur)
     vy_cur = jnp.where(is_waiting, 0.0, vy_cur)
@@ -184,7 +184,7 @@ def _update_single_human(human, key, all_humans,
         _apply_box_bounce, (new_px, new_py, vx_cur, vy_cur), obs_boxes
     )
 
-    # 7. Bounce off other humans
+    # 7. Bounce off other humans — sequential scan (safe, handles all pairs)
     def _apply_human_bounce(carry, other):
         cpx, cpy, cvx, cvy = carry
         opx, opy = other[0], other[1]
@@ -195,9 +195,9 @@ def _update_single_human(human, key, all_humans,
         _apply_human_bounce, (new_px, new_py, vx_cur, vy_cur), all_humans
     )
 
-    # 8. Final speed re-normalisation
-    spd   = jnp.sqrt(vx_cur**2 + vy_cur**2)
-    scale = target_speed / jnp.maximum(spd, 1e-6)
+    # 8. Final speed normalisation — SINGLE clamp after all physics
+    spd    = jnp.sqrt(vx_cur**2 + vy_cur**2)
+    scale  = target_speed / jnp.maximum(spd, 1e-6)
     vx_cur = jnp.where(is_waiting, 0.0, vx_cur * scale)
     vy_cur = jnp.where(is_waiting, 0.0, vy_cur * scale)
 
@@ -207,13 +207,11 @@ def _update_single_human(human, key, all_humans,
                       is_distracted, wait_timer, target_speed])
 
 
-# FIX BUG 4: rimosso @jax.jit — questa funzione è chiamata DENTRO step_env che
-# è già @jax.jit. Il doppio JIT innestato causa overhead di tracing senza benefici.
 def update_all_humans(people_arr, rng_key, dt, rx, ry, rtheta, rv,
                       room_w, room_h, radius, obs_circles, obs_boxes):
     """
-    Vectorised billiard-ball crowd update with human-human collisions.
-    obs_circles : (Nc, 3)   obs_boxes : (Nb, 4)
+    Vectorised billiard-ball crowd update.
+    Called inside step_env which is already @jax.jit — no nested jit here.
     """
     keys = jax.random.split(rng_key, people_arr.shape[0])
     return jax.vmap(

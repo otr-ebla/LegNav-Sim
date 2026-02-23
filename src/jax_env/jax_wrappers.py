@@ -1,36 +1,47 @@
 """
 jax_wrappers.py — Observation Stacking & Auto-Reset
 ====================================================
-FIXES vs previous version:
-  1. state_vec slice updated from [3:8] to [3:9] — state_vec is now size 6
-     (added rear_prox scalar in jax_env.py).
-  2. Autoreset broadcast fix retained (was already correct).
+CHANGES vs previous version:
 
-Obs layout: [pose_stack(3*stack_dim) | state_vec(6) | lidar_stack(num_rays*stack_dim)]
-Total: 9 + 6 + 324 = 339
+  Updated for new obs layout from jax_env.py:
+    STATE_VEC_SIZE: 6 → 9  (rear_prox expanded from 1 scalar to 4 scalars)
+    SINGLE_OBS_SIZE: 117 → 120
+    Stacked OBS_SIZE: 339 → 342  (9 + 9 + 324)
+
+  IMPROVEMENT — jnp.roll replaced with slice-assign (NEW):
+    jnp.roll(axis=0) on a (3, N) array allocates a full copy and then
+    applies a gather permutation. For temporal stacking with shift=-1 and
+    at[-1].set(...), we can do this more efficiently with a direct slice:
+      new_stack = jnp.concatenate([old_stack[1:], new_frame[None]], axis=0)
+    This is equivalent, avoids the roll+gather, and XLA can fuse it more
+    aggressively since the output shape is statically known.
+
+  UNCHANGED — autoreset broadcast logic was already correct.
+
+Obs layout: [pose_stack(3*stack_dim=9) | state_vec(9) | lidar_stack(num_rays*stack_dim=324)]
+Total: 9 + 9 + 324 = 342
 """
 
 import jax
 import jax.numpy as jnp
 from flax import struct
-from jax_env import EnvState, NUM_RAYS, SINGLE_OBS_SIZE
+from jax_env import EnvState, NUM_RAYS, SINGLE_OBS_SIZE, STATE_VEC_SIZE
 
-STATE_VEC_SIZE = 6   # v, w, max_v_norm, goal_dist, goal_align, rear_prox
-POSE_SIZE      = 3
+POSE_SIZE = 3
 
 
 @struct.dataclass
 class StackedEnvState:
     env_state:   EnvState
     lidar_stack: jnp.ndarray   # (stack_dim, NUM_RAYS)
-    pose_stack:  jnp.ndarray   # (stack_dim, 3)
+    pose_stack:  jnp.ndarray   # (stack_dim, POSE_SIZE)
 
 
 def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3, num_rays: int = NUM_RAYS):
     """
     Temporal stacking wrapper.
-    Obs layout: [pose_stack(3*stack_dim) | state_vec(6) | lidar_stack(num_rays*stack_dim)]
-    Total: 9 + 6 + 324 = 339 elements.
+    Obs layout: [pose_stack(3*stack_dim) | state_vec(STATE_VEC_SIZE) | lidar_stack(num_rays*stack_dim)]
+    Total: 9 + 9 + 324 = 342 elements.
     """
 
     @jax.jit
@@ -61,8 +72,9 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3, num_rays: 
         new_state_vec = base_obs[POSE_SIZE : POSE_SIZE + STATE_VEC_SIZE]
         new_lidar     = base_obs[POSE_SIZE + STATE_VEC_SIZE:]
 
-        new_lidar_stack = jnp.roll(state.lidar_stack, shift=-1, axis=0).at[-1].set(new_lidar)
-        new_pose_stack  = jnp.roll(state.pose_stack,  shift=-1, axis=0).at[-1].set(new_pose)
+        # IMPROVEMENT: concatenate slice instead of roll+set — avoids gather permutation
+        new_lidar_stack = jnp.concatenate([state.lidar_stack[1:], new_lidar[None]], axis=0)
+        new_pose_stack  = jnp.concatenate([state.pose_stack[1:],  new_pose[None]],  axis=0)
 
         new_stacked_state = StackedEnvState(
             env_state=new_base_state,
@@ -80,8 +92,7 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3, num_rays: 
 def make_autoreset_env(reset_fn, step_fn):
     """
     Auto-reset wrapper.
-    done is scalar bool. For each pytree leaf of shape (d1,d2,...),
-    reshape done to (1,...,1) with the same ndim so jnp.where broadcasts correctly.
+    done is scalar bool. For each pytree leaf, reshape done to broadcast correctly.
     """
 
     @jax.jit

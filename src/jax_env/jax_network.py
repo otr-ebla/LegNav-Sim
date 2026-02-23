@@ -1,23 +1,26 @@
 """
 jax_network.py — Actor-Critic Neural Network
 =============================================
-CRITICAL FIX vs previous version:
+CHANGES vs previous version:
 
-  ENTROPY SATURATION (the reason training plateaued at update ~90):
-    The previous version used a single GLOBAL log_std parameter (shape [2],
-    shared across all states). The entropy loss gradient (coef=0.05) pushed
-    this scalar directly into the +0.5 ceiling of the clamp, where it stuck
-    permanently at H=3.838. The policy became maximally noisy and could never
-    tighten regardless of how good the mean became — the advantage signal was
-    completely overwhelmed by the noise.
+  Updated stack_dim awareness: OBS_SIZE is now 342 (was 339).
+    pose_size  = 3 * stack_dim = 9   (unchanged)
+    state_size = 9               (was 6 — rear_prox expanded to 4 scalars)
+    lidar_flat = 342 - 9 - 9 = 324  (unchanged: 108 rays × 3 frames)
 
-    FIX: log_std is now a STATE-DEPENDENT Dense head (same as SAC style).
-      • Different states get different noise levels (more expressive)
-      • The entropy gradient is spread across the full Dense(2) layer params
-        instead of a 2-element vector → cannot saturate at the ceiling
-      • Initialised with bias=-1.0 → initial std=exp(-1)≈0.37, not 1.0
-      • Clamp extended to [-4, +0.5]: same upper bound, wider floor so the
-        policy can commit to good actions as it improves
+  IMPROVEMENT — LR warmup note:
+    The network itself is unchanged. The optimizer in jax_ppo.py now uses
+    a warmup schedule (see that file). No changes needed here.
+
+  UNCHANGED — Architecture, log_std head, critic head, entropy fix all correct.
+
+Architecture:
+  LiDAR stack  -> Conv1D(32,7) -> Conv1D(64,5) -> Conv1D(64,3) -> LayerNorm
+  Pose+State   -> Dense(128)   -> Dense(64)
+  Concat       -> Dense(256)   -> Dense(128)             [shared trunk]
+  Actor mean   -> Dense(action_dim)
+  Actor logstd -> Dense(action_dim)  [state-dependent, bias init -1.0]
+  Critic       -> Dense(128)   -> Dense(64) -> Dense(1)  [separate head]
 """
 
 import jax
@@ -28,25 +31,19 @@ from typing import Tuple
 LOG_STD_MIN = -4.0
 LOG_STD_MAX =  0.5
 
+# state_size must match STATE_VEC_SIZE in jax_env.py
+_STATE_VEC_SIZE = 9   # v, w, max_v_norm, goal_dist, goal_align, rear_prox×4
+
 
 class EndToEndActorCritic(nn.Module):
-    """
-    Architecture:
-      LiDAR stack  -> Conv1D(32,7) -> Conv1D(64,5) -> Conv1D(64,3) -> LayerNorm
-      Pose+State   -> Dense(128)   -> Dense(64)
-      Concat       -> Dense(256)   -> Dense(128)             [shared trunk]
-      Actor mean   -> Dense(action_dim)
-      Actor logstd -> Dense(action_dim)  [state-dependent, bias init -1.0]
-      Critic       -> Dense(128)   -> Dense(64) -> Dense(1)  [separate head]
-    """
     action_dim: int
     stack_dim:  int = 3
     num_rays:   int = 108
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        pose_size  = 3 * self.stack_dim   # 9
-        state_size = 6
+        pose_size  = 3 * self.stack_dim          # 9
+        state_size = _STATE_VEC_SIZE             # 9
 
         pose_stack = x[..., :pose_size]
         state_vec  = x[..., pose_size : pose_size + state_size]
