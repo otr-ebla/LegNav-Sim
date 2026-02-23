@@ -297,7 +297,7 @@ if __name__ == "__main__":
     env_obs, env_state = init_env_state(env_rng, min_goal_dist=cur_min_dist)
     print(f"Ready. obs={env_obs.shape}\n")
 
-    best_suc = 10.0   # was 25.0 — save checkpoint as soon as we reach 10%
+    best_suc = 60.0   # was 25.0 — save checkpoint as soon as we reach 10%
 
     hdr = (f"{'Upd':>5} | {'EpRet':>7} | {'Suc%':>5} {'Col%':>5} {'Tmo%':>5} |"
            f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} | {'FPS':>7} {'#Ep':>6} | {'MinDist':>7}")
@@ -339,15 +339,13 @@ if __name__ == "__main__":
         # ── Curriculum update ─────────────────────────────────────────────────
         # Exponential moving average: alpha=0.1 → ~10-update lag → stable transitions
         if n_ep > 0:
-            rolling_suc = 0.9 * rolling_suc + 0.1 * suc_pct
+            rolling_suc = 0.97 * rolling_suc + 0.03 * suc_pct
 
         new_min_dist = curriculum_min_goal_dist(rolling_suc)
-        if new_min_dist != cur_min_dist:
+        if new_min_dist > cur_min_dist:
             cur_min_dist = new_min_dist
             new_stage    = next(i for i, (t, _) in enumerate(CURRICULUM_STAGES) if rolling_suc < t)
-            print(f"\n  ⬆  Curriculum advance → stage {new_stage}: "
-                  f"min_goal_dist={cur_min_dist:.1f} m  (rolling_suc={rolling_suc:.1f}%)")
-            # Re-initialise envs with new goal distance — existing env_state keeps rolling
+            
             rng, reinit_rng = jax.random.split(rng)
             env_obs, env_state = init_env_state(reinit_rng, min_goal_dist=cur_min_dist)
 
