@@ -9,48 +9,34 @@ FIXES & IMPROVEMENTS vs previous version:
 
   FIX 3 (carried) — Reward priority order made explicit and unambiguous.
 
-  FIX 4 — passive_col logic was wrong (NEW):
-    Old: passive_col = human_collision & ~active_col
-    This was True even when the robot drove into someone from behind
-    (outside the FOV cone) at speed — still the robot's fault.
-    Correct definition: passive = human walked into a STOPPED/SLOW robot.
-    New: active  = colliding human is in front FOV AND robot moving fast
-         passive = colliding human is behind/side AND robot nearly stopped
+  FIX 4 (carried) — passive_col correct active/passive semantics.
 
-  FIX 5 — People spawn without obstacle safety check (NEW):
-    People were placed with a plain uniform() — no check vs obs_circles,
-    obs_boxes, or walls. On reset they could spawn inside obstacles, causing
-    chaotic immediate bounces and unrealistic initial states.
-    FIX: people now use the same while_loop resampling pattern as the robot,
-    with a per-person clearance = PEOPLE_RADIUS + 0.15.
+  FIX 5 (carried) — People spawn with obstacle safety check.
 
-  IMPROVEMENT A — Social comfort-zone penalty (NEW):
-    Soft per-human penalty when closer than COMFORT_DIST (1.0 m).
-    Teaches proactive avoidance instead of only reacting to contact.
-    Scaled so the per-step penalty is small (~0.03 max/human) but accumulates.
+  IMPROVEMENT A (carried) — Social comfort-zone penalty.
 
-  IMPROVEMENT B — Goal direction in robot frame (NEW):
-    Replaced global (s_x, s_y) pose with ego-centric goal vector
-    (gdx_ego, gdy_ego) rotated into the robot's reference frame.
-    This makes the observation rotationally invariant, helping sample
-    efficiency significantly: the network no longer needs to learn to ignore
-    absolute room coordinates.
-    NOTE: SINGLE_OBS_SIZE remains 3 + 6 + NUM_RAYS = 117 because we still
-    carry s_theta in pose_vec (needed for temporal stack orientation cue).
-    The two global x/y scalars become two ego-frame goal scalars — same size.
+  IMPROVEMENT B (carried) — Goal direction in robot frame (ego-centric).
 
-  IMPROVEMENT C — rear_prox uses all 4 rays (not just min) (NEW):
-    Was: single scalar = min of 4 rear rays (3 rays discarded).
-    Now: keep all REAR_RAYS scalars and pack them into state_vec.
-    STATE_VEC_SIZE updated 6→9, SINGLE_OBS_SIZE updated 117→120.
-    OBS_SIZE (stacked×3) updated: 9+9+324 = 342.
-    (jax_wrappers.py and jax_train.py updated to match.)
+  IMPROVEMENT C (carried) — rear_prox uses all 4 rays.
 
-  IMPROVEMENT D — Fused single LiDAR call (NEW):
-    get_obs previously called compute_lidar TWICE (forward + rear sweep).
-    Now both sweeps are merged into ONE call with full 360° FOV = 2π,
-    with NUM_RAYS+REAR_RAYS total rays, then split by index.
-    Halves the LiDAR kernel launches per step (significant at 4096 envs).
+  IMPROVEMENT D (carried) — Fused single LiDAR call.
+
+  CURRICULUM (NEW) — Goal distance curriculum via min_goal_dist parameter:
+    reset_env now accepts an optional min_goal_dist argument (default 3.0 m,
+    matching the original hardcoded value). jax_ppo.py passes a scalar that
+    starts at CURRICULUM_START_DIST and grows as success rate improves.
+    - Stage 0 (suc <  30%): min_goal_dist = 1.0 m  — very easy warm-up
+    - Stage 1 (suc <  55%): min_goal_dist = 2.5 m  — medium distances
+    - Stage 2 (suc <  70%): min_goal_dist = 4.5 m  — close to full range
+    - Stage 3 (suc >= 70%): min_goal_dist = 6.0 m  — full difficulty
+    The while_loop resampling guarantees the constraint is always satisfied.
+
+  REWARD SHAPING (NEW) — Denser progress signal:
+    - progress coefficient raised 3.0 → 5.0 (stronger gradient signal)
+    - heading_bonus: small reward (+0.015 max) when well-aligned with goal
+      and moving forward — encourages pointing toward goal before advancing
+    - step_pen tightened -0.004 → -0.006 for stronger time pressure
+    - goal reward raised 20.0 → 25.0 for clearer terminal signal
 
 Obs layout (single frame): pose(3) + state_vec(9) + lidar(NUM_RAYS) = 120
 Stacked × 3: 9 + 9 + 324 = 342
@@ -79,6 +65,11 @@ FOV            = jnp.pi          # 180° forward-facing LiDAR
 GOAL_RADIUS    = 0.3             # success threshold (metres)
 COMFORT_DIST   = 1.0             # social comfort zone radius (m)
 COMFORT_COEF   = 0.03            # reward penalty per-human per-step at distance 0
+HEADING_BONUS  = 0.015           # max reward for well-aligned + moving forward
+PROGRESS_COEF  = 5.0             # progress reward coefficient (was 3.0)
+
+# Curriculum: default min goal distance — overridden by jax_ppo.py at runtime
+DEFAULT_MIN_GOAL_DIST = 3.0
 
 # IMPROVEMENT C: state_vec now has 9 entries (was 6)
 # v, w, max_v_norm, goal_dist_norm, goal_align_norm, rear_prox×4
@@ -204,7 +195,7 @@ def get_obs(state: EnvState) -> jnp.ndarray:
 # ── Reset ─────────────────────────────────────────────────────────────────────
 
 @jax.jit
-def reset_env(key: jnp.ndarray):
+def reset_env(key: jnp.ndarray, min_goal_dist: float = DEFAULT_MIN_GOAL_DIST):
     k1, k2, k3, k4, k5, k6, k7, k8, k9 = jax.random.split(key, 9)
 
     max_v  = jax.random.uniform(k1, minval=0.2, maxval=2.0)
@@ -256,11 +247,10 @@ def reset_env(key: jnp.ndarray):
 
     # ── Goal spawn ────────────────────────────────────────────────────────────
     GOAL_CLEARANCE = GOAL_RADIUS + 0.3
-    MIN_GOAL_DIST  = 3.0
 
     def _goal_cond(carry):
         gx, gy, k = carry
-        too_close = jnp.sqrt((gx - rx)**2 + (gy - ry)**2) < MIN_GOAL_DIST
+        too_close = jnp.sqrt((gx - rx)**2 + (gy - ry)**2) < min_goal_dist
         return too_close | ~_is_safe(gx, gy, GOAL_CLEARANCE, obs_circles, obs_boxes)
 
     def _goal_body(carry):
@@ -394,20 +384,25 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
     done          = goal_reached | collision | timeout
 
     # ── Reward ────────────────────────────────────────────────────────────────
-    progress  = 3.0 * (prev_dist - new_dist)
-    step_pen  = -0.004
+    progress  = PROGRESS_COEF * (prev_dist - new_dist)   # was 3.0, now 5.0
+    step_pen  = -0.006                                    # was -0.004, tighter time pressure
     smooth    = -0.5 * jnp.abs(target_w - state.w)
     speed_bon = 0.02 * target_v / jnp.maximum(state.max_v, 1e-3)
+
+    # Heading bonus: reward being aligned with goal AND moving forward
+    goal_angle_cur = jnp.arctan2(state.goal_y - new_y, state.goal_x - new_x)
+    align_cur      = (goal_angle_cur - new_theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
+    heading_bon    = HEADING_BONUS * jnp.maximum(0.0, jnp.cos(align_cur)) * (target_v / jnp.maximum(state.max_v, 1e-3))
 
     # IMPROVEMENT A: social comfort-zone soft penalty
     comfort_pen = -COMFORT_COEF * jnp.sum(
         jnp.maximum(0.0, 1.0 - dists_p / COMFORT_DIST)
     )
 
-    reward = progress + step_pen + smooth + speed_bon + comfort_pen
+    reward = progress + step_pen + smooth + speed_bon + heading_bon + comfort_pen
 
     # FIX 3 (carried): explicit priority — goal > obs > wall > active_human > passive > timeout
-    reward = jnp.where(goal_reached, 20.0, reward)
+    reward = jnp.where(goal_reached, 25.0, reward)                                              # was 20.0
     reward = jnp.where(obs_collision  & ~goal_reached, -7.0, reward)
     reward = jnp.where(wall_collision & ~obs_collision & ~goal_reached, -7.0, reward)
     reward = jnp.where(active_col  & ~obs_collision & ~wall_collision & ~goal_reached, -7.0, reward)

@@ -8,13 +8,16 @@ CHANGES vs previous version:
     SINGLE_OBS_SIZE: 117 → 120
     Stacked OBS_SIZE: 339 → 342  (9 + 9 + 324)
 
-  IMPROVEMENT — jnp.roll replaced with slice-assign (NEW):
-    jnp.roll(axis=0) on a (3, N) array allocates a full copy and then
-    applies a gather permutation. For temporal stacking with shift=-1 and
-    at[-1].set(...), we can do this more efficiently with a direct slice:
-      new_stack = jnp.concatenate([old_stack[1:], new_frame[None]], axis=0)
-    This is equivalent, avoids the roll+gather, and XLA can fuse it more
-    aggressively since the output shape is statically known.
+  IMPROVEMENT (carried) — jnp.roll replaced with slice-assign.
+
+  CURRICULUM (NEW) — reset_stacked accepts min_goal_dist:
+    The signature is reset_stacked(key, min_goal_dist=3.0) and it forwards
+    the value to base_reset_fn (i.e. reset_env). Because min_goal_dist is a
+    Python float in the JAX static-args sense, changing it causes a retrace
+    of the JIT-ted reset — acceptable since it happens at most 3 times.
+    jax_train.init_env_state() builds a closure over the current curriculum
+    distance and passes it to jax.vmap, so the curriculum propagates
+    naturally without any changes to collect_rollouts or step logic.
 
   UNCHANGED — autoreset broadcast logic was already correct.
 
@@ -45,8 +48,8 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3, num_rays: 
     """
 
     @jax.jit
-    def reset_stacked(key):
-        base_obs, base_state = base_reset_fn(key)
+    def reset_stacked(key, min_goal_dist: float = 3.0):
+        base_obs, base_state = base_reset_fn(key, min_goal_dist)
         pose      = base_obs[0:POSE_SIZE]
         state_vec = base_obs[POSE_SIZE : POSE_SIZE + STATE_VEC_SIZE]
         lidar     = base_obs[POSE_SIZE + STATE_VEC_SIZE:]

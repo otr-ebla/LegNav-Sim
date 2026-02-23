@@ -9,9 +9,19 @@ CHANGES vs previous version:
 
   FIX (carried) — _vmap_reset JIT applied once at module level.
 
-  IMPROVEMENT — LR warmup in PPO (see jax_ppo.py, not here).
+  ROLLOUT_STEPS: 256 → 64
+    Shorter rollouts = more frequent PPO updates = faster convergence.
+    Part of 30-min training overhaul (see jax_ppo.py).
 
-  UNCHANGED — collect_rollouts, NUM_ENVS, ROLLOUT_STEPS, all correct.
+  CURRICULUM (NEW) — init_env_state accepts min_goal_dist:
+    jax_ppo.py passes the current curriculum distance at each stage change.
+    Because min_goal_dist is a Python float (not a JAX array), a change in
+    its value triggers a retrace of _vmap_reset — but this happens at most
+    3 times across the full run (one per curriculum stage boundary).
+    collect_rollouts is unchanged: curriculum only affects resets, which
+    happen inside make_autoreset_env → step_autoreset → reset_fn.
+    The autoreset reset_fn is bound at make_stacked_env time, so to change
+    curriculum distance we reinitialise env_obs/env_state from jax_ppo.py.
 """
 
 import os
@@ -42,24 +52,33 @@ GPU_DEVICE = _verify_gpu()
 
 # Config
 NUM_ENVS      = 4096
-ROLLOUT_STEPS = 256
+ROLLOUT_STEPS = 64     # was 256 — shorter rollouts for more frequent PPO updates
 
 # OBS_SIZE updated: 9 (pose×3) + 9 (state_vec) + 324 (lidar×3) = 342
 OBS_SIZE = 3 * 3 + 9 + 108 * 3    # 342
 
-# Environment setup
+# Environment setup — built with default min_goal_dist; re-bound at curriculum changes
+# via init_env_state(rng, min_goal_dist=X) which rebuilds _vmap_reset with the new dist.
 reset_stacked, step_stacked = make_stacked_env(reset_env, step_env, stack_dim=3)
 step_auto   = make_autoreset_env(reset_stacked, step_stacked)
 
-# JIT applied at module level — one compilation only
-_vmap_reset = jax.jit(jax.vmap(reset_stacked))
+# JIT applied at module level — one compilation only (retraces on min_goal_dist change, max 3×)
 _vmap_step  = jax.jit(jax.vmap(step_auto, in_axes=(0, 0, 0)))
 
 
-def init_env_state(rng_key):
-    """Initialise all NUM_ENVS environments once before the training loop."""
+def init_env_state(rng_key, min_goal_dist: float = 3.0):
+    """
+    Initialise all NUM_ENVS environments once before the training loop.
+    min_goal_dist is a Python float — changing it triggers a retrace of
+    _vmap_reset (cheap: happens at most 3 times across the full run).
+    """
+    # Build a specialised reset that closes over min_goal_dist
+    def _reset_with_dist(key):
+        return reset_stacked(key, min_goal_dist=min_goal_dist)
+
+    vmap_reset = jax.jit(jax.vmap(_reset_with_dist))
     reset_keys = jax.random.split(rng_key, NUM_ENVS)
-    obs, state = _vmap_reset(reset_keys)
+    obs, state = vmap_reset(reset_keys)
     return obs, state
 
 
