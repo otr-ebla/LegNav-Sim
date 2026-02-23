@@ -208,9 +208,10 @@ def draw_panel(surface, fonts, ep, step, ep_ret, v, w, goal_dist, goal_align,
     sep()
     txt(f"Ep ret {ep_ret:>+7.2f}", C_GOAL, "mid")
     sep()
-    txt("── Rolling Stats (50 eps) ─", C_DIM, "small"); y += 2
+    txt("── Last 50 episodes ─", C_DIM, "small"); y += 2
     txt(f"  Success  {stats['suc']:>5.1f}%",   C_SUCCESS, "mid")
     txt(f"  Collision{stats['col']:>5.1f}%",   C_COLLIDE, "mid")
+    txt(f"  Pass. Col{stats['pcol']:>5.1f}%",  (200, 100, 100), "mid") # NEW
     txt(f"  Timeout  {stats['tmo']:>5.1f}%",   C_TIMEOUT, "mid")
     txt(f"  Avg ret  {stats['ret']:>+6.1f}",   C_TEXT,    "mid")
     sep()
@@ -279,10 +280,10 @@ def main():
     banner_t    = 0
 
     def get_stats():
-        if not ep_hist: return {"suc":0.,"col":0.,"tmo":0.,"ret":0.}
+        if not ep_hist: return {"suc":0.,"col":0.,"tmo":0.,"pcol":0.,"ret":0.}
         w = np.array(ep_hist[-50:])
         return {"suc": w[:,1].mean()*100, "col": w[:,2].mean()*100,
-                "tmo": w[:,3].mean()*100, "ret": w[:,0].mean()}
+                "tmo": w[:,3].mean()*100, "pcol": w[:,4].mean()*100, "ret": w[:,0].mean()}
 
     print("🎮 Running. Close window or press Q to stop.")
 
@@ -348,11 +349,14 @@ def main():
         if done:
             goal = bool(info["goal_reached"])
             col  = bool(info["collision"])
+            pcol = bool(info["passive_col"])  # <-- AGGIUNGI QUESTA RIGA
             tmo  = not goal and not col
             
             banner   = "success" if goal else ("collision" if col else "timeout")
             banner_t = fps * 2
-            ep_hist.append((ep_reward, float(goal), float(col), float(tmo)))
+            
+            # AGGIUNGI float(pcol) ALLA FINE DELLA TUPLA
+            ep_hist.append((ep_reward, float(goal), float(col), float(tmo), float(pcol)))
             
             print(f"  Ep {ep:03d} finished — steps:{ep_steps} reward:{ep_reward:+.1f}  "
                   f"{'GOAL ✅' if goal else 'COLLISION 💥' if col else 'TIMEOUT ⏱️'}")

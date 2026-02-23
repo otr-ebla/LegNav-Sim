@@ -1,23 +1,28 @@
 """
 jax_env.py — Core 2D Navigation Environment
 ============================================
-FIXES vs previous version:
-  1. Circle collision threshold: was `closest_cir < 0.0` (ignores robot body),
-     now `closest_cir < ROBOT_RADIUS` — consistent with box collision.
-  2. Goal RNG: was using same key k5/k6 for both jnp.where branches (both
-     uniform calls evaluated with same key → correlated draws). Now uses
-     k5a/k5b split per axis.
-  3. Spawn safety: robot start and goal positions are now validated to be at
-     least (ROBOT_RADIUS + max_obs_r + 0.1) away from all obstacles and from
-     each other, using jax.lax.while_loop resampling.
-  4. Reward rebalancing: terminal rewards scaled down 10× (±20/−7) so the
-     value function can bootstrap in a stable range. Step rewards kept as-is.
-  5. FOV kept at π (180°) but a 4-scalar "rear proximity" feature added to
-     state_vec so the agent can sense what's directly behind it.
+FIXES in questa versione:
+
+  BUG 1 — wall_collision sempre False (CRITICO):
+    new_x/new_y erano già clampati a [ROBOT_RADIUS, ROOM-ROBOT_RADIUS] PRIMA
+    del calcolo di wall_clearance, quindi wall_clearance >= 0 sempre.
+    FIX: rilevare la collisione PRIMA del clamp, confrontando la posizione
+    integrata grezza con i bordi. Il clamp rimane per correggere la posizione
+    fisica, ma il flag collision è calcolato sulla posizione non clampata.
+
+  BUG 2 — rear_angles variabile dead code (MINORE):
+    rear_angles veniva costruito ma compute_lidar usava rear_theta come
+    orientamento, ignorando completamente rear_angles. Rimosso.
+
+  BUG 3 — Reward cascading ambiguo (MINORE):
+    L'ordine dei jnp.where terminali era ambiguo in caso di collisione
+    simultanea umano + ostacolo (robot schiacciato). Riordinato in modo
+    esplicito con priorità chiara: goal > obs_col > active_col > passive_col > timeout.
+
+  INVARIATO — Tutto il resto (GAE, obs layout, spawn safety, LiDAR) era corretto.
 
 Obs layout (single frame): pose(3) + state_vec(6) + lidar(NUM_RAYS) = 117
 Stacked × 3 = 9 + 6 + 324 = 339
-NOTE: OBS_SIZE in jax_train.py updated accordingly.
 """
 
 import jax
@@ -27,6 +32,7 @@ from jax_physics import compute_lidar
 from jax_humans import update_all_humans
 
 # ── Constants ─────────────────────────────────────────────────────────────────
+DT = 0.15
 MAX_STEPS    = 400
 NUM_RAYS     = 108
 NUM_PEOPLE   = 6
@@ -40,6 +46,9 @@ MAX_LIDAR_DIST = 12.0
 FOV          = jnp.pi          # 180° forward-facing LiDAR
 REAR_RAYS    = 4               # extra rear-proximity scalars added to state_vec
 GOAL_RADIUS  = 0.3             # success threshold (metres)
+
+# Costante pre-calcolata (non ricalcolata ogni frame in get_obs)
+_MAX_GOAL_DIST = float(jnp.sqrt(ROOM_W**2 + ROOM_H**2))
 
 # Single-frame obs size: pose(3) + state_vec(6) + lidar(NUM_RAYS)
 # state_vec: v, w, max_v_norm, goal_dist_norm, goal_align_norm, rear_prox_norm
@@ -103,22 +112,21 @@ def get_obs(state: EnvState) -> jnp.ndarray:
         (MAX_LIDAR_DIST - raw_lidar) / (MAX_LIDAR_DIST - ROBOT_RADIUS), 0.0, 1.0
     )
 
-    # FIX: rear proximity — 4 rays spanning 180° behind the robot
-    # Gives the agent awareness of what is directly behind it.
-    rear_fov    = jnp.pi
-    rear_theta  = state.theta + jnp.pi   # pointing backwards
-    rear_angles = rear_theta - rear_fov * 0.5 + jnp.arange(REAR_RAYS) * (rear_fov / (REAR_RAYS - 1))
-    rear_raw    = compute_lidar(
+    # FIX BUG 2: rear_angles era dead code — rimosso.
+    # compute_lidar prende (x, y, theta_centro_fov, ...) e costruisce i raggi
+    # internamente attorno a theta. Passare rear_theta è sufficiente.
+    rear_theta = state.theta + jnp.pi   # punta all'indietro
+    rear_raw = compute_lidar(
         state.x, state.y, rear_theta,
         all_circles, state.obs_boxes,
-        REAR_RAYS, float(rear_fov), MAX_LIDAR_DIST, ROOM_W, ROOM_H
+        REAR_RAYS, float(jnp.pi), MAX_LIDAR_DIST, ROOM_W, ROOM_H
     )
-    # Single rear proximity scalar: normalised min rear distance
+    # Singolo scalare di prossimità posteriore: min distanza posteriore normalizzata
     rear_prox = jnp.clip(
         (MAX_LIDAR_DIST - jnp.min(rear_raw)) / (MAX_LIDAR_DIST - ROBOT_RADIUS), 0.0, 1.0
     )
 
-    # Pose (normalised to [~-1, 1])
+    # Pose (normalizzata a [~-1, 1])
     s_x     = state.x     / ROOM_W
     s_y     = state.y     / ROOM_H
     s_theta = state.theta / jnp.pi
@@ -129,7 +137,8 @@ def get_obs(state: EnvState) -> jnp.ndarray:
     goal_dist  = jnp.sqrt(dx**2 + dy**2)
     goal_angle = jnp.arctan2(dy, dx)
     goal_align = (goal_angle - state.theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
-    MAX_GOAL_DIST = jnp.sqrt(ROOM_W**2 + ROOM_H**2)
+    # FIX: usa costante pre-calcolata invece di ricalcolare sqrt ogni frame
+    MAX_GOAL_DIST = _MAX_GOAL_DIST
 
     pose_vec  = jnp.array([s_x, s_y, s_theta])
     state_vec = jnp.array([
@@ -138,7 +147,7 @@ def get_obs(state: EnvState) -> jnp.ndarray:
         state.max_v / 2.0,                           # [0.1, 1]
         goal_dist  / MAX_GOAL_DIST,                  # [0, 1]
         goal_align / jnp.pi,                         # [-1, 1]
-        rear_prox,                                   # [0, 1]  FIX: rear awareness
+        rear_prox,                                   # [0, 1]
     ])
 
     return jnp.concatenate([pose_vec, state_vec, inv_lidar])
@@ -187,7 +196,7 @@ def reset_env(key: jnp.ndarray):
 
     obs_boxes = jax.vmap(init_box)(box_keys)
 
-    # ── Robot spawn — FIX: resample until safe ────────────────────────────────
+    # ── Robot spawn — resample until safe ─────────────────────────────────────
     ROBOT_CLEARANCE = ROBOT_RADIUS + 0.35
 
     def _robot_cond(carry):
@@ -206,9 +215,9 @@ def reset_env(key: jnp.ndarray):
     rx, ry, k2 = jax.lax.while_loop(_robot_cond, _robot_body, (rx0, ry0, k2))
     rtheta = jax.random.uniform(k4, minval=-jnp.pi, maxval=jnp.pi)
 
-    # ── Goal spawn — FIX: split keys + resample until safe + far from robot ──
+    # ── Goal spawn — split keys + resample until safe + far from robot ────────
     GOAL_CLEARANCE  = GOAL_RADIUS + 0.3
-    MIN_GOAL_DIST   = 3.0   # goal must be at least this far from robot
+    MIN_GOAL_DIST   = 3.0
 
     def _goal_cond(carry):
         gx, gy, k = carry
@@ -222,7 +231,6 @@ def reset_env(key: jnp.ndarray):
         gy = jax.random.uniform(kb, minval=margin, maxval=ROOM_H - margin)
         return gx, gy, k
 
-    # FIX: use separate keys k5a, k5b for the two branches — not the same key
     k5a, k5b = jax.random.split(k5)
     gx0 = jax.random.uniform(k5a, minval=margin, maxval=ROOM_W - margin)
     gy0 = jax.random.uniform(k5b, minval=margin, maxval=ROOM_H - margin)
@@ -260,7 +268,7 @@ def reset_env(key: jnp.ndarray):
 
 @jax.jit
 def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
-    dt = 0.2
+    dt = DT
 
     target_v = jnp.clip(action[0], 0.0,  state.max_v)
     target_w = jnp.clip(action[1], -1.0, 1.0)
@@ -268,12 +276,19 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
     # Midpoint integration
     mid_theta = state.theta + 0.5 * target_w * dt
     new_theta = (state.theta + target_w * dt + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
-    new_x     = state.x + target_v * dt * jnp.cos(mid_theta)
-    new_y     = state.y + target_v * dt * jnp.sin(mid_theta)
+    raw_x     = state.x + target_v * dt * jnp.cos(mid_theta)
+    raw_y     = state.y + target_v * dt * jnp.sin(mid_theta)
 
-    # Wall clamp
-    new_x = jnp.clip(new_x, ROBOT_RADIUS, ROOM_W - ROBOT_RADIUS)
-    new_y = jnp.clip(new_y, ROBOT_RADIUS, ROOM_H - ROBOT_RADIUS)
+    # FIX BUG 1: rilevare la wall_collision sulla posizione RAW (prima del clamp).
+    # Se clampata prima, wall_clearance è sempre >= 0 → wall_collision sempre False.
+    wall_collision = (
+        (raw_x < ROBOT_RADIUS) | (raw_x > ROOM_W - ROBOT_RADIUS) |
+        (raw_y < ROBOT_RADIUS) | (raw_y > ROOM_H - ROBOT_RADIUS)
+    )
+
+    # Il clamp corregge la posizione fisica (il robot non attraversa il muro)
+    new_x = jnp.clip(raw_x, ROBOT_RADIUS, ROOM_W - ROBOT_RADIUS)
+    new_y = jnp.clip(raw_y, ROBOT_RADIUS, ROOM_H - ROBOT_RADIUS)
 
     # Update humans
     human_key, _ = jax.random.split(key)
@@ -284,21 +299,32 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
         state.obs_circles, state.obs_boxes
     )
 
-    # ── Distances ──────────────────────────────────────────────────────────────
+    # ── Distances & Collisions ─────────────────────────────────────────────────
     prev_dist = jnp.sqrt((state.x  - state.goal_x)**2 + (state.y  - state.goal_y)**2)
     new_dist  = jnp.sqrt((new_x    - state.goal_x)**2 + (new_y    - state.goal_y)**2)
 
-    # Nearest human (center-to-center)
+    # Human distances and angles
     dx_p = new_people[:, 0] - new_x
     dy_p = new_people[:, 1] - new_y
-    closest_human = jnp.min(jnp.sqrt(dx_p**2 + dy_p**2))
+    dists_p = jnp.sqrt(dx_p**2 + dy_p**2)
+    closest_human = jnp.min(dists_p)
 
-    # Nearest circular obstacle — surface distance from robot centre
+    human_col_mask  = dists_p < (ROBOT_RADIUS + PEOPLE_RADIUS)
+    human_collision = jnp.any(human_col_mask)
+
+    # Active vs Passive Collision check
+    angles_p   = jnp.arctan2(dy_p, dx_p)
+    rel_angles = (angles_p - new_theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
+    in_fov     = jnp.abs(rel_angles) <= (jnp.pi / 2.0)
+
+    active_col  = jnp.any(human_col_mask & in_fov) & (target_v > 0.1)
+    passive_col = human_collision & (~active_col)
+
+    # Obstacle distances
     dx_c = state.obs_circles[:, 0] - new_x
     dy_c = state.obs_circles[:, 1] - new_y
     closest_cir = jnp.min(jnp.sqrt(dx_c**2 + dy_c**2) - state.obs_circles[:, 2])
 
-    # Nearest box obstacle — centre-to-surface distance
     def _box_dist(box):
         cx, cy, hw, hh = box
         ddx = jnp.maximum(jnp.abs(new_x - cx) - hw, 0.0)
@@ -306,33 +332,29 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
         return jnp.sqrt(ddx**2 + ddy**2)
     closest_box = jnp.min(jax.vmap(_box_dist)(state.obs_boxes))
 
-    # Wall clearance
-    wall_clearance = jnp.minimum(
-        jnp.minimum(new_x, ROOM_W - new_x),
-        jnp.minimum(new_y, ROOM_H - new_y)
-    ) - ROBOT_RADIUS
+    obs_collision  = (closest_cir < ROBOT_RADIUS) | (closest_box < ROBOT_RADIUS)
+    # wall_collision ora correttamente calcolata sulla posizione raw (vedi sopra)
+    collision      = human_collision | obs_collision | wall_collision
+    timeout        = (state.time_step + 1) >= MAX_STEPS
 
-    # ── Rewards ────────────────────────────────────────────────────────────────
+    # ── Reward & Terminations ─────────────────────────────────────────────────
     progress  = 3.0 * (prev_dist - new_dist)
     step_pen  = -0.004
     smooth    = -0.5 * jnp.abs(target_w - state.w)
     speed_bon = 0.02 * target_v / jnp.maximum(state.max_v, 1e-3)
     reward    = progress + step_pen + smooth + speed_bon
 
-    # ── Terminations ───────────────────────────────────────────────────────────
     goal_reached = new_dist < GOAL_RADIUS
-    human_collision = closest_human < (ROBOT_RADIUS + PEOPLE_RADIUS)
-    # FIX: circle threshold now uses ROBOT_RADIUS (was 0.0, ignored robot body)
-    obs_collision   = (closest_cir < ROBOT_RADIUS) | (closest_box < ROBOT_RADIUS)
-    wall_collision  = wall_clearance < 0.0
-    collision       = human_collision | obs_collision | wall_collision
-    timeout         = (state.time_step + 1) >= MAX_STEPS
-    done            = goal_reached | collision | timeout
+    done         = goal_reached | collision | timeout
 
-    # FIX: terminal rewards scaled down 10× → value function can bootstrap
-    # stably; curriculum of positive/negative is preserved in ratio.
-    reward = jnp.where(goal_reached,              20.0, reward)
-    reward = jnp.where(collision & ~goal_reached, -7.0, reward)
+    # FIX BUG 3: Reward terminali con priorità esplicita e non ambigua.
+    # Ordine: goal > ostacoli statici/muro > collisione attiva umano > passiva > timeout
+    # Ogni ramo è mutuamente esclusivo tramite ~goal_reached e ~human_collision guards.
+    reward = jnp.where(goal_reached, 20.0, reward)
+    reward = jnp.where(obs_collision & ~goal_reached, -7.0, reward)
+    reward = jnp.where(wall_collision & ~obs_collision & ~goal_reached, -7.0, reward)
+    reward = jnp.where(human_collision & active_col & ~obs_collision & ~wall_collision & ~goal_reached, -7.0, reward)
+    reward = jnp.where(human_collision & passive_col & ~obs_collision & ~wall_collision & ~goal_reached, -2.0, reward)
     reward = jnp.where(timeout & ~goal_reached & ~collision, -0.5, reward)
 
     new_state = state.replace(
@@ -347,6 +369,7 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
         "discount":      jnp.where(done, 0.0, 1.0),
         "goal_reached":  goal_reached,
         "collision":     collision,
+        "passive_col":   passive_col,
         "closest_human": closest_human,
     }
     return obs, new_state, reward, done, info

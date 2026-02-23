@@ -5,14 +5,17 @@ CHANGES vs previous version:
   NUM_ENVS      16384 -> 4096   (same batch size, 4x longer horizon)
   ROLLOUT_STEPS    64 -> 256    (episodes are 15-1000 steps; 64 was too short)
 
-Why: with ROLLOUT_STEPS=64 every rollout window contained only ~5 complete
-episodes per env. The GAE bootstrap at step-64 introduced heavy bias because
-V(s') at the truncation boundary was poorly estimated (critic still learning).
-Longer rollouts give the advantage estimator a better view of each episode,
-reduce bootstrap bias, and provide more signal for the critic to fit.
+FIX in questa versione:
 
-Total batch size is unchanged: 4096 * 256 = 1,048,576 transitions/update.
-Memory: 4096 * 256 * 339 * 4 bytes = 1.42 GB rollout obs — fits easily.
+  BUG 7 — init_env_state ricompila il JIT ad ogni chiamata (PERFORMANCE):
+    _vmap_reset era definita a livello modulo ma poi wrappata in jax.jit()
+    DENTRO init_env_state ad ogni invocazione. Ogni chiamata a init_env_state
+    ricreava un nuovo oggetto JIT compilato (cache miss garantito).
+    FIX: il JIT di _vmap_reset è applicato a livello modulo, una volta sola,
+    e init_env_state usa direttamente la versione già compilata.
+
+  INVARIATO — collect_rollouts, batched_sample_action, OBS_SIZE, NUM_ENVS,
+  ROLLOUT_STEPS erano tutti corretti.
 """
 
 import os
@@ -42,21 +45,25 @@ def _verify_gpu():
 GPU_DEVICE = _verify_gpu()
 
 # Config
-NUM_ENVS      = 4096    # was 16384 — reduced so ROLLOUT_STEPS can be 256
-ROLLOUT_STEPS = 256     # was 64    — 4x longer horizon, same total batch
+NUM_ENVS      = 4096    # was 16384
+ROLLOUT_STEPS = 256     # was 64
 OBS_SIZE      = 3 * 3 + 6 + 108 * 3    # 339
 
 # Environment setup
 reset_stacked, step_stacked = make_stacked_env(reset_env, step_env, stack_dim=3)
 step_auto   = make_autoreset_env(reset_stacked, step_stacked)
-_vmap_reset = jax.vmap(reset_stacked)
-_vmap_step  = jax.vmap(step_auto, in_axes=(0, 0, 0))
+
+# FIX BUG 7: JIT applicato a livello modulo, UNA VOLTA SOLA.
+# Prima era: jax.jit(_vmap_reset) chiamato dentro init_env_state ogni volta → cache miss.
+_vmap_reset = jax.jit(jax.vmap(reset_stacked))
+_vmap_step  = jax.jit(jax.vmap(step_auto, in_axes=(0, 0, 0)))
 
 
 def init_env_state(rng_key):
     """Initialise all NUM_ENVS environments once before the training loop."""
     reset_keys = jax.random.split(rng_key, NUM_ENVS)
-    obs, state = jax.jit(_vmap_reset)(reset_keys)
+    # FIX: usa direttamente _vmap_reset già JIT-compilato (nessuna ricompilazione)
+    obs, state = _vmap_reset(reset_keys)
     return obs, state
 
 

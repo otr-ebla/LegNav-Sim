@@ -1,35 +1,33 @@
 """
 jax_debug_train.py — Single-Environment Visual Debug Training
 =============================================================
-FIXES vs previous version:
+FIX in questa versione:
 
-  BUG 3 — Scaled actions stored, raw log-prob used (CRITICAL):
-    Was: raw_action, lp = sample_action(...)  →  action = scale(raw_action)
-         buf_act.append(scaled_action)  but  buf_lp.append(lp from raw space)
-    Then ppo_update computed (scaled_action - raw_mean) / std — wrong space.
-    FIX: store raw_action in buf_act; pass scaled env_action to the env only.
+  BUG 6 — infer() restituisce logstd con shape (1,2) invece di (2,) (CRITICO):
+    network.apply({"params":p}, obs[None]) restituisce:
+      mean:   (1, 2)  → dopo [0] diventa (2,)   ✅
+      logstd: (1, 2)  → NON era strippata del batch dim → rimane (1, 2)  ❌
+      value:  (1,)    → dopo [0] diventa scalare  ✅
+    Nella versione precedente logstd[0] mancava. Questo causava:
+      - sample_action_raw: noise.shape=(2,) vs logstd.shape=(1,2)
+        → broadcasting implicito, noise diventava (1,2) → action (1,2)
+        → lp somma su axis=-1 con shape sbagliata → log_prob scalare ma errato
+      - ppo_update: z = (raw_actions - mean) / (std+1e-8) con shapes mismatched
+        → broadcasting silenzioso, loss calcolata su dimensioni errate
+    FIX: aggiunto logstd[0] (strip batch dim) in infer().
 
-  BUG 4 — compute_lidar imported inside draw_lidar() every frame:
-    Caused repeated JAX recompilation (cache miss on local import alias).
-    FIX: imported at module level as _compute_lidar.
+  BUG 8 — pop(0) su lista Python in hot loop (PERFORMANCE MINORE):
+    buf_obs.pop(0) è O(N) su lista Python (shift di tutti gli elementi).
+    FIX: sostituito con collections.deque(maxlen=BUF_SIZE) che è O(1).
 
-  DESIGN 5 — clip(r, 0.8, 1.2) hardcoded:
-    FIX: now uses CLIP_EPS constant (0.2), so clip(r, 1-CLIP_EPS, 1+CLIP_EPS).
-
-  OBS_SIZE updated to 339 (state_vec is now 6 after rear_prox added in jax_env).
-
-Controls:
-  SPACE  pause / unpause
-  R      force reset
-  L      toggle LiDAR rays
-  H      toggle human velocity arrows
-  +/-    FPS up / down
-  Q/ESC  quit
+  INVARIATO — Tutto il resto (Bug 3 raw actions, Bug 4 module-level import,
+  Bug 5 CLIP_EPS, draw functions, PPO update logic) era già corretto.
 """
 
 import os
 import math
 import warnings
+import collections
 import pygame
 import numpy as np
 import jax
@@ -39,7 +37,6 @@ import flax.serialization
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-# FIX (Bug 4): import compute_lidar at module level — never inside draw_lidar()
 from jax_physics import compute_lidar as _compute_lidar
 
 from jax_env import (reset_env, step_env,
@@ -50,7 +47,7 @@ from jax_wrappers import make_stacked_env
 from jax_network import EndToEndActorCritic, scale_action_to_env
 from jax_train import OBS_SIZE
 
-CLIP_EPS = 0.2   # FIX (Design 5): use named constant, not hardcoded 0.8/1.2
+CLIP_EPS = 0.2
 
 # ── Layout ────────────────────────────────────────────────────────────────────
 SIM_SIZE  = 800
@@ -102,7 +99,6 @@ def make_fonts():
 # ── Draw helpers ──────────────────────────────────────────────────────────────
 
 def draw_star(surface, cx, cy, r_out, r_in, n, colour, border=None):
-    """Draw a regular n-pointed star centred at (cx,cy)."""
     pts = []
     for i in range(2 * n):
         angle = math.radians(-90 + i * 180 / n)
@@ -121,7 +117,6 @@ def draw_lidar(surface, state, show):
     fov    = float(FOV)
     angles = theta - fov / 2 + np.arange(NUM_RAYS) * fov / (NUM_RAYS - 1)
 
-    # FIX (Bug 4): use module-level _compute_lidar (not re-imported each call)
     people_cir = np.column_stack([
         np.array(state.people[:, 0]),
         np.array(state.people[:, 1]),
@@ -141,7 +136,6 @@ def draw_lidar(surface, state, show):
         col = tuple(int(C_RAY_NEAR[i]*t + C_RAY_FAR[i]*(1-t)) for i in range(3))
         pygame.draw.line(surface, col, (rx, ry), (ex, ey), 1)
 
-    # FOV boundary lines
     for side in [-1, 1]:
         ang = theta + side * fov / 2
         ex, ey = W(float(state.x) + MAX_LIDAR_DIST * np.cos(ang),
@@ -150,7 +144,6 @@ def draw_lidar(surface, state, show):
 
 
 def draw_scene(surface, state, show_lidar, show_arrows):
-    # Floor + grid
     pygame.draw.rect(surface, C_FLOOR, (0, 0, SIM_SIZE, SIM_SIZE))
     for i in range(int(ROOM_W) + 1):
         sx, _ = W(i, 0); pygame.draw.line(surface, C_GRID, (sx, 0), (sx, SIM_SIZE))
@@ -160,7 +153,6 @@ def draw_scene(surface, state, show_lidar, show_arrows):
 
     draw_lidar(surface, state, show_lidar)
 
-    # Rectangular obstacles
     for box in np.array(state.obs_boxes):
         cx, cy, hw, hh = box
         sx, sy = W(cx - hw, cy + hh)
@@ -169,7 +161,6 @@ def draw_scene(surface, state, show_lidar, show_arrows):
         pygame.draw.rect(surface, C_BOX,   (sx, sy, pw, ph))
         pygame.draw.rect(surface, C_BOX_L, (sx, sy, pw, ph), 2)
 
-    # Circular obstacles
     for cir in np.array(state.obs_circles):
         cx, cy, r = cir
         sx, sy = W(cx, cy)
@@ -177,12 +168,10 @@ def draw_scene(surface, state, show_lidar, show_arrows):
         pygame.draw.circle(surface, C_CIRCLE,   (sx, sy), pr)
         pygame.draw.circle(surface, C_CIRCLE_L, (sx, sy), pr, 2)
 
-    # Goal — 5-pointed star
     gx, gy = W(float(state.goal_x), float(state.goal_y))
     draw_star(surface, gx, gy, int(0.30 * SCALE), int(0.12 * SCALE),
               5, C_GOAL, C_GOAL2)
 
-    # People — billiard balls with velocity arrows
     for i in range(int(state.people.shape[0])):
         px, py   = float(state.people[i, 0]), float(state.people[i, 1])
         vx, vy   = float(state.people[i, 2]), float(state.people[i, 3])
@@ -198,7 +187,6 @@ def draw_scene(surface, state, show_lidar, show_arrows):
                 ax, ay = W(px + vx / spd * 0.5, py + vy / spd * 0.5)
                 pygame.draw.line(surface, (20, 120, 20), (sx, sy), (ax, ay), 2)
 
-    # Robot body + heading
     rx, ry = W(float(state.x), float(state.y))
     rr     = max(4, int(ROBOT_RADIUS * SCALE))
     pygame.draw.circle(surface, C_ROBOT,   (rx, ry), rr)
@@ -247,6 +235,7 @@ def draw_panel(surface, fonts, px0, ep, step, ep_ret, v, w,
     txt("── Last 50 episodes ─", C_DIM, "small"); y += 2
     txt(f"  Success  {stats['suc']:>5.1f}%",   C_SUCCESS, "mid")
     txt(f"  Collision{stats['col']:>5.1f}%",   C_COLLIDE, "mid")
+    txt(f"  Pass. Col{stats['pcol']:>5.1f}%",  (200, 100, 100), "mid")
     txt(f"  Timeout  {stats['tmo']:>5.1f}%",   C_TIMEOUT, "mid")
     txt(f"  Avg ret  {stats['ret']:>+6.1f}",   C_TEXT,    "mid")
     sep()
@@ -254,7 +243,6 @@ def draw_panel(surface, fonts, px0, ep, step, ep_ret, v, w,
     txt("L lidar  H arrows",     C_DIM, "tiny")
     txt("+/- FPS   Q quit",      C_DIM, "tiny")
 
-    # Outcome banner drawn on the sim viewport
     if banner_t > 0:
         label, col = {
             "success"  : ("✓  GOAL REACHED", C_SUCCESS),
@@ -283,7 +271,10 @@ optimizer = optax.chain(
 @jax.jit
 def infer(params, obs):
     mean, logstd, value = network.apply({"params": params}, obs[None])
-    return mean[0], logstd, value[0]
+    # FIX BUG 6: strip batch dim da TUTTI e tre gli output.
+    # Prima: logstd NON aveva [0] → shape (1,2) invece di (2,)
+    # → broadcasting silenzioso in sample_action_raw e ppo_update → log_prob errato.
+    return mean[0], logstd[0], value[0]
 
 
 @jax.jit
@@ -298,10 +289,8 @@ def sample_action_raw(key, mean, logstd):
 @jax.jit
 def ppo_update(params, opt_state, obs, raw_actions, returns, advantages, old_lp):
     """
-    FIX (Bug 3): raw_actions are the un-squashed Gaussian samples,
-    consistent with old_lp which was computed in the same raw space.
-    The residual (raw_actions - mean) / std is now valid.
-    FIX (Design 5): uses CLIP_EPS constant instead of hardcoded 0.8/1.2.
+    raw_actions sono i campioni Gaussiani non-squashati,
+    coerenti con old_lp calcolato nello stesso spazio raw.
     """
     def loss_fn(p):
         mean, logstd, vals = network.apply({"params": p}, obs)
@@ -310,13 +299,11 @@ def ppo_update(params, opt_state, obs, raw_actions, returns, advantages, old_lp)
         lp   = jnp.sum(-0.5*(z**2 + jnp.log(2*jnp.pi)) - logstd, axis=-1)
         adv  = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         r    = jnp.exp(jnp.clip(lp - old_lp, -5.0, 5.0))
-        # FIX (Design 5): use CLIP_EPS constant
         pi_l = -jnp.mean(jnp.minimum(
             r * adv,
             jnp.clip(r, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS) * adv
         ))
         v_l  = 0.5 * jnp.mean((returns - vals)**2)
-        # Gaussian entropy — logstd not 2*logstd
         ent  = -0.05 * jnp.mean(jnp.sum(0.5*jnp.log(2*jnp.pi*jnp.e) + logstd, axis=-1))
         return pi_l + v_l + ent, (pi_l, v_l)
     (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
@@ -343,7 +330,7 @@ def gae(rewards, values, dones, gamma=0.99, lam=0.95):
 def main():
     CKPT      = "checkpoints/ppo_model_best.msgpack"
     STACK     = 3
-    TRAIN_EPS = 5      # PPO update every N episodes
+    TRAIN_EPS = 5
     BUF_SIZE  = 512
 
     reset_stk, step_stk = make_stacked_env(reset_env, step_env, stack_dim=STACK)
@@ -374,8 +361,14 @@ def main():
     rng, k = jax.random.split(rng)
     obs, state = jreset(k)
 
-    # Buffers — store RAW actions (not scaled)
-    buf_obs, buf_raw_act, buf_rew, buf_done, buf_lp, buf_val = [], [], [], [], [], []
+    # FIX BUG 8: deque(maxlen=BUF_SIZE) è O(1) per append/pop,
+    # lista.pop(0) è O(N) — su BUF_SIZE=512 è trascurabile ma è buona pratica.
+    buf_obs     = collections.deque(maxlen=BUF_SIZE)
+    buf_raw_act = collections.deque(maxlen=BUF_SIZE)
+    buf_rew     = collections.deque(maxlen=BUF_SIZE)
+    buf_done    = collections.deque(maxlen=BUF_SIZE)
+    buf_lp      = collections.deque(maxlen=BUF_SIZE)
+    buf_val     = collections.deque(maxlen=BUF_SIZE)
 
     ep, step, ep_ret = 0, 0, 0.0
     n_upd         = 0
@@ -389,10 +382,10 @@ def main():
     ep_hist       = []
 
     def get_stats():
-        if not ep_hist: return {"suc":0.,"col":0.,"tmo":0.,"ret":0.}
+        if not ep_hist: return {"suc":0.,"col":0.,"tmo":0.,"pcol":0.,"ret":0.}
         w = np.array(ep_hist[-50:])
         return {"suc": w[:,1].mean()*100, "col": w[:,2].mean()*100,
-                "tmo": w[:,3].mean()*100, "ret": w[:,0].mean()}
+                "tmo": w[:,3].mean()*100, "pcol": w[:,4].mean()*100, "ret": w[:,0].mean()}
 
     print(f"🎮  Debug train started (OBS_SIZE={OBS_SIZE}). SPACE=pause  R=reset  Q=quit")
 
@@ -418,38 +411,34 @@ def main():
 
         # ── Inference + step ──────────────────────────────────────────────────
         rng, ak, sk = jax.random.split(rng, 3)
+        # FIX BUG 6: infer() ora restituisce logstd con shape (2,) correttamente
         mean, logstd, value = infer(params, obs)
 
-        # FIX (Bug 3): get raw action and its log-prob in raw space
         raw_action, lp = sample_action_raw(ak, mean, logstd)
 
-        # Scale to env ranges ONLY for environment interaction
         mv = float(state.env_state.max_v)
         env_action = scale_action_to_env(raw_action, mv)
 
         obs, state, reward, done, info = jstep(sk, state, env_action)
         ep_ret += float(reward); step += 1; last_rew = float(reward)
 
-        # FIX (Bug 3): store RAW action (not env_action) so PPO residual is valid
         buf_obs.append(np.array(obs))
-        buf_raw_act.append(np.array(raw_action))   # <-- RAW, not scaled
+        buf_raw_act.append(np.array(raw_action))
         buf_rew.append(float(reward))
         buf_done.append(bool(done))
         buf_lp.append(float(lp))
         buf_val.append(float(value))
 
-        if len(buf_obs) > BUF_SIZE:
-            buf_obs.pop(0); buf_raw_act.pop(0); buf_rew.pop(0)
-            buf_done.pop(0); buf_lp.pop(0); buf_val.pop(0)
-
         # ── Episode end ───────────────────────────────────────────────────────
         if done:
             goal = bool(info["goal_reached"])
             col  = bool(info["collision"])
+            pcol = bool(info["passive_col"])
             tmo  = not goal and not col
             banner  = "success" if goal else ("collision" if col else "timeout")
             banner_t= fps * 2
-            ep_hist.append((ep_ret, float(goal), float(col), float(tmo)))
+
+            ep_hist.append((ep_ret, float(goal), float(col), float(tmo), float(pcol)))
             ep += 1
 
             sym = "✓" if goal else ("✗" if col else "⏱")
@@ -457,14 +446,14 @@ def main():
 
             if ep % TRAIN_EPS == 0 and len(buf_obs) >= 32:
                 b_obs     = jnp.array(np.array(buf_obs))
-                b_raw_act = jnp.array(np.array(buf_raw_act))   # RAW actions
-                b_ret, b_adv = gae(buf_rew, buf_val, buf_done)
+                b_raw_act = jnp.array(np.array(buf_raw_act))
+                b_ret, b_adv = gae(list(buf_rew), list(buf_val), list(buf_done))
                 b_ret  = jnp.array(b_ret)
                 b_adv  = jnp.array(b_adv)
-                b_lp   = jnp.array(buf_lp)
+                b_lp   = jnp.array(list(buf_lp))
                 params, opt_state, loss = ppo_update(
                     params, opt_state,
-                    b_obs, b_raw_act,   # pass RAW actions
+                    b_obs, b_raw_act,
                     b_ret, b_adv, b_lp
                 )
                 n_upd += 1

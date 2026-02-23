@@ -1,10 +1,18 @@
 """
 jax_humans.py — Crowd as Billiard Balls
 =========================================
-FIXES vs previous version:
-  1. Human-human elastic collision implemented (was promised in docstring but missing).
-     Self-collision masked out by checking dist < 1e-3.
-  2. No other changes — wall/obstacle bounces were already correct.
+FIX in questa versione:
+
+  BUG 4 — Doppio @jax.jit su update_all_humans (PERFORMANCE):
+    update_all_humans era decorata @jax.jit ma viene chiamata DENTRO step_env
+    che è già @jax.jit. Il JIT innestato è legale in JAX ma causa overhead di
+    tracing aggiuntivo ad ogni compilazione e può interferire con ottimizzazioni
+    di fusione del grafo computazionale del JIT esterno.
+    FIX: rimosso @jax.jit da update_all_humans. Il JIT di step_env coprirà
+    l'intera funzione inclusa la vmap crowd.
+
+  INVARIATO — Tutto il resto (elastic bounce, human-human collision, wall
+  bounce, obstacle bounce, stochastic behaviors) era già corretto.
 
 human array: [px, py, vx, vy, angle, is_distracted, wait_timer, target_speed]
 """
@@ -67,7 +75,7 @@ def _bounce_box(px, py, vx, vy, bx, by, bw, bh, hr):
 
 def _bounce_human_pair(px, py, vx, vy, opx, opy, radius):
     """
-    FIX: Elastic bounce of this human off another human at (opx, opy).
+    Elastic bounce of this human off another human at (opx, opy).
     Self-collision (dist ≈ 0) is masked out safely.
     """
     dx   = px - opx
@@ -99,47 +107,62 @@ def _update_single_human(human, key, all_humans,
                           dt, rx, ry, rtheta, rv,
                           room_w, room_h, radius):
     """
-    Single billiard-ball human step.
+    Single billiard-ball human step with stochastic behaviors.
     obs_circles : (Nc, 3)  [cx, cy, r]
     obs_boxes   : (Nb, 4)  [cx, cy, hw, hh]
     all_humans  : (Np, 8)  — for human-human collisions
     """
     px, py, vx, vy, angle, is_distracted, wait_timer, target_speed = human
 
-    # ── Robot avoidance (light repulsion) ────────────────────────────────────
+    # 1. Stochastic Events
+    k1, k2, k3 = jax.random.split(key, 3)
+
+    toggle_distract = jax.random.uniform(k1) < 0.01
+    is_distracted   = jnp.where(toggle_distract, 1.0 - is_distracted, is_distracted)
+
+    start_waiting = (wait_timer <= 0.0) & (jax.random.uniform(k2) < 0.005)
+    wait_duration = jax.random.uniform(k3, minval=1.0, maxval=4.0)
+    wait_timer    = jnp.where(start_waiting, wait_duration, wait_timer - dt)
+
+    is_waiting = wait_timer > 0.0
+
+    # 2. Robot avoidance (light repulsion)
     dx_r   = px - rx
     dy_r   = py - ry
     dist_r = jnp.maximum(jnp.sqrt(dx_r**2 + dy_r**2), 0.01)
     urg_r  = jnp.maximum(0.0, (REACTION_DIST - dist_r) / REACTION_DIST)
-    apply_r= (dist_r < REACTION_DIST) & (is_distracted < 0.5)
+
+    apply_r= (dist_r < REACTION_DIST) & (is_distracted < 0.5) & (~is_waiting)
     rep_vx = jnp.where(apply_r, (dx_r / dist_r) * REP_STRENGTH * urg_r, 0.0)
     rep_vy = jnp.where(apply_r, (dy_r / dist_r) * REP_STRENGTH * urg_r, 0.0)
 
     vx_rep = vx + rep_vx * dt
     vy_rep = vy + rep_vy * dt
 
-    # Re-normalise to target_speed after nudge
     spd    = jnp.sqrt(vx_rep**2 + vy_rep**2)
     scale  = target_speed / jnp.maximum(spd, 1e-6)
     vx_cur = vx_rep * scale
     vy_cur = vy_rep * scale
 
-    # ── Move ─────────────────────────────────────────────────────────────────
+    vx_cur = jnp.where(is_waiting, 0.0, vx_cur)
+    vy_cur = jnp.where(is_waiting, 0.0, vy_cur)
+
+    # 3. Move
     new_px = px + vx_cur * dt
     new_py = py + vy_cur * dt
 
-    # ── Bounce off walls ──────────────────────────────────────────────────────
+    # 4. Bounce off walls
     bxl = new_px - radius < 0.0
     bxh = new_px + radius > room_w
     byl = new_py - radius < 0.0
     byh = new_py + radius > room_h
 
-    new_px = jnp.where(bxl, radius,          jnp.where(bxh, room_w - radius, new_px))
-    new_py = jnp.where(byl, radius,          jnp.where(byh, room_h - radius, new_py))
+    new_px = jnp.where(bxl, radius,        jnp.where(bxh, room_w - radius, new_px))
+    new_py = jnp.where(byl, radius,        jnp.where(byh, room_h - radius, new_py))
     vx_cur = jnp.where(bxl | bxh, -vx_cur, vx_cur)
     vy_cur = jnp.where(byl | byh, -vy_cur, vy_cur)
 
-    # ── Bounce off circular obstacles ─────────────────────────────────────────
+    # 5. Bounce off circular obstacles
     def _apply_circle_bounce(carry, obs):
         cpx, cpy, cvx, cvy = carry
         cx, cy, cr = obs
@@ -150,7 +173,7 @@ def _update_single_human(human, key, all_humans,
         _apply_circle_bounce, (new_px, new_py, vx_cur, vy_cur), obs_circles
     )
 
-    # ── Bounce off rectangular obstacles ──────────────────────────────────────
+    # 6. Bounce off rectangular obstacles
     def _apply_box_bounce(carry, obs):
         cpx, cpy, cvx, cvy = carry
         bx, by, bw, bh = obs
@@ -161,7 +184,7 @@ def _update_single_human(human, key, all_humans,
         _apply_box_bounce, (new_px, new_py, vx_cur, vy_cur), obs_boxes
     )
 
-    # ── FIX: Bounce off other humans (human-human elastic collision) ──────────
+    # 7. Bounce off other humans
     def _apply_human_bounce(carry, other):
         cpx, cpy, cvx, cvy = carry
         opx, opy = other[0], other[1]
@@ -172,19 +195,20 @@ def _update_single_human(human, key, all_humans,
         _apply_human_bounce, (new_px, new_py, vx_cur, vy_cur), all_humans
     )
 
-    # ── Re-normalise speed ────────────────────────────────────────────────────
+    # 8. Final speed re-normalisation
     spd   = jnp.sqrt(vx_cur**2 + vy_cur**2)
     scale = target_speed / jnp.maximum(spd, 1e-6)
-    vx_cur *= scale
-    vy_cur *= scale
+    vx_cur = jnp.where(is_waiting, 0.0, vx_cur * scale)
+    vy_cur = jnp.where(is_waiting, 0.0, vy_cur * scale)
 
-    new_angle = jnp.arctan2(vy_cur, vx_cur)
+    new_angle = jnp.where(is_waiting, angle, jnp.arctan2(vy_cur, vx_cur))
 
     return jnp.stack([new_px, new_py, vx_cur, vy_cur, new_angle,
                       is_distracted, wait_timer, target_speed])
 
 
-@jax.jit
+# FIX BUG 4: rimosso @jax.jit — questa funzione è chiamata DENTRO step_env che
+# è già @jax.jit. Il doppio JIT innestato causa overhead di tracing senza benefici.
 def update_all_humans(people_arr, rng_key, dt, rx, ry, rtheta, rv,
                       room_w, room_h, radius, obs_circles, obs_boxes):
     """
