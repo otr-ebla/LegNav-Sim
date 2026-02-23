@@ -72,14 +72,16 @@ def init_env_state(rng_key, min_goal_dist: float = 3.0):
     min_goal_dist is a Python float — changing it triggers a retrace of
     _vmap_reset (cheap: happens at most 3 times across the full run).
     """
-    # Build a specialised reset that closes over min_goal_dist
+    global _vmap_step
+    step_auto = make_autoreset_env(reset_stacked, step_stacked, 
+                                    min_goal_dist=min_goal_dist)
+    _vmap_step = jax.jit(jax.vmap(step_auto, in_axes=(0, 0, 0)))
+    
     def _reset_with_dist(key):
         return reset_stacked(key, min_goal_dist=min_goal_dist)
-
     vmap_reset = jax.jit(jax.vmap(_reset_with_dist))
     reset_keys = jax.random.split(rng_key, NUM_ENVS)
-    obs, state = vmap_reset(reset_keys)
-    return obs, state
+    return vmap_reset(reset_keys)
 
 
 def batched_sample_action(rng_key, mean, logstd):

@@ -92,18 +92,12 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3, num_rays: 
     return reset_stacked, step_stacked
 
 
-def make_autoreset_env(reset_fn, step_fn):
-    """
-    Auto-reset wrapper.
-    done is scalar bool. For each pytree leaf, reshape done to broadcast correctly.
-    """
-
+def make_autoreset_env(reset_fn, step_fn, min_goal_dist: float = 3.0):
     @jax.jit
     def step_autoreset(key, state, action):
         step_key, reset_key = jax.random.split(key)
-
         obs, next_state, reward, done, info = step_fn(step_key, state, action)
-        reset_obs, reset_state = reset_fn(reset_key)
+        reset_obs, reset_state = reset_fn(reset_key, min_goal_dist) 
 
         def _select(reset_leaf, next_leaf):
             d = done.reshape((1,) * reset_leaf.ndim) if reset_leaf.ndim > 0 else done

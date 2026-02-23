@@ -71,19 +71,19 @@ from jax_train import collect_rollouts, init_env_state, NUM_ENVS, ROLLOUT_STEPS,
 GAMMA          = 0.99
 GAE_LAMBDA     = 0.95
 CLIP_EPS       = 0.25    # was 0.2
-VF_COEF        = 1.0
-ENTROPY_COEF   = 0.005   # was 0.002 — more exploration for curriculum
-MAX_GRAD_NORM  = 0.5
-PPO_EPOCHS     = 6       # was 4 — reuse data more
-LR_START       = 5e-4    # was 3e-4
+VF_COEF        = 0.25#1.0
+ENTROPY_COEF   = 0.01   # was 0.002 — more exploration for curriculum
+MAX_GRAD_NORM  = 0.3
+PPO_EPOCHS     = 4       # was 4 — reuse data more
+LR_START       = 3e-4    # was 3e-4
 LR_END         = 1e-4    # was 5e-5
 LR_MIN         = 1e-5    # was 1e-6
-WARMUP_UPDATES = 5       # was 20
+WARMUP_UPDATES = 10       # was 20
 TOTAL_UPDATES  = 400     # was 600
 
 # Batch config
 BATCH_SIZE      = NUM_ENVS * ROLLOUT_STEPS
-N_MINIBATCHES   = 4      # was 8 — larger minibatches
+N_MINIBATCHES   = 8      # was 8 — larger minibatches
 MINI_BATCH_SIZE = BATCH_SIZE // N_MINIBATCHES
 
 assert BATCH_SIZE % N_MINIBATCHES == 0, (
@@ -96,10 +96,10 @@ network = EndToEndActorCritic(action_dim=2)
 # Maps rolling success rate → minimum goal distance for reset_env.
 # Stages advance monotonically as the agent improves.
 CURRICULUM_STAGES = [
-    (30.0, 1.0),   # suc <  30% → 1.0 m  (warm-up: nearly trivial)
-    (55.0, 2.5),   # suc <  55% → 2.5 m  (medium range)
-    (70.0, 4.5),   # suc <  70% → 4.5 m  (near full difficulty)
-    (101., 6.0),   # suc >= 70% → 6.0 m  (full room)
+    (15.0, 1.0),   # avanza già a 15% — non aspettare 30%
+    (40.0, 2.5),
+    (60.0, 4.5),
+    (101., 6.0),
 ]
 
 def curriculum_min_goal_dist(suc_pct: float) -> float:
