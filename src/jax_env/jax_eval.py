@@ -1,16 +1,19 @@
 """
 jax_eval.py — Visual Evaluation with PyGame
 ============================================
-Fixes vs original:
-  - dummy_obs size corrected to OBS_SIZE (338)
-  - Checkpoint loading updated for new bundle format (params + opt_state)
-  - draw_env draws room walls, circular pillars, LiDAR rays, and heading arrows
-  - Deterministic action (no sampling noise) via get_deterministic_action
-  - Graceful handling when no checkpoint exists (runs random policy)
-  - Clock-controlled loop with configurable FPS
+Evaluates the trained PPO policy with a high-quality dual-pane renderer.
+All rendering logic is decoupled from JAX physics to maximize FPS.
+
+FIXES: 
+  - LiDAR reconstruction mathematically fixed to account for ROBOT_RADIUS,
+    eliminating the 0.2m visual "forcefield" offset.
+  - UI, colors, and layouts perfectly mirrored from jax_debug_train.
 """
 
 import os
+os.environ["JAX_PLATFORMS"] = "cpu"  # Force CPU execution
+
+import math
 import time
 import pygame
 import numpy as np
@@ -18,193 +21,347 @@ import jax
 import jax.numpy as jnp
 import flax.serialization
 
-from jax_env import reset_env, step_env, ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS, NUM_RAYS
+from jax_env import (reset_env, step_env,
+                     ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS,
+                     NUM_RAYS, MAX_LIDAR_DIST, FOV, NUM_PEOPLE,
+                     NUM_OBS_CIR, NUM_OBS_BOX, MAX_STEPS)
 from jax_wrappers import make_stacked_env
-from jax_network import EndToEndActorCritic, get_deterministic_action
-from jax_train import OBS_SIZE
+from jax_network import EndToEndActorCritic, scale_action_to_env
 
-# ── Display config ────────────────────────────────────────────────────────────
-WINDOW_SIZE = 800
-SCALE       = WINDOW_SIZE / max(ROOM_W, ROOM_H)
-FPS_TARGET  = 20   # real-time playback speed
+# ── Configuration ─────────────────────────────────────────────────────────────
+OBS_SIZE   = 339
+SIM_SIZE   = 800
+PANEL_W    = 300
+WINDOW_W   = SIM_SIZE + PANEL_W
+WINDOW_H   = SIM_SIZE
+SCALE      = SIM_SIZE / max(ROOM_W, ROOM_H)
+FPS_TARGET = 30
 
 # ── Colours ───────────────────────────────────────────────────────────────────
-C_BG       = (245, 245, 245)
-C_WALL     = (40,  40,  40)
-C_ROBOT    = (30,  80, 220)
-C_GOAL     = (255, 165,   0)
-C_PERSON   = (50, 180,  50)
-C_OBSTACLE = (120, 120, 120)
-C_LIDAR    = (200,  60,  60, 60)   # semi-transparent
+C_BG       = (28,  28,  34)
+C_FLOOR    = (44,  44,  52)
+C_GRID     = (56,  56,  66)
+C_WALL     = (190, 190, 205)
+C_ROBOT    = (60,  140, 255)
+C_ROBOT_H  = (170, 210, 255)
+C_GOAL     = (255, 210,  40)
+C_GOAL2    = (220, 150,  10)
+C_PERSON   = (70,  200,  80)
+C_PERSON_D = (255, 160,  40)
+C_CIRCLE   = (140,  90,  60)
+C_CIRCLE_L = (180, 120,  80)
+C_BOX      = ( 90, 110, 145)
+C_BOX_L    = (120, 145, 185)
+C_RAY_FAR  = ( 50, 200,  50)
+C_RAY_NEAR = (220,  50,  50)
+C_PANEL    = ( 20,  20,  26)
+C_TEXT     = (215, 215, 228)
+C_DIM      = (120, 120, 138)
+C_SUCCESS  = ( 50, 215,  95)
+C_COLLIDE  = (230,  60,  60)
+C_TIMEOUT  = (210, 165,  50)
 
 
-def to_screen(x, y):
-    """Sim coords → PyGame pixels (Y-flipped)."""
-    return int(x * SCALE), int(WINDOW_SIZE - y * SCALE)
+def W(x, y):
+    """World coordinates to screen pixels (Y-flipped)."""
+    return int(x * SCALE), int(SIM_SIZE - y * SCALE)
 
 
-def load_checkpoint(dummy_params, dummy_opt_state, filepath):
+def make_fonts():
+    return {
+        "big"  : pygame.font.SysFont("monospace", 21, bold=True),
+        "mid"  : pygame.font.SysFont("monospace", 15),
+        "small": pygame.font.SysFont("monospace", 13),
+        "tiny" : pygame.font.SysFont("monospace", 11),
+    }
+
+
+def load_checkpoint(filepath):
     if not os.path.exists(filepath):
         raise FileNotFoundError(filepath)
     with open(filepath, "rb") as f:
         raw = f.read()
-    bundle = flax.serialization.from_bytes(
-        {"params": dummy_params, "opt_state": dummy_opt_state}, raw
-    )
+    bundle = flax.serialization.msgpack_restore(raw)
     return bundle["params"]
 
 
-def draw_env(screen, state, lidar_raw=None):
-    """Render a single frame onto `screen`."""
-    screen.fill(C_BG)
+# ── Rendering Helpers ─────────────────────────────────────────────────────────
 
-    # Room border
-    pygame.draw.rect(screen, C_WALL, pygame.Rect(0, 0, WINDOW_SIZE, WINDOW_SIZE), 3)
-
-    # Circular pillar obstacles
-    for i in range(state.obstacles.shape[0]):
-        cx, cy, r = float(state.obstacles[i, 0]), float(state.obstacles[i, 1]), float(state.obstacles[i, 2])
-        sx, sy = to_screen(cx, cy)
-        pygame.draw.circle(screen, C_OBSTACLE, (sx, sy), max(1, int(r * SCALE)))
-
-    # Goal
-    gx, gy = to_screen(float(state.goal_x), float(state.goal_y))
-    pygame.draw.circle(screen, C_GOAL, (gx, gy), int(0.3 * SCALE))
-    pygame.draw.circle(screen, (200, 120, 0), (gx, gy), int(0.3 * SCALE), 2)
-
-    # LiDAR rays (optional, semi-transparent overlay)
-    if lidar_raw is not None:
-        fov   = 2.0 * np.pi
-        theta = float(state.theta)
-        angles = theta - fov / 2.0 + np.arange(NUM_RAYS) * (fov / (NUM_RAYS - 1))
-        for i, (ang, dist) in enumerate(zip(angles, lidar_raw)):
-            ex = float(state.x) + dist * np.cos(ang)
-            ey = float(state.y) + dist * np.sin(ang)
-            sx_, sy_ = to_screen(float(state.x), float(state.y))
-            ex_, ey_ = to_screen(ex, ey)
-            pygame.draw.line(screen, (220, 80, 80), (sx_, sy_), (ex_, ey_), 1)
-
-    # People
-    for i in range(state.people.shape[0]):
-        px, py  = float(state.people[i, 0]), float(state.people[i, 1])
-        ang     = float(state.people[i, 4])
-        distracted = float(state.people[i, 5]) > 0.5
-        cx_, cy_ = to_screen(px, py)
-        colour = (255, 140, 0) if distracted else C_PERSON
-        pygame.draw.circle(screen, colour, (cx_, cy_), max(1, int(PEOPLE_RADIUS * SCALE)))
-        hx_, hy_ = to_screen(px + 0.35 * np.cos(ang), py + 0.35 * np.sin(ang))
-        pygame.draw.line(screen, (0, 80, 0), (cx_, cy_), (hx_, hy_), 2)
-
-    # Robot body
-    rx_, ry_ = to_screen(float(state.x), float(state.y))
-    pygame.draw.circle(screen, C_ROBOT, (rx_, ry_), max(1, int(ROBOT_RADIUS * SCALE)))
-    # Heading arrow
-    theta = float(state.theta)
-    hx_, hy_ = to_screen(
-        float(state.x) + ROBOT_RADIUS * 2.0 * np.cos(theta),
-        float(state.y) + ROBOT_RADIUS * 2.0 * np.sin(theta)
-    )
-    pygame.draw.line(screen, (0, 0, 100), (rx_, ry_), (hx_, hy_), 3)
-
-    pygame.display.flip()
+def draw_star(surface, cx, cy, r_out, r_in, n, colour, border=None):
+    """Draw a regular n-pointed star centred at (cx,cy)."""
+    pts = []
+    for i in range(2 * n):
+        angle = math.radians(-90 + i * 180 / n)
+        r     = r_out if i % 2 == 0 else r_in
+        pts.append((cx + r * math.cos(angle), cy + r * math.sin(angle)))
+    pygame.draw.polygon(surface, colour, pts)
+    if border:
+        pygame.draw.polygon(surface, border, pts, 2)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+def draw_lidar(surface, state, raw_lidar, show):
+    """Draw LiDAR rays using the already-computed distance array."""
+    if not show or raw_lidar is None:
+        return
+    rx, ry = W(float(state.x), float(state.y))
+    theta  = float(state.theta)
+    fov    = float(FOV)
+    angles = theta - fov / 2.0 + np.arange(NUM_RAYS) * fov / (NUM_RAYS - 1)
+
+    for ang, dist in zip(angles, raw_lidar):
+        ex, ey = W(float(state.x) + dist * math.cos(ang),
+                   float(state.y) + dist * math.sin(ang))
+        t   = max(0.0, 1.0 - dist / MAX_LIDAR_DIST)
+        col = tuple(int(C_RAY_NEAR[i]*t + C_RAY_FAR[i]*(1-t)) for i in range(3))
+        pygame.draw.line(surface, col, (rx, ry), (ex, ey), 1)
+
+    for side in [-1, 1]:
+        ang = theta + side * fov / 2.0
+        ex, ey = W(float(state.x) + MAX_LIDAR_DIST * math.cos(ang),
+                   float(state.y) + MAX_LIDAR_DIST * math.sin(ang))
+        pygame.draw.line(surface, C_DIM, (rx, ry), (ex, ey), 1)
+
+
+def draw_scene(surface, state, raw_lidar, show_lidar, show_arrows):
+    pygame.draw.rect(surface, C_FLOOR, (0, 0, SIM_SIZE, SIM_SIZE))
+    for i in range(int(ROOM_W) + 1):
+        sx, _ = W(i, 0); pygame.draw.line(surface, C_GRID, (sx, 0), (sx, SIM_SIZE))
+    for j in range(int(ROOM_H) + 1):
+        _, sy = W(0, j); pygame.draw.line(surface, C_GRID, (0, sy), (SIM_SIZE, sy))
+    pygame.draw.rect(surface, C_WALL, (0, 0, SIM_SIZE, SIM_SIZE), 3)
+
+    draw_lidar(surface, state, raw_lidar, show_lidar)
+
+    for box in np.array(state.obs_boxes):
+        cx, cy, hw, hh = box
+        sx, sy = W(cx - hw, cy + hh)
+        pw = int(2 * hw * SCALE)
+        ph = int(2 * hh * SCALE)
+        pygame.draw.rect(surface, C_BOX,   (sx, sy, pw, ph))
+        pygame.draw.rect(surface, C_BOX_L, (sx, sy, pw, ph), 2)
+
+    for cir in np.array(state.obs_circles):
+        cx, cy, r = cir
+        sx, sy = W(cx, cy)
+        pr = max(2, int(r * SCALE))
+        pygame.draw.circle(surface, C_CIRCLE,   (sx, sy), pr)
+        pygame.draw.circle(surface, C_CIRCLE_L, (sx, sy), pr, 2)
+
+    gx, gy = W(float(state.goal_x), float(state.goal_y))
+    draw_star(surface, gx, gy, int(0.30 * SCALE), int(0.12 * SCALE),
+              5, C_GOAL, C_GOAL2)
+
+    for i in range(int(state.people.shape[0])):
+        px, py   = float(state.people[i, 0]), float(state.people[i, 1])
+        vx, vy   = float(state.people[i, 2]), float(state.people[i, 3])
+        dist_    = float(state.people[i, 5]) > 0.5
+        sx, sy   = W(px, py)
+        pr       = max(3, int(PEOPLE_RADIUS * SCALE))
+        col      = C_PERSON_D if dist_ else C_PERSON
+        pygame.draw.circle(surface, col, (sx, sy), pr)
+        pygame.draw.circle(surface, (20, 20, 20), (sx, sy), pr, 1)
+        if show_arrows:
+            spd = math.hypot(vx, vy)
+            if spd > 0.05:
+                ax, ay = W(px + vx / spd * 0.5, py + vy / spd * 0.5)
+                pygame.draw.line(surface, (20, 120, 20), (sx, sy), (ax, ay), 2)
+
+    rx, ry = W(float(state.x), float(state.y))
+    rr     = max(4, int(ROBOT_RADIUS * SCALE))
+    pygame.draw.circle(surface, C_ROBOT,   (rx, ry), rr)
+    pygame.draw.circle(surface, C_ROBOT_H, (rx, ry), rr, 2)
+    theta  = float(state.theta)
+    hx, hy = W(float(state.x) + ROBOT_RADIUS * 3 * math.cos(theta),
+               float(state.y) + ROBOT_RADIUS * 3 * math.sin(theta))
+    pygame.draw.line(surface, C_ROBOT_H, (rx, ry), (hx, hy), 3)
+
+
+def draw_panel(surface, fonts, ep, step, ep_ret, v, w, goal_dist, goal_align, 
+               closest_h, stats, banner, banner_t):
+    pygame.draw.rect(surface, C_PANEL, (SIM_SIZE, 0, PANEL_W, WINDOW_H))
+    pygame.draw.line(surface, C_WALL, (SIM_SIZE, 0), (SIM_SIZE, WINDOW_H), 2)
+
+    y  = 10
+    lh = 19
+    x0 = SIM_SIZE + 10
+
+    def txt(s, col=C_TEXT, font="mid"):
+        nonlocal y
+        surface.blit(fonts[font].render(s, True, col), (x0, y))
+        y += lh
+
+    def sep():
+        nonlocal y
+        pygame.draw.line(surface, C_DIM, (x0, y+3), (x0 + PANEL_W-20, y+3), 1)
+        y += 10
+
+    txt("─ EVALUATION ─", C_TEXT, "big"); y += 2; sep()
+    txt(f"Episode  {ep:>5d}",  font="mid")
+    txt(f"Step     {step:>4d}", font="mid")
+    sep()
+    txt(f"v     {v:>+6.3f} m/s",      font="mid")
+    txt(f"ω     {w:>+6.3f} rad/s",    font="mid")
+    sep()
+    txt(f"Goal  {goal_dist:>5.2f} m",       font="mid")
+    txt(f"Align {math.degrees(goal_align):>+5.1f}°", font="mid")
+    txt(f"Human {closest_h:>5.2f} m",       font="mid")
+    sep()
+    txt(f"Ep ret {ep_ret:>+7.2f}", C_GOAL, "mid")
+    sep()
+    txt("── Rolling Stats (50 eps) ─", C_DIM, "small"); y += 2
+    txt(f"  Success  {stats['suc']:>5.1f}%",   C_SUCCESS, "mid")
+    txt(f"  Collision{stats['col']:>5.1f}%",   C_COLLIDE, "mid")
+    txt(f"  Timeout  {stats['tmo']:>5.1f}%",   C_TIMEOUT, "mid")
+    txt(f"  Avg ret  {stats['ret']:>+6.1f}",   C_TEXT,    "mid")
+    sep()
+    txt("SPACE pause  R reset",  C_DIM, "tiny")
+    txt("L lidar  H arrows",     C_DIM, "tiny")
+    txt("+/- FPS   Q quit",      C_DIM, "tiny")
+
+    if banner_t > 0:
+        label, col = {
+            "success"  : ("✓  GOAL REACHED", C_SUCCESS),
+            "collision": ("✗  COLLISION",    C_COLLIDE),
+            "timeout"  : ("⏱  TIMEOUT",      C_TIMEOUT),
+        }.get(banner, ("", C_TEXT))
+        if label:
+            surf = fonts["big"].render(label, True, col)
+            bx   = SIM_SIZE // 2 - surf.get_width() // 2
+            by   = SIM_SIZE // 2 - surf.get_height() // 2
+            bg   = pygame.Surface((surf.get_width()+24, surf.get_height()+12))
+            bg.fill((20, 20, 26)); bg.set_alpha(220)
+            surface.blit(bg,  (bx-12, by-6))
+            surface.blit(surf,(bx, by))
+
+
+# ── Main Loop ─────────────────────────────────────────────────────────────────
+
 def main():
-    print("🚀 JAX LiDAR-Nav Evaluation")
+    print(f"🚀 JAX LiDAR-Nav Evaluation  (OBS_SIZE={OBS_SIZE})")
 
-    # Network
     network = EndToEndActorCritic(action_dim=2)
     rng = jax.random.PRNGKey(0)
     rng, init_rng = jax.random.split(rng)
 
-    dummy_obs  = jnp.zeros((1, OBS_SIZE))
-    params     = network.init(init_rng, dummy_obs)["params"]
-    from optax import adam
-    dummy_opt  = adam(3e-4).init(params)
+    dummy_obs = jnp.zeros((1, OBS_SIZE))
+    params    = network.init(init_rng, dummy_obs)["params"]
 
     ckpt = "checkpoints/ppo_model_best.msgpack"
     try:
-        params = load_checkpoint(params, dummy_opt, ckpt)
+        params = load_checkpoint(ckpt)
         print(f"✅ Loaded weights from {ckpt}")
     except FileNotFoundError:
         print(f"⚠️  No checkpoint at {ckpt} — running random policy.")
 
-    # Env (stacked, no auto-reset for evaluation so we see episode boundaries)
     reset_stacked, step_stacked = make_stacked_env(reset_env, step_env, stack_dim=3)
     fast_reset = jax.jit(reset_stacked)
     fast_step  = jax.jit(step_stacked)
 
-    # PyGame
     pygame.init()
-    screen = pygame.display.set_mode((WINDOW_SIZE, WINDOW_SIZE))
+    screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
     pygame.display.set_caption("JAX Indoor-Nav — Evaluation")
     clock = pygame.time.Clock()
-    font  = pygame.font.SysFont("monospace", 16)
+    fonts = make_fonts()
 
     rng, reset_rng = jax.random.split(rng)
     obs, stacked_state = fast_reset(reset_rng)
-    ep_reward  = 0.0
-    ep_steps   = 0
-    ep_count   = 0
 
-    print("🎮 Running. Close window to stop.")
+    ep        = 0
+    ep_steps  = 0
+    ep_reward = 0.0
+    ep_hist   = []
+
+    paused      = False
+    show_lidar  = True
+    show_arrows = True
+    fps         = FPS_TARGET
+    banner      = ""
+    banner_t    = 0
+
+    def get_stats():
+        if not ep_hist: return {"suc":0.,"col":0.,"tmo":0.,"ret":0.}
+        w = np.array(ep_hist[-50:])
+        return {"suc": w[:,1].mean()*100, "col": w[:,2].mean()*100,
+                "tmo": w[:,3].mean()*100, "ret": w[:,0].mean()}
+
+    print("🎮 Running. Close window or press Q to stop.")
 
     while True:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                pygame.quit()
-                return
+                pygame.quit(); return
+            if event.type == pygame.KEYDOWN:
+                if event.key in (pygame.K_q, pygame.K_ESCAPE): pygame.quit(); return
+                if event.key == pygame.K_SPACE:  paused = not paused
+                if event.key == pygame.K_l:      show_lidar  = not show_lidar
+                if event.key == pygame.K_h:      show_arrows = not show_arrows
+                if event.key == pygame.K_EQUALS: fps = min(fps + 5, 60)
+                if event.key == pygame.K_MINUS:  fps = max(fps - 5, 1)
+                if event.key == pygame.K_r:
+                    rng, reset_rng = jax.random.split(rng)
+                    obs, stacked_state = fast_reset(reset_rng)
+                    ep_reward = 0.0; ep_steps = 0
+                    banner_t = 0
 
-        # Deterministic inference
-        obs_batch  = obs[None]   # add batch dim
+        if paused:
+            clock.tick(10); continue
+
+        # 1. Forward Pass (Deterministic)
+        obs_batch  = obs[None]
         mean, _, _ = network.apply({"params": params}, obs_batch)
-        action     = get_deterministic_action(jnp.squeeze(mean, axis=0))
+        raw_mean   = jnp.squeeze(mean, axis=0)
 
+        max_v      = float(stacked_state.env_state.max_v)
+        env_action = scale_action_to_env(raw_mean, max_v)
+
+        # 2. Step Env
         rng, step_rng = jax.random.split(rng)
-        obs, stacked_state, reward, done, info = fast_step(step_rng, stacked_state, action)
+        obs, stacked_state, reward, done, info = fast_step(step_rng, stacked_state, env_action)
         ep_reward += float(reward)
         ep_steps  += 1
 
-        # Pull state to CPU for rendering
+        # 3. Render Prep
         cpu_state = jax.device_get(stacked_state.env_state)
+        cpu_lidar_stack = jax.device_get(stacked_state.lidar_stack)
+        
+        # FIX: The exact inverse of the scaling formula used in jax_env.py
+        raw_lidar = MAX_LIDAR_DIST - cpu_lidar_stack[-1] * (MAX_LIDAR_DIST - ROBOT_RADIUS)
 
-        # Extract raw lidar from current obs (last num_rays elements of the latest frame)
-        # obs layout: pose_stack(9) + state_vec(5) + lidar_stack(324)
-        # Latest lidar frame = last NUM_RAYS values of lidar_stack portion
-        cpu_lidar_stack = jax.device_get(stacked_state.lidar_stack)  # (3, 108)
-        cpu_lidar = cpu_lidar_stack[-1]   # most recent frame (108,)
+        dx = float(cpu_state.goal_x) - float(cpu_state.x)
+        dy = float(cpu_state.goal_y) - float(cpu_state.y)
+        gdist  = math.hypot(dx, dy)
+        galign = (math.atan2(dy, dx) - float(cpu_state.theta) + math.pi) % (2*math.pi) - math.pi
+        ch     = float(info["closest_human"]) - ROBOT_RADIUS - PEOPLE_RADIUS
 
-        # Convert normalised lidar back to raw distances for rendering
-        from jax_env import MAX_LIDAR_DIST
-        raw_lidar = MAX_LIDAR_DIST * (1.0 - cpu_lidar)
+        screen.fill(C_BG)
+        draw_scene(screen, cpu_state, raw_lidar, show_lidar, show_arrows)
+        draw_panel(screen, fonts, ep, ep_steps, ep_reward,
+                   float(cpu_state.v), float(cpu_state.w),
+                   gdist, galign, ch,
+                   get_stats(), banner, banner_t)
 
-        draw_env(screen, cpu_state, raw_lidar)
+        if banner_t > 0: banner_t -= 1
 
-        # HUD overlay
-        hud = font.render(
-            f"Ep {ep_count:03d}  Step {ep_steps:04d}  R {ep_reward:+.1f}  "
-            f"v={float(stacked_state.env_state.v):.2f}  w={float(stacked_state.env_state.w):.2f}",
-            True, (20, 20, 20)
-        )
-        screen.blit(hud, (8, 8))
         pygame.display.flip()
-        clock.tick(FPS_TARGET)
+        clock.tick(fps)
 
         if done:
             goal = bool(info["goal_reached"])
             col  = bool(info["collision"])
-            print(f"  Ep {ep_count:03d} finished — steps:{ep_steps} reward:{ep_reward:.1f}  "
+            tmo  = not goal and not col
+            
+            banner   = "success" if goal else ("collision" if col else "timeout")
+            banner_t = fps * 2
+            ep_hist.append((ep_reward, float(goal), float(col), float(tmo)))
+            
+            print(f"  Ep {ep:03d} finished — steps:{ep_steps} reward:{ep_reward:+.1f}  "
                   f"{'GOAL ✅' if goal else 'COLLISION 💥' if col else 'TIMEOUT ⏱️'}")
-            time.sleep(0.5)
-
-            ep_count  += 1
-            ep_reward  = 0.0
-            ep_steps   = 0
-
+            
+            ep += 1
+            ep_reward = 0.0
+            ep_steps  = 0
             rng, reset_rng = jax.random.split(rng)
             obs, stacked_state = fast_reset(reset_rng)
-
 
 if __name__ == "__main__":
     main()

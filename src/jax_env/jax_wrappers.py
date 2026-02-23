@@ -1,26 +1,26 @@
 """
 jax_wrappers.py — Observation Stacking & Auto-Reset
 ====================================================
-Fixes vs original:
-  - make_autoreset_env: reset uses a freshly split key (not the same key as step)
-  - jnp.where broadcasting fixed: done is scalar, state leaves can be any shape
-  - StackedEnvState documented clearly
-  - Obs size consistent with jax_env.py (3 + 5 + NUM_RAYS = 116 per frame)
+FIXES vs previous version:
+  1. state_vec slice updated from [3:8] to [3:9] — state_vec is now size 6
+     (added rear_prox scalar in jax_env.py).
+  2. Autoreset broadcast fix retained (was already correct).
+
+Obs layout: [pose_stack(3*stack_dim) | state_vec(6) | lidar_stack(num_rays*stack_dim)]
+Total: 9 + 6 + 324 = 339
 """
 
 import jax
 import jax.numpy as jnp
 from flax import struct
-from jax_env import EnvState, NUM_RAYS
+from jax_env import EnvState, NUM_RAYS, SINGLE_OBS_SIZE
+
+STATE_VEC_SIZE = 6   # v, w, max_v_norm, goal_dist, goal_align, rear_prox
+POSE_SIZE      = 3
 
 
 @struct.dataclass
 class StackedEnvState:
-    """
-    Wraps EnvState with circular buffers for temporal stacking.
-      lidar_stack : (stack_dim, NUM_RAYS)
-      pose_stack  : (stack_dim, 3)
-    """
     env_state:   EnvState
     lidar_stack: jnp.ndarray   # (stack_dim, NUM_RAYS)
     pose_stack:  jnp.ndarray   # (stack_dim, 3)
@@ -28,45 +28,39 @@ class StackedEnvState:
 
 def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3, num_rays: int = NUM_RAYS):
     """
-    Returns (reset_stacked, step_stacked) wrapping the base env with temporal stacking.
-    Stacked obs layout: [pose_stack(3*stack_dim) | state_vec(5) | lidar_stack(num_rays*stack_dim)]
-    Total: 3*3 + 5 + 108*3 = 338 elements.
+    Temporal stacking wrapper.
+    Obs layout: [pose_stack(3*stack_dim) | state_vec(6) | lidar_stack(num_rays*stack_dim)]
+    Total: 9 + 6 + 324 = 339 elements.
     """
 
     @jax.jit
-    def reset_stacked(key: jnp.ndarray):
+    def reset_stacked(key):
         base_obs, base_state = base_reset_fn(key)
+        pose      = base_obs[0:POSE_SIZE]
+        state_vec = base_obs[POSE_SIZE : POSE_SIZE + STATE_VEC_SIZE]
+        lidar     = base_obs[POSE_SIZE + STATE_VEC_SIZE:]
 
-        # base_obs layout: pose(3) | state_vec(5) | lidar(num_rays)
-        pose      = base_obs[0:3]
-        state_vec = base_obs[3:8]
-        lidar     = base_obs[8:]
-
-        lidar_stack = jnp.tile(lidar[None, :], (stack_dim, 1))  # (stack_dim, num_rays)
-        pose_stack  = jnp.tile(pose[None,  :], (stack_dim, 1))  # (stack_dim, 3)
+        lidar_stack = jnp.tile(lidar[None, :], (stack_dim, 1))
+        pose_stack  = jnp.tile(pose[None,  :], (stack_dim, 1))
 
         stacked_state = StackedEnvState(
             env_state=base_state,
             lidar_stack=lidar_stack,
             pose_stack=pose_stack
         )
-
         flat_obs = jnp.concatenate([
-            pose_stack.flatten(),    # 3 * stack_dim
-            state_vec,               # 5
-            lidar_stack.flatten()    # num_rays * stack_dim
+            pose_stack.flatten(), state_vec, lidar_stack.flatten()
         ])
         return flat_obs, stacked_state
 
     @jax.jit
-    def step_stacked(key: jnp.ndarray, state: StackedEnvState, action: jnp.ndarray):
+    def step_stacked(key, state: StackedEnvState, action):
         base_obs, new_base_state, reward, done, info = base_step_fn(key, state.env_state, action)
 
-        new_pose      = base_obs[0:3]
-        new_state_vec = base_obs[3:8]
-        new_lidar     = base_obs[8:]
+        new_pose      = base_obs[0:POSE_SIZE]
+        new_state_vec = base_obs[POSE_SIZE : POSE_SIZE + STATE_VEC_SIZE]
+        new_lidar     = base_obs[POSE_SIZE + STATE_VEC_SIZE:]
 
-        # Shift circular buffers (oldest frame out, newest in at index -1)
         new_lidar_stack = jnp.roll(state.lidar_stack, shift=-1, axis=0).at[-1].set(new_lidar)
         new_pose_stack  = jnp.roll(state.pose_stack,  shift=-1, axis=0).at[-1].set(new_pose)
 
@@ -75,11 +69,8 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3, num_rays: 
             lidar_stack=new_lidar_stack,
             pose_stack=new_pose_stack
         )
-
         flat_obs = jnp.concatenate([
-            new_pose_stack.flatten(),
-            new_state_vec,
-            new_lidar_stack.flatten()
+            new_pose_stack.flatten(), new_state_vec, new_lidar_stack.flatten()
         ])
         return flat_obs, new_stacked_state, reward, done, info
 
@@ -88,33 +79,24 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3, num_rays: 
 
 def make_autoreset_env(reset_fn, step_fn):
     """
-    Auto-reset wrapper: if an episode ends (done=True) the env is immediately reset.
-    The returned obs/state is always valid for the NEXT episode.
-
-    FIX 1: reset_key is derived from a fresh split, not reusing the step key.
-    FIX 2: jnp.where broadcasts `done` (scalar) against arbitrary-shaped leaves.
+    Auto-reset wrapper.
+    done is scalar bool. For each pytree leaf of shape (d1,d2,...),
+    reshape done to (1,...,1) with the same ndim so jnp.where broadcasts correctly.
     """
 
     @jax.jit
-    def step_autoreset(key: jnp.ndarray, state, action: jnp.ndarray):
-        step_key, reset_key = jax.random.split(key)   # FIX 1: independent keys
+    def step_autoreset(key, state, action):
+        step_key, reset_key = jax.random.split(key)
 
         obs, next_state, reward, done, info = step_fn(step_key, state, action)
-
         reset_obs, reset_state = reset_fn(reset_key)
 
-        # FIX 2: reshape `done` to broadcast against each leaf's shape
-        final_state = jax.tree_util.tree_map(
-            lambda r, n: jnp.where(
-                done.reshape((1,) * (r.ndim - 0) if r.ndim == 0 else (1,) * r.ndim).squeeze()
-                if r.ndim > 0 else done,
-                r, n
-            ),
-            reset_state,
-            next_state
-        )
+        def _select(reset_leaf, next_leaf):
+            d = done.reshape((1,) * reset_leaf.ndim) if reset_leaf.ndim > 0 else done
+            return jnp.where(d, reset_leaf, next_leaf)
 
-        final_obs = jnp.where(done, reset_obs, obs)
+        final_state = jax.tree_util.tree_map(_select, reset_state, next_state)
+        final_obs   = jnp.where(done, reset_obs, obs)
 
         return final_obs, final_state, reward, done, info
 

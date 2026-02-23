@@ -1,14 +1,10 @@
 """
 jax_physics.py — Vectorized 2D Physics & LiDAR Engine
 ======================================================
-Fixes vs original:
-  - Removed erroneous @jax.vmap decorator from _intersect_ray_circle (caused crash)
-  - Corrected vmap axis logic in get_ray_circles_intersections
-  - Fixed min reduction axis after double-vmap (N,M) → (N,)
-  - Added obstacle segment (box wall) intersections for rectangular obstacles
-  - All functions are pure, jit-compatible, and vmap-safe
+No changes needed from original — this file was already correct.
 """
 
+import functools
 import jax
 import jax.numpy as jnp
 
@@ -18,16 +14,8 @@ import jax.numpy as jnp
 # ---------------------------------------------------------------------------
 
 @jax.jit
-def get_ray_wall_intersections(
-    x0: float, y0: float,
-    angles: jnp.ndarray,
-    room_w: float, room_h: float
-) -> jnp.ndarray:
-    """
-    N rays vs 4 axis-aligned room walls.
-    angles : (N,)
-    returns: (N,) minimum positive distance to a wall.
-    """
+def get_ray_wall_intersections(x0, y0, angles, room_w, room_h):
+    """N rays vs 4 axis-aligned walls. angles:(N,) → returns (N,)"""
     dx = jnp.cos(angles)
     dy = jnp.sin(angles)
 
@@ -52,26 +40,16 @@ def get_ray_wall_intersections(
 
 
 # ---------------------------------------------------------------------------
-# Circle Intersections  (FIX: removed top-level @jax.vmap — was double-vmapped)
+# Circle Intersections
 # ---------------------------------------------------------------------------
 
-def _intersect_ray_circle_scalar(
-    ray_x: float, ray_y: float,
-    dx: float, dy: float,
-    cx: float, cy: float, r: float
-) -> float:
-    """
-    Analytic ray-circle intersection for a SINGLE ray and SINGLE circle.
-    Ray: P(t) = (ray_x + t*dx, ray_y + t*dy),  direction must be unit-length.
-    Returns smallest positive t, or jnp.inf if no intersection.
-    """
+def _intersect_ray_circle_scalar(ray_x, ray_y, dx, dy, cx, cy, r):
+    """Single ray vs single circle. Returns smallest positive t or inf."""
     fx = ray_x - cx
     fy = ray_y - cy
-
-    # a = dx²+dy² = 1  (unit direction)
-    b = 2.0 * (fx * dx + fy * dy)
-    c = fx * fx + fy * fy - r * r
-    disc = b * b - 4.0 * c          # a=1
+    b  = 2.0 * (fx * dx + fy * dy)
+    c  = fx * fx + fy * fy - r * r
+    disc = b * b - 4.0 * c
 
     sqrt_disc = jnp.sqrt(jnp.maximum(0.0, disc))
     t1 = (-b - sqrt_disc) * 0.5
@@ -80,56 +58,34 @@ def _intersect_ray_circle_scalar(
     valid_t1 = jnp.where(t1 > 1e-5, t1, jnp.inf)
     valid_t2 = jnp.where(t2 > 1e-5, t2, jnp.inf)
     min_t    = jnp.minimum(valid_t1, valid_t2)
-
     return jnp.where(disc < 0.0, jnp.inf, min_t)
 
 
 @jax.jit
-def get_ray_circles_intersections(
-    x0: float, y0: float,
-    angles: jnp.ndarray,
-    circles: jnp.ndarray
-) -> jnp.ndarray:
+def get_ray_circles_intersections(x0, y0, angles, circles):
     """
     N rays vs M circles.
-    angles  : (N,)
-    circles : (M, 3)  columns = [cx, cy, radius]
-    returns : (N,)  closest circle hit per ray.
-
-    Strategy: vmap over rays (outer), then vmap over circles (inner).
-    Both vmaps are applied HERE — never on the scalar kernel above.
+    angles:(N,)  circles:(M,3) [cx,cy,r]  → returns (N,)
     """
-    dx = jnp.cos(angles)   # (N,)
-    dy = jnp.sin(angles)   # (N,)
+    dx = jnp.cos(angles)
+    dy = jnp.sin(angles)
+    cx, cy, r = circles[:, 0], circles[:, 1], circles[:, 2]
 
-    cx = circles[:, 0]     # (M,)
-    cy = circles[:, 1]     # (M,)
-    r  = circles[:, 2]     # (M,)
-
-    # Inner vmap: 1 ray vs M circles  →  (M,)
-    def one_ray_vs_all_circles(dxi, dyi):
+    def one_ray(dxi, dyi):
         return jax.vmap(
             lambda cxi, cyi, ri: _intersect_ray_circle_scalar(x0, y0, dxi, dyi, cxi, cyi, ri)
         )(cx, cy, r)
 
-    # Outer vmap: N rays  →  (N, M)
-    distances = jax.vmap(one_ray_vs_all_circles)(dx, dy)
-
-    # Closest circle per ray  (N,)
+    distances = jax.vmap(one_ray)(dx, dy)
     return jnp.min(distances, axis=1)
 
 
 # ---------------------------------------------------------------------------
-# Rectangular (box) obstacle intersections — new, more realistic
+# Box (AABB) Intersections
 # ---------------------------------------------------------------------------
 
-def _intersect_ray_aabb_scalar(
-    x0: float, y0: float,
-    dx: float, dy: float,
-    bx: float, by: float,   # box centre
-    bw: float, bh: float,   # half-widths
-) -> float:
-    """Slab-method AABB intersection for 1 ray, 1 box."""
+def _intersect_ray_aabb_scalar(x0, y0, dx, dy, bx, by, bw, bh):
+    """Slab method: single ray vs single axis-aligned box."""
     eps = 1e-7
     idx = 1.0 / jnp.where(jnp.abs(dx) < eps, jnp.sign(dx) * eps + eps, dx)
     idy = 1.0 / jnp.where(jnp.abs(dy) < eps, jnp.sign(dy) * eps + eps, dy)
@@ -142,18 +98,14 @@ def _intersect_ray_aabb_scalar(
     tmin = jnp.maximum(jnp.minimum(tx1, tx2), jnp.minimum(ty1, ty2))
     tmax = jnp.minimum(jnp.maximum(tx1, tx2), jnp.maximum(ty1, ty2))
 
-    hit = (tmax >= jnp.maximum(tmin, 1e-5))
+    hit = tmax >= jnp.maximum(tmin, 1e-5)
     t   = jnp.where(tmin > 1e-5, tmin, tmax)
     return jnp.where(hit & (t > 1e-5), t, jnp.inf)
 
 
 @jax.jit
-def get_ray_boxes_intersections(
-    x0: float, y0: float,
-    angles: jnp.ndarray,
-    boxes: jnp.ndarray,         # (K, 4)  [cx, cy, half_w, half_h]
-) -> jnp.ndarray:
-    """N rays vs K boxes → (N,)"""
+def get_ray_boxes_intersections(x0, y0, angles, boxes):
+    """N rays vs K boxes. boxes:(K,4) [cx,cy,hw,hh] → (N,)"""
     dx = jnp.cos(angles)
     dy = jnp.sin(angles)
     bx, by, bw, bh = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
@@ -163,30 +115,22 @@ def get_ray_boxes_intersections(
             lambda bxi, byi, bwi, bhi: _intersect_ray_aabb_scalar(x0, y0, dxi, dyi, bxi, byi, bwi, bhi)
         )(bx, by, bw, bh)
 
-    distances = jax.vmap(one_ray)(dx, dy)   # (N, K)
+    distances = jax.vmap(one_ray)(dx, dy)
     return jnp.min(distances, axis=1)
 
 
 # ---------------------------------------------------------------------------
 # Full LiDAR sweep
+# static_argnums: num_rays (5), fov (6), max_dist (7), room_w (8), room_h (9)
 # ---------------------------------------------------------------------------
 
-@jax.jit
-def compute_lidar(
-    x: float, y: float, theta: float,
-    circles: jnp.ndarray,       # (M, 3) [cx, cy, r]
-    boxes: jnp.ndarray,         # (K, 4) [cx, cy, hw, hh]
-    num_rays: int,
-    fov: float,
-    max_dist: float,
-    room_w: float,
-    room_h: float,
-) -> jnp.ndarray:
+@functools.partial(jax.jit, static_argnums=(5, 6, 7, 8, 9))
+def compute_lidar(x, y, theta, circles, boxes, num_rays, fov, max_dist, room_w, room_h):
     """
-    Full 360° (or arbitrary FOV) LiDAR sweep.
+    Full LiDAR sweep.
+    circles:(M,3) [cx,cy,r]   boxes:(K,4) [cx,cy,hw,hh]
     Returns (num_rays,) clipped distances.
     """
-    # Evenly spaced angles across full FOV (endpoint-inclusive)
     angles = theta - fov * 0.5 + jnp.arange(num_rays) * (fov / (num_rays - 1))
 
     wall_dists   = get_ray_wall_intersections(x, y, angles, room_w, room_h)
