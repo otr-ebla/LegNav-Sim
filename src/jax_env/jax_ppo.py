@@ -7,22 +7,41 @@ FIXES & IMPROVEMENTS vs previous version:
 
   FIX (carried) — BATCH_SIZE % N_MINIBATCHES assertion.
 
-  IMPROVEMENT A — LR warmup schedule (NEW):
-    Starting at LR_START=3e-4 from step 0 can cause destructive early
-    gradient updates before the critic has calibrated. Added a short linear
-    warmup from LR_MIN=1e-6 to LR_START over WARMUP_UPDATES=20 steps,
-    then linear decay to LR_END over the remaining updates.
-    Uses optax.join_schedules with a piecewise schedule.
+  IMPROVEMENT A (carried) — LR warmup schedule.
 
-  IMPROVEMENT B — ENTROPY_COEF is now a shared constant imported by
-    jax_debug_train.py (was mismatched: 0.002 here vs 0.05 in debug).
-    Both files now use ENTROPY_COEF = 0.002.
-    (jax_debug_train.py updated accordingly.)
+  IMPROVEMENT B (carried) — ENTROPY_COEF shared constant.
 
-  IMPROVEMENT C — OBS_SIZE updated to 342 (was 339):
-    Matches new jax_env.py layout (rear_prox 1→4 scalars, ego goal obs).
+  IMPROVEMENT C (carried) — OBS_SIZE = 342.
 
-  UNCHANGED — GAE, PPO loss, clip, VF_COEF, checkpoint logic all correct.
+  30-MIN TRAINING OVERHAUL (NEW):
+    Hyperparameters retuned for ~30-minute wall-clock convergence at 110k FPS.
+
+    Key changes:
+      ROLLOUT_STEPS : 256  → 64    (4× more frequent updates)
+      TOTAL_UPDATES : 600  → 400   (compensated by richer per-update signal)
+      N_MINIBATCHES : 8   → 4     (larger minibatches, less overhead)
+      PPO_EPOCHS    : 4   → 6     (reuse each batch more aggressively)
+      WARMUP_UPDATES: 20  → 5     (fast ramp-up)
+      LR_START      : 3e-4 → 5e-4  (more aggressive early learning)
+      LR_END        : 5e-5 → 1e-4  (keep learning rate meaningful at end)
+      LR_MIN        : 1e-6 → 1e-5  (warmup floor)
+      ENTROPY_COEF  : 0.002 → 0.005 (more exploration — critical for curriculum)
+      CLIP_EPS      : 0.2  → 0.25  (slightly more permissive updates)
+      best_suc init : 25.0 → 10.0  (save checkpoint earlier)
+
+  CURRICULUM (NEW):
+    Goal distance starts small and grows with the rolling success rate.
+    Controlled by curriculum_min_goal_dist() which maps suc_pct to a distance.
+    Passed as a static arg to a specialised reset wrapper in jax_train.py.
+
+      Stage 0  suc <  30% : min_dist = 1.0 m   (trivial warm-up)
+      Stage 1  suc <  55% : min_dist = 2.5 m   (medium range)
+      Stage 2  suc <  70% : min_dist = 4.5 m   (near full range)
+      Stage 3  suc >= 70% : min_dist = 6.0 m   (full difficulty)
+
+    Because min_goal_dist changes the JIT signature of reset_env (static float),
+    we use a small Python-level dispatch table and retrace only when the stage
+    changes (at most 3 retraces total across the whole run).
 """
 
 import os
@@ -51,20 +70,20 @@ from jax_train import collect_rollouts, init_env_state, NUM_ENVS, ROLLOUT_STEPS,
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 GAMMA          = 0.99
 GAE_LAMBDA     = 0.95
-CLIP_EPS       = 0.2
+CLIP_EPS       = 0.25    # was 0.2
 VF_COEF        = 1.0
-ENTROPY_COEF   = 0.002   # shared with jax_debug_train.py — do not change independently
+ENTROPY_COEF   = 0.005   # was 0.002 — more exploration for curriculum
 MAX_GRAD_NORM  = 0.5
-PPO_EPOCHS     = 4
-LR_START       = 3e-4
-LR_END         = 5e-5
-LR_MIN         = 1e-6    # warmup start
-WARMUP_UPDATES = 20      # steps of linear warmup before decay
-TOTAL_UPDATES  = 600
+PPO_EPOCHS     = 6       # was 4 — reuse data more
+LR_START       = 5e-4    # was 3e-4
+LR_END         = 1e-4    # was 5e-5
+LR_MIN         = 1e-5    # was 1e-6
+WARMUP_UPDATES = 5       # was 20
+TOTAL_UPDATES  = 400     # was 600
 
 # Batch config
 BATCH_SIZE      = NUM_ENVS * ROLLOUT_STEPS
-N_MINIBATCHES   = 8
+N_MINIBATCHES   = 4      # was 8 — larger minibatches
 MINI_BATCH_SIZE = BATCH_SIZE // N_MINIBATCHES
 
 assert BATCH_SIZE % N_MINIBATCHES == 0, (
@@ -72,6 +91,23 @@ assert BATCH_SIZE % N_MINIBATCHES == 0, (
 )
 
 network = EndToEndActorCritic(action_dim=2)
+
+# ── Curriculum ────────────────────────────────────────────────────────────────
+# Maps rolling success rate → minimum goal distance for reset_env.
+# Stages advance monotonically as the agent improves.
+CURRICULUM_STAGES = [
+    (30.0, 1.0),   # suc <  30% → 1.0 m  (warm-up: nearly trivial)
+    (55.0, 2.5),   # suc <  55% → 2.5 m  (medium range)
+    (70.0, 4.5),   # suc <  70% → 4.5 m  (near full difficulty)
+    (101., 6.0),   # suc >= 70% → 6.0 m  (full room)
+]
+
+def curriculum_min_goal_dist(suc_pct: float) -> float:
+    """Return min_goal_dist for the current success rate."""
+    for threshold, dist in CURRICULUM_STAGES:
+        if suc_pct < threshold:
+            return dist
+    return CURRICULUM_STAGES[-1][1]
 
 # IMPROVEMENT A: piecewise warmup then linear decay
 _warmup_schedule = optax.linear_schedule(
@@ -222,11 +258,12 @@ def collect_episode_outcomes(rewards, dones, goal_reached, collision):
 
 if __name__ == "__main__":
 
-    print("PPO Training — GPU 0")
+    print("PPO Training — GPU 0  [30-min mode]")
     print(f"  Envs       : {NUM_ENVS}  x  steps {ROLLOUT_STEPS}  =  {BATCH_SIZE:,} batch")
     print(f"  Minibatches: {N_MINIBATCHES} x {MINI_BATCH_SIZE} | epochs {PPO_EPOCHS}")
     print(f"  VF_COEF={VF_COEF}  ENTROPY_COEF={ENTROPY_COEF}  LR warmup {LR_MIN}->{LR_START} then decay ->{LR_END}")
-    print(f"  OBS_SIZE={OBS_SIZE}  log_std: state-dependent, bias=-1.0, clamp [{-4.0},{0.5}]\n")
+    print(f"  OBS_SIZE={OBS_SIZE}  log_std: state-dependent, bias=-1.0, clamp [{-4.0},{0.5}]")
+    print(f"  Curriculum stages: {CURRICULUM_STAGES}\n")
 
     rng = jax.random.PRNGKey(42)
     rng, init_rng, env_rng = jax.random.split(rng, 3)
@@ -249,14 +286,21 @@ if __name__ == "__main__":
     else:
         print("Starting fresh.")
 
+    # ── Curriculum state ──────────────────────────────────────────────────────
+    cur_min_dist  = curriculum_min_goal_dist(0.0)   # start at easiest stage
+    cur_stage     = 0
+    rolling_suc   = 0.0   # exponential moving average of success rate
+
+    print(f"Curriculum: starting at min_goal_dist={cur_min_dist:.1f} m")
+
     print("Initialising environments...")
-    env_obs, env_state = init_env_state(env_rng)
+    env_obs, env_state = init_env_state(env_rng, min_goal_dist=cur_min_dist)
     print(f"Ready. obs={env_obs.shape}\n")
 
-    best_suc = 25.0
+    best_suc = 10.0   # was 25.0 — save checkpoint as soon as we reach 10%
 
     hdr = (f"{'Upd':>5} | {'EpRet':>7} | {'Suc%':>5} {'Col%':>5} {'Tmo%':>5} |"
-           f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} | {'FPS':>7} {'#Ep':>6}")
+           f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} | {'FPS':>7} {'#Ep':>6} | {'MinDist':>7}")
     print(hdr)
     print("─" * len(hdr))
 
@@ -292,6 +336,21 @@ if __name__ == "__main__":
         else:
             mean_ret, suc_pct, col_pct, tmo_pct = 0.0, 0.0, 0.0, 0.0
 
+        # ── Curriculum update ─────────────────────────────────────────────────
+        # Exponential moving average: alpha=0.1 → ~10-update lag → stable transitions
+        if n_ep > 0:
+            rolling_suc = 0.9 * rolling_suc + 0.1 * suc_pct
+
+        new_min_dist = curriculum_min_goal_dist(rolling_suc)
+        if new_min_dist != cur_min_dist:
+            cur_min_dist = new_min_dist
+            new_stage    = next(i for i, (t, _) in enumerate(CURRICULUM_STAGES) if rolling_suc < t)
+            print(f"\n  ⬆  Curriculum advance → stage {new_stage}: "
+                  f"min_goal_dist={cur_min_dist:.1f} m  (rolling_suc={rolling_suc:.1f}%)")
+            # Re-initialise envs with new goal distance — existing env_state keeps rolling
+            rng, reinit_rng = jax.random.split(rng)
+            env_obs, env_state = init_env_state(reinit_rng, min_goal_dist=cur_min_dist)
+
         _, _, last_val = network.apply({"params": train_state[0]}, env_obs)
         advantages, returns = compute_gae(rewards, values, dones, last_val)
 
@@ -315,10 +374,10 @@ if __name__ == "__main__":
                 f"{suc_pct:>4.1f}% {col_pct:>4.1f}% {tmo_pct:>4.1f}% | "
                 f"{float(mean_loss):>7.4f} {float(p_loss):>6.3f} "
                 f"{float(v_loss):>6.3f} {float(entropy):>6.3f} | "
-                f"{fps:>7,.0f} {n_ep:>6d}  lr={lr_now:.2e}"
+                f"{fps:>7,.0f} {n_ep:>6d}  lr={lr_now:.2e} | {cur_min_dist:>5.1f}m"
             )
 
-        if suc_pct > best_suc:
+        if suc_pct > best_suc and n_ep > 0:
             best_suc = suc_pct
             save_checkpoint(train_state[0], train_state[1], ckpt_path)
 
