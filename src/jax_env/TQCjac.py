@@ -1,23 +1,30 @@
 """
-TQCjax.py — Truncated Quantile Critics  (GPU 1)
+TQCjax.py — Truncated Quantile Critics
 ================================================
-Pinned to GPU 1 via CUDA_VISIBLE_DEVICES=1 so it runs alongside PPO on GPU 0.
-
-FIXES for 110k+ FPS:
-  1. FULL JAX LOOP FUSION: Wraps the collection, buffer insertion, sampling, 
-     and gradient update steps inside a `jax.lax.scan` to execute entirely on 
-     the GPU in chunks of `LOG_EVERY`. Eliminates Python dispatch overhead.
-  2. JAX EPISODE STATS: Replaces the NumPy rolling window with a fully 
-     vectorized GPU statistics tracker (`collect_episode_outcomes`).
-  3. CRITIC ENSEMBLE REDUCTION: N_CRITICS dropped from 5 to 3. This reduces 
-     the pairwise Huber loss calculation from 15 million floats per update 
-     down to 5.5 million, drastically cutting GPU memory bandwidth bottlenecks.
+FIXES for 110k+ FPS & Flexibility:
+  1. ARGPARSE: Added support for --gpu (0 or 1) and --bfloat16.
+  2. MIXED PRECISION: When --bfloat16 is active, the CNN and MLPs execute in 
+     bfloat16 on the GPU Tensor Cores, while the physics engine and the Huber 
+     Loss remain safely in float32.
+  3. FULL JAX LOOP FUSION: Wraps the collection, buffer insertion, sampling, 
+     and gradient update steps inside a `jax.lax.scan`.
+  4. JAX EPISODE STATS: Vectorized GPU statistics tracker.
+  5. CRITIC ENSEMBLE REDUCTION: N_CRITICS=3 to drastically cut memory bandwidth.
 """
 
 import os
+import argparse
+
+# ── ARGUMENT PARSING ──────────────────────────────────────────────────────────
+parser = argparse.ArgumentParser(description="JAX TQC Training")
+parser.add_argument("--gpu", type=str, default="1", choices=["0", "1"], help="Target GPU ID (0 or 1)")
+parser.add_argument("--bfloat16", action="store_true", help="Enable bfloat16 mixed precision for neural networks")
+args, _ = parser.parse_known_args()
+
 os.environ["JAX_PLATFORMS"]               = "cuda"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 os.environ["TF_GPU_ALLOCATOR"]            = "cuda_malloc_async"
+os.environ["CUDA_VISIBLE_DEVICES"]        = args.gpu
 
 import time
 import warnings
@@ -50,9 +57,9 @@ LOG_EVERY      = 500
 SAVE_EVERY     = 5000
 
 # TQC-specific (Optimized for execution speed)
-N_CRITICS        = 3     # Reduced from 5
+N_CRITICS        = 3     
 N_ATOMS          = 25    
-N_TOP_ATOMS_DROP = 3     # Reduced from 5
+N_TOP_ATOMS_DROP = 3     
 N_TARGET_ATOMS   = N_CRITICS * N_ATOMS - N_TOP_ATOMS_DROP   # 72
 HUBER_KAPPA      = 1.0   
 
@@ -61,6 +68,8 @@ LOG_STD_EPS   = 1e-6
 
 CKPT_DIR  = "checkpoints_tqc"
 CKPT_PATH = f"{CKPT_DIR}/tqc_best.msgpack"
+
+NET_DTYPE = jnp.bfloat16 if args.bfloat16 else jnp.float32
 
 # ── Curriculum ────────────────────────────────────────────────────────────────
 CURRICULUM_STAGES = [
@@ -85,10 +94,10 @@ def _curriculum_stage(suc_pct: float) -> int:
 def _check_gpu():
     try: devs = jax.devices("cuda")
     except RuntimeError: devs = []
-    if len(devs) < 2:
-        raise RuntimeError("Less than 2 CUDA devices found. TQC requires CudaDevice(1).")
-    target_device = devs[1]
-    print(f"TQC pinned to: {target_device}  (physical GPU 1)")
+    if not devs:
+        raise RuntimeError(f"No CUDA devices found for GPU {args.gpu}.")
+    target_device = devs[0] # CUDA_VISIBLE_DEVICES isolates the selected GPU to index 0
+    print(f"TQC pinned to: {target_device}  (physical GPU {args.gpu})")
     return target_device
 
 target_gpu = _check_gpu()
@@ -110,6 +119,8 @@ def init_env_state(rng_key, min_goal_dist: float = 3.0):
 class ObsEncoder(nn.Module):
     stack_dim: int = 3
     num_rays:  int = 108
+    dtype: jnp.dtype = NET_DTYPE
+    
     @nn.compact
     def __call__(self, x):
         pose_size = 3 * self.stack_dim
@@ -118,48 +129,60 @@ class ObsEncoder(nn.Module):
         state_vec  = x[..., pose_size : pose_size + state_size]
         lidar_flat = x[..., pose_size + state_size:]
         batch_shape = lidar_flat.shape[:-1]
-        lidar_cnn = lidar_flat.reshape((*batch_shape, self.num_rays, self.stack_dim))
-        cnn = nn.relu(nn.Conv(features=32, kernel_size=(7,), strides=(2,), padding='SAME')(lidar_cnn))
-        cnn = nn.relu(nn.Conv(features=64, kernel_size=(5,), strides=(2,), padding='SAME')(cnn))
-        cnn = nn.relu(nn.Conv(features=64, kernel_size=(3,), strides=(2,), padding='SAME')(cnn))
-        cnn_feat = nn.LayerNorm()(cnn.reshape((*batch_shape, -1)))
-        global_in = jnp.concatenate([pose_stack, state_vec], axis=-1)
-        global_feat = nn.relu(nn.Dense(128)(global_in))
-        global_feat = nn.relu(nn.Dense(64)(global_feat))
+        
+        # Cast inputs to network dtype
+        lidar_cnn = lidar_flat.reshape((*batch_shape, self.num_rays, self.stack_dim)).astype(self.dtype)
+        cnn = nn.relu(nn.Conv(features=32, kernel_size=(7,), strides=(2,), padding='SAME', dtype=self.dtype)(lidar_cnn))
+        cnn = nn.relu(nn.Conv(features=64, kernel_size=(5,), strides=(2,), padding='SAME', dtype=self.dtype)(cnn))
+        cnn = nn.relu(nn.Conv(features=64, kernel_size=(3,), strides=(2,), padding='SAME', dtype=self.dtype)(cnn))
+        cnn_feat = nn.LayerNorm(dtype=self.dtype)(cnn.reshape((*batch_shape, -1)))
+        
+        global_in = jnp.concatenate([pose_stack, state_vec], axis=-1).astype(self.dtype)
+        global_feat = nn.relu(nn.Dense(128, dtype=self.dtype)(global_in))
+        global_feat = nn.relu(nn.Dense(64, dtype=self.dtype)(global_feat))
+        
         fused = jnp.concatenate([cnn_feat, global_feat], axis=-1)
-        shared = nn.relu(nn.Dense(256)(fused))
-        return nn.relu(nn.Dense(128)(shared))   
+        shared = nn.relu(nn.Dense(256, dtype=self.dtype)(fused))
+        return nn.relu(nn.Dense(128, dtype=self.dtype)(shared))   
 
 # ── Actor ─────────────────────────────────────────────────────────────────────
 class TQCActorNetwork(nn.Module):
     action_dim:  int   = ACTION_DIM
     LOG_STD_MIN: float = -5.0
     LOG_STD_MAX: float =  2.0
+    dtype: jnp.dtype = NET_DTYPE
+    
     @nn.compact
     def __call__(self, obs):
-        feat = ObsEncoder()(obs)
-        mean = nn.Dense(self.action_dim)(feat)
-        log_std = nn.Dense(self.action_dim)(feat)
-        return mean, jnp.clip(log_std, self.LOG_STD_MIN, self.LOG_STD_MAX)
+        feat = ObsEncoder(dtype=self.dtype)(obs)
+        mean = nn.Dense(self.action_dim, dtype=self.dtype)(feat)
+        log_std = nn.Dense(self.action_dim, dtype=self.dtype)(feat)
+        # Always cast outputs back to float32 for physics and loss stability
+        return mean.astype(jnp.float32), jnp.clip(log_std.astype(jnp.float32), self.LOG_STD_MIN, self.LOG_STD_MAX)
 
 # ── Quantile Critics ──────────────────────────────────────────────────────────
 class QuantileCriticNetwork(nn.Module):
     n_atoms:    int = N_ATOMS
     action_dim: int = ACTION_DIM
+    dtype: jnp.dtype = NET_DTYPE
+    
     @nn.compact
     def __call__(self, obs, action):
-        feat = ObsEncoder()(obs)
-        x = nn.relu(nn.Dense(256)(jnp.concatenate([feat, action], axis=-1)))
-        x = nn.relu(nn.Dense(128)(x))
-        return nn.Dense(self.n_atoms)(x)
+        feat = ObsEncoder(dtype=self.dtype)(obs)
+        x = nn.relu(nn.Dense(256, dtype=self.dtype)(jnp.concatenate([feat, action.astype(self.dtype)], axis=-1)))
+        x = nn.relu(nn.Dense(128, dtype=self.dtype)(x))
+        # Always cast output atoms back to float32 for stable Huber loss
+        return nn.Dense(self.n_atoms, dtype=self.dtype)(x).astype(jnp.float32)
 
 class TQCCriticEnsemble(nn.Module):
     n_critics:  int = N_CRITICS
     n_atoms:    int = N_ATOMS
     action_dim: int = ACTION_DIM
+    dtype: jnp.dtype = NET_DTYPE
+    
     @nn.compact
     def __call__(self, obs, action):
-        all_atoms = [QuantileCriticNetwork(self.n_atoms, self.action_dim, name=f'critic_{i}')(obs, action) for i in range(self.n_critics)]
+        all_atoms = [QuantileCriticNetwork(self.n_atoms, self.action_dim, dtype=self.dtype, name=f'critic_{i}')(obs, action) for i in range(self.n_critics)]
         return jnp.stack(all_atoms, axis=1)
 
 _TAUS = (2.0 * jnp.arange(1, N_ATOMS + 1) - 1.0) / (2.0 * N_ATOMS)
@@ -326,13 +349,14 @@ def save_checkpoint(ap, cp, tp, aos, cos, la, laos, step):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("TQC Training — GPU 1 (CUDA_VISIBLE_DEVICES=1)")
+    precision_str = "bfloat16" if args.bfloat16 else "float32"
+    print(f"TQC Training — GPU {args.gpu} (CUDA_VISIBLE_DEVICES={args.gpu}) | Precision: {precision_str}")
     print(f"  N_ENVS={N_ENVS}  BUFFER={BUFFER_CAP:,}  BATCH={BATCH_SIZE}")
     print(f"  N_CRITICS={N_CRITICS}  N_ATOMS={N_ATOMS}  N_TOP_DROP={N_TOP_ATOMS_DROP}  N_TARGET_ATOMS={N_TARGET_ATOMS}")
 
     rng = jax.random.PRNGKey(7)
     rng, ka, kc = jax.random.split(rng, 3)
-    dummy_obs = jnp.zeros((2, OBS_SIZE)); dummy_act = jnp.zeros((2, ACTION_DIM))
+    dummy_obs = jnp.zeros((2, OBS_SIZE), dtype=jnp.float32); dummy_act = jnp.zeros((2, ACTION_DIM), dtype=jnp.float32)
 
     ap  = actor_net.init(ka, dummy_obs)["params"]
     cp = critic_net.init(kc, dummy_obs, dummy_act)["params"]
@@ -347,12 +371,12 @@ if __name__ == "__main__":
     rolling_suc  = 0.0
 
     print(f"Curriculum: starting stage {cur_stage}, min_goal_dist={cur_min_dist:.1f} m")
-    print("Initialising environments on GPU 1...")
+    print(f"Initialising environments on GPU {args.gpu}...")
     rng, env_rng = jax.random.split(rng)
     env_obs, env_state, vmap_step = init_env_state(env_rng, min_goal_dist=cur_min_dist)
     replay_buf  = make_buffer(BUFFER_CAP)
     total_steps, n_updates = 0, 0
-    best_suc = 20.0
+    best_suc = 60.0
 
     print("Warming up buffer (filling with random actions)...")
     for _ in range((WARMUP_STEPS // N_ENVS) + 1):
