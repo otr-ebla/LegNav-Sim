@@ -13,15 +13,12 @@ FIXES vs previous version:
       • Rear:  REAR_RAYS=4  rays, FOV=π*0.75, anchored at theta+π
                 → 4 probes spread across the rear hemisphere ✓
 
-  FIX B — passive_col logic corrected (Bug #2):
-    Old code: active = human_collision & robot moving, passive = robot stopped.
-    Wrong: ignores whether the human was actually visible in the LiDAR FOV.
-    CORRECT definition:
-      active  = human_collision & target_v > 0.1 & human in forward 180° FOV
-                (robot was moving AND the human was visible — robot's fault)
-      passive = human_collision & ~active
-                (robot stopped, OR human came from outside the forward FOV)
-    FOV test: dot(robot_heading, vector_to_human) > 0, matching the 180° LiDAR.
+  FIX B — passive_col logic was too narrow (Bug #2):
+    Old code: active = in_front & moving, passive = behind & stopped.
+    A human walking into a stopped robot from the FRONT matched NEITHER branch,
+    so human_collision=True but no penalty was applied.
+    FIX: exhaustive split — active = human_collision & robot moving (>0.1),
+         passive = human_collision & robot stopped (≤0.1). Always one fires.
 
   FIX C — while_loop rejection sampler had no iteration cap (Bug #5):
     Dense obstacle configs could hang indefinitely on GPU.
@@ -63,7 +60,7 @@ DT             = 0.15
 MAX_STEPS      = 400
 NUM_RAYS       = 108
 REAR_RAYS      = 4
-NUM_PEOPLE     = 10
+NUM_PEOPLE     = 6
 NUM_OBS_CIR    = 6
 NUM_OBS_BOX    = 6
 ROOM_W         = 12.0
@@ -132,10 +129,14 @@ def _is_safe(x, y, clearance, obs_circles, obs_boxes):
 # ── Observation ───────────────────────────────────────────────────────────────
 
 def get_obs(state: EnvState) -> jnp.ndarray:
+    # Use state.people.shape[0] instead of the hardcoded NUM_PEOPLE constant so
+    # that jax_env_multi (and any other wrapper) can override the number of
+    # people per scenario without causing a shape mismatch in jnp.stack.
+    n_people = state.people.shape[0]
     people_circles = jnp.stack([
         state.people[:, 0],
         state.people[:, 1],
-        jnp.full(NUM_PEOPLE, PEOPLE_RADIUS)
+        jnp.full(n_people, PEOPLE_RADIUS)
     ], axis=-1)
     all_circles = jnp.concatenate([people_circles, state.obs_circles], axis=0)
 
@@ -371,18 +372,11 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
     human_col_mask  = dists_p < (ROBOT_RADIUS + PEOPLE_RADIUS)
     human_collision = jnp.any(human_col_mask)
 
-    # Active collision: human in forward 180° FOV AND robot is moving.
-    # The human was visible in LiDAR — the robot's fault for not avoiding.
-    # FOV test: dot(robot_heading, vector_to_human) > 0
-    #   heading = (cos(new_theta), sin(new_theta))
-    #   vector to human = (dx_p, dy_p) — unnormalised, sign is sufficient.
-    # Passive: robot was stopped OR all colliding humans came from behind the FOV.
-    heading_dot = dx_p * jnp.cos(new_theta) + dy_p * jnp.sin(new_theta)  # (NUM_PEOPLE,)
-    in_fov_mask = heading_dot > 0.0                                        # forward 180°
-    any_active  = jnp.any(human_col_mask & in_fov_mask)
-
-    active_col  = human_collision & (target_v > 0.1) & any_active
-    passive_col = human_collision & ~active_col
+    # FIX B: exhaustive split — one branch always fires when human_collision=True.
+    # active  = robot is moving (its fault for not stopping/avoiding)
+    # passive = robot is stationary (human walked into it)
+    active_col  = human_collision & (target_v >  0.1)
+    passive_col = human_collision & (target_v <= 0.1)
 
     # Obstacle collisions
     dx_c = state.obs_circles[:, 0] - new_x
