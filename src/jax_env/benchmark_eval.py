@@ -13,6 +13,7 @@ os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 os.environ["TF_GPU_ALLOCATOR"]            = "cuda_malloc_async"
 
 import time
+import functools
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
