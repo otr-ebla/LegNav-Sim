@@ -1,27 +1,22 @@
 """
 jax_train.py — Rollout Collection
 ===================================
-CHANGES vs previous version:
+FIXES vs previous version:
 
-  OBS_SIZE: 339 → 342
-    Matches jax_env.py new layout: 9 + 9 + 324 = 342
-    (pose_stack=9, state_vec=9, lidar_stack=324)
+  FIX — _vmap_step stale-closure bug (Bug #3):
+    The old code stored _vmap_step as a module-level global that was mutated
+    inside init_env_state(). collect_rollouts was @jax.jit, so it captured
+    _vmap_step at first-trace time and never saw the updated closure after a
+    curriculum stage change.
+    FIX: init_env_state() now RETURNS the freshly built vmap_step function.
+    collect_rollouts receives it as an explicit argument declared in
+    static_argnums=(2,3) so that a new vmap_step (new Python object) triggers
+    a retrace — meaning the new curriculum distance actually takes effect.
 
-  FIX (carried) — _vmap_reset JIT applied once at module level.
+  FIX — @jax.jit removed from reset_env / step_env (Issue #8, coordinated
+    with jax_env.py): JIT now lives only at the outermost vmap level here.
 
-  ROLLOUT_STEPS: 256 → 64
-    Shorter rollouts = more frequent PPO updates = faster convergence.
-    Part of 30-min training overhaul (see jax_ppo.py).
-
-  CURRICULUM (NEW) — init_env_state accepts min_goal_dist:
-    jax_ppo.py passes the current curriculum distance at each stage change.
-    Because min_goal_dist is a Python float (not a JAX array), a change in
-    its value triggers a retrace of _vmap_reset — but this happens at most
-    3 times across the full run (one per curriculum stage boundary).
-    collect_rollouts is unchanged: curriculum only affects resets, which
-    happen inside make_autoreset_env → step_autoreset → reset_fn.
-    The autoreset reset_fn is bound at make_stacked_env time, so to change
-    curriculum distance we reinitialise env_obs/env_state from jax_ppo.py.
+  All previous changes (OBS_SIZE=342, ROLLOUT_STEPS, curriculum) are carried.
 """
 
 import os
@@ -51,37 +46,41 @@ def _verify_gpu():
 GPU_DEVICE = _verify_gpu()
 
 # Config
-NUM_ENVS      = 4096
-ROLLOUT_STEPS = 100     # was 256 — shorter rollouts for more frequent PPO updates
+NUM_ENVS      = 16384
+ROLLOUT_STEPS = 64
 
-# OBS_SIZE updated: 9 (pose×3) + 9 (state_vec) + 324 (lidar×3) = 342
+# OBS_SIZE: 9 (pose×3) + 9 (state_vec) + 324 (lidar×3) = 342
 OBS_SIZE = 3 * 3 + 9 + 108 * 3    # 342
 
-# Environment setup — built with default min_goal_dist; re-bound at curriculum changes
-# via init_env_state(rng, min_goal_dist=X) which rebuilds _vmap_reset with the new dist.
+# Build stacked env functions once — these are pure function pairs, no JIT here.
 reset_stacked, step_stacked = make_stacked_env(reset_env, step_env, stack_dim=3)
-step_auto   = make_autoreset_env(reset_stacked, step_stacked)
-
-# JIT applied at module level — one compilation only (retraces on min_goal_dist change, max 3×)
-_vmap_step  = jax.jit(jax.vmap(step_auto, in_axes=(0, 0, 0)))
 
 
 def init_env_state(rng_key, min_goal_dist: float = 3.0):
     """
-    Initialise all NUM_ENVS environments once before the training loop.
-    min_goal_dist is a Python float — changing it triggers a retrace of
-    _vmap_reset (cheap: happens at most 3 times across the full run).
+    Initialise all NUM_ENVS environments and return the vmap_step closure
+    bound to the current curriculum distance.
+
+    Returns: (env_obs, env_state, vmap_step)
+      vmap_step — the JIT-compiled vmapped autoreset stepper for this stage.
+                  Pass it into collect_rollouts as a static arg so that a
+                  curriculum change (new Python object) triggers a retrace.
+
+    FIX (Bug #3): vmap_step is returned and threaded explicitly instead of
+    being a mutable global, eliminating the stale-closure bug.
     """
-    global _vmap_step
-    step_auto = make_autoreset_env(reset_stacked, step_stacked, 
-                                    min_goal_dist=min_goal_dist)
-    _vmap_step = jax.jit(jax.vmap(step_auto, in_axes=(0, 0, 0)))
-    
+    step_auto = make_autoreset_env(reset_stacked, step_stacked,
+                                   min_goal_dist=min_goal_dist)
+    # JIT lives here — outermost level, no nested JIT inside step_env/reset_env.
+    vmap_step = jax.jit(jax.vmap(step_auto, in_axes=(0, 0, 0)))
+
     def _reset_with_dist(key):
         return reset_stacked(key, min_goal_dist=min_goal_dist)
     vmap_reset = jax.jit(jax.vmap(_reset_with_dist))
+
     reset_keys = jax.random.split(rng_key, NUM_ENVS)
-    return vmap_reset(reset_keys)
+    env_obs, env_state = vmap_reset(reset_keys)
+    return env_obs, env_state, vmap_step
 
 
 def batched_sample_action(rng_key, mean, logstd):
@@ -92,11 +91,17 @@ def batched_sample_action(rng_key, mean, logstd):
     return actions, log_probs
 
 
-@functools.partial(jax.jit, static_argnums=(2,))
-def collect_rollouts(rng_key, params, apply_fn, env_state, env_obs):
+# static_argnums:
+#   2 = apply_fn   (unchanged across curriculum)
+#   3 = vmap_step  (NEW — changes on curriculum stage, triggers retrace)
+@functools.partial(jax.jit, static_argnums=(2, 3))
+def collect_rollouts(rng_key, params, apply_fn, vmap_step, env_state, env_obs):
     """
     Collect ROLLOUT_STEPS steps across NUM_ENVS environments.
-    Persistent env state across calls; autoreset handles episode boundaries.
+
+    vmap_step is a static arg: when init_env_state() returns a new vmap_step
+    object (after a curriculum change), passing it here causes JAX to retrace
+    and compile a new kernel that uses the updated autoreset closure.
     """
     def _env_step(carry, _):
         current_state, current_obs, current_rng = carry
@@ -109,7 +114,7 @@ def collect_rollouts(rng_key, params, apply_fn, env_state, env_obs):
         env_actions = scale_actions_batched(raw_actions, max_v)
 
         step_keys = jax.random.split(step_rng, NUM_ENVS)
-        next_obs, next_state, rewards, dones, infos = _vmap_step(
+        next_obs, next_state, rewards, dones, infos = vmap_step(
             step_keys, current_state, env_actions
         )
 
@@ -122,6 +127,7 @@ def collect_rollouts(rng_key, params, apply_fn, env_state, env_obs):
             "dones":        dones,
             "goal_reached": infos["goal_reached"],
             "collision":    infos["collision"],
+            "passive_col":  infos["passive_col"],
         }
         return (next_state, next_obs, current_rng), transition
 

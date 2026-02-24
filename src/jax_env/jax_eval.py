@@ -27,7 +27,11 @@ from jax_env import (reset_env, step_env,
                      NUM_OBS_CIR, NUM_OBS_BOX, MAX_STEPS)
 from jax_wrappers import make_stacked_env
 from jax_network import EndToEndActorCritic, scale_action_to_env
-from jax_train import OBS_SIZE
+
+# OBS_SIZE defined here directly to avoid importing jax_train,
+# which calls _verify_gpu() at module level and crashes on CPU-only eval.
+# Must match jax_train.OBS_SIZE: 9 (pose×3) + 9 (state_vec) + 324 (lidar×3) = 342
+OBS_SIZE = 342
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 SIM_SIZE   = 800

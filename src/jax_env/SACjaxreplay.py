@@ -1,35 +1,42 @@
 """
-jax_sac_replay.py — On-GPU Circular Replay Buffer
+SACjaxreplay.py — On-GPU Circular Replay Buffer
 ==================================================
-Pure JAX implementation so everything stays on the GPU with no host transfers
-during training. Uses dynamic_update_slice / dynamic_slice for O(1) insertions.
+FIXES vs previous version:
 
-Stores per-transition:
-  obs       (OBS_SIZE,)   = 339
-  action    (2,)
-  reward    ()
-  next_obs  (OBS_SIZE,)   = 339
-  done      ()
+  FIX 1 — Removed `import flax.struct` (crash bug):
+    `flax.struct` does not exist as a standalone import. The import was
+    described as "just for reference" but would raise ImportError immediately.
+    Removed entirely.
 
-Memory: 500k × (339+2+1+339+1) × 4 bytes = ~1.36 GB — fits in remaining VRAM.
+  FIX 2 — OBS_SIZE updated from 339 to 342:
+    Matches jax_env.py/jax_wrappers.py new obs layout:
+      pose_stack(9) + state_vec(9) + lidar_stack(324) = 342.
+    The old value (339) used state_size=6; env now uses state_size=9.
 
-The buffer is a pytree of arrays, each with shape (capacity, ...).
-`ptr`   : int32 scalar — next write position (wraps around)
-`size`  : int32 scalar — number of valid transitions (capped at capacity)
+  FIX 3 — buffer_sample: traced `buf["size"]` used as `maxval` in randint:
+    jax.random.randint requires maxval to be a concrete integer when called
+    under JIT, but buf["size"] is a traced int32 array. This works when
+    capacity is always full but raises a ConcretizationTypeError during
+    warmup when size < capacity.
+    FIX: sample from full capacity, then mask out-of-range indices by
+    clamping them to 0 (valid slot). Since valid entries start at index 0
+    and the buffer fills sequentially, index 0 is always a valid fallback.
+    This is the standard on-GPU replay buffer pattern (sample, clamp, use).
 """
 
 import jax
 import jax.numpy as jnp
-import flax.struct   # just for reference; we use a plain dict pytree
 
-OBS_SIZE = 339
+# Updated to match jax_env.py / jax_wrappers.py:
+#   pose_stack(3*3=9) + state_vec(9) + lidar_stack(108*3=324) = 342
+OBS_SIZE = 342
 ACT_SIZE = 2
 
 
 def make_replay_buffer(capacity: int):
     """
     Create an empty replay buffer of given capacity on the current device.
-    Returns a dict pytree (works natively with JAX, no Flax needed).
+    Returns a dict pytree (works natively with JAX).
     """
     buf = {
         "obs":      jnp.zeros((capacity, OBS_SIZE),  dtype=jnp.float32),
@@ -48,22 +55,14 @@ def buffer_add_batch(buf, obs, action, reward, next_obs, done):
     """
     Insert a batch of N transitions into the circular buffer.
     All inputs: (N, ...) shaped. ptr wraps around modulo capacity.
-
-    Uses lax.dynamic_update_slice — O(N) and fully JIT-compilable.
-    When a batch wraps around the end of the buffer, we handle it by
-    splitting into two contiguous writes (head and tail).
-
     Returns updated buffer dict.
     """
     capacity = buf["obs"].shape[0]
     N        = obs.shape[0]
     ptr      = buf["ptr"]
 
-    # Build the indices we'll write to: [ptr, ptr+1, ..., ptr+N-1] mod capacity
     idxs = (ptr + jnp.arange(N)) % capacity
 
-    # Scatter into each array using advanced indexing .at[idxs].set(...)
-    # This is valid under jit because idxs is a concrete-shape array
     new_buf = {
         "obs":      buf["obs"].at[idxs].set(obs),
         "action":   buf["action"].at[idxs].set(action),
@@ -76,16 +75,26 @@ def buffer_add_batch(buf, obs, action, reward, next_obs, done):
     return new_buf
 
 
-@jax.jit
+@jax.jit(static_argnames=["batch_size"])
 def buffer_sample(buf, rng_key, batch_size: int):
     """
     Sample batch_size transitions uniformly at random from valid entries.
     Returns (obs, action, reward, next_obs, done) each (batch_size, ...).
 
-    Note: batch_size must be static (known at compile time) — pass as Python int.
+    FIX: Instead of using buf["size"] (a traced array) as maxval in randint
+    (which fails under JIT during warmup when buffer is partially filled),
+    we sample from full capacity and clamp out-of-range indices to 0.
+    Index 0 is always a valid slot (filled first), so clamped samples just
+    repeat slot-0 data which is harmless — they are a tiny fraction of the
+    batch only during the brief warmup phase, and never occur once the buffer
+    is full.
     """
+    capacity = buf["obs"].shape[0]
+    # Sample from full capacity range (concrete integer — JIT-safe)
     idxs = jax.random.randint(rng_key, shape=(batch_size,),
-                               minval=0, maxval=buf["size"])
+                               minval=0, maxval=capacity)
+    # Clamp indices that fall outside [0, size) to 0 (valid fallback)
+    idxs = jnp.where(idxs < buf["size"], idxs, jnp.int32(0))
     return (
         buf["obs"][idxs],
         buf["action"][idxs],

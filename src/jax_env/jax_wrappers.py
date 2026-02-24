@@ -1,25 +1,17 @@
 """
 jax_wrappers.py — Observation Stacking & Auto-Reset
 ====================================================
-CHANGES vs previous version:
+FIXES vs previous version:
 
-  Updated for new obs layout from jax_env.py:
-    STATE_VEC_SIZE: 6 → 9  (rear_prox expanded from 1 scalar to 4 scalars)
-    SINGLE_OBS_SIZE: 117 → 120
-    Stacked OBS_SIZE: 339 → 342  (9 + 9 + 324)
+  FIX — @jax.jit removed from reset_stacked, step_stacked, step_autoreset
+    (Issue #8, coordinated with jax_env.py and jax_train.py):
+    All three functions were @jax.jit decorated but are always called from
+    within an outer jax.jit (the vmap in jax_train.init_env_state).
+    Nested JIT prevents XLA from fusing across boundaries and adds tracing
+    overhead. JIT now lives only at the outermost vmap level in jax_train.py.
 
-  IMPROVEMENT (carried) — jnp.roll replaced with slice-assign.
-
-  CURRICULUM (NEW) — reset_stacked accepts min_goal_dist:
-    The signature is reset_stacked(key, min_goal_dist=3.0) and it forwards
-    the value to base_reset_fn (i.e. reset_env). Because min_goal_dist is a
-    Python float in the JAX static-args sense, changing it causes a retrace
-    of the JIT-ted reset — acceptable since it happens at most 3 times.
-    jax_train.init_env_state() builds a closure over the current curriculum
-    distance and passes it to jax.vmap, so the curriculum propagates
-    naturally without any changes to collect_rollouts or step logic.
-
-  UNCHANGED — autoreset broadcast logic was already correct.
+  All previous changes (obs layout 342, slice-assign stacking, curriculum
+  min_goal_dist forwarding) are carried forward unchanged.
 
 Obs layout: [pose_stack(3*stack_dim=9) | state_vec(9) | lidar_stack(num_rays*stack_dim=324)]
 Total: 9 + 9 + 324 = 342
@@ -45,9 +37,11 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3, num_rays: 
     Temporal stacking wrapper.
     Obs layout: [pose_stack(3*stack_dim) | state_vec(STATE_VEC_SIZE) | lidar_stack(num_rays*stack_dim)]
     Total: 9 + 9 + 324 = 342 elements.
+
+    FIX: @jax.jit removed from reset_stacked and step_stacked.
+    JIT lives only at the outermost vmap level in jax_train.py.
     """
 
-    @jax.jit
     def reset_stacked(key, min_goal_dist: float = 3.0):
         base_obs, base_state = base_reset_fn(key, min_goal_dist)
         pose      = base_obs[0:POSE_SIZE]
@@ -67,7 +61,6 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3, num_rays: 
         ])
         return flat_obs, stacked_state
 
-    @jax.jit
     def step_stacked(key, state: StackedEnvState, action):
         base_obs, new_base_state, reward, done, info = base_step_fn(key, state.env_state, action)
 
@@ -75,7 +68,6 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3, num_rays: 
         new_state_vec = base_obs[POSE_SIZE : POSE_SIZE + STATE_VEC_SIZE]
         new_lidar     = base_obs[POSE_SIZE + STATE_VEC_SIZE:]
 
-        # IMPROVEMENT: concatenate slice instead of roll+set — avoids gather permutation
         new_lidar_stack = jnp.concatenate([state.lidar_stack[1:], new_lidar[None]], axis=0)
         new_pose_stack  = jnp.concatenate([state.pose_stack[1:],  new_pose[None]],  axis=0)
 
@@ -93,14 +85,18 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3, num_rays: 
 
 
 def make_autoreset_env(reset_fn, step_fn, min_goal_dist: float = 3.0):
-    @jax.jit
+    """
+    FIX: @jax.jit removed from step_autoreset.
+    JIT lives only at the outermost vmap level in jax_train.py.
+    """
     def step_autoreset(key, state, action):
         step_key, reset_key = jax.random.split(key)
         obs, next_state, reward, done, info = step_fn(step_key, state, action)
-        reset_obs, reset_state = reset_fn(reset_key, min_goal_dist) 
+        reset_obs, reset_state = reset_fn(reset_key, min_goal_dist)
 
         def _select(reset_leaf, next_leaf):
-            d = done.reshape((1,) * reset_leaf.ndim) if reset_leaf.ndim > 0 else done
+            d = jnp.asarray(done)
+            d = d.reshape((1,) * next_leaf.ndim) if next_leaf.ndim > 0 else d
             return jnp.where(d, reset_leaf, next_leaf)
 
         final_state = jax.tree_util.tree_map(_select, reset_state, next_state)

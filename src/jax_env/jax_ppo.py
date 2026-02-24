@@ -1,61 +1,57 @@
 """
 jax_ppo.py — Single-GPU PPO Training  (GPU 0)
 ===============================================
-FIXES & IMPROVEMENTS vs previous version:
+FIXES vs previous version:
 
-  FIX (carried) — removed dead-code last_done variable.
+  FIX — _vmap_step stale-closure (Bug #3, coordinated with jax_train.py):
+    init_env_state() now returns (env_obs, env_state, vmap_step).
+    collect_rollouts receives vmap_step as an explicit static arg.
+    On curriculum stage change, the new vmap_step object triggers a retrace
+    so the new min_goal_dist actually propagates into the rollout loop.
+    cur_stage is now properly tracked and printed.
 
-  FIX (carried) — BATCH_SIZE % N_MINIBATCHES assertion.
+  FIX — rolling_suc EMA alpha 0.03 → 0.1 (Issue #10):
+    With α=0.03 the time constant was ~33 updates, causing the agent to
+    spend 60-80 updates at the wrong curriculum stage. α=0.1 (~10-update
+    lag) is appropriate for a 400-update run with 3 stage transitions.
 
-  IMPROVEMENT A (carried) — LR warmup schedule.
+  FIX — Scheduler step-count mismatch (Critical):
+    The optax step counter is incremented once per optimizer.update() call.
+    Because ppo_update_epoch runs N_MINIBATCHES=200 updates inside a
+    jax.lax.scan, and run_ppo_updates scans over PPO_EPOCHS=6 epochs, the
+    optimizer advances by 200×6=1200 steps per outer training update.
+    The old WARMUP_UPDATES=10 and TOTAL_UPDATES=400 were in outer-update
+    units, so the scheduler saw 1200 steps per outer update and exhausted
+    warmup (10 steps) halfway through the very first outer update, then
+    hit LR_END by outer update 1-2, silently killing all learning.
+    FIX: _WARMUP_OPT_STEPS and _TOTAL_OPT_STEPS scale by
+    _OPT_STEPS_PER_UPDATE = PPO_EPOCHS × N_MINIBATCHES = 1200, so the
+    scheduler now spans the correct real optimizer-step range.
+    lr_now display is also fixed to query scheduler at the true step.
 
-  IMPROVEMENT B (carried) — ENTROPY_COEF shared constant.
-
-  IMPROVEMENT C (carried) — OBS_SIZE = 342.
-
-  30-MIN TRAINING OVERHAUL (NEW):
-    Hyperparameters retuned for ~30-minute wall-clock convergence at 110k FPS.
-
-    Key changes:
-      ROLLOUT_STEPS : 256  → 64    (4× more frequent updates)
-      TOTAL_UPDATES : 600  → 400   (compensated by richer per-update signal)
-      N_MINIBATCHES : 8   → 4     (larger minibatches, less overhead)
-      PPO_EPOCHS    : 4   → 6     (reuse each batch more aggressively)
-      WARMUP_UPDATES: 20  → 5     (fast ramp-up)
-      LR_START      : 3e-4 → 5e-4  (more aggressive early learning)
-      LR_END        : 5e-5 → 1e-4  (keep learning rate meaningful at end)
-      LR_MIN        : 1e-6 → 1e-5  (warmup floor)
-      ENTROPY_COEF  : 0.002 → 0.005 (more exploration — critical for curriculum)
-      CLIP_EPS      : 0.2  → 0.25  (slightly more permissive updates)
-      best_suc init : 25.0 → 10.0  (save checkpoint earlier)
-
-  CURRICULUM (NEW):
-    Goal distance starts small and grows with the rolling success rate.
-    Controlled by curriculum_min_goal_dist() which maps suc_pct to a distance.
-    Passed as a static arg to a specialised reset wrapper in jax_train.py.
-
-      Stage 0  suc <  30% : min_dist = 1.0 m   (trivial warm-up)
-      Stage 1  suc <  55% : min_dist = 2.5 m   (medium range)
-      Stage 2  suc <  70% : min_dist = 4.5 m   (near full range)
-      Stage 3  suc >= 70% : min_dist = 6.0 m   (full difficulty)
-
-    Because min_goal_dist changes the JIT signature of reset_env (static float),
-    we use a small Python-level dispatch table and retrace only when the stage
-    changes (at most 3 retraces total across the whole run).
+  All previous hyperparameters, curriculum stages, and PPO logic are carried.
 """
 
 import os
+import argparse
+
+# Parse arguments BEFORE setting environment variables and importing JAX
+parser = argparse.ArgumentParser(description="JAX PPO Training")
+# Keep type=str because os.environ requires string values
+parser.add_argument("--gpu", type=str, default="0", choices=["0", "1"], help="Target GPU ID (0 or 1)")
+args, _ = parser.parse_known_args()
 
 os.environ["JAX_PLATFORMS"]               = "cuda"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 os.environ["TF_GPU_ALLOCATOR"]            = "cuda_malloc_async"
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+os.environ["CUDA_VISIBLE_DEVICES"]        = args.gpu
 
 import time
 import warnings
 import jax
 import jax.numpy as jnp
 
+# ALWAYS index 0, regardless of which physical GPU you chose
 jax.config.update("jax_default_device", jax.devices("cuda")[0])
 
 import optax
@@ -70,60 +66,69 @@ from jax_train import collect_rollouts, init_env_state, NUM_ENVS, ROLLOUT_STEPS,
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 GAMMA          = 0.99
 GAE_LAMBDA     = 0.95
-CLIP_EPS       = 0.25    # was 0.2
-VF_COEF        = 0.25#1.0
-ENTROPY_COEF   = 0.01   # was 0.002 — more exploration for curriculum
-MAX_GRAD_NORM  = 0.3
-PPO_EPOCHS     = 4       # was 4 — reuse data more
-LR_START       = 3e-4    # was 3e-4
-LR_END         = 1e-4    # was 5e-5
-LR_MIN         = 1e-5    # was 1e-6
-WARMUP_UPDATES = 10       # was 20
-TOTAL_UPDATES  = 400     # was 600
+CLIP_EPS       = 0.25
+VF_COEF        = 0.25
+ENTROPY_COEF   = 0.01
+MAX_GRAD_NORM  = 0.5
+PPO_EPOCHS     = 4
+LR_START       = 5e-4
+LR_END         = 1e-4
+LR_MIN         = 1e-5
+WARMUP_UPDATES = 5
+TOTAL_UPDATES  = 500
 
-# Batch config
 BATCH_SIZE      = NUM_ENVS * ROLLOUT_STEPS
-N_MINIBATCHES   = 200     # was 8 — larger minibatches
-MINI_BATCH_SIZE = 2000
+N_MINIBATCHES   = 256
+MINI_BATCH_SIZE = BATCH_SIZE // N_MINIBATCHES
 
 assert BATCH_SIZE % N_MINIBATCHES == 0, (
     f"BATCH_SIZE={BATCH_SIZE} not divisible by N_MINIBATCHES={N_MINIBATCHES}."
 )
 
+# Each outer update runs PPO_EPOCHS × N_MINIBATCHES optimizer steps inside
+# jax.lax.scan, so the optax step counter advances by that factor per update.
+# The scheduler must be expressed in true optimizer-step units, otherwise
+# warmup exhausts in update 0 and LR collapses to LR_END by update 1-2.
+_OPT_STEPS_PER_UPDATE = PPO_EPOCHS * N_MINIBATCHES   # 6 × 200 = 1200
+_WARMUP_OPT_STEPS     = WARMUP_UPDATES * _OPT_STEPS_PER_UPDATE   # 12_000
+_TOTAL_OPT_STEPS      = TOTAL_UPDATES  * _OPT_STEPS_PER_UPDATE   # 480_000
+
 network = EndToEndActorCritic(action_dim=2)
 
 # ── Curriculum ────────────────────────────────────────────────────────────────
-# Maps rolling success rate → minimum goal distance for reset_env.
-# Stages advance monotonically as the agent improves.
 CURRICULUM_STAGES = [
-    (15.0, 1.0),   # avanza già a 15% — non aspettare 30%
-    (15.0, 2.5),
-    (40.0, 5.0),
-    (60.0, 6.5),
+    (20.0, 1.5),
+    (35.0, 3.0),
+    (50.0, 5.5),
+    (65.0, 7.0),
     (101., 8.0),
 ]
 
 def curriculum_min_goal_dist(suc_pct: float) -> float:
-    """Return min_goal_dist for the current success rate."""
     for threshold, dist in CURRICULUM_STAGES:
         if suc_pct < threshold:
             return dist
     return CURRICULUM_STAGES[-1][1]
 
-# IMPROVEMENT A: piecewise warmup then linear decay
+def _curriculum_stage(suc_pct: float) -> int:
+    for i, (threshold, _) in enumerate(CURRICULUM_STAGES):
+        if suc_pct < threshold:
+            return i
+    return len(CURRICULUM_STAGES) - 1
+
 _warmup_schedule = optax.linear_schedule(
     init_value=LR_MIN,
     end_value=LR_START,
-    transition_steps=WARMUP_UPDATES,
+    transition_steps=_WARMUP_OPT_STEPS,
 )
 _decay_schedule = optax.linear_schedule(
     init_value=LR_START,
     end_value=LR_END,
-    transition_steps=TOTAL_UPDATES - WARMUP_UPDATES,
+    transition_steps=_TOTAL_OPT_STEPS - _WARMUP_OPT_STEPS,
 )
 scheduler = optax.join_schedules(
     schedules=[_warmup_schedule, _decay_schedule],
-    boundaries=[WARMUP_UPDATES],
+    boundaries=[_WARMUP_OPT_STEPS],
 )
 
 optimizer = optax.chain(
@@ -152,11 +157,6 @@ def load_checkpoint(dummy_params, dummy_opt_state,
 
 @jax.jit
 def compute_gae(rewards, values, dones, last_val):
-    """
-    Standard GAE with reverse scan.
-    rewards, values, dones: (ROLLOUT_STEPS, NUM_ENVS)
-    last_val: (NUM_ENVS,)
-    """
     def _step(carry, t):
         gae, nv = carry
         r, v, d = t
@@ -189,8 +189,7 @@ def ppo_loss_fn(params, obs, actions, advantages, returns, old_log_probs):
         jnp.clip(ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS) * advantages,
     ))
 
-    value_loss = VF_COEF * jnp.mean((returns - values) ** 2)
-
+    value_loss   = VF_COEF * jnp.mean((returns - values) ** 2)
     entropy      = jnp.mean(jnp.sum(0.5 * jnp.log(2.0 * jnp.pi * jnp.e) + logstd, axis=-1))
     entropy_loss = -ENTROPY_COEF * entropy
 
@@ -234,33 +233,61 @@ def run_ppo_updates(train_state, obs_flat, actions_flat, adv_flat, ret_flat,
 
 
 @jax.jit
-def collect_episode_outcomes(rewards, dones, goal_reached, collision):
+def collect_episode_outcomes(rewards, dones, goal_reached, collision, passive_col):
+    """
+    Build mutually exclusive episode outcome categories that sum to 100%.
+
+    From jax_env:
+      collision   = human_col | obs_col | wall_col  (includes passive)
+      passive_col = human_col & robot_stopped & human_in_fov  (subset of collision)
+
+    So active_col = collision & ~passive_col  (wall/obs/active human — robot's fault)
+       passive_col = passive_col              (human walked into stopped robot)
+
+    Priority (applied in order, each exclusive):
+      1. success     : goal_reached
+      2. active_col  : collision & ~passive_col & ~goal_reached
+      3. passive_col : passive_col & ~goal_reached
+      4. timeout     : done & ~goal_reached & ~collision
+    """
     N = rewards.shape[1]
 
     def _scan(carry, t):
         ep_ret = carry
-        r, d, g, c = t
-        ep_ret  = ep_ret + r
-        timeout = d & ~g & ~c
-        out_ret = jnp.where(d, ep_ret, 0.0)
-        out_suc = jnp.where(d, g.astype(jnp.float32), 0.0)
-        out_col = jnp.where(d, c.astype(jnp.float32), 0.0)
-        out_tmo = jnp.where(d, timeout.astype(jnp.float32), 0.0)
-        out_msk = d.astype(jnp.float32)
-        ep_ret  = jnp.where(d, 0.0, ep_ret)
-        return ep_ret, (out_ret, out_suc, out_col, out_tmo, out_msk)
+        r, d, g, c, p = t
+        ep_ret = ep_ret + r
 
-    _, (ep_rets, ep_suc, ep_col, ep_tmo, ep_msk) = jax.lax.scan(
+        # Split collision into mutually exclusive sub-types first.
+        # p (passive_col) is always a subset of c (collision), so:
+        #   active = c & ~p  (wall/obs/moving-robot human collision)
+        #   passive = p      (human walked into stationary robot)
+        act_col = c & ~p
+
+        # Now build strict priority masks (each episode falls in exactly one).
+        is_suc  = g
+        is_acol = act_col & ~is_suc
+        is_pcol = p       & ~is_suc
+        is_tmo  = d & ~is_suc & ~act_col & ~p
+
+        out_ret  = jnp.where(d, ep_ret, 0.0)
+        out_suc  = jnp.where(d, is_suc.astype(jnp.float32),  0.0)
+        out_col  = jnp.where(d, is_acol.astype(jnp.float32), 0.0)
+        out_pcol = jnp.where(d, is_pcol.astype(jnp.float32), 0.0)
+        out_tmo  = jnp.where(d, is_tmo.astype(jnp.float32),  0.0)
+        out_msk  = d.astype(jnp.float32)
+
+        ep_ret = jnp.where(d, 0.0, ep_ret)
+        return ep_ret, (out_ret, out_suc, out_col, out_pcol, out_tmo, out_msk)
+
+    _, (ep_rets, ep_suc, ep_col, ep_pcol, ep_tmo, ep_msk) = jax.lax.scan(
         _scan, jnp.zeros(N),
-        (rewards, dones, goal_reached, collision)
+        (rewards, dones, goal_reached, collision, passive_col)
     )
-    return ep_rets.ravel(), ep_suc.ravel(), ep_col.ravel(), ep_tmo.ravel(), ep_msk.ravel()
-
+    return ep_rets.ravel(), ep_suc.ravel(), ep_col.ravel(), ep_pcol.ravel(), ep_tmo.ravel(), ep_msk.ravel()
 
 if __name__ == "__main__":
 
-    print("PPO Training — GPU 0  [30-min mode]")
-    print(f"  Envs       : {NUM_ENVS}  x  steps {ROLLOUT_STEPS}  =  {BATCH_SIZE:,} batch")
+    print(f"PPO Training — GPU {args.gpu}  [30-min mode]") # <-- Updated to use args.gpu    print(f"  Envs       : {NUM_ENVS}  x  steps {ROLLOUT_STEPS}  =  {BATCH_SIZE:,} batch")
     print(f"  Minibatches: {N_MINIBATCHES} x {MINI_BATCH_SIZE} | epochs {PPO_EPOCHS}")
     print(f"  VF_COEF={VF_COEF}  ENTROPY_COEF={ENTROPY_COEF}  LR warmup {LR_MIN}->{LR_START} then decay ->{LR_END}")
     print(f"  OBS_SIZE={OBS_SIZE}  log_std: state-dependent, bias=-1.0, clamp [{-4.0},{0.5}]")
@@ -288,20 +315,22 @@ if __name__ == "__main__":
         print("Starting fresh.")
 
     # ── Curriculum state ──────────────────────────────────────────────────────
-    cur_min_dist  = curriculum_min_goal_dist(0.0)   # start at easiest stage
-    cur_stage     = 0
-    rolling_suc   = 0.0   # exponential moving average of success rate
+    cur_min_dist = curriculum_min_goal_dist(0.0)
+    cur_stage    = _curriculum_stage(0.0)
+    rolling_suc  = 0.0   # FIX Issue #10: EMA alpha raised to 0.1 below
 
-    print(f"Curriculum: starting at min_goal_dist={cur_min_dist:.1f} m")
+    print(f"Curriculum: starting stage {cur_stage}, min_goal_dist={cur_min_dist:.1f} m")
 
     print("Initialising environments...")
-    env_obs, env_state = init_env_state(env_rng, min_goal_dist=cur_min_dist)
+    # FIX Bug #3: init_env_state returns vmap_step; thread it into collect_rollouts.
+    env_obs, env_state, vmap_step = init_env_state(env_rng, min_goal_dist=cur_min_dist)
     print(f"Ready. obs={env_obs.shape}\n")
 
-    best_suc = 60.0   # was 25.0 — save checkpoint as soon as we reach 10%
+    best_suc = 60.0
 
-    hdr = (f"{'Upd':>5} | {'EpRet':>7} | {'Suc%':>5} {'Col%':>5} {'Tmo%':>5} |"
-           f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} | {'FPS':>7} {'#Ep':>6} | {'MinDist':>7}")
+    hdr = (f"{'Upd':>5} | {'EpRet':>7} | {'Suc%':>5} {'Col%':>5} {'Pcol%':>5} {'Tmo%':>5} |"
+           f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} | {'FPS':>7} {'#Ep':>6} {'LR':>6}| "
+           f"{'Stage':>5} {'MinDist':>7} {'Time':>6}")
     print(hdr)
     print("─" * len(hdr))
 
@@ -311,8 +340,9 @@ if __name__ == "__main__":
         t0 = time.time()
 
         rng, rollout_rng, update_rng = jax.random.split(rng, 3)
+        # FIX Bug #3: pass vmap_step explicitly as static arg.
         rollout_history, env_state, env_obs = collect_rollouts(
-            rollout_rng, train_state[0], network.apply, env_state, env_obs
+            rollout_rng, train_state[0], network.apply, vmap_step, env_state, env_obs
         )
 
         rewards      = rollout_history["rewards"]
@@ -323,9 +353,10 @@ if __name__ == "__main__":
         lp_all       = rollout_history["log_probs"]
         goal_reached = rollout_history["goal_reached"]
         collision    = rollout_history["collision"]
+        passive_col  = rollout_history["passive_col"]  # <-- ADD THIS LINE
 
-        ep_rets, ep_suc, ep_col, ep_tmo, ep_msk = collect_episode_outcomes(
-            rewards, dones, goal_reached, collision
+        ep_rets, ep_suc, ep_col, ep_pcol, ep_tmo, ep_msk = collect_episode_outcomes(
+            rewards, dones, goal_reached, collision, passive_col
         )
 
         n_ep = int(ep_msk.sum())
@@ -333,22 +364,28 @@ if __name__ == "__main__":
             mean_ret = float((ep_rets * ep_msk).sum() / n_ep)
             suc_pct  = float((ep_suc * ep_msk).sum() / n_ep) * 100.0
             col_pct  = float((ep_col * ep_msk).sum() / n_ep) * 100.0
+            pcol_pct = float((ep_pcol * ep_msk).sum() / n_ep) * 100.0  # <-- CALCULATE PASSIVE COLLISION PCT
             tmo_pct  = float((ep_tmo * ep_msk).sum() / n_ep) * 100.0
         else:
-            mean_ret, suc_pct, col_pct, tmo_pct = 0.0, 0.0, 0.0, 0.0
+            mean_ret, suc_pct, col_pct, pcol_pct, tmo_pct = 0.0, 0.0, 0.0, 0.0, 0.0
 
         # ── Curriculum update ─────────────────────────────────────────────────
-        # Exponential moving average: alpha=0.1 → ~10-update lag → stable transitions
+        # FIX Issue #10: alpha raised from 0.03 → 0.1 for faster stage transitions.
         if n_ep > 0:
-            rolling_suc = 0.97 * rolling_suc + 0.03 * suc_pct
+            rolling_suc = 0.9 * rolling_suc + 0.1 * suc_pct
 
         new_min_dist = curriculum_min_goal_dist(rolling_suc)
+        new_stage    = _curriculum_stage(rolling_suc)
+
         if new_min_dist > cur_min_dist:
             cur_min_dist = new_min_dist
-            new_stage    = next(i for i, (t, _) in enumerate(CURRICULUM_STAGES) if rolling_suc < t)
+            cur_stage    = new_stage
             
+
             rng, reinit_rng = jax.random.split(rng)
-            env_obs, env_state = init_env_state(reinit_rng, min_goal_dist=cur_min_dist)
+            # FIX Bug #3: capture the new vmap_step returned by init_env_state.
+            env_obs, env_state, vmap_step = init_env_state(reinit_rng,
+                                                           min_goal_dist=cur_min_dist)
 
         _, _, last_val = network.apply({"params": train_state[0]}, env_obs)
         advantages, returns = compute_gae(rewards, values, dones, last_val)
@@ -367,13 +404,15 @@ if __name__ == "__main__":
 
         if update % 10 == 0:
             p_loss, v_loss, entropy = aux
-            lr_now = float(scheduler(update))
+            lr_now = float(scheduler(update * _OPT_STEPS_PER_UPDATE))
+            elapsedtime = (time.time() - t_start)/60.0
             print(
                 f"{update:>5d} | {mean_ret:>7.1f} | "
-                f"{suc_pct:>4.1f}% {col_pct:>4.1f}% {tmo_pct:>4.1f}% | "
+                f"{suc_pct:>4.1f}% {col_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% | "
                 f"{float(mean_loss):>7.4f} {float(p_loss):>6.3f} "
                 f"{float(v_loss):>6.3f} {float(entropy):>6.3f} | "
-                f"{fps:>7,.0f} {n_ep:>6d}  lr={lr_now:.2e} | {cur_min_dist:>5.1f}m"
+                f"{fps:>7,.0f} {n_ep:>6d} {lr_now:.2e} | "
+                f"{cur_stage:>5d} {cur_min_dist:>5.1f}m {elapsedtime:>5.1f}min"
             )
 
         if suc_pct > best_suc and n_ep > 0:

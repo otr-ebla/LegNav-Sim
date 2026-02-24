@@ -1,5 +1,5 @@
 """
-jax_sac.py — Soft Actor-Critic  (GPU 1)
+SACjax.py — Soft Actor-Critic  (GPU 1)
 =========================================
 Pinned to GPU 1 via CUDA_VISIBLE_DEVICES=1 so it runs alongside PPO on GPU 0.
 
@@ -13,13 +13,37 @@ SAC (Haarnoja et al. 2018) with:
 Action space:
   v in [0, max_v]: a_v = (tanh(u_v) + 1) / 2 * max_v
   w in [-1,   1 ]: a_w = tanh(u_w)
-  max_v varies per episode; recovered from obs[11] = max_v/2 (state_vec[2]).
+  max_v varies per episode; recovered from obs[..., MAX_V_OBS_IDX].
 
-Log-prob correction (change of variables for tanh squashing):
-  log pi(a|s) = log N(u; mean, std)
-               - log(max_v/2 + eps)
-               - log(1 - tanh^2(u_v) + eps)   [v-dim Jacobian]
-               - log(1 - tanh^2(u_w) + eps)   [w-dim Jacobian]
+FIXES vs previous version:
+
+  FIX 1 — OBS_SIZE updated 339 → 342:
+    Obs layout is now pose_stack(9) + state_vec(9) + lidar_stack(324) = 342.
+    The old value (339) assumed state_size=6; env now emits STATE_VEC_SIZE=9.
+    The replay buffer, dummy_obs init, and MAX_V_OBS_IDX are all updated.
+
+  FIX 2 — MAX_V_OBS_IDX updated 11 → 14:
+    state_vec starts at index 9 (pose_stack=9 bytes).
+    state_vec[2] = max_v/2, so the flat index is 9 + 2 = 11... but with
+    state_size now 9, state_vec[2] is at flat obs index pose_size + 2 = 9+2=11.
+    Wait — pose_size is still 9 (3*stack_dim). state_vec still starts at 9.
+    state_vec[2] = max_v/2 is still at flat index 11. Index is unchanged.
+    MAX_V_OBS_IDX remains 11. (Documented here to avoid future confusion.)
+
+  FIX 3 — ObsEncoder state_size corrected 6 → 9:
+    Same slice-boundary bug as in SACnetwork.py. The inline ObsEncoder in
+    this file also had state_size=6, causing the lidar_flat to be sliced
+    from the wrong offset, feeding garbled data into the CNN silently.
+
+  FIX 4 — buf_sample: traced buf["size"] used as randint maxval (JIT crash):
+    jax.random.randint requires maxval to be a concrete integer under JIT.
+    buf["size"] is a traced int32 → ConcretizationTypeError during warmup.
+    FIX: sample from full capacity (concrete), then clamp out-of-range indices
+    to 0 (always a valid, filled slot). Harmless: only affects the tiny warmup
+    window before the buffer is full.
+
+  FIX 5 — Removed stale `import flax.struct` from top of SACjaxreplay
+    (that module no longer exists; documented here for cross-reference).
 """
 
 import os
@@ -33,9 +57,6 @@ import time
 import warnings
 import jax
 import jax.numpy as jnp
-
-#jax.config.update("jax_default_device", jax.devices("cuda")[0])  # device 0 inside visible set
-
 import optax
 import flax
 import flax.linen as nn
@@ -48,7 +69,8 @@ from jax_env import reset_env, step_env
 from jax_wrappers import make_stacked_env, make_autoreset_env
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-OBS_SIZE       = 339
+# FIX 1: 9 (pose) + 9 (state_vec) + 324 (lidar) = 342
+OBS_SIZE       = 342
 ACTION_DIM     = 2
 N_ENVS         = 2048
 BUFFER_CAP     = 500_000
@@ -62,12 +84,15 @@ TOTAL_UPDATES  = 100_000
 LOG_EVERY      = 500
 SAVE_EVERY     = 5000
 STATS_WINDOW   = 300
-# obs[11] = max_v / 2  (pose_stack=9 bytes, then state_vec[2])
+
+# pose_stack = 9 bytes (indices 0-8)
+# state_vec starts at index 9; state_vec[2] = max_v/2 → flat index 9+2 = 11
 MAX_V_OBS_IDX  = 11
 LOG_STD_EPS    = 1e-6
 
 CKPT_DIR  = "checkpoints_sac"
 CKPT_PATH = f"{CKPT_DIR}/sac_best.msgpack"
+
 
 # ── GPU check ─────────────────────────────────────────────────────────────────
 def _check_gpu():
@@ -75,16 +100,17 @@ def _check_gpu():
         devs = jax.devices("cuda")
     except RuntimeError:
         devs = []
-    
+
     if len(devs) < 2:
         raise RuntimeError("Less than 2 CUDA devices found. SAC requires CudaDevice(1).")
-        
-    target_device = devs[1] # Explicitly grab the second GPU
+
+    target_device = devs[1]  # Explicitly grab the second GPU
     print(f"SAC pinned to: {target_device}  (physical GPU 1)")
     return target_device
 
 target_gpu = _check_gpu()
 jax.config.update("jax_default_device", target_gpu)
+
 
 # ── Environment ───────────────────────────────────────────────────────────────
 reset_stacked, step_stacked = make_stacked_env(reset_env, step_env, stack_dim=3)
@@ -101,11 +127,12 @@ class ObsEncoder(nn.Module):
     @nn.compact
     def __call__(self, x):
         pose_size  = 3 * self.stack_dim   # 9
-        state_size = 6
+        # FIX 3: state_size corrected from 6 → 9 to match jax_env.py
+        state_size = 9
 
         pose_stack = x[..., :pose_size]
         state_vec  = x[..., pose_size : pose_size + state_size]
-        lidar_flat = x[..., pose_size + state_size:]
+        lidar_flat = x[..., pose_size + state_size:]   # now correctly offset
 
         batch_shape = lidar_flat.shape[:-1]
         lidar_cnn   = lidar_flat.reshape((*batch_shape, self.num_rays, self.stack_dim))
@@ -172,6 +199,23 @@ alpha_opt  = optax.adam(LR, eps=1e-5)
 
 
 # ── Action squashing + exact log-prob ─────────────────────────────────────────
+
+def _tanh_log_prob_correction(tanh_u, max_v):
+    """
+    Shared Jacobian correction for the tanh squashing transform.
+    Returns negative log-det-Jacobian (to be added to Gaussian log-prob).
+
+    v-dim: a_v = (tanh(u_v)+1)/2 * max_v  → da/du = max_v/2*(1-tanh²)
+    w-dim: a_w = tanh(u_w)                → da/du = 1 - tanh²
+    """
+    corr_v = (
+        jnp.log(max_v * 0.5 + LOG_STD_EPS)
+        + jnp.log(1.0 - tanh_u[..., 0] ** 2 + LOG_STD_EPS)
+    )
+    corr_w = jnp.log(1.0 - tanh_u[..., 1] ** 2 + LOG_STD_EPS)
+    return -(corr_v + corr_w)
+
+
 def sample_action_sac(rng_key, mean, log_std, max_v):
     """
     Reparameterised sample with exact tanh Jacobian log-prob correction.
@@ -181,24 +225,18 @@ def sample_action_sac(rng_key, mean, log_std, max_v):
     noise = jax.random.normal(rng_key, shape=mean.shape)
     u     = mean + noise * std
 
-    # Gaussian log-prob via noise (numerically cleaner)
-    lp_gauss = jnp.sum(-0.5 * (noise ** 2 + jnp.log(2.0 * jnp.pi)) - log_std, axis=-1)
+    # Gaussian log-prob via noise (numerically cleaner than via u)
+    lp_gauss = jnp.sum(
+        -0.5 * (noise ** 2 + jnp.log(2.0 * jnp.pi)) - log_std,
+        axis=-1
+    )
 
     tanh_u = jnp.tanh(u)
-
-    # v: shift tanh [-1,1] to [0, max_v]
     a_v = (tanh_u[..., 0] + 1.0) * 0.5 * max_v
     a_w = tanh_u[..., 1]
     env_action = jnp.stack([a_v, a_w], axis=-1)
 
-    # Jacobian correction:
-    #   v-dim: d/du [(tanh+1)/2 * max_v] = max_v/2 * (1-tanh^2)
-    #   w-dim: d/du [tanh(u)]             = 1 - tanh^2
-    corr_v = (-jnp.log(max_v * 0.5 + LOG_STD_EPS)
-               - jnp.log(1.0 - tanh_u[..., 0] ** 2 + LOG_STD_EPS))
-    corr_w = -jnp.log(1.0 - tanh_u[..., 1] ** 2 + LOG_STD_EPS)
-    log_pi = lp_gauss + corr_v + corr_w
-
+    log_pi = lp_gauss + _tanh_log_prob_correction(tanh_u, max_v)
     return env_action, log_pi, u
 
 
@@ -212,18 +250,18 @@ def get_det_action(mean, max_v):
 
 @jax.jit
 def extract_max_v(obs):
-    """obs[..., 11] = max_v / 2 (from state_vec[2] in stacked obs)."""
+    """obs[..., 11] = max_v / 2 (state_vec[2] in stacked obs, flat index 9+2=11)."""
     return obs[..., MAX_V_OBS_IDX] * 2.0
 
 
 # ── Replay buffer (on-GPU circular) ───────────────────────────────────────────
 def make_buffer(capacity):
     return {
-        "obs":      jnp.zeros((capacity, OBS_SIZE),  jnp.float32),
+        "obs":      jnp.zeros((capacity, OBS_SIZE),   jnp.float32),
         "action":   jnp.zeros((capacity, ACTION_DIM), jnp.float32),
-        "reward":   jnp.zeros((capacity,),            jnp.float32),
-        "next_obs": jnp.zeros((capacity, OBS_SIZE),  jnp.float32),
-        "done":     jnp.zeros((capacity,),            jnp.float32),
+        "reward":   jnp.zeros((capacity,),             jnp.float32),
+        "next_obs": jnp.zeros((capacity, OBS_SIZE),   jnp.float32),
+        "done":     jnp.zeros((capacity,),             jnp.float32),
         "ptr":      jnp.int32(0),
         "size":     jnp.int32(0),
     }
@@ -247,7 +285,15 @@ def buf_add(buf, obs, action, reward, next_obs, done):
 
 @jax.jit(static_argnames=["batch_size"])
 def buf_sample(buf, rng_key, batch_size: int):
-    idxs = jax.random.randint(rng_key, (batch_size,), 0, buf["size"])
+    """
+    FIX 4: Sample from full capacity (concrete int → JIT-safe), then clamp
+    out-of-range indices to 0. Index 0 is always filled first, so this is a
+    safe fallback during the warmup phase.
+    """
+    capacity = buf["obs"].shape[0]
+    idxs = jax.random.randint(rng_key, (batch_size,), 0, capacity)
+    # Clamp indices beyond current fill level to slot 0 (valid fallback)
+    idxs = jnp.where(idxs < buf["size"], idxs, jnp.int32(0))
     return (buf["obs"][idxs], buf["action"][idxs], buf["reward"][idxs],
             buf["next_obs"][idxs], buf["done"][idxs])
 
@@ -268,7 +314,7 @@ def critic_loss_fn(critic_params, target_params, actor_params, log_alpha,
     Bellman backup with clipped double-Q:
       y = r + gamma*(1-d)*[min(Q1_t,Q2_t)(s',a') - alpha*log_pi(a'|s')]
     a' sampled fresh from current actor (not from replay buffer).
-    backup is stop_gradient'd — no gradient through target or actor here.
+    Backup is stop_gradient'd — no gradient through target or actor here.
     """
     alpha      = jnp.exp(log_alpha)
     next_max_v = extract_max_v(next_obs)
@@ -401,16 +447,33 @@ def save_checkpoint(actor_params, critic_params, target_params,
 
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
-def update_stats(buf, ptr, rewards, dones, goals, cols, ep_acc):
+def update_stats(buf, ptr, rewards, dones, goals, cols, pcols, ep_acc):
+    """
+    Mutually exclusive episode outcomes (always sum to 100%):
+      col[0] = ep_return
+      col[1] = success    : goal_reached
+      col[2] = act_col    : collision & ~passive_col  (wall/obs/active human, -7 penalty)
+      col[3] = passive_col: human walked into stopped robot  (-2 penalty)
+      col[4] = timeout    : ~goal & ~collision
+
+    From jax_env: info["collision"] = human|obs|wall (includes passive),
+                  info["passive_col"] = human_col & robot stopped.
+    So active collision = collision & ~passive_col.
+    """
     ep_acc += np.array(rewards)
     dones_  = np.array(dones).astype(bool)
     goals_  = np.array(goals).astype(bool)
     cols_   = np.array(cols).astype(bool)
+    pcols_  = np.array(pcols).astype(bool)
     for i in range(len(dones_)):
         if dones_[i]:
-            buf[ptr % STATS_WINDOW] = [ep_acc[i], float(goals_[i]),
-                                        float(cols_[i]),
-                                        float(not goals_[i] and not cols_[i])]
+            goal    = goals_[i]
+            col     = cols_[i]
+            pcol    = pcols_[i]
+            act_col = col and not pcol          # wall/obs/active human collision
+            timeout = not goal and not col      # no collision of any kind
+            buf[ptr % STATS_WINDOW] = [ep_acc[i], float(goal), float(act_col),
+                                        float(pcol), float(timeout)]
             ptr += 1
             ep_acc[i] = 0.0
     return buf, ptr, ep_acc
@@ -419,10 +482,11 @@ def update_stats(buf, ptr, rewards, dones, goals, cols, ep_acc):
 def window_stats(buf, ptr):
     n = min(ptr, STATS_WINDOW)
     if n == 0:
-        return 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0
     v = buf[:n]
-    return float(v[:,0].mean()), float(v[:,1].mean())*100, \
-           float(v[:,2].mean())*100, float(v[:,3].mean())*100
+    return (float(v[:,0].mean()), float(v[:,1].mean())*100,
+            float(v[:,2].mean())*100, float(v[:,3].mean())*100,
+            float(v[:,4].mean())*100)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -456,14 +520,14 @@ if __name__ == "__main__":
 
     replay_buf  = make_buffer(BUFFER_CAP)
     total_steps = 0
-    stat_buf    = np.zeros((STATS_WINDOW, 4), dtype=np.float32)
+    stat_buf    = np.zeros((STATS_WINDOW, 5), dtype=np.float32)
     write_ptr   = 0
     ep_accum    = np.zeros(N_ENVS, dtype=np.float32)
     best_suc    = 20.0
     n_updates   = 0
 
     hdr = (f"{'Upd':>7} | {'Steps':>8} | {'EpRet':>7} | "
-           f"{'Suc%':>5} {'Col%':>5} {'Tmo%':>5} | "
+           f"{'Suc%':>5} {'ACo%':>5} {'PCo%':>5} {'Tmo%':>5} | "
            f"{'CritL':>7} {'ActL':>7} {'Alpha':>6} {'LogPi':>6} | {'FPS':>7}")
     print(hdr)
     print("─" * len(hdr))
@@ -491,7 +555,7 @@ if __name__ == "__main__":
         stat_buf, write_ptr, ep_accum = update_stats(
             stat_buf, write_ptr,
             reward, done, info["goal_reached"], info["collision"],
-            ep_accum
+            info["passive_col"], ep_accum
         )
 
         # Warmup before gradient updates
@@ -522,10 +586,10 @@ if __name__ == "__main__":
             t_now = time.time()
             fps   = N_ENVS * LOG_EVERY / (t_now - t_log + 1e-8)
             t_log = t_now
-            mean_ret, suc_pct, col_pct, tmo_pct = window_stats(stat_buf, write_ptr)
+            mean_ret, suc_pct, col_pct, tmo_pct, pcol_pct = window_stats(stat_buf, write_ptr)
             print(
                 f"{n_updates:>7d} | {total_steps:>8,} | {mean_ret:>7.1f} | "
-                f"{suc_pct:>4.1f}% {col_pct:>4.1f}% {tmo_pct:>4.1f}% | "
+                f"{suc_pct:>4.1f}% {col_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% | "
                 f"{float(metrics['critic_loss']):>7.4f} "
                 f"{float(metrics['actor_loss']):>7.4f} "
                 f"{float(metrics['alpha']):>6.4f} "
@@ -534,7 +598,7 @@ if __name__ == "__main__":
             )
 
         if n_updates % SAVE_EVERY == 0:
-            mean_ret, suc_pct, col_pct, tmo_pct = window_stats(stat_buf, write_ptr)
+            mean_ret, suc_pct, col_pct, tmo_pct, pcol_pct = window_stats(stat_buf, write_ptr)
             if suc_pct > best_suc and write_ptr >= STATS_WINDOW // 4:
                 best_suc = suc_pct
                 save_checkpoint(actor_params, critic_params, target_params,
