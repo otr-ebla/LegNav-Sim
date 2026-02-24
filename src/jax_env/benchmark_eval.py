@@ -91,28 +91,29 @@ def dynamic_reset_stacked(key, min_dist, scen_idx, target_max_v):
     """Resets env and injects the target max_v immediately."""
     base_obs, base_state = reset_env(key, min_dist, scen_idx)
     
+    # get_obs layout: pose(3) + state_vec(9) + lidar(108) = 120
+    # Correct slices:
+    pose      = base_obs[0:3]        # 3 elements
+    state_vec = base_obs[3:12]       # 9 elements (state_vec)
+    lidar     = base_obs[12:]        # 108 elements (front lidar)
+
     # Force the specific target_max_v
     base_state = base_state.replace(max_v=target_max_v)
     
     # Recompute state vector with new max_v
-    dx = base_state.goal_x - base_state.x
-    dy = base_state.goal_y - base_state.y
-    max_goal_dist = jnp.sqrt(ROOM_W**2 + ROOM_H**2)
-    goal_dist  = jnp.sqrt(dx**2 + dy**2)
-    goal_angle = jnp.arctan2(dy, dx)
-    goal_align = (goal_angle - base_state.theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
-    
+    # state_vec layout: [v/max_v, w, max_v_norm, goal_dist, goal_align, rear_prox×4]
     new_state_vec = jnp.array([
-        0.0, 0.0, (target_max_v - 0.2) / 1.8,
-        goal_dist / max_goal_dist, goal_align / jnp.pi,
-        base_obs[14], base_obs[15], base_obs[16], base_obs[17] # rear prox
+        0.0,                                    # v/max_v  (just reset)
+        0.0,                                    # w        (just reset)
+        (target_max_v - 0.2) / 1.8,            # max_v_norm
+        state_vec[3],                           # goal_dist (reuse from obs)
+        state_vec[4],                           # goal_align (reuse from obs)
+        state_vec[5], state_vec[6],             # rear prox 0,1
+        state_vec[7], state_vec[8],             # rear prox 2,3
     ])
     
-    pose      = base_obs[0:9]
-    lidar     = base_obs[18:]
-    
-    lidar_stack = jnp.tile(lidar[None, :], (3, 1))
-    pose_stack  = jnp.tile(pose[:3][None,  :], (3, 1))
+    lidar_stack = jnp.tile(lidar[None, :], (3, 1))   # (3, 108)
+    pose_stack  = jnp.tile(pose[None,  :], (3, 1))   # (3, 3)
     
     stacked_state = StackedEnvState(env_state=base_state, lidar_stack=lidar_stack, pose_stack=pose_stack)
     flat_obs = jnp.concatenate([pose_stack.flatten(), new_state_vec, lidar_stack.flatten()])
@@ -121,9 +122,10 @@ def dynamic_reset_stacked(key, min_dist, scen_idx, target_max_v):
 @jax.jit
 def step_stacked_headless(key, state: StackedEnvState, action):
     base_obs, new_base_state, reward, done, info = step_env(key, state.env_state, action)
-    new_pose      = base_obs[0:9][:3]
-    new_state_vec = base_obs[9:18]
-    new_lidar     = base_obs[18:]
+    # get_obs layout: pose(3) + state_vec(9) + lidar(108) = 120
+    new_pose      = base_obs[0:3]        # 3 elements
+    new_state_vec = base_obs[3:12]       # 9 elements
+    new_lidar     = base_obs[12:]        # 108 elements
 
     new_lidar_stack = jnp.concatenate([state.lidar_stack[1:], new_lidar[None]], axis=0)
     new_pose_stack  = jnp.concatenate([state.pose_stack[1:],  new_pose[None]],  axis=0)
