@@ -8,7 +8,7 @@ dataset in seconds, and outputs a high-res comparison dashboard image.
 
 import os
 # Force GPU for massive parallel evaluation
-os.environ["JAX_PLATFORMS"]               = "cuda"
+os.environ["JAX_PLATFORMS"]               = "cuda,cpu"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 os.environ["TF_GPU_ALLOCATOR"]            = "cuda_malloc_async"
 
