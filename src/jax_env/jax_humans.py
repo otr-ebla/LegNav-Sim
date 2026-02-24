@@ -33,8 +33,8 @@ human array: [px, py, vx, vy, angle, is_distracted, wait_timer, target_speed]
 import jax
 import jax.numpy as jnp
 
-REACTION_DIST = 1.0    # robot repulsion radius (m)
-REP_STRENGTH  = 6.0    # repulsion force magnitude
+REACTION_DIST = 1.5   # robot repulsion radius (m)
+REP_STRENGTH  = 8.0    # repulsion force magnitude
 HUMAN_RADIUS  = 0.2    # same as PEOPLE_RADIUS in jax_env.py
 
 
@@ -119,7 +119,8 @@ def _update_single_human(human, key, all_humans,
     # 1. Stochastic Events
     k1, k2, k3 = jax.random.split(key, 3)
 
-    toggle_distract = jax.random.uniform(k1) < 0.01
+    #toggle_distract = jax.random.uniform(k1) < 0.01
+    toggle_distract = jnp.array(False)
     is_distracted   = jnp.where(toggle_distract, 1.0 - is_distracted, is_distracted)
 
     start_waiting = (wait_timer <= 0.0) & (jax.random.uniform(k2) < 0.005)

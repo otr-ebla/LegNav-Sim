@@ -222,9 +222,10 @@ def draw_panel(surface, fonts, ep, step, ep_ret, v, w, goal_dist, goal_align,
 
     if banner_t > 0:
         label, col = {
-            "success"  : ("✓  GOAL REACHED", C_SUCCESS),
-            "collision": ("✗  COLLISION",    C_COLLIDE),
-            "timeout"  : ("⏱  TIMEOUT",      C_TIMEOUT),
+            "success"     : ("✓  GOAL REACHED", C_SUCCESS),
+            "collision"   : ("✗  COLLISION",    C_COLLIDE),
+            "passive_col" : ("🚶 PASSIVE COL",  (200, 100, 100)), # Added passive collision UI
+            "timeout"     : ("⏱  TIMEOUT",      C_TIMEOUT),
         }.get(banner, ("", C_TEXT))
         if label:
             surf = fonts["big"].render(label, True, col)
@@ -349,15 +350,19 @@ def main():
             goal = bool(info["goal_reached"])
             col  = bool(info["collision"])
             pcol = bool(info["passive_col"])
-            tmo  = not goal and not col
+            
+            # Separate active from passive collisions to ensure mutually exclusive metrics
+            active_col = col and not pcol
+            tmo        = not goal and not col
 
-            banner   = "success" if goal else ("collision" if col else "timeout")
+            # Correctly route all 4 mutually exclusive states
+            banner   = "success" if goal else ("collision" if active_col else ("passive_col" if pcol else "timeout"))
             banner_t = fps * 2
 
-            ep_hist.append((ep_reward, float(goal), float(col), float(tmo), float(pcol)))
+            ep_hist.append((ep_reward, float(goal), float(active_col), float(tmo), float(pcol)))
 
             print(f"  Ep {ep:03d} finished — steps:{ep_steps} reward:{ep_reward:+.1f}  "
-                  f"{'GOAL ✅' if goal else 'COLLISION 💥' if col else 'TIMEOUT ⏱️'}")
+                  f"{'GOAL ✅' if goal else 'PASSIVE COL 🚶' if pcol else 'COLLISION 💥' if active_col else 'TIMEOUT ⏱️'}")
 
             ep += 1
             ep_reward = 0.0

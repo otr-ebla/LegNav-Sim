@@ -1,49 +1,34 @@
 """
-SACjax.py — Soft Actor-Critic  (GPU 1)
-=========================================
+TQCjax.py — Truncated Quantile Critics  (GPU 1)
+================================================
 Pinned to GPU 1 via CUDA_VISIBLE_DEVICES=1 so it runs alongside PPO on GPU 0.
 
-SAC (Haarnoja et al. 2018) with:
-  - Twin critics + target networks (soft update tau=0.005)
-  - Squashed Gaussian policy with exact tanh Jacobian log-prob correction
-  - Automatic temperature (alpha) tuning to maintain target entropy = -|A|
-  - On-GPU circular replay buffer (500k transitions, ~1.4 GB)
-  - Vectorised collection across N_ENVS parallel environments
+TQC (Kuznetsov et al. 2020, https://arxiv.org/abs/2005.04269) extends SAC with:
+  - N_CRITICS separate critic networks, each outputting N_ATOMS quantile atoms
+  - Critic loss: quantile Huber regression (not MSE)
+  - Target backup: sort the N_CRITICS * N_ATOMS target atoms per sample,
+    DROP the top N_TOP_ATOMS_DROP to suppress overestimation, regress the
+    remaining (N_CRITICS * N_ATOMS - N_TOP_ATOMS_DROP) atoms
+  - Actor loss: maximise mean over ALL atoms across ALL critics
+  - Automatic alpha tuning: identical to SAC
 
-Action space:
+Key shapes (defaults: N_CRITICS=5, N_ATOMS=25, N_TOP_ATOMS_DROP=5):
+  critic output per network  : (batch, N_ATOMS)
+  all critics stacked         : (batch, N_CRITICS, N_ATOMS)
+  total target atoms          : N_CRITICS * N_ATOMS = 125
+  after dropping top-5        : N_TARGET_ATOMS = 120
+  quantile midpoints τ        : (N_ATOMS,)  τ_i = (2i-1)/(2*N_ATOMS)
+
+Action space (same as SAC):
   v in [0, max_v]: a_v = (tanh(u_v) + 1) / 2 * max_v
   w in [-1,   1 ]: a_w = tanh(u_w)
-  max_v varies per episode; recovered from obs[..., MAX_V_OBS_IDX].
+  max_v recovered from obs[..., MAX_V_OBS_IDX] * 2.
 
-FIXES vs previous version:
-
-  FIX 1 — OBS_SIZE updated 339 → 342:
-    Obs layout is now pose_stack(9) + state_vec(9) + lidar_stack(324) = 342.
-    The old value (339) assumed state_size=6; env now emits STATE_VEC_SIZE=9.
-    The replay buffer, dummy_obs init, and MAX_V_OBS_IDX are all updated.
-
-  FIX 2 — MAX_V_OBS_IDX updated 11 → 14:
-    state_vec starts at index 9 (pose_stack=9 bytes).
-    state_vec[2] = max_v/2, so the flat index is 9 + 2 = 11... but with
-    state_size now 9, state_vec[2] is at flat obs index pose_size + 2 = 9+2=11.
-    Wait — pose_size is still 9 (3*stack_dim). state_vec still starts at 9.
-    state_vec[2] = max_v/2 is still at flat index 11. Index is unchanged.
-    MAX_V_OBS_IDX remains 11. (Documented here to avoid future confusion.)
-
-  FIX 3 — ObsEncoder state_size corrected 6 → 9:
-    Same slice-boundary bug as in SACnetwork.py. The inline ObsEncoder in
-    this file also had state_size=6, causing the lidar_flat to be sliced
-    from the wrong offset, feeding garbled data into the CNN silently.
-
-  FIX 4 — buf_sample: traced buf["size"] used as randint maxval (JIT crash):
-    jax.random.randint requires maxval to be a concrete integer under JIT.
-    buf["size"] is a traced int32 → ConcretizationTypeError during warmup.
-    FIX: sample from full capacity (concrete), then clamp out-of-range indices
-    to 0 (always a valid, filled slot). Harmless: only affects the tiny warmup
-    window before the buffer is full.
-
-  FIX 5 — Removed stale `import flax.struct` from top of SACjaxreplay
-    (that module no longer exists; documented here for cross-reference).
+Quantile Huber loss (κ=1):
+  u     = target_j - atom_i
+  L_κ   = 0.5*u²            if |u| <= κ, else  κ*(|u| - 0.5*κ)
+  ρ_τ_i = |τ_i - (u < 0)| * L_κ / κ
+  loss  = mean_over_batch[ mean_over_atoms[ mean_over_targets[ρ] ] ]
 """
 
 import os
@@ -68,9 +53,8 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 from jax_env import reset_env, step_env
 from jax_wrappers import make_stacked_env, make_autoreset_env
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-# FIX 1: 9 (pose) + 9 (state_vec) + 324 (lidar) = 342
-OBS_SIZE       = 342
+# ── Hyperparameters ───────────────────────────────────────────────────────────
+OBS_SIZE       = 342        # pose_stack(9) + state_vec(9) + lidar_stack(324)
 ACTION_DIM     = 2
 N_ENVS         = 2048
 BUFFER_CAP     = 500_000
@@ -85,13 +69,19 @@ LOG_EVERY      = 500
 SAVE_EVERY     = 5000
 STATS_WINDOW   = 300
 
-# pose_stack = 9 bytes (indices 0-8)
-# state_vec starts at index 9; state_vec[2] = max_v/2 → flat index 9+2 = 11
-MAX_V_OBS_IDX  = 11
-LOG_STD_EPS    = 1e-6
+# TQC-specific
+N_CRITICS        = 5     # number of independent critic networks
+N_ATOMS          = 25    # quantile atoms per critic
+N_TOP_ATOMS_DROP = 5     # drop this many largest target atoms per sample
+N_TARGET_ATOMS   = N_CRITICS * N_ATOMS - N_TOP_ATOMS_DROP   # 120
+HUBER_KAPPA      = 1.0   # Huber loss threshold κ
 
-CKPT_DIR  = "checkpoints_sac"
-CKPT_PATH = f"{CKPT_DIR}/sac_best.msgpack"
+# obs[..., 11] = max_v/2  (pose_stack=9, state_vec[2] at flat index 9+2=11)
+MAX_V_OBS_IDX = 11
+LOG_STD_EPS   = 1e-6
+
+CKPT_DIR  = "checkpoints_tqc"
+CKPT_PATH = f"{CKPT_DIR}/tqc_best.msgpack"
 
 
 # ── GPU check ─────────────────────────────────────────────────────────────────
@@ -100,12 +90,10 @@ def _check_gpu():
         devs = jax.devices("cuda")
     except RuntimeError:
         devs = []
-
     if len(devs) < 2:
-        raise RuntimeError("Less than 2 CUDA devices found. SAC requires CudaDevice(1).")
-
-    target_device = devs[1]  # Explicitly grab the second GPU
-    print(f"SAC pinned to: {target_device}  (physical GPU 1)")
+        raise RuntimeError("Less than 2 CUDA devices found. TQC requires CudaDevice(1).")
+    target_device = devs[1]
+    print(f"TQC pinned to: {target_device}  (physical GPU 1)")
     return target_device
 
 target_gpu = _check_gpu()
@@ -121,18 +109,21 @@ _vmap_step  = jax.jit(jax.vmap(step_auto, in_axes=(0, 0, 0)))
 
 # ── Shared obs encoder ────────────────────────────────────────────────────────
 class ObsEncoder(nn.Module):
+    """
+    Encodes stacked obs → 128-dim feature vector.
+    Obs layout: pose_stack(9) | state_vec(9) | lidar_stack(324) = 342
+    """
     stack_dim: int = 3
     num_rays:  int = 108
 
     @nn.compact
     def __call__(self, x):
         pose_size  = 3 * self.stack_dim   # 9
-        # FIX 3: state_size corrected from 6 → 9 to match jax_env.py
-        state_size = 9
+        state_size = 9                    # STATE_VEC_SIZE from jax_env.py
 
         pose_stack = x[..., :pose_size]
         state_vec  = x[..., pose_size : pose_size + state_size]
-        lidar_flat = x[..., pose_size + state_size:]   # now correctly offset
+        lidar_flat = x[..., pose_size + state_size:]
 
         batch_shape = lidar_flat.shape[:-1]
         lidar_cnn   = lidar_flat.reshape((*batch_shape, self.num_rays, self.stack_dim))
@@ -148,12 +139,13 @@ class ObsEncoder(nn.Module):
         fused  = jnp.concatenate([cnn_feat, global_feat], axis=-1)
         shared = nn.relu(nn.Dense(256)(fused))
         shared = nn.relu(nn.Dense(128)(shared))
-        return shared
+        return shared   # (batch, 128)
 
 
 # ── Actor ─────────────────────────────────────────────────────────────────────
-class SACActorNetwork(nn.Module):
-    action_dim: int = ACTION_DIM
+class TQCActorNetwork(nn.Module):
+    """Squashed Gaussian actor — same architecture as SAC actor."""
+    action_dim:  int   = ACTION_DIM
     LOG_STD_MIN: float = -5.0
     LOG_STD_MAX: float =  2.0
 
@@ -166,95 +158,154 @@ class SACActorNetwork(nn.Module):
         return mean, log_std
 
 
-# ── Twin critic ───────────────────────────────────────────────────────────────
-class SACCriticNetwork(nn.Module):
+# ── Single quantile critic ────────────────────────────────────────────────────
+class QuantileCriticNetwork(nn.Module):
+    """
+    One critic that outputs N_ATOMS quantile values for Q(s,a).
+    Input:  obs (batch, OBS_SIZE), action (batch, ACTION_DIM)
+    Output: atoms (batch, N_ATOMS)
+    """
+    n_atoms:    int = N_ATOMS
     action_dim: int = ACTION_DIM
 
     @nn.compact
     def __call__(self, obs, action):
-        # Separate encoders for Q1 and Q2 (no shared weights between twins)
-        feat1 = ObsEncoder(name='enc_q1')(obs)
-        feat2 = ObsEncoder(name='enc_q2')(obs)
-
-        q1_in = jnp.concatenate([feat1, action], axis=-1)
-        q2_in = jnp.concatenate([feat2, action], axis=-1)
-
-        q1 = nn.relu(nn.Dense(256, name='q1_l1')(q1_in))
-        q1 = nn.relu(nn.Dense(128, name='q1_l2')(q1))
-        q1 = jnp.squeeze(nn.Dense(1, name='q1_out')(q1), axis=-1)
-
-        q2 = nn.relu(nn.Dense(256, name='q2_l1')(q2_in))
-        q2 = nn.relu(nn.Dense(128, name='q2_l2')(q2))
-        q2 = jnp.squeeze(nn.Dense(1, name='q2_out')(q2), axis=-1)
-
-        return q1, q2
+        feat  = ObsEncoder()(obs)
+        x     = jnp.concatenate([feat, action], axis=-1)
+        x     = nn.relu(nn.Dense(256)(x))
+        x     = nn.relu(nn.Dense(128)(x))
+        atoms = nn.Dense(self.n_atoms)(x)   # (batch, N_ATOMS) — no final activation
+        return atoms
 
 
-actor_net  = SACActorNetwork()
-critic_net = SACCriticNetwork()
+# ── Ensemble of N_CRITICS quantile critics ────────────────────────────────────
+class TQCCriticEnsemble(nn.Module):
+    """
+    N_CRITICS independent QuantileCriticNetwork instances.
+    Each critic has fully separate weights (own ObsEncoder + heads).
+    Output: (batch, N_CRITICS, N_ATOMS)
+    """
+    n_critics:  int = N_CRITICS
+    n_atoms:    int = N_ATOMS
+    action_dim: int = ACTION_DIM
+
+    @nn.compact
+    def __call__(self, obs, action):
+        all_atoms = []
+        for i in range(self.n_critics):
+            atoms = QuantileCriticNetwork(
+                n_atoms=self.n_atoms,
+                action_dim=self.action_dim,
+                name=f'critic_{i}'
+            )(obs, action)   # (batch, N_ATOMS)
+            all_atoms.append(atoms)
+        return jnp.stack(all_atoms, axis=1)   # (batch, N_CRITICS, N_ATOMS)
+
+
+# ── Quantile midpoints τ (precomputed at module level) ────────────────────────
+# τ_i = (2i - 1) / (2 * N_ATOMS)  for i = 1 … N_ATOMS
+# Shape (N_ATOMS,) — used in the Huber loss below.
+_TAUS = (2.0 * jnp.arange(1, N_ATOMS + 1) - 1.0) / (2.0 * N_ATOMS)
+
+
+# ── Network + optimiser instances ─────────────────────────────────────────────
+actor_net  = TQCActorNetwork()
+critic_net = TQCCriticEnsemble()
 
 actor_opt  = optax.adam(LR, eps=1e-5)
 critic_opt = optax.adam(LR, eps=1e-5)
 alpha_opt  = optax.adam(LR, eps=1e-5)
 
 
-# ── Action squashing + exact log-prob ─────────────────────────────────────────
+# ── Action squashing helpers ──────────────────────────────────────────────────
 
 def _tanh_log_prob_correction(tanh_u, max_v):
     """
-    Shared Jacobian correction for the tanh squashing transform.
-    Returns negative log-det-Jacobian (to be added to Gaussian log-prob).
-
-    v-dim: a_v = (tanh(u_v)+1)/2 * max_v  → da/du = max_v/2*(1-tanh²)
-    w-dim: a_w = tanh(u_w)                → da/du = 1 - tanh²
+    Negative log-det-Jacobian of the squashing transform (identical to SAC).
+      v: a_v = (tanh(u_v)+1)/2 * max_v  →  log|da/du| = log(max_v/2) + log(1-tanh²)
+      w: a_w = tanh(u_w)                 →  log|da/du| = log(1-tanh²)
+    Returns the NEGATIVE sum (add to Gaussian log-prob to get log π).
     """
-    corr_v = (
-        jnp.log(max_v * 0.5 + LOG_STD_EPS)
-        + jnp.log(1.0 - tanh_u[..., 0] ** 2 + LOG_STD_EPS)
-    )
+    corr_v = (jnp.log(max_v * 0.5 + LOG_STD_EPS)
+              + jnp.log(1.0 - tanh_u[..., 0] ** 2 + LOG_STD_EPS))
     corr_w = jnp.log(1.0 - tanh_u[..., 1] ** 2 + LOG_STD_EPS)
     return -(corr_v + corr_w)
 
 
-def sample_action_sac(rng_key, mean, log_std, max_v):
+def sample_action(rng_key, mean, log_std, max_v):
     """
-    Reparameterised sample with exact tanh Jacobian log-prob correction.
-    Returns: env_action (2,), log_pi scalar, pre-squash u (2,)
+    Reparameterised sample from squashed Gaussian.
+    Returns: env_action (2,), log_pi scalar.
     """
     std   = jnp.exp(log_std)
     noise = jax.random.normal(rng_key, shape=mean.shape)
     u     = mean + noise * std
 
-    # Gaussian log-prob via noise (numerically cleaner than via u)
     lp_gauss = jnp.sum(
         -0.5 * (noise ** 2 + jnp.log(2.0 * jnp.pi)) - log_std,
         axis=-1
     )
-
-    tanh_u = jnp.tanh(u)
-    a_v = (tanh_u[..., 0] + 1.0) * 0.5 * max_v
-    a_w = tanh_u[..., 1]
+    tanh_u     = jnp.tanh(u)
+    a_v        = (tanh_u[..., 0] + 1.0) * 0.5 * max_v
+    a_w        = tanh_u[..., 1]
     env_action = jnp.stack([a_v, a_w], axis=-1)
-
-    log_pi = lp_gauss + _tanh_log_prob_correction(tanh_u, max_v)
-    return env_action, log_pi, u
-
-
-def get_det_action(mean, max_v):
-    """Deterministic eval action (no noise)."""
-    tanh_mean = jnp.tanh(mean)
-    a_v = (tanh_mean[..., 0] + 1.0) * 0.5 * max_v
-    a_w = tanh_mean[..., 1]
-    return jnp.stack([a_v, a_w], axis=-1)
+    log_pi     = lp_gauss + _tanh_log_prob_correction(tanh_u, max_v)
+    return env_action, log_pi
 
 
 @jax.jit
 def extract_max_v(obs):
-    """obs[..., 11] = max_v / 2 (state_vec[2] in stacked obs, flat index 9+2=11)."""
+    """obs[..., 11] = max_v/2  →  return max_v."""
     return obs[..., MAX_V_OBS_IDX] * 2.0
 
 
-# ── Replay buffer (on-GPU circular) ───────────────────────────────────────────
+# ── Quantile Huber loss ───────────────────────────────────────────────────────
+
+def quantile_huber_loss(atoms, targets, taus, kappa=HUBER_KAPPA):
+    """
+    Quantile Huber regression loss for one critic.
+
+    Args:
+      atoms   : (batch, N_ATOMS)         — predicted quantile values
+      targets : (batch, N_TARGET_ATOMS)  — regression targets (stop-gradient'd)
+      taus    : (N_ATOMS,)               — quantile midpoints for the predictions
+      kappa   : float                    — Huber threshold (1.0)
+
+    Returns scalar loss.
+
+    For each (b, i, j):
+      u     = targets[b,j] - atoms[b,i]      target minus prediction
+      L_κ   = 0.5*u²          if |u| <= κ
+              κ*(|u| - 0.5*κ) otherwise
+      ρ     = |τ_i - 1(u<0)| * L_κ / κ
+
+    Loss = mean_b [ (1/N_ATOMS) * sum_i [ (1/N_TARGET_ATOMS) * sum_j ρ ] ]
+    """
+    # Expand dims for broadcasting:
+    #   atoms  : (batch, N_ATOMS, 1)
+    #   targets: (batch, 1, N_TARGET_ATOMS)
+    #   u      : (batch, N_ATOMS, N_TARGET_ATOMS)
+    u = targets[:, None, :] - atoms[:, :, None]
+
+    # Huber loss
+    abs_u = jnp.abs(u)
+    huber = jnp.where(abs_u <= kappa,
+                      0.5 * u ** 2,
+                      kappa * (abs_u - 0.5 * kappa))
+
+    # Asymmetric quantile weighting: |τ_i - 1(u < 0)|
+    # taus: (N_ATOMS,) → (1, N_ATOMS, 1)
+    indicator = (u < 0.0).astype(jnp.float32)
+    weight    = jnp.abs(taus[None, :, None] - indicator)
+
+    rho = weight * huber / kappa   # (batch, N_ATOMS, N_TARGET_ATOMS)
+
+    # Mean over targets axis, then mean over atoms and batch
+    return jnp.mean(jnp.mean(rho, axis=2))   # scalar
+
+
+# ── Replay buffer ─────────────────────────────────────────────────────────────
+
 def make_buffer(capacity):
     return {
         "obs":      jnp.zeros((capacity, OBS_SIZE),   jnp.float32),
@@ -286,13 +337,11 @@ def buf_add(buf, obs, action, reward, next_obs, done):
 @jax.jit(static_argnames=["batch_size"])
 def buf_sample(buf, rng_key, batch_size: int):
     """
-    FIX 4: Sample from full capacity (concrete int → JIT-safe), then clamp
-    out-of-range indices to 0. Index 0 is always filled first, so this is a
-    safe fallback during the warmup phase.
+    Sample from full capacity (concrete int → JIT-safe).
+    Clamp out-of-range indices to slot 0 during warmup.
     """
     capacity = buf["obs"].shape[0]
     idxs = jax.random.randint(rng_key, (batch_size,), 0, capacity)
-    # Clamp indices beyond current fill level to slot 0 (valid fallback)
     idxs = jnp.where(idxs < buf["size"], idxs, jnp.int32(0))
     return (buf["obs"][idxs], buf["action"][idxs], buf["reward"][idxs],
             buf["next_obs"][idxs], buf["done"][idxs])
@@ -311,58 +360,96 @@ def soft_update(target, online):
 def critic_loss_fn(critic_params, target_params, actor_params, log_alpha,
                    obs, action, reward, next_obs, done, rng_key):
     """
-    Bellman backup with clipped double-Q:
-      y = r + gamma*(1-d)*[min(Q1_t,Q2_t)(s',a') - alpha*log_pi(a'|s')]
-    a' sampled fresh from current actor (not from replay buffer).
-    Backup is stop_gradient'd — no gradient through target or actor here.
+    TQC critic loss.
+
+    Step-by-step target construction:
+      1. Sample a' ~ π(·|s') from the CURRENT actor.
+      2. Compute target atoms via the TARGET critic: (batch, N_CRITICS, N_ATOMS).
+      3. Flatten critics dim → (batch, N_CRITICS*N_ATOMS), sort ascending.
+      4. Keep only the bottom N_TARGET_ATOMS (drop top N_TOP_ATOMS_DROP).
+         This is the truncation that suppresses overestimation.
+      5. Subtract entropy: backup_j = r + γ*(1-d)*(z*_j - α*log_π(a'|s'))
+         The entropy term is subtracted from each kept atom individually.
+         stop_gradient applied to the entire backup.
+
+    Online loss:
+      For each of the N_CRITICS online critics, compute quantile_huber_loss
+      between its (batch, N_ATOMS) outputs and the (batch, N_TARGET_ATOMS)
+      backup. Sum losses across critics.
     """
     alpha      = jnp.exp(log_alpha)
     next_max_v = extract_max_v(next_obs)
+    batch_size = obs.shape[0]
 
+    # Next action from current actor
     mean_n, lgs_n = actor_net.apply({"params": actor_params}, next_obs)
-    rng_acts = jax.random.split(rng_key, next_obs.shape[0])
-    next_act, next_lp, _ = jax.vmap(sample_action_sac)(rng_acts, mean_n, lgs_n, next_max_v)
+    rng_acts      = jax.random.split(rng_key, batch_size)
+    next_act, next_lp = jax.vmap(sample_action)(rng_acts, mean_n, lgs_n, next_max_v)
 
-    q1_t, q2_t = critic_net.apply({"params": target_params}, next_obs, next_act)
-    v_next   = jnp.minimum(q1_t, q2_t) - alpha * next_lp
-    backup   = jax.lax.stop_gradient(reward + GAMMA * (1.0 - done) * v_next)
+    # Target atoms: (batch, N_CRITICS, N_ATOMS) → flatten → sort → truncate
+    target_atoms  = critic_net.apply({"params": target_params}, next_obs, next_act)
+    target_flat   = target_atoms.reshape(batch_size, N_CRITICS * N_ATOMS)
+    target_sorted = jnp.sort(target_flat, axis=1)            # ascending along atom axis
+    target_kept   = target_sorted[:, :N_TARGET_ATOMS]        # (batch, N_TARGET_ATOMS)
 
-    q1, q2   = critic_net.apply({"params": critic_params}, obs, action)
-    loss_q1  = jnp.mean((q1 - backup) ** 2)
-    loss_q2  = jnp.mean((q2 - backup) ** 2)
-    return loss_q1 + loss_q2, (loss_q1, loss_q2, jnp.mean(backup))
+    # Bellman backup with entropy regularisation
+    # next_lp: (batch,) → (batch, 1) to broadcast across N_TARGET_ATOMS
+    backup = jax.lax.stop_gradient(
+        reward[:, None]
+        + GAMMA * (1.0 - done[:, None]) * (target_kept - alpha * next_lp[:, None])
+    )   # (batch, N_TARGET_ATOMS)
+
+    # Online atoms: (batch, N_CRITICS, N_ATOMS)
+    online_atoms = critic_net.apply({"params": critic_params}, obs, action)
+
+    # Sum quantile Huber loss across all critics
+    total_loss = jnp.float32(0.0)
+    q_sum      = jnp.float32(0.0)
+    for i in range(N_CRITICS):
+        atoms_i     = online_atoms[:, i, :]          # (batch, N_ATOMS)
+        total_loss  = total_loss + quantile_huber_loss(atoms_i, backup, _TAUS)
+        q_sum       = q_sum + jnp.mean(atoms_i)
+
+    mean_q = q_sum / N_CRITICS
+    return total_loss, mean_q
 
 
 # ── Actor loss ────────────────────────────────────────────────────────────────
 @jax.jit
 def actor_loss_fn(actor_params, critic_params, log_alpha, obs, rng_key):
     """
-    Minimise E[alpha*log_pi(a|s) - min(Q1,Q2)(s,a)].
-    Action is reparameterised -> gradient flows through actor_params.
-    critic_params not in argnums=0 -> no critic gradient here.
+    TQC actor loss:
+      L(π) = E_s [ α*log_π(a|s) - mean_{c,i}[Z_c_i(s,a)] ]
+
+    Maximising the mean over ALL critics and ALL atoms is an unbiased
+    estimate of the full distributional value E_τ[Z(s,a)].
+    No critic gradient: critic_params not in argnums=0.
     """
     alpha = jnp.exp(log_alpha)
     max_v = extract_max_v(obs)
 
     mean, log_std = actor_net.apply({"params": actor_params}, obs)
-    rng_acts = jax.random.split(rng_key, obs.shape[0])
-    action, log_pi, _ = jax.vmap(sample_action_sac)(rng_acts, mean, log_std, max_v)
+    rng_acts      = jax.random.split(rng_key, obs.shape[0])
+    action, log_pi = jax.vmap(sample_action)(rng_acts, mean, log_std, max_v)
 
-    q1, q2 = critic_net.apply({"params": critic_params}, obs, action)
-    loss   = jnp.mean(alpha * log_pi - jnp.minimum(q1, q2))
+    # (batch, N_CRITICS, N_ATOMS) → mean over all critics and atoms per sample
+    all_atoms = critic_net.apply({"params": critic_params}, obs, action)
+    q_mean    = jnp.mean(all_atoms)   # scalar: mean over batch, critics, atoms
+
+    loss = jnp.mean(alpha * log_pi) - q_mean
     return loss, jnp.mean(log_pi)
 
 
 # ── Alpha loss ────────────────────────────────────────────────────────────────
 @jax.jit
 def alpha_loss_fn(log_alpha, log_pi_mean):
-    """L(alpha) = -alpha * (log_pi + H_target). log_pi treated as constant."""
+    """Identical to SAC: L(α) = -α*(log_π + H*)."""
     return -log_alpha * (log_pi_mean + TARGET_ENTROPY)
 
 
-# ── Full SAC update step ──────────────────────────────────────────────────────
+# ── Full TQC update step ──────────────────────────────────────────────────────
 @jax.jit
-def sac_update(actor_params, actor_opt_state,
+def tqc_update(actor_params, actor_opt_state,
                critic_params, critic_opt_state,
                target_params,
                log_alpha, alpha_opt_state,
@@ -371,14 +458,14 @@ def sac_update(actor_params, actor_opt_state,
     rng_c, rng_a = jax.random.split(rng_key)
 
     # 1. Critic
-    (c_loss, (c1, c2, q_mean)), c_grads = jax.value_and_grad(
+    (c_loss, q_mean), c_grads = jax.value_and_grad(
         critic_loss_fn, argnums=0, has_aux=True
     )(critic_params, target_params, actor_params,
       log_alpha, obs, action, reward, next_obs, done, rng_c)
     c_upd, new_copt = critic_opt.update(c_grads, critic_opt_state, critic_params)
     new_critic      = optax.apply_updates(critic_params, c_upd)
 
-    # 2. Actor
+    # 2. Actor (uses freshly updated critic)
     (a_loss, log_pi_mean), a_grads = jax.value_and_grad(
         actor_loss_fn, argnums=0, has_aux=True
     )(actor_params, new_critic, log_alpha, obs, rng_a)
@@ -386,8 +473,8 @@ def sac_update(actor_params, actor_opt_state,
     new_actor       = optax.apply_updates(actor_params, a_upd)
 
     # 3. Alpha
-    log_pi_sg = jax.lax.stop_gradient(log_pi_mean)
-    al_loss, al_grad = jax.value_and_grad(alpha_loss_fn)(log_alpha, log_pi_sg)
+    log_pi_sg         = jax.lax.stop_gradient(log_pi_mean)
+    al_loss, al_grad  = jax.value_and_grad(alpha_loss_fn)(log_alpha, log_pi_sg)
     al_upd, new_alopt = alpha_opt.update(al_grad, alpha_opt_state)
     new_log_alpha     = optax.apply_updates(log_alpha, al_upd)
 
@@ -411,14 +498,14 @@ def sac_update(actor_params, actor_opt_state,
 # ── Collection step ───────────────────────────────────────────────────────────
 @jax.jit
 def collect_step(actor_params, env_state, env_obs, rng_key):
-    """One parallel step across N_ENVS envs. Actor called with full batch."""
+    """One parallel step across all N_ENVS environments."""
     rng_act, rng_step = jax.random.split(rng_key)
 
     mean, log_std = actor_net.apply({"params": actor_params}, env_obs)
     max_v         = extract_max_v(env_obs)
 
-    rng_acts = jax.random.split(rng_act, N_ENVS)
-    env_action, _lp, _ = jax.vmap(sample_action_sac)(rng_acts, mean, log_std, max_v)
+    rng_acts           = jax.random.split(rng_act, N_ENVS)
+    env_action, _lp    = jax.vmap(sample_action)(rng_acts, mean, log_std, max_v)
 
     step_keys = jax.random.split(rng_step, N_ENVS)
     new_obs, new_state, reward, done, info = _vmap_step(step_keys, env_state, env_action)
@@ -443,22 +530,18 @@ def save_checkpoint(actor_params, critic_params, target_params,
     }
     with open(CKPT_PATH, "wb") as f:
         f.write(flax.serialization.to_bytes(bundle))
-    print(f"  SAC checkpoint -> {CKPT_PATH}  (step {step})")
+    print(f"  TQC checkpoint -> {CKPT_PATH}  (step {step})")
 
 
-# ── Stats ─────────────────────────────────────────────────────────────────────
+# ── Episode stats (identical logic to SACjax.py) ─────────────────────────────
 def update_stats(buf, ptr, rewards, dones, goals, cols, pcols, ep_acc):
     """
-    Mutually exclusive episode outcomes (always sum to 100%):
-      col[0] = ep_return
-      col[1] = success    : goal_reached
-      col[2] = act_col    : collision & ~passive_col  (wall/obs/active human, -7 penalty)
-      col[3] = passive_col: human walked into stopped robot  (-2 penalty)
-      col[4] = timeout    : ~goal & ~collision
-
-    From jax_env: info["collision"] = human|obs|wall (includes passive),
-                  info["passive_col"] = human_col & robot stopped.
-    So active collision = collision & ~passive_col.
+    Mutually exclusive outcomes (always sum to 100%):
+      [0] ep_return
+      [1] success    : goal_reached
+      [2] active_col : collision & ~passive_col
+      [3] passive_col: human walked into stopped robot
+      [4] timeout    : ~goal & ~collision
     """
     ep_acc += np.array(rewards)
     dones_  = np.array(dones).astype(bool)
@@ -470,8 +553,8 @@ def update_stats(buf, ptr, rewards, dones, goals, cols, pcols, ep_acc):
             goal    = goals_[i]
             col     = cols_[i]
             pcol    = pcols_[i]
-            act_col = col and not pcol          # wall/obs/active human collision
-            timeout = not goal and not col      # no collision of any kind
+            act_col = col and not pcol
+            timeout = not goal and not col
             buf[ptr % STATS_WINDOW] = [ep_acc[i], float(goal), float(act_col),
                                         float(pcol), float(timeout)]
             ptr += 1
@@ -484,23 +567,25 @@ def window_stats(buf, ptr):
     if n == 0:
         return 0.0, 0.0, 0.0, 0.0, 0.0
     v = buf[:n]
-    return (float(v[:,0].mean()), float(v[:,1].mean())*100,
-            float(v[:,2].mean())*100, float(v[:,3].mean())*100,
-            float(v[:,4].mean())*100)
+    return (float(v[:, 0].mean()), float(v[:, 1].mean()) * 100,
+            float(v[:, 2].mean()) * 100, float(v[:, 3].mean()) * 100,
+            float(v[:, 4].mean()) * 100)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
 
-    print("SAC Training — GPU 1 (CUDA_VISIBLE_DEVICES=1)")
+    print("TQC Training — GPU 1 (CUDA_VISIBLE_DEVICES=1)")
     print(f"  N_ENVS={N_ENVS}  BUFFER={BUFFER_CAP:,}  BATCH={BATCH_SIZE}")
+    print(f"  N_CRITICS={N_CRITICS}  N_ATOMS={N_ATOMS}  "
+          f"N_TOP_DROP={N_TOP_ATOMS_DROP}  N_TARGET_ATOMS={N_TARGET_ATOMS}")
     print(f"  gamma={GAMMA}  tau={TAU}  lr={LR}  H*={TARGET_ENTROPY}\n")
 
     rng = jax.random.PRNGKey(7)
 
-    # Initialise networks
+    # ── Initialise networks ───────────────────────────────────────────────────
     rng, ka, kc = jax.random.split(rng, 3)
-    dummy_obs = jnp.zeros((2, OBS_SIZE))   # batch of 2 for Conv init
+    dummy_obs = jnp.zeros((2, OBS_SIZE))    # batch ≥ 2 for Conv shape inference
     dummy_act = jnp.zeros((2, ACTION_DIM))
 
     actor_params  = actor_net.init(ka, dummy_obs)["params"]
@@ -512,7 +597,7 @@ if __name__ == "__main__":
     log_alpha        = jnp.array(jnp.log(0.1), dtype=jnp.float32)
     alpha_opt_state  = alpha_opt.init(log_alpha)
 
-    # Init envs
+    # ── Initialise environments ───────────────────────────────────────────────
     print("Initialising environments on GPU 1...")
     rng, env_rng = jax.random.split(rng)
     env_obs, env_state = _vmap_reset(jax.random.split(env_rng, N_ENVS))
@@ -526,9 +611,9 @@ if __name__ == "__main__":
     best_suc    = 20.0
     n_updates   = 0
 
-    hdr = (f"{'Upd':>7} | {'Steps':>8} | {'EpRet':>7} | "
+    hdr = (f"{'Upd':>7} | {'Steps':>10} | {'EpRet':>7} | "
            f"{'Suc%':>5} {'ACo%':>5} {'PCo%':>5} {'Tmo%':>5} | "
-           f"{'CritL':>7} {'ActL':>7} {'Alpha':>6} {'LogPi':>6} | {'FPS':>7}")
+           f"{'CritL':>7} {'ActL':>7} {'Alpha':>6} {'LogPi':>6} {'Qmean':>7} | {'FPS':>7}")
     print(hdr)
     print("─" * len(hdr))
 
@@ -536,35 +621,31 @@ if __name__ == "__main__":
     t_log   = time.time()
 
     while n_updates < TOTAL_UPDATES:
-        # Collect one step from all envs
+
+        # ── Collect ───────────────────────────────────────────────────────────
         rng, collect_rng = jax.random.split(rng)
         new_obs, env_state, obs_before, env_action, reward, done, info = \
             collect_step(actor_params, env_state, env_obs, collect_rng)
 
-        # Add to replay buffer
-        replay_buf = buf_add(replay_buf,
-                             obs_before,
-                             env_action,
-                             reward,
-                             new_obs,
-                             done.astype(jnp.float32))
-        env_obs     = new_obs
+        replay_buf = buf_add(replay_buf, obs_before, env_action,
+                             reward, new_obs, done.astype(jnp.float32))
+        env_obs      = new_obs
         total_steps += N_ENVS
 
-        # Track episode stats
         stat_buf, write_ptr, ep_accum = update_stats(
             stat_buf, write_ptr,
-            reward, done, info["goal_reached"], info["collision"],
-            info["passive_col"], ep_accum
+            reward, done,
+            info["goal_reached"], info["collision"], info["passive_col"],
+            ep_accum
         )
 
-        # Warmup before gradient updates
+        # ── Warmup ────────────────────────────────────────────────────────────
         if total_steps < WARMUP_STEPS:
             if total_steps % (N_ENVS * 20) == 0:
                 print(f"  warmup {total_steps:,}/{WARMUP_STEPS:,}")
             continue
 
-        # One gradient update per collection step
+        # ── Update ────────────────────────────────────────────────────────────
         rng, samp_rng, upd_rng = jax.random.split(rng, 3)
         b_obs, b_act, b_rew, b_next, b_done = buf_sample(replay_buf, samp_rng, BATCH_SIZE)
 
@@ -572,7 +653,7 @@ if __name__ == "__main__":
          critic_params, critic_opt_state,
          target_params,
          log_alpha, alpha_opt_state,
-         metrics) = sac_update(
+         metrics) = tqc_update(
             actor_params, actor_opt_state,
             critic_params, critic_opt_state,
             target_params,
@@ -582,23 +663,26 @@ if __name__ == "__main__":
         )
         n_updates += 1
 
+        # ── Log ───────────────────────────────────────────────────────────────
         if n_updates % LOG_EVERY == 0:
             t_now = time.time()
             fps   = N_ENVS * LOG_EVERY / (t_now - t_log + 1e-8)
             t_log = t_now
-            mean_ret, suc_pct, col_pct, pcol_pct, tmo_pct = window_stats(stat_buf, write_ptr)
+            mean_ret, suc_pct, acol_pct, pcol_pct, tmo_pct = window_stats(stat_buf, write_ptr)
             print(
-                f"{n_updates:>7d} | {total_steps:>8,} | {mean_ret:>7.1f} | "
-                f"{suc_pct:>4.1f}% {col_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% | "
+                f"{n_updates:>7d} | {total_steps:>10,} | {mean_ret:>7.1f} | "
+                f"{suc_pct:>4.1f}% {acol_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% | "
                 f"{float(metrics['critic_loss']):>7.4f} "
                 f"{float(metrics['actor_loss']):>7.4f} "
                 f"{float(metrics['alpha']):>6.4f} "
-                f"{float(metrics['log_pi']):>6.3f} | "
+                f"{float(metrics['log_pi']):>6.3f} "
+                f"{float(metrics['q_mean']):>7.3f} | "
                 f"{fps:>7,.0f}"
             )
 
+        # ── Save ──────────────────────────────────────────────────────────────
         if n_updates % SAVE_EVERY == 0:
-            mean_ret, suc_pct, col_pct, tmo_pct, pcol_pct = window_stats(stat_buf, write_ptr)
+            mean_ret, suc_pct, acol_pct, pcol_pct, tmo_pct = window_stats(stat_buf, write_ptr)
             if suc_pct > best_suc and write_ptr >= STATS_WINDOW // 4:
                 best_suc = suc_pct
                 save_checkpoint(actor_params, critic_params, target_params,
@@ -606,4 +690,4 @@ if __name__ == "__main__":
                                 log_alpha, alpha_opt_state, n_updates)
 
     elapsed = time.time() - t_start
-    print(f"\nSAC done! {elapsed/3600:.2f}h | Best success: {best_suc:.1f}%")
+    print(f"\nTQC done! {elapsed/3600:.2f}h | Best success: {best_suc:.1f}%")
