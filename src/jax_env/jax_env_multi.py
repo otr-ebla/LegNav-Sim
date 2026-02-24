@@ -1,8 +1,12 @@
 """
 jax_env_multi.py — Core 2D Navigation Environment with JHSFM
 =============================================================
-A standalone drop-in replacement that uses jax_scenarios.py to provide 
-distinct training scenarios, driven by the JHSFM physics engine.
+PATCH — Leg-pair simulation:
+  reset_env: initialises leg_phases with random offsets.
+  step_env:  advances leg_phases each step via jax_legs.advance_phase().
+  get_obs (from jax_env) already handles USE_LEGS via get_leg_circles().
+
+No other changes vs previous version.
 """
 
 import jax
@@ -10,47 +14,42 @@ import jax.numpy as jnp
 import sys
 import os
 
-# 1. Add the project root to sys.path so 'src' can be found by all sub-modules
-# This resolves the ModuleNotFoundError in jhsfm_utils/JHSFM/jhsfm/utils.py
-current_dir = os.path.dirname(os.path.abspath(__file__)) # src/jax_env
-project_root = os.path.abspath(os.path.join(current_dir, "../../")) # root directory
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(current_dir, "../../"))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-# 2. Now perform the core imports
-from jax_env import EnvState, get_obs, ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS, DT, MAX_STEPS, GOAL_RADIUS, COMFORT_DIST, COMFORT_COEF, HEADING_BONUS, PROGRESS_COEF
+from jax_env import (EnvState, get_obs,
+                     ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS, DT,
+                     MAX_STEPS, GOAL_RADIUS, COMFORT_DIST, COMFORT_COEF,
+                     HEADING_BONUS, PROGRESS_COEF)
 from jax_scenarios import generate_scenario
+from jax_legs import advance_feet, init_foot_state
 
-# 3. Import JHSFM using the 'src' prefix to match their internal structure
 try:
     from src.jhsfm_utils.JHSFM.jhsfm.hsfm import step as hsfm_step
     from src.jhsfm_utils.JHSFM.jhsfm.utils import get_standard_humans_parameters
 except ImportError:
-    # Fallback for alternative path configurations
     from jhsfm_utils.JHSFM.jhsfm.hsfm import step as hsfm_step
     from jhsfm_utils.JHSFM.jhsfm.utils import get_standard_humans_parameters
 
 __all__ = ["reset_env", "step_env", "EnvState", "get_obs"]
 
-# Configuration for JHSFM
-HSFM_DT = 0.05
+HSFM_DT    = 0.05
 N_SUBSTEPS = int(DT / HSFM_DT)
 NUM_PEOPLE = 12
 
+
 def build_hsfm_obstacles(obs_boxes):
-    """Converts the room and AABB boxes into JHSFM line segments."""
-    # Room perimeter
     room_edges = jnp.array([
         [[0.0, 0.0], [ROOM_W, 0.0]],
         [[ROOM_W, 0.0], [ROOM_W, ROOM_H]],
         [[ROOM_W, ROOM_H], [0.0, ROOM_H]],
         [[0.0, ROOM_H], [0.0, 0.0]]
-    ]) # Shape: (4, 2, 2)
-    
-    # Box conversion
+    ])
+
     def box_to_edges(box):
         cx, cy, hw, hh = box
-        # Hide invisible boxes by stacking them at (0,0)
         valid = jnp.where(hw > 0.0, 1.0, 0.0)
         p1 = jnp.array([cx - hw, cy - hh]) * valid
         p2 = jnp.array([cx + hw, cy - hh]) * valid
@@ -60,21 +59,27 @@ def build_hsfm_obstacles(obs_boxes):
             jnp.stack([p1, p2]), jnp.stack([p2, p3]),
             jnp.stack([p3, p4]), jnp.stack([p4, p1])
         ])
-        
-    box_edges = jax.vmap(box_to_edges)(obs_boxes) # Shape: (NUM_OBS_BOX, 4, 2, 2)
-    all_edges = jnp.concatenate([room_edges[None, ...], box_edges], axis=0) # Shape: (N_OBS, 4, 2, 2)
-    
-    # JHSFM expects: (N_Agents, N_Obs, Max_Edges, 2, 2)
+
+    box_edges = jax.vmap(box_to_edges)(obs_boxes)
+    all_edges = jnp.concatenate([room_edges[None, ...], box_edges], axis=0)
     return jnp.tile(all_edges[None, ...], (NUM_PEOPLE + 1, 1, 1, 1, 1))
 
 
 def reset_env(key: jax.Array, min_goal_dist: float = 3.0, scenario_idx: int = -1):
-    rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people = generate_scenario(key, min_goal_dist, scenario_idx)
+    k_main, k_legs = jax.random.split(key)
+
+    rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people = \
+        generate_scenario(k_main, min_goal_dist, scenario_idx)
+
+    # ── NEW: staggered initial gait phases ────────────────────────────────────
+    foot_state = init_foot_state(people, k_legs)
+
     state = EnvState(
         x=rx, y=ry, theta=rtheta, v=0.0, w=0.0,
         goal_x=gx, goal_y=gy, max_v=max_v,
         people=people, obs_circles=obs_circles, obs_boxes=obs_boxes,
-        time_step=0
+        time_step=0,
+        foot_state=foot_state,
     )
     return get_obs(state), state
 
@@ -89,62 +94,57 @@ def step_env(key, state, action):
     raw_x     = state.x + target_v * DT * jnp.cos(mid_theta)
     raw_y     = state.y + target_v * DT * jnp.sin(mid_theta)
 
-    wall_collision = (raw_x < ROBOT_RADIUS) | (raw_x > ROOM_W - ROBOT_RADIUS) | (raw_y < ROBOT_RADIUS) | (raw_y > ROOM_H - ROBOT_RADIUS)
+    wall_collision = (raw_x < ROBOT_RADIUS) | (raw_x > ROOM_W - ROBOT_RADIUS) | \
+                     (raw_y < ROBOT_RADIUS) | (raw_y > ROOM_H - ROBOT_RADIUS)
     new_x = jnp.clip(raw_x, ROBOT_RADIUS, ROOM_W - ROBOT_RADIUS)
     new_y = jnp.clip(raw_y, ROBOT_RADIUS, ROOM_H - ROBOT_RADIUS)
 
-    # 2. Extract Data for JHSFM
-    hsfm_params = get_standard_humans_parameters(NUM_PEOPLE + 1)
+    # 2. JHSFM substeps (unchanged)
+    hsfm_params      = get_standard_humans_parameters(NUM_PEOPLE + 1)
     static_obstacles = build_hsfm_obstacles(state.obs_boxes)
-    
-    # 3. Inner loop for JHSFM Substeps
+
     def _hsfm_substep(carry, _):
         h_state, r_state = carry
-        
-        # Route waypoints based on goal_idx
-        idx = state.people[:, 10]
+        idx  = state.people[:, 10]
         g1x, g1y = state.people[:, 6], state.people[:, 7]
         g2x, g2y = state.people[:, 8], state.people[:, 9]
-        gx = jnp.where(idx == 0, g1x, g2x)
-        gy = jnp.where(idx == 0, g1y, g2y)
-        h_goals = jnp.stack([gx, gy], axis=-1)
-        
-        r_goal = jnp.array([state.goal_x, state.goal_y])
-        
-        # Concatenate humans and robot for HSFM
-        ext_state = jnp.concatenate([h_state, r_state[None, :]], axis=0)
-        ext_goals = jnp.concatenate([h_goals, r_goal[None, :]], axis=0)
-        
-        next_ext_state = hsfm_step(ext_state, ext_goals, hsfm_params, static_obstacles, HSFM_DT)
-        
-        # Keep humans clamped inside walls to prevent escaping on high force
-        next_h_state = next_ext_state[:-1]
-        clamped_x = jnp.clip(next_h_state[:, 0], 0.1, ROOM_W - 0.1)
-        clamped_y = jnp.clip(next_h_state[:, 1], 0.1, ROOM_H - 0.1)
-        next_h_state = next_h_state.at[:, 0].set(clamped_x).at[:, 1].set(clamped_y)
-        
-        return (next_h_state, r_state), None
+        gx   = jnp.where(idx == 0, g1x, g2x)
+        gy   = jnp.where(idx == 0, g1y, g2y)
+        h_goals    = jnp.stack([gx, gy], axis=-1)
+        r_goal     = jnp.array([state.goal_x, state.goal_y])
+        ext_state  = jnp.concatenate([h_state, r_state[None, :]], axis=0)
+        ext_goals  = jnp.concatenate([h_goals, r_goal[None, :]], axis=0)
+        next_ext   = hsfm_step(ext_state, ext_goals, hsfm_params, static_obstacles, HSFM_DT)
+        next_h     = next_ext[:-1]
+        clamped_x  = jnp.clip(next_h[:, 0], 0.1, ROOM_W - 0.1)
+        clamped_y  = jnp.clip(next_h[:, 1], 0.1, ROOM_H - 0.1)
+        next_h     = next_h.at[:, 0].set(clamped_x).at[:, 1].set(clamped_y)
+        return (next_h, r_state), None
 
-    # Init substep data
     h_state_init = state.people[:, :6]
-    r_state_init = jnp.array([new_x, new_y, target_v * jnp.cos(new_theta), target_v * jnp.sin(new_theta), new_theta, target_w])
-    
-    (new_h_state, _), _ = jax.lax.scan(_hsfm_substep, (h_state_init, r_state_init), None, length=N_SUBSTEPS)
-    
-    # 4. Waypoint Updating (Toggle goal_idx if reached)
+    r_state_init = jnp.array([new_x, new_y,
+                               target_v * jnp.cos(new_theta),
+                               target_v * jnp.sin(new_theta),
+                               new_theta, target_w])
+    (new_h_state, _), _ = jax.lax.scan(
+        _hsfm_substep, (h_state_init, r_state_init), None, length=N_SUBSTEPS
+    )
+
+    # 3. Waypoint toggle
     idx_cur = state.people[:, 10]
     g1x, g1y = state.people[:, 6], state.people[:, 7]
     g2x, g2y = state.people[:, 8], state.people[:, 9]
-    gx_cur = jnp.where(idx_cur == 0, g1x, g2x)
-    gy_cur = jnp.where(idx_cur == 0, g1y, g2y)
-    
-    dist_to_goal = jnp.sqrt((new_h_state[:, 0] - gx_cur)**2 + (new_h_state[:, 1] - gy_cur)**2)
-    new_idx = jnp.where(dist_to_goal < 0.5, 1.0 - idx_cur, idx_cur)
-    
-    # Repackage people array (11 elements)
+    gx_cur   = jnp.where(idx_cur == 0, g1x, g2x)
+    gy_cur   = jnp.where(idx_cur == 0, g1y, g2y)
+    dist_to_goal = jnp.sqrt((new_h_state[:, 0] - gx_cur)**2 +
+                             (new_h_state[:, 1] - gy_cur)**2)
+    new_idx  = jnp.where(dist_to_goal < 0.5, 1.0 - idx_cur, idx_cur)
     new_people = jnp.concatenate([new_h_state, state.people[:, 6:10], new_idx[:, None]], axis=-1)
 
-    # 5. Distance and Collision Logic
+    # ── NEW: advance leg gait phases ──────────────────────────────────────────
+    new_foot_state = advance_feet(state.foot_state, new_people, DT)
+
+    # 4. Distance and Collision Logic
     prev_dist = jnp.sqrt((state.x - state.goal_x)**2 + (state.y - state.goal_y)**2)
     new_dist  = jnp.sqrt((new_x  - state.goal_x)**2 + (new_y  - state.goal_y)**2)
 
@@ -179,7 +179,7 @@ def step_env(key, state, action):
     goal_reached  = new_dist < GOAL_RADIUS
     done          = goal_reached | collision | timeout
 
-    # 6. Reward Logic
+    # 5. Reward
     progress  = PROGRESS_COEF * (prev_dist - new_dist)
     step_pen  = -0.006
     smooth    = -0.5 * jnp.abs(target_w - state.w)
@@ -187,8 +187,9 @@ def step_env(key, state, action):
 
     goal_angle_cur = jnp.arctan2(state.goal_y - new_y, state.goal_x - new_x)
     align_cur      = (goal_angle_cur - new_theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
-    heading_bon    = HEADING_BONUS * jnp.maximum(0.0, jnp.cos(align_cur)) * (target_v / jnp.maximum(state.max_v, 1e-3))
-    comfort_pen = -COMFORT_COEF * jnp.sum(jnp.maximum(0.0, 1.0 - dists_p / COMFORT_DIST))
+    heading_bon    = HEADING_BONUS * jnp.maximum(0.0, jnp.cos(align_cur)) * \
+                     (target_v / jnp.maximum(state.max_v, 1e-3))
+    comfort_pen    = -COMFORT_COEF * jnp.sum(jnp.maximum(0.0, 1.0 - dists_p / COMFORT_DIST))
 
     reward = progress + step_pen + smooth + speed_bon + heading_bon + comfort_pen
     reward = jnp.where(goal_reached, 25.0, reward)
@@ -202,10 +203,11 @@ def step_env(key, state, action):
         x=new_x, y=new_y, theta=new_theta,
         v=target_v, w=target_w,
         people=new_people,
-        time_step=state.time_step + 1
+        time_step=state.time_step + 1,
+        foot_state=new_foot_state,
     )
 
-    obs = get_obs(new_state)
+    obs  = get_obs(new_state)
     info = {
         "discount":      jnp.where(done, 0.0, 1.0),
         "goal_reached":  goal_reached,

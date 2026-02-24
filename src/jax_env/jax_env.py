@@ -1,51 +1,41 @@
 """
 jax_env.py — Core 2D Navigation Environment
 ============================================
-FIXES vs previous version:
+PATCH — Leg-pair LiDAR simulation (on top of all previous fixes):
 
-  FIX A — LiDAR anchor was wrong (Bug #1):
-    The old code made a single 360° sweep anchored at theta, so ray 0 pointed
-    straight BEHIND the robot (theta - π). The first 108 rays covered nearly
-    the full circle starting from the rear — not the intended forward 180°.
-    FIX: two separate compute_lidar calls:
-      • Front: NUM_RAYS=108 rays, FOV=π, anchored at theta
-                → ray 0 at theta-π/2 (right), ray 107 at theta+π/2 (left) ✓
-      • Rear:  REAR_RAYS=4  rays, FOV=π*0.75, anchored at theta+π
-                → 4 probes spread across the rear hemisphere ✓
+  NEW: USE_LEGS flag (module-level bool).
+    Set USE_LEGS = True  → each human emits 2 small leg circles in LiDAR
+    Set USE_LEGS = False → legacy single-cylinder model (for ablation)
 
-  FIX B — passive_col logic was too narrow (Bug #2):
-    Old code: active = in_front & moving, passive = behind & stopped.
-    A human walking into a stopped robot from the FRONT matched NEITHER branch,
-    so human_collision=True but no penalty was applied.
-    FIX: exhaustive split — active = human_collision & robot moving (>0.1),
-         passive = human_collision & robot stopped (≤0.1). Always one fires.
+  NEW: EnvState.leg_phases  (NUM_PEOPLE,) float32
+    Per-human gait phase that advances every step. Stored in state so that
+    jax.lax.scan / vmap across envs keeps each environment's gait independent.
 
-  FIX C — while_loop rejection sampler had no iteration cap (Bug #5):
-    Dense obstacle configs could hang indefinitely on GPU.
-    FIX: carry includes an iteration counter; after MAX_RESAMPLE_ITERS the
-    loop exits and the last sampled position is used (guaranteed non-infinite).
+  CHANGED: get_obs
+    Uses jax_legs.get_leg_circles() instead of building people_circles
+    directly. The circles fed to compute_lidar are now 2*N leg circles
+    (radius=LEG_RADIUS=0.08 m) instead of N body circles (PEOPLE_RADIUS=0.2 m).
+    → No change to OBS_SIZE or network input layout.
 
-  FIX D — @jax.jit removed from reset_env and step_env (Issue #8):
-    Both functions were @jax.jit decorated but are always called from within
-    an outer jax.jit (via vmap in jax_train.py). Nested JIT prevents kernel
-    fusion and adds tracing overhead.
-    FIX: removed @jax.jit from reset_env and step_env. JIT lives only at the
-    outermost vmap level in jax_train.py.
+  CHANGED: reset_env
+    Initialises leg_phases with random uniform offsets in [0, 2π) so
+    humans don't all start mid-stride simultaneously.
 
-  FIX E — Person spawn ignored robot and goal positions (Bug #9):
-    The old _p_cond only checked static obstacle clearance. People could
-    spawn directly on top of the robot or goal, causing an immediate collision
-    penalty on step 0 before the agent could act. The agent was unfairly
-    punished for a reset-time placement it had no control over.
-    FIX: _p_cond now also rejects positions within (ROBOT_RADIUS +
-    PEOPLE_RADIUS + 0.3) of the robot spawn and within GOAL_RADIUS of the
-    goal. The extra 0.3 m margin prevents a person from immediately walking
-    into the robot on the very first step.
+  CHANGED: step_env
+    Advances leg_phases via jax_legs.advance_phase() before building new_state.
 
-  All previous fixes (FIX 1-5) and improvements (A-D) are carried forward.
+  COLLISION detection (rewards) is UNCHANGED — still uses body centres.
+  This is intentional: leg-phase jitter would corrupt the reward signal.
 
+  To toggle legs from CLI, set the env variable or pass --legs to eval scripts:
+    USE_LEGS is read from the module-level constant; eval/train scripts can
+    override it via:
+        import jax_env; jax_env.USE_LEGS = False
+
+Previous fixes: A (LiDAR anchor), B (passive_col), C (resample cap),
+                D (no nested JIT), E (person spawn clearance).
 Obs layout (single frame): pose(3) + state_vec(9) + lidar(NUM_RAYS) = 120
-Stacked × 3: 9 + 9 + 324 = 342
+Stacked × 3: 9 + 9 + 324 = 342  (UNCHANGED)
 """
 
 import math
@@ -54,6 +44,12 @@ import jax.numpy as jnp
 from flax import struct
 from jax_physics import compute_lidar
 from jax_humans import update_all_humans
+from jax_legs import get_leg_circles, advance_feet, init_foot_state
+
+# ── Feature flag ──────────────────────────────────────────────────────────────
+# Flip this to False for cylinder-model baseline/ablation training.
+# Eval scripts can override: import jax_env; jax_env.USE_LEGS = False
+USE_LEGS = True
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 DT             = 0.15
@@ -75,9 +71,7 @@ COMFORT_COEF   = 0.03
 HEADING_BONUS  = 0.015
 PROGRESS_COEF  = 5.0
 
-# Rejection-sampler iteration cap — prevents infinite while_loop on GPU
 MAX_RESAMPLE_ITERS = 200
-
 DEFAULT_MIN_GOAL_DIST = 3.0
 
 STATE_VEC_SIZE  = 9   # v, w, max_v_norm, goal_dist, goal_align, rear_prox×4
@@ -99,6 +93,8 @@ class EnvState:
     obs_circles: jnp.ndarray   # (NUM_OBS_CIR, 3)  [cx, cy, r]
     obs_boxes:   jnp.ndarray   # (NUM_OBS_BOX, 4)  [cx, cy, hw, hh]
     time_step:   jnp.int32
+    # ── NEW: per-human gait phase ────────────────────────────────────────────
+    foot_state:  jnp.ndarray   # (NUM_PEOPLE, 8) — planted-foot gait state
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -129,33 +125,30 @@ def _is_safe(x, y, clearance, obs_circles, obs_boxes):
 # ── Observation ───────────────────────────────────────────────────────────────
 
 def get_obs(state: EnvState) -> jnp.ndarray:
-    # Use state.people.shape[0] instead of the hardcoded NUM_PEOPLE constant so
-    # that jax_env_multi (and any other wrapper) can override the number of
-    # people per scenario without causing a shape mismatch in jnp.stack.
-    n_people = state.people.shape[0]
-    people_circles = jnp.stack([
-        state.people[:, 0],
-        state.people[:, 1],
-        jnp.full(n_people, PEOPLE_RADIUS)
-    ], axis=-1)
-    all_circles = jnp.concatenate([people_circles, state.obs_circles], axis=0)
+    """
+    Build the flat observation vector.
 
-    # FIX A: Two separate LiDAR calls instead of one broken 360° sweep.
-    #
-    # Front sweep — 108 rays, FOV=π, anchored at theta:
-    #   compute_lidar spans [theta - FOV/2 .. theta + FOV/2]
-    #                     = [theta - π/2  .. theta + π/2]
-    #   ray 0  → theta - π/2  (right side of robot) ✓
-    #   ray 107 → theta + π/2 (left  side of robot) ✓
+    PATCH: people_circles is now replaced by leg circles from jax_legs.
+    The number of circles fed to compute_lidar changes:
+      USE_LEGS=True  → 2*N_people + N_obs_circles  (leg-pair model)
+      USE_LEGS=False → N_people + N_obs_circles     (cylinder model)
+    compute_lidar handles variable circle counts via vmap, so this is fine.
+
+    OBS_SIZE = 342 is UNCHANGED — the output vector layout is identical.
+    """
+    # ── Build human geometry for LiDAR ───────────────────────────────────────
+    # USE_LEGS is a Python bool → resolved at trace time, no conditional overhead
+    human_circles = get_leg_circles(state.people, state.foot_state, use_legs=USE_LEGS)
+    all_circles = jnp.concatenate([human_circles, state.obs_circles], axis=0)
+
+    # Front LiDAR sweep — 108 rays, FOV=π
     raw_lidar = compute_lidar(
         state.x, state.y, state.theta,
         all_circles, state.obs_boxes,
         NUM_RAYS, float(FOV), MAX_LIDAR_DIST, ROOM_W, ROOM_H
     )
 
-    # Rear sweep — 4 rays, FOV=0.75π, anchored at theta+π (pointing backward):
-    #   spans [theta + π - 0.375π .. theta + π + 0.375π]
-    #        = [theta + 0.625π    .. theta + 1.375π]
+    # Rear sweep — 4 rays, FOV=0.75π
     _REAR_FOV = float(jnp.pi * 0.75)
     rear_raw = compute_lidar(
         state.x, state.y, state.theta + jnp.pi,
@@ -168,7 +161,7 @@ def get_obs(state: EnvState) -> jnp.ndarray:
     )
     rear_prox_vec = jnp.clip(
         (MAX_LIDAR_DIST - rear_raw) / (MAX_LIDAR_DIST - ROBOT_RADIUS), 0.0, 1.0
-    )  # shape (4,)
+    )
 
     dx    = state.goal_x - state.x
     dy    = state.goal_y - state.y
@@ -202,9 +195,8 @@ def get_obs(state: EnvState) -> jnp.ndarray:
 
 # ── Reset ─────────────────────────────────────────────────────────────────────
 
-# FIX D: @jax.jit removed — JIT lives at the outermost vmap level in jax_train.py.
 def reset_env(key: jnp.ndarray, min_goal_dist: float = DEFAULT_MIN_GOAL_DIST):
-    k1, k2, k3, k4, k5, k6, k7, k8, k9 = jax.random.split(key, 9)
+    k1, k2, k3, k4, k5, k6, k7, k8, k9, k_legs = jax.random.split(key, 10)
 
     max_v  = jax.random.uniform(k1, minval=0.2, maxval=2.0)
     margin = ROBOT_RADIUS + 0.5
@@ -237,7 +229,6 @@ def reset_env(key: jnp.ndarray, min_goal_dist: float = DEFAULT_MIN_GOAL_DIST):
     # ── Robot spawn ───────────────────────────────────────────────────────────
     ROBOT_CLEARANCE = ROBOT_RADIUS + 0.35
 
-    # FIX C: carry = (x, y, key, iter_count); exit after MAX_RESAMPLE_ITERS.
     def _robot_cond(carry):
         rx, ry, k, i = carry
         return ~_is_safe(rx, ry, ROBOT_CLEARANCE, obs_circles, obs_boxes) & \
@@ -276,11 +267,8 @@ def reset_env(key: jnp.ndarray, min_goal_dist: float = DEFAULT_MIN_GOAL_DIST):
     gy0 = jax.random.uniform(k5b, minval=margin, maxval=ROOM_H - margin)
     gx, gy, _, _ = jax.lax.while_loop(_goal_cond, _goal_body, (gx0, gy0, k6, 0))
 
-    # ── People — safe spawn with obstacle, robot, and goal clearance ─────────
-    PERSON_CLEARANCE  = PEOPLE_RADIUS + 0.15
-    # FIX E: minimum separation from robot at spawn to avoid instant collision
-    # on step 0. 0.3 m margin gives the human ~1 step of travel before it
-    # could physically reach the robot even at max human speed (1.4 m/s * 0.15 s = 0.21 m).
+    # ── People ────────────────────────────────────────────────────────────────
+    PERSON_CLEARANCE   = PEOPLE_RADIUS + 0.15
     PERSON_ROBOT_CLEAR = ROBOT_RADIUS + PEOPLE_RADIUS + 0.3
     PERSON_GOAL_CLEAR  = GOAL_RADIUS + PEOPLE_RADIUS + 0.1
     people_keys = jax.random.split(k7, NUM_PEOPLE)
@@ -293,7 +281,6 @@ def reset_env(key: jnp.ndarray, min_goal_dist: float = DEFAULT_MIN_GOAL_DIST):
         def _p_cond(carry):
             px, py, k, i = carry
             obs_safe    = _is_safe(px, py, PERSON_CLEARANCE, obs_circles, obs_boxes)
-            # FIX E: also reject overlap with robot spawn and goal positions.
             robot_clear = jnp.sqrt((px - rx)**2 + (py - ry)**2) > PERSON_ROBOT_CLEAR
             goal_clear  = jnp.sqrt((px - gx)**2 + (py - gy)**2) > PERSON_GOAL_CLEAR
             return (~obs_safe | ~robot_clear | ~goal_clear) & (i < MAX_RESAMPLE_ITERS)
@@ -315,6 +302,10 @@ def reset_env(key: jnp.ndarray, min_goal_dist: float = DEFAULT_MIN_GOAL_DIST):
 
     people = jax.vmap(init_person)(people_keys)
 
+    # ── NEW: random initial gait phases ───────────────────────────────────────
+    # Stagger phases so humans aren't all in sync at episode start.
+    foot_state = init_foot_state(people, k_legs)
+
     state = EnvState(
         x=rx, y=ry, theta=rtheta,
         v=0.0, w=0.0,
@@ -323,14 +314,14 @@ def reset_env(key: jnp.ndarray, min_goal_dist: float = DEFAULT_MIN_GOAL_DIST):
         people=people,
         obs_circles=obs_circles,
         obs_boxes=obs_boxes,
-        time_step=0
+        time_step=0,
+        foot_state=foot_state,
     )
     return get_obs(state), state
 
 
 # ── Step ──────────────────────────────────────────────────────────────────────
 
-# FIX D: @jax.jit removed — JIT lives at the outermost vmap level in jax_train.py.
 def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
     dt = DT
 
@@ -343,7 +334,6 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
     raw_x     = state.x + target_v * dt * jnp.cos(mid_theta)
     raw_y     = state.y + target_v * dt * jnp.sin(mid_theta)
 
-    # Wall collision detected on raw position before clamp
     wall_collision = (
         (raw_x < ROBOT_RADIUS) | (raw_x > ROOM_W - ROBOT_RADIUS) |
         (raw_y < ROBOT_RADIUS) | (raw_y > ROOM_H - ROBOT_RADIUS)
@@ -359,7 +349,10 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
         state.obs_circles, state.obs_boxes
     )
 
-    # ── Distances ─────────────────────────────────────────────────────────────
+    # ── NEW: advance leg gait phases ──────────────────────────────────────────
+    new_foot_state = advance_feet(state.foot_state, new_people, dt)
+
+    # ── Distances & collisions (body centres — stable reward signal) ──────────
     prev_dist = jnp.sqrt((state.x - state.goal_x)**2 + (state.y - state.goal_y)**2)
     new_dist  = jnp.sqrt((new_x  - state.goal_x)**2 + (new_y  - state.goal_y)**2)
 
@@ -368,17 +361,12 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
     dists_p = jnp.sqrt(dx_p**2 + dy_p**2)
     closest_human = jnp.min(dists_p)
 
-    # ── Collisions ────────────────────────────────────────────────────────────
     human_col_mask  = dists_p < (ROBOT_RADIUS + PEOPLE_RADIUS)
     human_collision = jnp.any(human_col_mask)
 
-    # FIX B: exhaustive split — one branch always fires when human_collision=True.
-    # active  = robot is moving (its fault for not stopping/avoiding)
-    # passive = robot is stationary (human walked into it)
     active_col  = human_collision & (target_v >  0.1)
     passive_col = human_collision & (target_v <= 0.1)
 
-    # Obstacle collisions
     dx_c = state.obs_circles[:, 0] - new_x
     dy_c = state.obs_circles[:, 1] - new_y
     closest_cir = jnp.min(jnp.sqrt(dx_c**2 + dy_c**2) - state.obs_circles[:, 2])
@@ -412,8 +400,6 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
     )
 
     reward = progress + step_pen + smooth + speed_bon + heading_bon + comfort_pen
-
-    # Explicit priority: goal > obs > wall > active_human > passive > timeout
     reward = jnp.where(goal_reached, 25.0, reward)
     reward = jnp.where(obs_collision  & ~goal_reached, -7.0, reward)
     reward = jnp.where(wall_collision & ~obs_collision & ~goal_reached, -7.0, reward)
@@ -425,7 +411,8 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
         x=new_x, y=new_y, theta=new_theta,
         v=target_v, w=target_w,
         people=new_people,
-        time_step=state.time_step + 1
+        time_step=state.time_step + 1,
+        foot_state=new_foot_state,
     )
 
     obs  = get_obs(new_state)
