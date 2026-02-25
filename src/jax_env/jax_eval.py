@@ -175,7 +175,7 @@ def draw_humans(surface, state, foot_state_np, show_arrows, use_legs):
             leg_r   = max(2, int(LEG_RADIUS * SCALE))
 
             # Faint body centre ring (shows collision boundary)
-            pygame.draw.circle(surface, C_BODY_RING, (sx, sy), body_r, 1)
+            #pygame.draw.circle(surface, C_BODY_RING, (sx, sy), body_r, 1)
 
             # Left leg
             lx, ly = W(float(left_legs_np[i, 0]), float(left_legs_np[i, 1]))

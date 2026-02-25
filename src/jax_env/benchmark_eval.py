@@ -2,48 +2,54 @@
 benchmark_eval.py — Massive Headless Evaluation Dashboard (GPU-Optimised)
 ==========================================================================
 Tests PPO, SAC, and TQC models across all 7 scenarios × 3 max_v limits.
-All computation runs on CUDA via JAX. Key GPU optimisations vs. prior version:
 
-  OPT 1 — N_ENVS 1000 → 4096:
-    With 1000 envs the GPU's SMs were severely under-utilised (each SM can
-    run thousands of threads). 4096 fills the warp pipeline without risking
-    OOM on a 16/24 GB card. Tune down to 2048 if you hit memory limits.
+BUGS FIXED (explaining the spurious 100% success rate):
+=======================================================
 
-  OPT 2 — Vectorise over (scenario × max_v) in one vmap call:
-    The old code had a Python for-loop: evaluate_chunk was called 7×3=21
-    times sequentially per policy, paying Python dispatch + XLA kernel-launch
-    overhead every time. Now evaluate_chunk_grid vmaps over all 21 combos
-    simultaneously, keeping everything on-device with zero Python round-trips.
+  BUG 1 — USE_LEGS not set (CRITICAL — explains 100% success):
+    benchmark_eval never imported jax_env or set jax_env.USE_LEGS before
+    calling reset_env/step_env.  With USE_LEGS=True (module default), the
+    collision geometry shrinks from ROBOT_RADIUS+PEOPLE_RADIUS=0.4 m to
+    ROBOT_RADIUS+LEG_RADIUS≈0.285 m, and the two leg circles (r=0.085 m)
+    are laterally offset by HIP_WIDTH/2=0.09 m from the body centre.  The
+    robot can physically walk straight through a human torso without either
+    leg circle triggering a collision — so every episode ends in a trivial
+    "success" because collisions have been silently disabled.
+    Also, if the policy was trained with USE_LEGS=False, the LiDAR sees
+    body-cylinder circles while benchmark evaluation would feed it leg-circle
+    observations — completely mismatched sensor data.
+    FIX: import jax_env and set USE_LEGS = False (or True) to match training
+    BEFORE any env import so the JIT traces the correct branch.
 
-  OPT 3 — Explicit device_put of params to GPU:
-    Checkpoints are loaded on CPU; without device_put JAX copies weights
-    lazily on each JIT call. We pin them once to the GPU device so every
-    forward pass reads from fast HBM.
+  BUG 2 — scen_idx traced inside vmap but evaluate_chunk was @jax.jit
+    (CRITICAL — explains identical 100% bars across all 7 scenarios):
+    evaluate_chunk_grid vmaps _eval_one over SCENARIOS = jnp.arange(7),
+    so scen_idx is a JAX-traced dynamic integer inside the vmap.  Calling
+    the @jax.jit-decorated evaluate_chunk with a traced scen_idx forces JAX
+    to retrace with a fake concrete value (0 on first call), then reuse that
+    compiled graph for all subsequent scenarios — every scenario silently ran
+    as scenario 0 (Random).  Result: all 7 scenario bars show identical numbers.
+    FIX: rename the body to _evaluate_chunk_inner (no decorator, pure
+    function), vmappable freely.  A thin @jax.jit evaluate_chunk wrapper is
+    kept only for standalone CLI calls.
 
-  OPT 4 — XLA_FLAGS for CUDA kernel tuning:
-    --xla_gpu_enable_triton_gemm=true  — use Triton fused GEMM (faster on
-      Ampere/Ada GPUs for the Conv1D + Dense layers in ObsEncoder).
-    --xla_gpu_cuda_graph_enable=true   — wrap the scan body in a CUDA graph
-      so the 500-step scan pays kernel-launch overhead only once.
-    --xla_gpu_enable_async_all_reduce=true — overlaps any collectives.
+  BUG 3 — closest_human clearance used PEOPLE_RADIUS unconditionally:
+    When USE_LEGS=True, info["closest_human"] is distance to the nearest
+    leg circle (radius=LEG_RADIUS), not body centre.  Subtracting
+    ROBOT_RADIUS + PEOPLE_RADIUS gives a wrong (too-small) clearance value
+    in the dashboard's Min Dist metric.
+    FIX: subtract ROBOT_RADIUS + LEG_RADIUS when USE_LEGS=True.
 
-  OPT 5 — block_until_ready after compile warmup:
-    Without this the timing clock starts before XLA finishes async
-    compilation, inflating the reported compile time and shortening the
-    measured eval time.
+  BUG 4 (minor) — dynamic_reset_stacked and step_stacked_headless each
+    carry their own @jax.jit which conflicts with being called from inside
+    the outer vmap in evaluate_chunk_grid.  These inner JITs are harmless
+    in practice (JAX flattens nested JITs) but add tracing overhead.
+    Left as-is to avoid regressions; documented here for awareness.
 
-  OPT 6 — donate_argnums on evaluate_chunk_grid:
-    Donating the rng_key array lets XLA reuse its buffer in-place across
-    vmap iterations, saving one allocation per (scenario, max_v) pair.
-
-  OPT 7 — Fold jax.random.split inside the scan with fold_in:
-    jax.random.fold_in(key, step_idx) is cheaper than split inside the scan
-    body because it avoids materialising the full (2,) output array; the
-    counter is XOR-folded into the Threefry state in a single fused op.
-
-FIXES carried from prior version:
-  FIX 1 — Use EndToEndActorCritic / SACActorNetwork (correct param trees).
-  FIX 2 — Correct raw-obs slices: base_obs[0:3], [3:12], [12:].
+GPU optimisations (unchanged from prior version):
+  OPT 1 — N_ENVS=4096; OPT 2 — grid vmap; OPT 3 — device_put params;
+  OPT 4 — XLA_FLAGS Triton GEMM; OPT 5 — block_until_ready warmup;
+  OPT 6 — donate_argnums; OPT 7 — fold_in RNG.
 """
 
 import os
@@ -67,10 +73,24 @@ import seaborn as sns
 import warnings
 warnings.filterwarnings("ignore")
 
+# ── BUG 1 FIX — Mirror USE_LEGS flag from training ───────────────────────────
+# benchmark_eval previously never set jax_env.USE_LEGS, so it inherited the
+# module default (True).  If policies were trained with USE_LEGS=False, the
+# benchmark runs with a completely different LiDAR geometry (2×small leg circles
+# instead of body cylinders) and different collision thresholds — the policy
+# sees sensor data it was never trained on and navigates nearly blind, yet the
+# 100% success appears because the COLLISION geometry also changes (leg circles
+# are tiny, so the robot physically passes through human bodies without
+# triggering a collision, trivially "succeeding").
+# Set this flag to match your training configuration BEFORE any env import.
+import jax_env
+jax_env.USE_LEGS = False   # ← set to True if you trained with --legs
+
 # ── Environment imports ───────────────────────────────────────────────────────
 from jax_env import ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS, DT, MAX_STEPS
 from jax_env_multi import reset_env, step_env
 from jax_wrappers import StackedEnvState
+from jax_legs import LEG_RADIUS
 
 # ── Network imports — exact classes used during training ──────────────────────
 from jax_network import EndToEndActorCritic
@@ -169,8 +189,15 @@ def step_stacked_headless(key, state: StackedEnvState, action):
 
 
 # ── Core evaluation kernel ────────────────────────────────────────────────────
-@functools.partial(jax.jit, static_argnums=(1,))
-def evaluate_chunk(params, net_type: str, scen_idx, target_max_v, rng_key):
+# BUG 4 FIX: The original evaluate_chunk was @jax.jit, then called from inside
+# evaluate_chunk_grid's vmap over SCENARIOS. When vmap traces scen_idx as a
+# dynamic value, the inner @jax.jit sees a non-concrete argument — JAX either
+# errors or retraces with a fake concrete value (typically 0), so every scenario
+# runs the same branch (scenario 0 = Random) → 100% success across all layouts.
+# FIX: split into two functions:
+#   _evaluate_chunk_inner — pure function, safe to vmap/scan over, no JIT.
+#   evaluate_chunk        — thin JIT wrapper for standalone (non-grid) calls.
+def _evaluate_chunk_inner(params, net_type: str, scen_idx, target_max_v, rng_key):
     """
     Runs N_ENVS full episodes for a single (policy, scenario, max_v).
     This is vmapped over (scenario, max_v) in evaluate_chunk_grid below.
@@ -223,7 +250,12 @@ def evaluate_chunk(params, net_type: str, scen_idx, target_max_v, rng_key):
         jerk_w = jnp.where(active, jnp.abs((aw - aw_p) / DT), 0.0)
 
         pl  = pl  + jnp.where(active, v * DT, 0.0)
-        ch  = info["closest_human"] - ROBOT_RADIUS - PEOPLE_RADIUS
+        # BUG 3 FIX: closest_human from info is distance to nearest leg when
+        # USE_LEGS=True (radius=LEG_RADIUS) or to body centre when False
+        # (radius=PEOPLE_RADIUS).  Use the matching clearance so the reported
+        # min_dist metric is consistent with collision geometry.
+        human_r = LEG_RADIUS if jax_env.USE_LEGS else PEOPLE_RADIUS
+        ch  = info["closest_human"] - ROBOT_RADIUS - human_r
         mhd = jnp.where(active, jnp.minimum(mhd, ch), mhd)
 
         g  = info["goal_reached"]
@@ -266,6 +298,13 @@ def evaluate_chunk(params, net_type: str, scen_idx, target_max_v, rng_key):
     }
 
 
+# Thin JIT wrapper for standalone (single scenario/speed) calls from CLI tools.
+# evaluate_chunk_grid does NOT use this — it calls _evaluate_chunk_inner directly.
+@functools.partial(jax.jit, static_argnums=(1,))
+def evaluate_chunk(params, net_type: str, scen_idx, target_max_v, rng_key):
+    return _evaluate_chunk_inner(params, net_type, scen_idx, target_max_v, rng_key)
+
+
 @functools.partial(jax.jit, static_argnums=(1,))
 def evaluate_chunk_grid(params, net_type: str, rng_key):
     """
@@ -273,9 +312,13 @@ def evaluate_chunk_grid(params, net_type: str, rng_key):
 
     Instead of 21 sequential Python for-loop iterations (each paying
     kernel-launch + Python overhead), we build a (N_SCENARIOS, N_SPEEDS)
-    grid of random keys and vmap evaluate_chunk over both axes.
+    grid of random keys and vmap _evaluate_chunk_inner over both axes.
     This keeps everything on-device; the GPU sees one big batched kernel
     rather than 21 small sequential ones.
+
+    BUG 4 FIX: calls _evaluate_chunk_inner (no inner JIT) so scen_idx
+    stays as a valid traced value through vmap without hitting JIT's
+    concreteness requirement.
 
     Output shapes: each metric is (N_SCENARIOS, N_SPEEDS, N_ENVS).
     """
@@ -287,7 +330,8 @@ def evaluate_chunk_grid(params, net_type: str, rng_key):
     def _eval_one(scen_idx, speed_keys):
         """Evaluate one scenario across all speeds."""
         def _eval_speed(max_v, key):
-            return evaluate_chunk(params, net_type, scen_idx, max_v, key)
+            # Use inner (non-JIT) function — scen_idx is a traced dynamic int here
+            return _evaluate_chunk_inner(params, net_type, scen_idx, max_v, key)
         return jax.vmap(_eval_speed)(MAX_V_TESTS, speed_keys)
 
     return jax.vmap(_eval_one)(SCENARIOS, keys_grid)
