@@ -312,7 +312,11 @@ def train_chunk(ap, aos, cp, cos, tp, la, laos, buf, vmap_step, es, eo, key):
         key, k_col, k_samp, k_upd = jax.random.split(key, 4)
         
         new_eo, new_es, obs_b, env_a, rew, done, info = collect_step(ap, es, eo, k_col, vmap_step)
-        new_buf = buf_add(buf, obs_b, env_a, rew, new_eo, done.astype(jnp.float32))
+        
+        # Calculate true terminal state (ignore timeouts for Bellman backup)
+        terminal = done & ~info["timeout"]
+        
+        new_buf = buf_add(buf, obs_b, env_a, rew, new_eo, terminal.astype(jnp.float32))
         b_obs, b_act, b_rew, b_next, b_done = buf_sample(new_buf, k_samp, BATCH_SIZE)
         
         new_ap, new_aos, new_cp, new_cos, new_tp, new_la, new_laos, metrics = \

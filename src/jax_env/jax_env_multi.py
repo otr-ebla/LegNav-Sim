@@ -364,5 +364,6 @@ def step_env(key, state, action):
         "passive_col":   passive_col,
         "closest_human": closest_human,
         "sp_mask":       sp_mask,
+        "timeout":       timeout,
     }
     return obs, new_state, reward, done, info

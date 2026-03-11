@@ -371,13 +371,16 @@ def train_chunk(ap, aos, cp, cos, tp, la, alo, buf, vmap_step, es, eo, key):
     def _loop_body(carry, _):
         ap, aos, cp, cos, tp, la, alo, buf, es, eo, key = carry
         key, k_col, k_samp, k_upd = jax.random.split(key, 4)
-
         # Collect one step
         new_eo, new_es, obs_b, env_a, rew, done, info = collect_step(
             ap, es, eo, k_col, vmap_step
         )
-        # Add to replay buffer (buffer stays in carry — no host roundtrip)
-        new_buf = buf_add(buf, obs_b, env_a, rew, new_eo, done.astype(jnp.float32))
+        
+        # Calculate true terminal state (ignore timeouts for Bellman backup)
+        terminal = done & ~info["timeout"]
+        
+        # Add to replay buffer using 'terminal' instead of 'done'
+        new_buf = buf_add(buf, obs_b, env_a, rew, new_eo, terminal.astype(jnp.float32))
         # Sample a training batch
         b_obs, b_act, b_rew, b_next, b_done = buf_sample(new_buf, k_samp, BATCH_SIZE)
         # SAC gradient update
