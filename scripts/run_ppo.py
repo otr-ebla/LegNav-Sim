@@ -29,7 +29,7 @@ def make_env_factory(num_people, num_obstacles, render_mode, use_legs, render_sk
             distraction_prob=distraction_prob,
             real_lidar_specs=real_lidar,
             lidar_noise_enable=lidar_noise,
-            stack_dim=5 if real_lidar else 3
+            stack_dim=3 if real_lidar else 3
         )
         env.reset(seed=rank + int(time.time())) 
         return env
@@ -88,7 +88,7 @@ def main():
     env = SubprocVecEnv(env_fns) if args.n_envs > 1 else DummyVecEnv(env_fns)
 
     # 4. Wrapper Stacking
-    stack_dim = 5 if args.real_lidar else 3
+    stack_dim = 3 if args.real_lidar else 3
     print(f"📦 Applying VecLidarStack (Dict Mode)")
     env = VecLidarStack(env, stack_dim=stack_dim)
 
