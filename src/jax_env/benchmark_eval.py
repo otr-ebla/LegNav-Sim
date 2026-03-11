@@ -141,12 +141,17 @@ def _rollout_body(net_apply_fn, squash_fn, params, scen_idx, target_max_v, rng_k
         jnp.zeros(N_ENVS),                        # path_len
         jnp.full(N_ENVS, 100.0),                  # min_human_dist
         jnp.ones(N_ENVS, dtype=jnp.bool_),        # active
+        jnp.zeros(N_ENVS),                        # yield_zone_steps (denominator)
+        jnp.zeros(N_ENVS),                        # yield_comply_steps (numerator)
     )
 
     human_r = LEG_RADIUS if jax_env.USE_LEGS else PEOPLE_RADIUS
 
+    YIELD_DIST = 1.5   # m  — must match jax_env_multi.py YIELD_DIST
+    YIELD_FOV  = 1.57  # rad — forward 90° each side
+
     def _step(carry, step_idx):
-        state, obs, v_p, av_p, w_p, aw_p, pl, mhd, active = carry
+        state, obs, v_p, av_p, w_p, aw_p, pl, mhd, active, yz_steps, yc_steps = carry
         k_step = jax.random.fold_in(rng_key, step_idx)
 
         raw_out = net_apply_fn({"params": params}, obs)
@@ -175,14 +180,37 @@ def _rollout_body(net_apply_fn, squash_fn, params, scen_idx, target_max_v, rng_k
         c  = info["collision"]    & active
         pc = info["passive_col"]  & active
 
+        # ── Yielding score accumulators ───────────────────────────────────────
+        # For each env: is any human in the yield zone (< YIELD_DIST, forward FOV)?
+        people    = next_state.env_state
+        px        = people.people[:, 0]   # (NUM_PEOPLE,)
+        py_p      = people.people[:, 1]
+        rx        = next_state.env_state.x          # scalar per env — but we're
+        ry        = next_state.env_state.y           # inside vmap so these are scalars
+        rtheta    = next_state.env_state.theta
+        dp_x      = px - rx
+        dp_y      = py_p - ry
+        dists_p   = jnp.sqrt(dp_x**2 + dp_y**2 + 1e-8)
+        rel_ang   = jnp.arctan2(dp_y, dp_x) - rtheta
+        rel_ang   = (rel_ang + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
+        active_p  = next_state.env_state.people[:, 10] >= 0.0
+        in_yz     = (dists_p < YIELD_DIST) & (jnp.abs(rel_ang) < YIELD_FOV) & active_p
+        any_in_yz = jnp.any(in_yz)   # scalar bool for this env
+
+        robot_stopped = v <= 0.1
+
+        new_yz_steps = yz_steps + jnp.where(active & any_in_yz, 1.0, 0.0)
+        new_yc_steps = yc_steps + jnp.where(active & any_in_yz & robot_stopped, 1.0, 0.0)
+
         step_data   = (active, done, g, c, pc, jerk_v, jerk_w)
         next_active = active & ~done
-        return (next_state, next_obs, v, av, w, aw, pl, mhd, next_active), step_data
+        return (next_state, next_obs, v, av, w, aw, pl, mhd, next_active,
+                new_yz_steps, new_yc_steps), step_data
 
     final_carry, step_data = jax.lax.scan(
         _step, carry, jnp.arange(MAX_STEPS, dtype=jnp.uint32)
     )
-    _, _, _, _, _, _, final_pl, final_mhd, _ = final_carry
+    _, _, _, _, _, _, final_pl, final_mhd, _, final_yz, final_yc = final_carry
     active_mask, _, goals, cols, pcols, jerks_v, jerks_w = step_data
 
     ep_lens = active_mask.sum(axis=0)
@@ -198,12 +226,24 @@ def _rollout_body(net_apply_fn, squash_fn, params, scen_idx, target_max_v, rng_k
     spl      = ep_goal * (init_dist / jnp.maximum(final_pl, init_dist))
     time_g   = jnp.where(ep_goal, ep_lens * DT, jnp.nan)
 
+    # Yielding score: fraction of yield-zone steps where robot was stopped.
+    # NaN when the robot never encountered anyone in its yield zone.
+    yield_score = jnp.where(
+        final_yz > 0,
+        final_yc / final_yz,
+        jnp.nan,
+    )
+
     return {
-        "success":  ep_goal.astype(jnp.float32),
-        "act_col":  act_col.astype(jnp.float32),
-        "pass_col": pass_col.astype(jnp.float32),
-        "timeout":  tmo.astype(jnp.float32),
-        "spl": spl, "jerk": avg_jerk, "min_dist": final_mhd, "time": time_g,
+        "success":     ep_goal.astype(jnp.float32),
+        "act_col":     act_col.astype(jnp.float32),
+        "pass_col":    pass_col.astype(jnp.float32),
+        "timeout":     tmo.astype(jnp.float32),
+        "spl":         spl,
+        "jerk":        avg_jerk,
+        "min_dist":    final_mhd,
+        "time":        time_g,
+        "yield_score": yield_score,
     }
 
 
@@ -284,17 +324,18 @@ def main():
                 ))
                 for i in range(N_ENVS):
                     results.append({
-                        "Policy":       p_name,
-                        "Scenario":     si,
-                        "Max_V":        v_max,
-                        "Success":      cell["success"][i],
-                        "Active Col":   cell["act_col"][i],
-                        "Passive Col":  cell["pass_col"][i],
-                        "Timeout":      cell["timeout"][i],
-                        "SPL":          cell["spl"][i],
-                        "Jerk":         cell["jerk"][i],
-                        "Min Dist":     cell["min_dist"][i],
-                        "Time to Goal": cell["time"][i],
+                        "Policy":        p_name,
+                        "Scenario":      si,
+                        "Max_V":         v_max,
+                        "Success":       cell["success"][i],
+                        "Active Col":    cell["act_col"][i],
+                        "Passive Col":   cell["pass_col"][i],
+                        "Timeout":       cell["timeout"][i],
+                        "SPL":           cell["spl"][i],
+                        "Jerk":          cell["jerk"][i],
+                        "Min Dist":      cell["min_dist"][i],
+                        "Time to Goal":  cell["time"][i],
+                        "Yield Score":   cell["yield_score"][i],
                     })
         print(f"  {p_name} done in {time.time() - t_policy:.1f}s")
 
@@ -306,146 +347,174 @@ def main():
     print("Generating dashboard...")
     sns.set_theme(style="whitegrid", palette="muted")
 
-    # 4 rows × 3 cols = 12 panels (panel 12 unused)
-    fig = plt.figure(figsize=(27, 28))
+    # Layout: 3 rows × 4 cols = 12 panels
+    #   Row 1: Success, Active Col, Passive Col, Timeout  — all vs Max_V
+    #   Row 2: SPL, Time to Goal, Safety Margin, Jerk
+    #   Row 3: Yield Score vs Max_V, Success by Scenario, Overall Outcomes, Training Curves
+    fig = plt.figure(figsize=(36, 21))
     fig.suptitle("RL Navigation Policies: Evaluation Dashboard",
-                 fontsize=26, weight="bold")
+                 fontsize=28, weight="bold")
 
-    # 1. Overall Outcomes
-    rate_df   = df.groupby("Policy")[["Success","Active Col","Passive Col","Timeout"]].mean().reset_index()
-    rate_melt = rate_df.melt(id_vars="Policy", var_name="Outcome", value_name="Rate")
-    rate_melt["Rate"] *= 100
-    ax1 = plt.subplot(4, 3, 1)
-    sns.barplot(data=rate_melt, x="Outcome", y="Rate", hue="Policy", ax=ax1)
-    ax1.set_title("Overall Episode Outcomes (%)", fontsize=13)
+    R, C = 3, 4   # rows, cols
+
+    # ── Row 1: outcome rates vs Max_V ────────────────────────────────────────
+
+    # 1. Success vs Speed
+    v_suc_df = df.groupby(["Max_V","Policy"])["Success"].mean().reset_index()
+    v_suc_df["Success"] *= 100
+    ax1 = plt.subplot(R, C, 1)
+    sns.lineplot(data=v_suc_df, x="Max_V", y="Success", hue="Policy",
+                 marker="o", linewidth=3, markersize=8, ax=ax1)
+    ax1.set_title("Success Rate vs. Max Speed", fontsize=13)
+    ax1.set_xticks(MAX_V_TESTS)
     ax1.set_ylim(0, 100)
+    ax1.set_xlabel("Max Linear Speed (m/s)")
+    ax1.set_ylabel("Rate (%)")
 
-    # 2. Success by Scenario
-    scen_df = df.groupby(["Scenario","Policy"])["Success"].mean().reset_index()
-    scen_df["Success"] *= 100
-    scen_df["Scenario_Name"] = scen_df["Scenario"].map(scen_names)
-    ax2 = plt.subplot(4, 3, 2)
-    sns.barplot(data=scen_df, x="Scenario_Name", y="Success", hue="Policy", ax=ax2)
-    ax2.set_title("Success Rate by Layout Topology", fontsize=13)
-    ax2.set_xticklabels(ax2.get_xticklabels(), rotation=30)
+    # 2. Active Collisions vs Speed
+    v_acol_df = df.groupby(["Max_V","Policy"])["Active Col"].mean().reset_index()
+    v_acol_df["Active Col"] *= 100
+    ax2 = plt.subplot(R, C, 2)
+    sns.lineplot(data=v_acol_df, x="Max_V", y="Active Col", hue="Policy",
+                 marker="X", linewidth=3, markersize=8, ax=ax2)
+    ax2.set_title("Active Collisions vs. Max Speed", fontsize=13)
+    ax2.set_xticks(MAX_V_TESTS)
     ax2.set_ylim(0, 100)
+    ax2.set_xlabel("Max Linear Speed (m/s)")
+    ax2.set_ylabel("Rate (%)")
 
-    # 3. Success vs Speed
-    v_df = df.groupby(["Max_V","Policy"])["Success"].mean().reset_index()
-    v_df["Success"] *= 100
-    ax3 = plt.subplot(4, 3, 3)
-    sns.lineplot(data=v_df, x="Max_V", y="Success", hue="Policy",
+    # 3. Passive Collisions vs Speed
+    v_pcol_df = df.groupby(["Max_V","Policy"])["Passive Col"].mean().reset_index()
+    v_pcol_df["Passive Col"] *= 100
+    ax3 = plt.subplot(R, C, 3)
+    sns.lineplot(data=v_pcol_df, x="Max_V", y="Passive Col", hue="Policy",
                  marker="o", linewidth=3, markersize=8, ax=ax3)
-    ax3.set_title("Success Rate vs. Robot Max Speed", fontsize=13)
+    ax3.set_title("Passive Collisions vs. Max Speed", fontsize=13)
     ax3.set_xticks(MAX_V_TESTS)
     ax3.set_ylim(0, 100)
+    ax3.set_xlabel("Max Linear Speed (m/s)")
+    ax3.set_ylabel("Rate (%)")
 
-    # 4. Active Collisions vs Speed
-    v_col_df = df.groupby(["Max_V","Policy"])["Active Col"].mean().reset_index()
-    v_col_df["Active Col"] *= 100
-    ax4 = plt.subplot(4, 3, 4)
-    sns.lineplot(data=v_col_df, x="Max_V", y="Active Col", hue="Policy",
-                 marker="X", linewidth=3, markersize=8, ax=ax4)
-    ax4.set_title("Active Collisions vs. Robot Max Speed", fontsize=13)
+    # 4. Timeout vs Speed
+    v_tmo_df = df.groupby(["Max_V","Policy"])["Timeout"].mean().reset_index()
+    v_tmo_df["Timeout"] *= 100
+    ax4 = plt.subplot(R, C, 4)
+    sns.lineplot(data=v_tmo_df, x="Max_V", y="Timeout", hue="Policy",
+                 marker="s", linewidth=3, markersize=8, ax=ax4)
+    ax4.set_title("Timeout Rate vs. Max Speed", fontsize=13)
     ax4.set_xticks(MAX_V_TESTS)
     ax4.set_ylim(0, 100)
+    ax4.set_xlabel("Max Linear Speed (m/s)")
+    ax4.set_ylabel("Rate (%)")
 
+    # ── Row 2: quality metrics ────────────────────────────────────────────────
     suc = df[df["Success"] == 1.0]
 
-    # 5. SPL
-    ax5 = plt.subplot(4, 3, 5)
+    # 5. SPL (successful episodes only)
+    ax5 = plt.subplot(R, C, 5)
     sns.boxplot(data=suc, x="Policy", y="SPL", hue="Policy", ax=ax5, showfliers=False)
     ax5.set_title("Success-weighted Path Length (SPL)", fontsize=13)
+    ax5.set_ylabel("SPL")
 
-    # 6. Time to Goal
-    ax6 = plt.subplot(4, 3, 6)
+    # 6. Time to Goal (successful episodes only)
+    ax6 = plt.subplot(R, C, 6)
     sns.boxplot(data=suc, x="Policy", y="Time to Goal", hue="Policy",
                 ax=ax6, showfliers=False)
     ax6.set_title("Time to Reach Goal (seconds)", fontsize=13)
+    ax6.set_ylabel("seconds")
 
-    # 7. Safety Margin vs Speed
-    ax7 = plt.subplot(4, 3, 7)
+    # 7. Safety Margin (Min Human Dist) vs Speed
+    ax7 = plt.subplot(R, C, 7)
     sns.lineplot(data=df, x="Max_V", y="Min Dist", hue="Policy",
                  marker="^", linewidth=3, markersize=8, ax=ax7)
-    ax7.set_title("Safety Margin (Min Human Dist) vs. Speed", fontsize=13)
+    ax7.set_title("Safety Margin vs. Max Speed", fontsize=13)
     ax7.axhline(0.0, color="red", linestyle="--", alpha=0.5, label="Collision Threshold")
     ax7.set_xticks(MAX_V_TESTS)
-    ax7.legend()
+    ax7.set_xlabel("Max Linear Speed (m/s)")
+    ax7.set_ylabel("Min Human Distance (m)")
+    ax7.legend(fontsize=9)
 
-    # 8. Jerk
-    ax8 = plt.subplot(4, 3, 8)
-    sns.boxplot(data=df, x="Policy", y="Jerk", hue="Policy",
-                ax=ax8, showfliers=False)
+    # 8. Kinematic Jerk
+    ax8 = plt.subplot(R, C, 8)
+    sns.boxplot(data=df, x="Policy", y="Jerk", hue="Policy", ax=ax8, showfliers=False)
     ax8.set_title("Average Kinematic Jerk (Smoothness)", fontsize=13)
+    ax8.set_ylabel("Jerk (m/s³ + rad/s³)")
 
-    # 9. Training Curves — episode reward over environment steps
-    # All three trainers now log 'step' as total_env_steps so the x-axis is
-    # comparable: PPO = update × NUM_ENVS × ROLLOUT_STEPS, SAC/TQC = total_steps.
-    ax9 = plt.subplot(4, 3, 9)
+    # ── Row 3: yielding, scenario breakdown, overall, training ───────────────
+
+    # 9. Yielding Score vs Speed
+    # YS = fraction of yield-zone steps where robot was stopped (v ≤ 0.1 m/s).
+    # NaN episodes (no yield-zone encounters) are excluded from the mean.
+    v_ys_df = df.groupby(["Max_V","Policy"])["Yield Score"].mean().reset_index()
+    ax9 = plt.subplot(R, C, 9)
+    sns.lineplot(data=v_ys_df, x="Max_V", y="Yield Score", hue="Policy",
+                 marker="D", linewidth=3, markersize=8, ax=ax9)
+    ax9.set_title("Yielding Score vs. Max Speed", fontsize=13)
+    ax9.set_xticks(MAX_V_TESTS)
+    ax9.set_ylim(0, 1)
+    ax9.set_xlabel("Max Linear Speed (m/s)")
+    ax9.set_ylabel("Yield Compliance (0–1)")
+    ax9.axhline(1.0, color="green", linestyle=":", alpha=0.4)
+    ax9.axhline(0.5, color="gray",  linestyle=":", alpha=0.4)
+
+    # 10. Success by Scenario
+    scen_names = {
+        0: "Random", 1: "Parallel", 2: "Perpend", 3: "Circular",
+        4: "Bottleneck", 5: "Intersect", 6: "Groups",
+    }
+    scen_df = df.groupby(["Scenario","Policy"])["Success"].mean().reset_index()
+    scen_df["Success"] *= 100
+    scen_df["Scenario_Name"] = scen_df["Scenario"].map(scen_names)
+    ax10 = plt.subplot(R, C, 10)
+    sns.barplot(data=scen_df, x="Scenario_Name", y="Success", hue="Policy", ax=ax10)
+    ax10.set_title("Success Rate by Layout Topology", fontsize=13)
+    ax10.set_xticklabels(ax10.get_xticklabels(), rotation=30, ha="right")
+    ax10.set_ylim(0, 100)
+    ax10.set_ylabel("Success Rate (%)")
+
+    # 11. Overall Episode Outcomes (bar chart)
+    rate_df   = df.groupby("Policy")[["Success","Active Col","Passive Col","Timeout"]].mean().reset_index()
+    rate_melt = rate_df.melt(id_vars="Policy", var_name="Outcome", value_name="Rate")
+    rate_melt["Rate"] *= 100
+    ax11 = plt.subplot(R, C, 11)
+    sns.barplot(data=rate_melt, x="Outcome", y="Rate", hue="Policy", ax=ax11)
+    ax11.set_title("Overall Episode Outcomes (%)", fontsize=13)
+    ax11.set_ylim(0, 100)
+    ax11.set_ylabel("Rate (%)")
+
+    # 12. Training Curves — episode reward over environment steps
+    ax12 = plt.subplot(R, C, 12)
     any_log = False
     POLICY_COLORS = {"PPO": "#4C72B0", "SAC": "#DD8452", "TQC": "#55A868"}
     for p_name, log_path in TRAINING_LOG_PATHS.items():
         if os.path.exists(log_path):
             try:
                 log_df = pd.read_csv(log_path)
-                # Convert raw step count → millions of env steps for readability
                 x_millions = log_df["step"] / 1e6
-                # Rolling-window smooth (window proportional to log density)
                 w = max(5, len(log_df) // 30)
                 smoothed = log_df["mean_ep_reward"].rolling(window=w, min_periods=1).mean()
-                # Faint raw trace
-                ax9.plot(
-                    x_millions, log_df["mean_ep_reward"],
-                    alpha=0.18, linewidth=1,
-                    color=POLICY_COLORS.get(p_name),
-                )
-                # Bold smoothed trace
-                ax9.plot(
-                    x_millions, smoothed,
-                    label=p_name, linewidth=2.5,
-                    color=POLICY_COLORS.get(p_name),
-                )
+                ax12.plot(x_millions, log_df["mean_ep_reward"],
+                          alpha=0.18, linewidth=1, color=POLICY_COLORS.get(p_name))
+                ax12.plot(x_millions, smoothed,
+                          label=p_name, linewidth=2.5, color=POLICY_COLORS.get(p_name))
                 any_log = True
             except Exception as e:
                 print(f"  Warning: could not read {log_path}: {e}")
 
     if any_log:
-        ax9.set_xlabel("Environment Steps (millions)", fontsize=11)
-        ax9.set_ylabel("Mean Episode Reward", fontsize=11)
-        ax9.set_title("Episode Reward During Training", fontsize=13)
-        ax9.axhline(0, color="gray", linestyle=":", linewidth=0.8, alpha=0.6)
-        ax9.legend(fontsize=10)
+        ax12.set_xlabel("Environment Steps (millions)", fontsize=11)
+        ax12.set_ylabel("Mean Episode Reward", fontsize=11)
+        ax12.set_title("Episode Reward During Training", fontsize=13)
+        ax12.axhline(0, color="gray", linestyle=":", linewidth=0.8, alpha=0.6)
+        ax12.legend(fontsize=10)
     else:
-        ax9.text(0.5, 0.5,
-                 "No training logs found.\nRun trainers to generate\n"
-                 "checkpoints/*/training_log.csv",
-                 ha="center", va="center", transform=ax9.transAxes,
-                 fontsize=11, color="gray")
-        ax9.set_title("Episode Reward During Training", fontsize=13)
-        ax9.set_axis_off()
-
-    # 10. Passive Collisions vs Speed
-    v_pcol_df = df.groupby(["Max_V","Policy"])["Passive Col"].mean().reset_index()
-    v_pcol_df["Passive Col"] *= 100
-    ax10 = plt.subplot(4, 3, 10)
-    sns.lineplot(data=v_pcol_df, x="Max_V", y="Passive Col", hue="Policy",
-                 marker="o", linewidth=3, markersize=8, ax=ax10)
-    ax10.set_title("Passive Collisions vs. Robot Max Speed", fontsize=13)
-    ax10.set_xticks(MAX_V_TESTS)
-    ax10.set_ylim(0, 100)
-
-    # 11. Timeout vs Speed
-    v_tmo_df = df.groupby(["Max_V","Policy"])["Timeout"].mean().reset_index()
-    v_tmo_df["Timeout"] *= 100
-    ax11 = plt.subplot(4, 3, 11)
-    sns.lineplot(data=v_tmo_df, x="Max_V", y="Timeout", hue="Policy",
-                 marker="s", linewidth=3, markersize=8, ax=ax11)
-    ax11.set_title("Timeout Rate vs. Robot Max Speed", fontsize=13)
-    ax11.set_xticks(MAX_V_TESTS)
-    ax11.set_ylim(0, 100)
-
-    # 12. (empty — reserved for future use)
-    plt.subplot(4, 3, 12).set_visible(False)
+        ax12.text(0.5, 0.5,
+                  "No training logs found.\nRun trainers to generate\n"
+                  "checkpoints/*/training_log.csv",
+                  ha="center", va="center", transform=ax12.transAxes,
+                  fontsize=11, color="gray")
+        ax12.set_title("Episode Reward During Training", fontsize=13)
+        ax12.set_axis_off()
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.savefig("Evaluation_Dashboard.png", dpi=300)
