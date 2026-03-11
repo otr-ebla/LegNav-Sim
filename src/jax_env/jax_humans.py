@@ -1,222 +1,285 @@
 """
-jax_humans.py — Crowd as Billiard Balls
-=========================================
-FIXES & IMPROVEMENTS vs previous version:
+jax_humans.py — Stable Social Force Model for dt=0.15s
+=======================================================
+The previous HSFM implementation oscillated because the original force
+magnitudes (Ai=2000 N, k1=120000 N/m) are tuned for dt≈0.01s. At dt=0.15s
+Euler integration is unconditionally unstable with those values.
 
-  FIX (carried) — Removed nested @jax.jit from update_all_humans.
+This implementation uses the SFM structure from Helbing & Molnár (1995) with:
+  - Forces rescaled for dt=0.15s stability
+  - Hard position correction (push-out) after integration so people
+    CANNOT penetrate walls, boxes, or circles regardless of force magnitudes
+  - Velocity-based steering (no torque/inertia — those need tiny dt)
+  - Smooth heading derived from velocity direction with low-pass filter
 
-  IMPROVEMENT A — Double speed normalization weakened avoidance (NEW):
-    The old code normalised velocity back to target_speed TWICE:
-      1. Immediately after adding the repulsion impulse (step 2)
-      2. Again at the very end after all bounces (step 8)
-    The first normalisation (step 2) was wrong: it cancelled out the
-    repulsion delta before it could redirect the human's trajectory.
-    If the human was moving at target_speed and we added rep_vx/rep_vy,
-    normalising back to target_speed made the magnitude unchanged and
-    only used the direction change — but then the final normalise did
-    the same, so the intermediate one was both redundant and harmful.
-    FIX: removed the premature step-2 normalisation. The repulsion impulse
-    now freely modifies direction+magnitude; the final step-8 normalisation
-    clamps back to target_speed after all physics are resolved.
-    This makes robot avoidance significantly more responsive.
-
-  IMPROVEMENT B — Vectorised human-human bounce (NEW):
-    The old code used jax.lax.scan over all_humans for per-human bounce
-    (sequential, O(N) scan steps per human → O(N²) total).
-    FIX: replaced the per-human scan with a fully vectorised vmap approach:
-    compute all N separation vectors at once with broadcasting, then reduce.
-    For N=6 humans this is negligible, but the pattern scales better.
-
-human array: [px, py, vx, vy, angle, is_distracted, wait_timer, target_speed]
+PEOPLE ARRAY (N, 8) — unchanged:
+  [0] px  [1] py  [2] vx  [3] vy  [4] theta
+  [5] distracted  [6] waypoint_x  [7] desired_spd
 """
 
 import jax
 import jax.numpy as jnp
 
-REACTION_DIST = 1.5   # robot repulsion radius (m)
-REP_STRENGTH  = 8.0    # repulsion force magnitude
-HUMAN_RADIUS  = 0.2    # same as PEOPLE_RADIUS in jax_env.py
+# ── Force tuning for dt=0.15s ─────────────────────────────────────────────────
+# Rule of thumb: F/m * dt < v_max  →  F < m*v_max/dt = 75*1.3/0.15 ≈ 650 N
+# We use much smaller values so a single step never overshoots.
+
+A_HUMAN    = 8.0     # N   repulsion magnitude (human-human)
+B_HUMAN    = 0.4     # m   decay distance
+OVERLAP_K  = 40.0    # N/m hard contact spring (only when overlapping)
+
+A_OBS      = 10.0    # N   repulsion from obstacles / walls
+B_OBS      = 0.25    # m
+
+A_ROBOT    = 8.0
+B_ROBOT    = 0.45    # m
+
+TAU        = 0.5     # s   goal-force relaxation time
+MAX_SPEED  = 1.6     # m/s
+DIST_MULT  = 0.55    # distracted speed fraction
+
+# Anisotropy: downweight forces from behind
+LAMBDA_A   = 0.3
+
+_WAYPOINT_R = 0.5
+_WP_MARGIN  = 0.8
+_EPS        = 1e-7
+_ROBOT_R    = 0.20
 
 
-def _bounce_circle(px, py, vx, vy, cx, cy, cr, hr):
-    dx       = px - cx
-    dy       = py - cy
-    dist     = jnp.sqrt(dx*dx + dy*dy)
-    min_dist = cr + hr
-    overlap  = dist < min_dist
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-    safe_dist = jnp.maximum(dist, 1e-6)
-    nx = dx / safe_dist
-    ny = dy / safe_dist
+def _n2(dx, dy):
+    """(distance, nx, ny) with eps guard."""
+    d = jnp.sqrt(dx*dx + dy*dy + _EPS)
+    return d, dx/d, dy/d
 
-    vdotn  = vx * nx + vy * ny
-    new_vx = jnp.where(overlap & (vdotn < 0), vx - 2.0 * vdotn * nx, vx)
-    new_vy = jnp.where(overlap & (vdotn < 0), vy - 2.0 * vdotn * ny, vy)
+def _aniso(nx, ny, vx, vy):
+    spd = jnp.sqrt(vx*vx + vy*vy + _EPS)
+    cos_phi = (vx*nx + vy*ny) / spd
+    return LAMBDA_A + (1.0 - LAMBDA_A) * (1.0 + cos_phi) * 0.5
 
-    push   = jnp.where(overlap, min_dist - dist + 0.001, 0.0)
-    new_px = px + nx * push
-    new_py = py + ny * push
+def _wpx_to_wpy(wpx, room_h):
+    frac = (wpx * 2.6180339887) % 1.0
+    return _WP_MARGIN + frac * (room_h - 2.0 * _WP_MARGIN)
 
-    return new_px, new_py, new_vx, new_vy
-
-
-def _bounce_box(px, py, vx, vy, bx, by, bw, bh, hr):
-    inner_x = bw + hr - jnp.abs(px - bx)
-    inner_y = bh + hr - jnp.abs(py - by)
-    inside  = (inner_x > 0) & (inner_y > 0)
-
-    reflect_x = inside & (inner_x < inner_y)
-    reflect_y = inside & (inner_y <= inner_x)
-
-    sx = jnp.sign(px - bx)
-    sy = jnp.sign(py - by)
-
-    new_vx = jnp.where(reflect_x & (vx * sx < 0), -vx, vx)
-    new_vy = jnp.where(reflect_y & (vy * sy < 0), -vy, vy)
-
-    new_px = jnp.where(reflect_x, bx + sx * (bw + hr + 0.001), px)
-    new_py = jnp.where(reflect_y, by + sy * (bh + hr + 0.001), py)
-
-    return new_px, new_py, new_vx, new_vy
+def _sample_wp(key, room_w, room_h):
+    k1, k2 = jax.random.split(key)
+    wpx = jax.random.uniform(k1, minval=_WP_MARGIN, maxval=room_w - _WP_MARGIN)
+    wpy = jax.random.uniform(k2, minval=_WP_MARGIN, maxval=room_h - _WP_MARGIN)
+    return wpx, wpy
 
 
-def _bounce_human_pair(px, py, vx, vy, opx, opy, radius):
-    dx   = px - opx
-    dy   = py - opy
-    dist = jnp.sqrt(dx*dx + dy*dy)
-    min_dist = 2.0 * radius
+# ── Force components ──────────────────────────────────────────────────────────
 
-    is_self   = dist < 1e-3
-    overlap   = (dist < min_dist) & ~is_self
+def _goal_force(px, py, vx, vy, wpx, wpy, v_des):
+    """Steer toward waypoint: f = (v_des*e_goal - v) / tau."""
+    dx, dy = wpx - px, wpy - py
+    _, ex, ey = _n2(dx, dy)
+    return (v_des*ex - vx) / TAU, (v_des*ey - vy) / TAU
 
-    safe_dist = jnp.maximum(dist, 1e-6)
-    nx = dx / safe_dist
-    ny = dy / safe_dist
+def _human_force(px, py, vx, vy, opx, opy, r):
+    """Repulsion + hard contact from one other person."""
+    dx, dy = px-opx, py-opy
+    dist, nx, ny = _n2(dx, dy)
+    # Soft exponential
+    mag  = A_HUMAN * jnp.exp(-(dist - 2*r) / B_HUMAN)
+    w    = _aniso(nx, ny, vx, vy)
+    # Hard contact spring (only when overlapping)
+    pen  = jnp.maximum(2*r - dist, 0.0)
+    hard = OVERLAP_K * pen
+    return (mag*w + hard)*nx, (mag*w + hard)*ny
 
-    vdotn  = vx * nx + vy * ny
-    new_vx = jnp.where(overlap & (vdotn < 0), vx - 2.0 * vdotn * nx, vx)
-    new_vy = jnp.where(overlap & (vdotn < 0), vy - 2.0 * vdotn * ny, vy)
+def _wall_force(px, py, room_w, room_h):
+    """Smooth repulsion from 4 walls."""
+    fx  = A_OBS * jnp.exp(-px / B_OBS)
+    fx -= A_OBS * jnp.exp(-(room_w - px) / B_OBS)
+    fy  = A_OBS * jnp.exp(-py / B_OBS)
+    fy -= A_OBS * jnp.exp(-(room_h - py) / B_OBS)
+    return fx, fy
 
-    push   = jnp.where(overlap, min_dist - dist + 0.001, 0.0)
-    new_px = px + nx * push
-    new_py = py + ny * push
+def _circle_force(px, py, vx, vy, circles):
+    """Repulsion from circular obstacles."""
+    def one(c):
+        cx, cy, r = c
+        dx, dy = px-cx, py-cy
+        dist, nx, ny = _n2(dx, dy)
+        surf = jnp.maximum(dist - r, 0.0)
+        mag  = A_OBS * jnp.exp(-surf / B_OBS)
+        pen  = jnp.maximum(r - dist, 0.0)   # inside circle
+        return (mag + OVERLAP_K*pen)*nx, (mag + OVERLAP_K*pen)*ny
+    fxs, fys = jax.vmap(one)(circles)
+    return jnp.sum(fxs), jnp.sum(fys)
 
-    return new_px, new_py, new_vx, new_vy
+def _box_force(px, py, boxes):
+    """Repulsion from AABB boxes."""
+    def one(b):
+        cx, cy, hw, hh = b
+        cpx = jnp.clip(px, cx-hw, cx+hw)
+        cpy = jnp.clip(py, cy-hh, cy+hh)
+        dx, dy = px-cpx, py-cpy
+        dist, nx, ny = _n2(dx, dy)
+        # inside box: dist≈0, need strong push
+        inside = (jnp.abs(px-cx) < hw) & (jnp.abs(py-cy) < hh)
+        # direction when inside: push to nearest face
+        face_dx = hw - jnp.abs(px-cx)
+        face_dy = hh - jnp.abs(py-cy)
+        sign_x  = jnp.sign(px-cx)
+        sign_y  = jnp.sign(py-cy)
+        nx_in   = jnp.where(face_dx < face_dy, sign_x, 0.0)
+        ny_in   = jnp.where(face_dx < face_dy, 0.0, sign_y)
+        pen     = jnp.where(face_dx < face_dy, face_dx, face_dy)
+        nx_use  = jnp.where(inside, nx_in, nx)
+        ny_use  = jnp.where(inside, ny_in, ny)
+        mag     = A_OBS * jnp.exp(-dist / B_OBS) + OVERLAP_K * jnp.where(inside, pen, 0.0)
+        return mag*nx_use, mag*ny_use
+    fxs, fys = jax.vmap(one)(boxes)
+    return jnp.sum(fxs), jnp.sum(fys)
+
+def _robot_force(px, py, rx, ry, distract):
+    dx, dy = px-rx, py-ry
+    dist, nx, ny = _n2(dx, dy)
+    surf = jnp.maximum(dist - _ROBOT_R, 0.0)
+    mag  = A_ROBOT * jnp.exp(-surf / B_ROBOT)
+    sens = jnp.where(distract > 0.5, 0.3, 1.0)
+    return mag*nx*sens, mag*ny*sens
 
 
-def _update_single_human(human, key, all_humans,
-                          obs_circles, obs_boxes,
-                          dt, rx, ry, rtheta, rv,
-                          room_w, room_h, radius):
-    """
-    Single billiard-ball human step with stochastic behaviors.
-    obs_circles : (Nc, 3)  [cx, cy, r]
-    obs_boxes   : (Nb, 4)  [cx, cy, hw, hh]
-    all_humans  : (Np, 8)  — for human-human collisions
-    """
-    px, py, vx, vy, angle, is_distracted, wait_timer, target_speed = human
+# ── Hard push-out (position correction) ──────────────────────────────────────
+# Forces alone can't prevent penetration at dt=0.15. We explicitly resolve
+# overlaps AFTER integration so people can never be inside obstacles.
 
-    # 1. Stochastic Events
-    k1, k2, k3 = jax.random.split(key, 3)
+def _pushout_walls(px, py, r, room_w, room_h):
+    px = jnp.clip(px, r, room_w - r)
+    py = jnp.clip(py, r, room_h - r)
+    return px, py
 
-    #toggle_distract = jax.random.uniform(k1) < 0.01
-    toggle_distract = jnp.array(False)
-    is_distracted   = jnp.where(toggle_distract, 1.0 - is_distracted, is_distracted)
+def _pushout_circles(px, py, r, circles):
+    def one(carry, c):
+        cpx, cpy = carry
+        cx, cy, cr = c
+        dx, dy = cpx-cx, cpy-cy
+        dist, nx, ny = _n2(dx, dy)
+        min_dist = cr + r
+        overlap  = dist < min_dist
+        push     = jnp.where(overlap, min_dist - dist + 1e-3, 0.0)
+        return (cpx + push*nx, cpy + push*ny), None
+    (px, py), _ = jax.lax.scan(one, (px, py), circles)
+    return px, py
 
-    start_waiting = (wait_timer <= 0.0) & (jax.random.uniform(k2) < 0.005)
-    wait_duration = jax.random.uniform(k3, minval=1.0, maxval=4.0)
-    wait_timer    = jnp.where(start_waiting, wait_duration, wait_timer - dt)
+def _pushout_boxes(px, py, r, boxes):
+    def one(carry, b):
+        cpx, cpy = carry
+        cx, cy, hw, hh = b
+        inside = (jnp.abs(cpx-cx) < hw+r) & (jnp.abs(cpy-cy) < hh+r)
+        # expanded box: [cx-hw-r, cx+hw+r] x [cy-hh-r, cy+hh+r]
+        # push to nearest face of expanded box
+        face_dx = (hw+r) - jnp.abs(cpx-cx)
+        face_dy = (hh+r) - jnp.abs(cpy-cy)
+        sign_x  = jnp.sign(cpx-cx)
+        sign_y  = jnp.sign(cpy-cy)
+        # push along shortest axis
+        push_x  = face_dx * sign_x
+        push_y  = face_dy * sign_y
+        use_x   = face_dx < face_dy
+        dpx     = jnp.where(inside, jnp.where(use_x, push_x, 0.0), 0.0)
+        dpy     = jnp.where(inside, jnp.where(use_x, 0.0, push_y), 0.0)
+        return (cpx + dpx, cpy + dpy), None
+    (px, py), _ = jax.lax.scan(one, (px, py), boxes)
+    return px, py
 
-    is_waiting = wait_timer > 0.0
 
-    # 2. Robot avoidance (light repulsion)
-    dx_r   = px - rx
-    dy_r   = py - ry
-    dist_r = jnp.maximum(jnp.sqrt(dx_r**2 + dy_r**2), 0.01)
-    urg_r  = jnp.maximum(0.0, (REACTION_DIST - dist_r) / REACTION_DIST)
+# ── Single human update ───────────────────────────────────────────────────────
 
-    apply_r = (dist_r < REACTION_DIST) & (is_distracted < 0.5) & (~is_waiting)
-    rep_vx  = jnp.where(apply_r, (dx_r / dist_r) * REP_STRENGTH * urg_r, 0.0)
-    rep_vy  = jnp.where(apply_r, (dy_r / dist_r) * REP_STRENGTH * urg_r, 0.0)
+def _update_one(human, key, all_humans, obs_circles, obs_boxes,
+                dt, rx, ry, room_w, room_h, radius):
+    px, py, vx, vy = human[0], human[1], human[2], human[3]
+    theta, distract, wp_x, des_spd = human[4], human[5], human[6], human[7]
 
-    # IMPROVEMENT A: apply repulsion impulse WITHOUT premature re-normalisation.
-    # The intermediate normalise was cancelling the avoidance direction change.
-    # Final normalise (step 8) will clamp speed after all physics.
-    vx_cur = vx + rep_vx * dt
-    vy_cur = vy + rep_vy * dt
+    k_wp, = jax.random.split(key, 1)
 
-    vx_cur = jnp.where(is_waiting, 0.0, vx_cur)
-    vy_cur = jnp.where(is_waiting, 0.0, vy_cur)
+    v_des = jnp.where(distract > 0.5, des_spd * DIST_MULT, des_spd)
 
-    # 3. Move
-    new_px = px + vx_cur * dt
-    new_py = py + vy_cur * dt
+    # Waypoint management
+    wp_y    = _wpx_to_wpy(wp_x, room_h)
+    dist_wp = jnp.sqrt((px-wp_x)**2 + (py-wp_y)**2)
+    need_wp = (dist_wp < _WAYPOINT_R) | (wp_x < 0.0)
+    nwpx, nwpy = _sample_wp(k_wp, room_w, room_h)
+    wp_x = jnp.where(need_wp, nwpx, wp_x)
+    wp_y = jnp.where(need_wp, nwpy, wp_y)
 
-    # 4. Bounce off walls
-    bxl = new_px - radius < 0.0
-    bxh = new_px + radius > room_w
-    byl = new_py - radius < 0.0
-    byh = new_py + radius > room_h
+    # Goal force
+    gfx, gfy = _goal_force(px, py, vx, vy, wp_x, wp_y, v_des)
 
-    new_px = jnp.where(bxl, radius,        jnp.where(bxh, room_w - radius, new_px))
-    new_py = jnp.where(byl, radius,        jnp.where(byh, room_h - radius, new_py))
-    vx_cur = jnp.where(bxl | bxh, -vx_cur, vx_cur)
-    vy_cur = jnp.where(byl | byh, -vy_cur, vy_cur)
+    # Human-human forces (vmap, zero out self)
+    N = all_humans.shape[0]
+    def hf(i):
+        opx, opy = all_humans[i,0], all_humans[i,1]
+        fx, fy = _human_force(px, py, vx, vy, opx, opy, radius)
+        is_self = jnp.sqrt((px-opx)**2 + (py-opy)**2) < 1e-3
+        return jnp.where(is_self, 0.0, fx), jnp.where(is_self, 0.0, fy)
+    hfxs, hfys = jax.vmap(hf)(jnp.arange(N))
+    hfx, hfy = jnp.sum(hfxs), jnp.sum(hfys)
 
-    # 5. Bounce off circular obstacles
-    def _apply_circle_bounce(carry, obs):
-        cpx, cpy, cvx, cvy = carry
-        cx, cy, cr = obs
-        cpx, cpy, cvx, cvy = _bounce_circle(cpx, cpy, cvx, cvy, cx, cy, cr, radius)
-        return (cpx, cpy, cvx, cvy), None
+    # Obstacle + wall forces
+    wfx, wfy = _wall_force(px, py, room_w, room_h)
+    cfx, cfy = _circle_force(px, py, vx, vy, obs_circles)
+    bfx, bfy = _box_force(px, py, obs_boxes)
+    rfx, rfy = _robot_force(px, py, rx, ry, distract)
 
-    (new_px, new_py, vx_cur, vy_cur), _ = jax.lax.scan(
-        _apply_circle_bounce, (new_px, new_py, vx_cur, vy_cur), obs_circles
-    )
+    # Sum and clamp acceleration (prevents single-step blow-up)
+    ax = gfx + hfx + wfx + cfx + bfx + rfx
+    ay = gfy + hfy + wfy + cfy + bfy + rfy
+    a_max = MAX_SPEED / dt      # never change velocity by more than MAX_SPEED in one step
+    amag  = jnp.sqrt(ax*ax + ay*ay) + _EPS
+    ax    = jnp.where(amag > a_max, ax * a_max / amag, ax)
+    ay    = jnp.where(amag > a_max, ay * a_max / amag, ay)
 
-    # 6. Bounce off rectangular obstacles
-    def _apply_box_bounce(carry, obs):
-        cpx, cpy, cvx, cvy = carry
-        bx, by, bw, bh = obs
-        cpx, cpy, cvx, cvy = _bounce_box(cpx, cpy, cvx, cvy, bx, by, bw, bh, radius)
-        return (cpx, cpy, cvx, cvy), None
+    # Euler velocity update
+    new_vx = vx + ax * dt
+    new_vy = vy + ay * dt
 
-    (new_px, new_py, vx_cur, vy_cur), _ = jax.lax.scan(
-        _apply_box_bounce, (new_px, new_py, vx_cur, vy_cur), obs_boxes
-    )
+    # Clamp speed
+    spd    = jnp.sqrt(new_vx**2 + new_vy**2) + _EPS
+    new_vx = jnp.where(spd > MAX_SPEED, new_vx * MAX_SPEED / spd, new_vx)
+    new_vy = jnp.where(spd > MAX_SPEED, new_vy * MAX_SPEED / spd, new_vy)
 
-    # 7. Bounce off other humans — sequential scan (safe, handles all pairs)
-    def _apply_human_bounce(carry, other):
-        cpx, cpy, cvx, cvy = carry
-        opx, opy = other[0], other[1]
-        cpx, cpy, cvx, cvy = _bounce_human_pair(cpx, cpy, cvx, cvy, opx, opy, radius)
-        return (cpx, cpy, cvx, cvy), None
+    # Position update
+    new_px = px + new_vx * dt
+    new_py = py + new_vy * dt
 
-    (new_px, new_py, vx_cur, vy_cur), _ = jax.lax.scan(
-        _apply_human_bounce, (new_px, new_py, vx_cur, vy_cur), all_humans
-    )
+    # ── Hard push-out: obstacles cannot be penetrated ─────────────────────────
+    new_px, new_py = _pushout_walls(new_px, new_py, radius, room_w, room_h)
+    new_px, new_py = _pushout_circles(new_px, new_py, radius, obs_circles)
+    new_px, new_py = _pushout_boxes(new_px, new_py, radius, obs_boxes)
 
-    # 8. Final speed normalisation — SINGLE clamp after all physics
-    spd    = jnp.sqrt(vx_cur**2 + vy_cur**2)
-    scale  = target_speed / jnp.maximum(spd, 1e-6)
-    vx_cur = jnp.where(is_waiting, 0.0, vx_cur * scale)
-    vy_cur = jnp.where(is_waiting, 0.0, vy_cur * scale)
+    # Heading: smooth low-pass toward velocity direction
+    moving    = spd > 0.1
+    vel_theta = jnp.arctan2(new_vy, new_vx)
+    # Blend: 80% old heading, 20% new — smooth rotation
+    d_theta   = (vel_theta - theta + jnp.pi) % (2*jnp.pi) - jnp.pi
+    new_theta = jnp.where(moving, theta + 0.25 * d_theta, theta)
 
-    new_angle = jnp.where(is_waiting, angle, jnp.arctan2(vy_cur, vx_cur))
+    # NaN guard
+    new_px    = jnp.nan_to_num(new_px, nan=px)
+    new_py    = jnp.nan_to_num(new_py, nan=py)
+    new_vx    = jnp.nan_to_num(new_vx, nan=0.0)
+    new_vy    = jnp.nan_to_num(new_vy, nan=0.0)
+    new_theta = jnp.nan_to_num(new_theta, nan=theta)
 
-    return jnp.stack([new_px, new_py, vx_cur, vy_cur, new_angle,
-                      is_distracted, wait_timer, target_speed])
+    return jnp.stack([new_px, new_py, new_vx, new_vy,
+                      new_theta, distract, wp_x, des_spd])
 
+
+# ── Public API ────────────────────────────────────────────────────────────────
 
 def update_all_humans(people_arr, rng_key, dt, rx, ry, rtheta, rv,
                       room_w, room_h, radius, obs_circles, obs_boxes):
-    """
-    Vectorised billiard-ball crowd update.
-    Called inside step_env which is already @jax.jit — no nested jit here.
-    """
-    keys = jax.random.split(rng_key, people_arr.shape[0])
+    """Drop-in replacement. people_arr: (N,8) → (N,8)."""
+    N    = people_arr.shape[0]
+    keys = jax.random.split(rng_key, N)
     return jax.vmap(
-        _update_single_human,
-        in_axes=(0, 0, None, None, None, None, None, None, None, None, None, None, None)
+        _update_one,
+        in_axes=(0, 0, None, None, None, None, None, None, None, None, None)
     )(people_arr, keys, people_arr, obs_circles, obs_boxes,
-      dt, rx, ry, rtheta, rv, room_w, room_h, radius)
+      dt, rx, ry, room_w, room_h, radius)

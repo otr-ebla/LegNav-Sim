@@ -44,7 +44,7 @@ import jax.numpy as jnp
 from flax import struct
 from jax_physics import compute_lidar
 from jax_humans import update_all_humans
-from jax_legs import get_leg_circles, advance_feet, init_foot_state
+from jax_legs import get_leg_circles, get_shoe_boxes, advance_feet, init_foot_state
 
 # ── Feature flag ──────────────────────────────────────────────────────────────
 # Flip this to False for cylinder-model baseline/ablation training.
@@ -53,12 +53,12 @@ USE_LEGS = True
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 DT             = 0.15
-MAX_STEPS      = 400
+MAX_STEPS      = 600
 NUM_RAYS       = 108
 REAR_RAYS      = 4
-NUM_PEOPLE     = 6
-NUM_OBS_CIR    = 6
-NUM_OBS_BOX    = 6
+NUM_PEOPLE     = 18
+NUM_OBS_CIR    = 7
+NUM_OBS_BOX    = 7
 ROOM_W         = 12.0
 ROOM_H         = 12.0
 ROBOT_RADIUS   = 0.2
@@ -68,8 +68,8 @@ FOV            = math.pi         # 180° forward-facing LiDAR
 GOAL_RADIUS    = 0.3
 COMFORT_DIST   = 1.0
 COMFORT_COEF   = 0.03
-HEADING_BONUS  = 0.015
-PROGRESS_COEF  = 5.0
+HEADING_BONUS  = 0.005
+PROGRESS_COEF  = 1.0
 
 MAX_RESAMPLE_ITERS = 200
 DEFAULT_MIN_GOAL_DIST = 3.0
@@ -95,6 +95,8 @@ class EnvState:
     time_step:   jnp.int32
     # ── NEW: per-human gait phase ────────────────────────────────────────────
     foot_state:  jnp.ndarray   # (NUM_PEOPLE, 8) — planted-foot gait state
+    time_stopped: jnp.int32
+    sp_mask:      jnp.ndarray   # (NUM_RAYS,)  -
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -124,7 +126,7 @@ def _is_safe(x, y, clearance, obs_circles, obs_boxes):
 
 # ── Observation ───────────────────────────────────────────────────────────────
 
-def get_obs(state: EnvState) -> jnp.ndarray:
+def get_obs(state: EnvState, key: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
     Build the flat observation vector.
 
@@ -142,11 +144,28 @@ def get_obs(state: EnvState) -> jnp.ndarray:
     all_circles = jnp.concatenate([human_circles, state.obs_circles], axis=0)
 
     # Front LiDAR sweep — 108 rays, FOV=π
+    # NOTE: shoes are NOT included here — LiDAR only sees leg circles, not shoes.
     raw_lidar = compute_lidar(
         state.x, state.y, state.theta,
         all_circles, state.obs_boxes,
         NUM_RAYS, float(FOV), MAX_LIDAR_DIST, ROOM_W, ROOM_H
     )
+
+    # ── NEW: Apply Vectorized Sensor Noise ────────────────────────────────────
+    k_gauss, k_sp = jax.random.split(key)
+    
+    # 1. Gaussian Noise (e.g., 0.05m standard deviation)
+    gaussian = jax.random.normal(k_gauss, raw_lidar.shape) * 0.05
+    
+    # 2. Salt & Pepper Noise (3% of rays)
+    sp_rand = jax.random.uniform(k_sp, raw_lidar.shape)
+    sp_mask = sp_rand < 0.03            # The 3% affected rays
+    is_max  = sp_rand < 0.015           # 1.5% drop to maximum
+    
+    # Apply Gaussian first, then overwrite with Salt/Pepper extremes
+    noisy_lidar = jnp.where(sp_mask, jnp.where(is_max, MAX_LIDAR_DIST, 0.0), raw_lidar + gaussian)
+    noisy_lidar = jnp.clip(noisy_lidar, 0.0, MAX_LIDAR_DIST)
+    # ──────────────────────────────────────────────────────────────────────────
 
     # Rear sweep — 4 rays, FOV=0.75π
     _REAR_FOV = float(jnp.pi * 0.75)
@@ -190,13 +209,13 @@ def get_obs(state: EnvState) -> jnp.ndarray:
     ])
     state_vec = jnp.concatenate([state_vec_scalars, rear_prox_vec])  # (9,)
 
-    return jnp.concatenate([pose_vec, state_vec, inv_lidar])  # 3+9+108 = 120
+    return jnp.concatenate([pose_vec, state_vec, inv_lidar]), sp_mask  # 3+9+108 = 120
 
 
 # ── Reset ─────────────────────────────────────────────────────────────────────
 
 def reset_env(key: jnp.ndarray, min_goal_dist: float = DEFAULT_MIN_GOAL_DIST):
-    k1, k2, k3, k4, k5, k6, k7, k8, k9, k_legs = jax.random.split(key, 10)
+    k1, k2, k3, k4, k5, k6, k7, k8, k9, k_legs, k_obs = jax.random.split(key, 11)
 
     max_v  = jax.random.uniform(k1, minval=0.2, maxval=2.0)
     margin = ROBOT_RADIUS + 0.5
@@ -316,8 +335,13 @@ def reset_env(key: jnp.ndarray, min_goal_dist: float = DEFAULT_MIN_GOAL_DIST):
         obs_boxes=obs_boxes,
         time_step=0,
         foot_state=foot_state,
+        time_stopped=0,
+        sp_mask=jnp.zeros(NUM_RAYS, dtype=jnp.bool_)
     )
-    return get_obs(state), state
+
+    obs, sp_mask = get_obs(state, k_obs)
+    state = state.replace(sp_mask=sp_mask)
+    return obs, state
 
 
 # ── Step ──────────────────────────────────────────────────────────────────────
@@ -341,7 +365,7 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
     new_x = jnp.clip(raw_x, ROBOT_RADIUS, ROOM_W - ROBOT_RADIUS)
     new_y = jnp.clip(raw_y, ROBOT_RADIUS, ROOM_H - ROBOT_RADIUS)
 
-    human_key, _ = jax.random.split(key)
+    human_key, k_obs = jax.random.split(key)
     new_people = update_all_humans(
         state.people, human_key, dt,
         new_x, new_y, new_theta, target_v,
@@ -349,10 +373,10 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
         state.obs_circles, state.obs_boxes
     )
 
-    # ── NEW: advance leg gait phases ──────────────────────────────────────────
+    # ── Advance leg gait phases ───────────────────────────────────────────────
     new_foot_state = advance_feet(state.foot_state, new_people, dt)
 
-    # ── Distances & collisions (body centres — stable reward signal) ──────────
+    # ── Distances & Angles ────────────────────────────────────────────────────
     prev_dist = jnp.sqrt((state.x - state.goal_x)**2 + (state.y - state.goal_y)**2)
     new_dist  = jnp.sqrt((new_x  - state.goal_x)**2 + (new_y  - state.goal_y)**2)
 
@@ -361,12 +385,29 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
     dists_p = jnp.sqrt(dx_p**2 + dy_p**2)
     closest_human = jnp.min(dists_p)
 
-    human_col_mask  = dists_p < (ROBOT_RADIUS + PEOPLE_RADIUS)
-    human_collision = jnp.any(human_col_mask)
+    human_angles = jnp.arctan2(dy_p, dx_p)
+    rel_angles   = (human_angles - new_theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
 
-    active_col  = human_collision & (target_v >  0.1)
-    passive_col = human_collision & (target_v <= 0.1)
+    # ── Human Collisions (Active vs Passive) ─────────────────────────────────
+    # Active collision: robot hit a human.
+    #   ALL three conditions must hold for at least one colliding human:
+    #     1. physical contact           — dists_p < ROBOT_RADIUS + PEOPLE_RADIUS
+    #     2. human in forward 180° FOV  — |rel_angle| < π/2
+    #     3. human within 1.5 m         — dists_p < 1.5
+    #     4. robot moving               — v >= 0.1 m/s
+    # Passive collision: human walked into the robot — everything else.
+    col_mask    = dists_p < (ROBOT_RADIUS + PEOPLE_RADIUS)
+    is_in_front = jnp.abs(rel_angles) < (jnp.pi / 2.0)   # forward 180° FOV
+    in_prox     = dists_p < 1.5                            # within 1.5 m
+    is_moving   = target_v >= 0.1                          # robot moving
 
+    active_mask  = col_mask & is_in_front & in_prox & is_moving
+    passive_mask = col_mask & ~active_mask
+
+    active_col  = jnp.any(active_mask)
+    passive_col = jnp.any(passive_mask)
+
+    # ── Obstacle Collisions ───────────────────────────────────────────────────
     dx_c = state.obs_circles[:, 0] - new_x
     dy_c = state.obs_circles[:, 1] - new_y
     closest_cir = jnp.min(jnp.sqrt(dx_c**2 + dy_c**2) - state.obs_circles[:, 2])
@@ -378,33 +419,84 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
         return jnp.sqrt(ddx**2 + ddy**2)
     closest_box = jnp.min(jax.vmap(_box_dist)(state.obs_boxes))
 
-    obs_collision = (closest_cir < ROBOT_RADIUS) | (closest_box < ROBOT_RADIUS)
-    collision     = human_collision | obs_collision | wall_collision
-    timeout       = (state.time_step + 1) >= MAX_STEPS
-    goal_reached  = new_dist < GOAL_RADIUS
-    done          = goal_reached | collision | timeout
+    # Shoe boxes — treat as obstacles when USE_LEGS=True
+    if USE_LEGS:
+        shoe_boxes_step = get_shoe_boxes(new_people, new_foot_state)
+        closest_shoe = jnp.min(jax.vmap(_box_dist)(shoe_boxes_step))
+    else:
+        closest_shoe = jnp.inf
 
-    # ── Reward ────────────────────────────────────────────────────────────────
-    progress  = PROGRESS_COEF * (prev_dist - new_dist)
-    step_pen  = -0.006
-    smooth    = -0.5 * jnp.abs(target_w - state.w)
+    obs_collision = (closest_cir < ROBOT_RADIUS) | (closest_box < ROBOT_RADIUS) | (closest_shoe < ROBOT_RADIUS)
+
+    # ── End of Episode Flags ──────────────────────────────────────────────────
+    collision    = active_col | passive_col | obs_collision | wall_collision
+    timeout      = (state.time_step + 1) >= MAX_STEPS
+    goal_reached = new_dist < GOAL_RADIUS
+    done         = goal_reached | collision | timeout
+
+    # ── Dense Rewards ─────────────────────────────────────────────────────────
+
+    # Progress: ~0.18/step at 1.2 m/s. Primary navigation signal, unchanged.
+    progress = PROGRESS_COEF * (prev_dist - new_dist)
+
+    # Step penalty: -0.006 → -0.02.
+    # Old value accumulated to only -2.4 over a full 400-step timeout — nearly
+    # free. At -0.02 a timeout costs -8, making efficiency matter.
+    step_pen = -0.02
+
+    # Smoothness: unchanged.
+    smooth = -0.5 * jnp.abs(target_w - state.w)
+
+    # Speed bonus: unchanged.
     speed_bon = 0.02 * target_v / jnp.maximum(state.max_v, 1e-3)
 
+    # Heading bonus: unchanged.
     goal_angle_cur = jnp.arctan2(state.goal_y - new_y, state.goal_x - new_x)
     align_cur      = (goal_angle_cur - new_theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
     heading_bon    = HEADING_BONUS * jnp.maximum(0.0, jnp.cos(align_cur)) * \
                      (target_v / jnp.maximum(state.max_v, 1e-3))
 
-    comfort_pen = -COMFORT_COEF * jnp.sum(
+    comfort_pen = -0.15 * jnp.sum(
         jnp.maximum(0.0, 1.0 - dists_p / COMFORT_DIST)
     )
 
-    reward = progress + step_pen + smooth + speed_bon + heading_bon + comfort_pen
-    reward = jnp.where(goal_reached, 25.0, reward)
-    reward = jnp.where(obs_collision  & ~goal_reached, -7.0, reward)
-    reward = jnp.where(wall_collision & ~obs_collision & ~goal_reached, -7.0, reward)
-    reward = jnp.where(active_col  & ~obs_collision & ~wall_collision & ~goal_reached, -7.0, reward)
-    reward = jnp.where(passive_col & ~obs_collision & ~wall_collision & ~goal_reached, -2.0, reward)
+    YIELD_DIST = 1.2
+    YIELD_FOV  = 1.5708
+
+    in_yield_zone      = (dists_p < YIELD_DIST) & (jnp.abs(rel_angles) < YIELD_FOV)
+    is_yield_situation = jnp.any(in_yield_zone)
+
+    closest_yield_dist = jnp.min(jnp.where(in_yield_zone, dists_p, 100.0))
+    urgency = jnp.where(is_yield_situation,
+                        (YIELD_DIST - closest_yield_dist) / YIELD_DIST, 0.0)
+
+    is_stopped = target_v <= 0.1
+
+    new_time_stopped = jnp.where(
+        is_yield_situation,
+        jnp.where(is_stopped, state.time_stopped + 1, state.time_stopped),
+        0,
+    )
+    decay = jnp.maximum(0.0, 1.0 - (new_time_stopped / 30.0))
+
+    yield_penalty = -2.5 * urgency * (target_v / jnp.maximum(state.max_v, 1e-3))
+    yield_bonus   =  0.4 * urgency * decay
+
+    yield_reward = jnp.where(
+        is_yield_situation,
+        jnp.where(is_stopped, yield_bonus, yield_penalty),
+        0.0
+    )
+
+    # ── Terminal Reward Overrides ─────────────────────────────────────────────
+    reward = progress + step_pen + smooth + speed_bon + heading_bon + comfort_pen + yield_reward
+
+    reward = jnp.where(goal_reached, 200.0, reward)
+    reward = jnp.where(obs_collision  & ~goal_reached, -70.0, reward)
+    reward = jnp.where(wall_collision & ~obs_collision & ~goal_reached, -70.0, reward)
+    reward = jnp.where(active_col  & ~obs_collision & ~wall_collision & ~goal_reached, -72.0, reward)
+
+    reward = jnp.where(passive_col & ~active_col & ~obs_collision & ~wall_collision & ~goal_reached, -22.0, reward)
     reward = jnp.where(timeout & ~goal_reached & ~collision, -0.5, reward)
 
     new_state = state.replace(
@@ -413,14 +505,18 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
         people=new_people,
         time_step=state.time_step + 1,
         foot_state=new_foot_state,
+        time_stopped=new_time_stopped,
     )
 
-    obs  = get_obs(new_state)
+    obs, sp_mask = get_obs(new_state, k_obs)
+    new_state = new_state.replace(sp_mask=sp_mask)
+
     info = {
         "discount":      jnp.where(done, 0.0, 1.0),
         "goal_reached":  goal_reached,
         "collision":     collision,
         "passive_col":   passive_col,
         "closest_human": closest_human,
+        "sp_mask":       sp_mask,
     }
     return obs, new_state, reward, done, info

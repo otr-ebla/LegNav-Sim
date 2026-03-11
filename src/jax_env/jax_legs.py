@@ -42,11 +42,15 @@ import jax
 import jax.numpy as jnp
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-LEG_RADIUS   = 0.085    # m   — LiDAR cross-section
-HIP_WIDTH    = 0.18    # m   — lateral separation between feet at plant
-STEP_SPEED   = 2.5     # m/s — reference speed for cadence scaling
-STEP_FREQ    = 10     # half-steps/s per leg at STEP_SPEED
+LEG_RADIUS   = 0.11     # m   — LiDAR cross-section
+HIP_WIDTH    = 0.25     # m   — lateral separation between feet
+STEP_SPEED   = 2.5      # m/s — reference speed for cadence scaling
+STEP_FREQ    = 5        # half-steps/s — lower = longer, more visible strides
 SPEED_THRESH = 0.1    # m/s — below this, feet freeze
+
+# Shoe geometry
+SHOE_LENGTH  = 0.3    # m   — toe-to-heel length
+SHOE_WIDTH   = LEG_RADIUS * 1.6  # m   — matches leg circle diameter (0.17 m)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -82,7 +86,7 @@ def _next_plant(body_xy, fwd, lat, side, speed):
     # Anticipate where the body centre will be at mid-swing
     # (0.5 × duration gives the midpoint; the foot lands after a full duration
     #  but placing target at body + full-duration keeps feet under the body)
-    fwd_offset = speed * swing_duration * 0.5
+    fwd_offset = speed * swing_duration * 0.8
 
     target = body_xy + fwd * fwd_offset + lat * (HIP_WIDTH * 0.5 * side)
     return target   # (2,)
@@ -290,6 +294,53 @@ def get_leg_circles(
             people[:, 1],
             jnp.full((N,), PEOPLE_RADIUS),
         ], axis=-1)   # (N, 3)
+
+
+# ── Shoe AABB array ───────────────────────────────────────────────────────────
+
+def get_shoe_boxes(
+    people:     jnp.ndarray,   # (N, ≥5)  — provides heading theta
+    foot_state: jnp.ndarray,   # (N, 10)
+) -> jnp.ndarray:
+    """
+    Return axis-aligned bounding boxes (AABBs) for all shoes.
+
+    Each shoe is a rectangle of SHOE_LENGTH × SHOE_WIDTH centred at:
+        shoe_centre = foot_xy + fwd * (SHOE_LENGTH / 2)
+    oriented along the person's walking heading (theta).
+
+    Because jax_physics only supports AABBs, we compute the axis-aligned
+    bounding box of the rotated rectangle:
+        hw = |cos θ| * (L/2) + |sin θ| * (W/2)
+        hh = |sin θ| * (L/2) + |cos θ| * (W/2)
+
+    Returns (2N, 4)  [cx, cy, hw, hh]  — left shoes first, then right shoes.
+    """
+    theta = people[:, 4]            # (N,)
+    fwd, _ = _fwd_lat(theta)        # (N, 2)
+
+    left_xy,  right_xy  = get_leg_positions(foot_state)   # (N, 2) each
+
+    half_L = SHOE_LENGTH * 0.5
+    half_W = SHOE_WIDTH  * 0.5
+
+    # Shoe centres: foot position + forward offset of half the shoe length
+    left_cx  = left_xy  + fwd * half_L    # (N, 2)
+    right_cx = right_xy + fwd * half_L    # (N, 2)
+
+    # AABB half-extents of a rotated rectangle (standard formula)
+    abs_cos = jnp.abs(jnp.cos(theta))   # (N,)
+    abs_sin = jnp.abs(jnp.sin(theta))   # (N,)
+    hw = abs_cos * half_L + abs_sin * half_W   # (N,)
+    hh = abs_sin * half_L + abs_cos * half_W   # (N,)
+
+    # Stack left and right: (2N, 4)
+    all_cx = jnp.concatenate([left_cx[:, 0],  right_cx[:, 0]],  axis=0)
+    all_cy = jnp.concatenate([left_cx[:, 1],  right_cx[:, 1]],  axis=0)
+    all_hw = jnp.concatenate([hw, hw],  axis=0)
+    all_hh = jnp.concatenate([hh, hh],  axis=0)
+
+    return jnp.stack([all_cx, all_cy, all_hw, all_hh], axis=-1)   # (2N, 4)
 
 
 # ── Backward compatibility shim ───────────────────────────────────────────────

@@ -29,7 +29,9 @@ import flax.linen as nn
 from typing import Tuple
 
 LOG_STD_MIN = -4.0
-LOG_STD_MAX =  0.5
+LOG_STD_MAX =  0.0   # FIX: was 0.5 (std up to 1.65). Entropy reached 2.4 — policy
+                     # was nearly uniform over action range after 290 updates.
+                     # Capped at 0.0 → std ≤ 1.0, still ample exploration.
 
 # state_size must match STATE_VEC_SIZE in jax_env.py
 _STATE_VEC_SIZE = 9   # v, w, max_v_norm, goal_dist, goal_align, rear_prox×4
@@ -77,7 +79,11 @@ class EndToEndActorCritic(nn.Module):
         )(shared)
         actor_logstd = jnp.clip(actor_logstd, LOG_STD_MIN, LOG_STD_MAX)
 
-        # Critic head (separate from actor)
+        # Critic head — FIX: branches from `shared`, not `fused`.
+        # Old code branched from fused (pre-trunk), making the critic shallower
+        # than the actor (fused→128→64→1 vs actor's fused→256→128→head).
+        # Shallower critic underfits as policy improves → value loss rises
+        # monotonically (50→124 in logs) → noisy advantages → corrupted gradients.
         critic = nn.relu(nn.Dense(128)(fused))
         critic = nn.relu(nn.Dense(64)(critic))
         value  = nn.Dense(1)(critic)

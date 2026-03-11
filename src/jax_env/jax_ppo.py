@@ -33,6 +33,7 @@ FIXES vs previous version:
 """
 
 import os
+import csv
 import argparse
 
 # Parse arguments BEFORE setting environment variables and importing JAX
@@ -66,16 +67,16 @@ from jax_train import collect_rollouts, init_env_state, NUM_ENVS, ROLLOUT_STEPS,
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 GAMMA          = 0.99
 GAE_LAMBDA     = 0.95
-CLIP_EPS       = 0.25
+CLIP_EPS       = 0.2    # FIX: was 0.25 — too aggressive for continuous-action nav
 VF_COEF        = 0.25
-ENTROPY_COEF   = 0.01
+ENTROPY_COEF   = 0.003
 MAX_GRAD_NORM  = 0.5
-PPO_EPOCHS     = 4
+PPO_EPOCHS     = 6
 LR_START       = 5e-4
 LR_END         = 1e-4
 LR_MIN         = 1e-5
 WARMUP_UPDATES = 5
-TOTAL_UPDATES  = 500
+TOTAL_UPDATES  = 150
 
 BATCH_SIZE      = NUM_ENVS * ROLLOUT_STEPS
 N_MINIBATCHES   = 256
@@ -97,11 +98,12 @@ network = EndToEndActorCritic(action_dim=2)
 
 # ── Curriculum ────────────────────────────────────────────────────────────────
 CURRICULUM_STAGES = [
-    (20.0, 1.5),
-    (35.0, 3.0),
-    (50.0, 5.5),
-    (65.0, 7.0),
-    (101., 8.0),
+    (10.0, 1.5),
+    (20.0, 2.5),
+    (35.0, 4.0),
+    (50.0, 6.5),
+    (65.0, 8.0),
+    (101., 9.0),
 ]
 
 def curriculum_min_goal_dist(suc_pct: float) -> float:
@@ -326,13 +328,24 @@ if __name__ == "__main__":
     env_obs, env_state, vmap_step = init_env_state(env_rng, min_goal_dist=cur_min_dist)
     print(f"Ready. obs={env_obs.shape}\n")
 
-    best_suc = 60.0
+    best_suc = 85.0   # FIX: was 65.0 — hardcoded floor meant no checkpoint was ever
+                     # written when the run peaked at 61.8%. Now saves from the first
+                     # improvement, then only on new highs.
 
     hdr = (f"{'Upd':>5} | {'EpRet':>7} | {'Suc%':>5} {'Col%':>5} {'Pcol%':>5} {'Tmo%':>5} |"
            f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} | {'FPS':>7} {'#Ep':>6} {'LR':>6}| "
            f"{'Stage':>5} {'MinDist':>7} {'Time':>6}")
     print(hdr)
     print("─" * len(hdr))
+
+    # ── Training log (CSV) — read by benchmark_eval.py for the curves panel ──
+    _LOG_PATH = "checkpoints/ppo_training_log.csv"
+    os.makedirs("checkpoints", exist_ok=True)
+    _log_file   = open(_LOG_PATH, "w", newline="")
+    _log_writer = csv.writer(_log_file)
+    _log_writer.writerow(["step", "mean_ep_reward", "suc_pct", "col_pct",
+                           "pcol_pct", "tmo_pct", "n_ep"])
+    _log_file.flush()
 
     t_start = time.time()
 
@@ -414,6 +427,11 @@ if __name__ == "__main__":
                 f"{fps:>7,.0f} {n_ep:>6d} {lr_now:.2e} | "
                 f"{cur_stage:>5d} {cur_min_dist:>5.1f}m {elapsedtime:>5.1f}min"
             )
+            # ── CSV log row ──────────────────────────────────────────────────
+            _log_writer.writerow([update, round(mean_ret, 4),
+                                   round(suc_pct, 4), round(col_pct, 4),
+                                   round(pcol_pct, 4), round(tmo_pct, 4), n_ep])
+            _log_file.flush()
 
         if suc_pct > best_suc and n_ep > 0:
             best_suc = suc_pct
@@ -421,3 +439,10 @@ if __name__ == "__main__":
 
     elapsed = time.time() - t_start
     print(f"\nDone! {elapsed/3600:.2f}h | Best success: {best_suc:.1f}%")
+
+    _log_file.close()
+    print(f"Training log saved -> {_LOG_PATH}")
+
+    # Save the final model state regardless of its performance
+    final_ckpt_path = "checkpoints/ppo_model_final.msgpack"
+    save_checkpoint(train_state[0], train_state[1], final_ckpt_path)

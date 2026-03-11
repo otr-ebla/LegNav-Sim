@@ -1,68 +1,27 @@
 """
-benchmark_eval.py — Massive Headless Evaluation Dashboard (GPU-Optimised)
-==========================================================================
-Tests PPO, SAC, and TQC models across all 7 scenarios × 3 max_v limits.
+benchmark_eval.py — High-Speed Evaluation Dashboard
+===================================================
+Evaluates RL models across all 7 scenarios and generates a visual dashboard.
 
-BUGS FIXED (explaining the spurious 100% success rate):
-=======================================================
+OOM FIX: Removed the nested vmap over (N_SCENARIOS × N_SPEEDS) that tried to
+allocate ~5.4 GiB for a single compiled graph. Evaluation is now a sequential
+Python loop over (scenario, speed) pairs; each iteration dispatches a single
+vmap over N_ENVS environments, which is the actual parallelism budget the GPU
+can handle. Compile time drops to seconds and VRAM stays under 2 GiB.
 
-  BUG 1 — USE_LEGS not set (CRITICAL — explains 100% success):
-    benchmark_eval never imported jax_env or set jax_env.USE_LEGS before
-    calling reset_env/step_env.  With USE_LEGS=True (module default), the
-    collision geometry shrinks from ROBOT_RADIUS+PEOPLE_RADIUS=0.4 m to
-    ROBOT_RADIUS+LEG_RADIUS≈0.285 m, and the two leg circles (r=0.085 m)
-    are laterally offset by HIP_WIDTH/2=0.09 m from the body centre.  The
-    robot can physically walk straight through a human torso without either
-    leg circle triggering a collision — so every episode ends in a trivial
-    "success" because collisions have been silently disabled.
-    Also, if the policy was trained with USE_LEGS=False, the LiDAR sees
-    body-cylinder circles while benchmark evaluation would feed it leg-circle
-    observations — completely mismatched sensor data.
-    FIX: import jax_env and set USE_LEGS = False (or True) to match training
-    BEFORE any env import so the JIT traces the correct branch.
-
-  BUG 2 — scen_idx traced inside vmap but evaluate_chunk was @jax.jit
-    (CRITICAL — explains identical 100% bars across all 7 scenarios):
-    evaluate_chunk_grid vmaps _eval_one over SCENARIOS = jnp.arange(7),
-    so scen_idx is a JAX-traced dynamic integer inside the vmap.  Calling
-    the @jax.jit-decorated evaluate_chunk with a traced scen_idx forces JAX
-    to retrace with a fake concrete value (0 on first call), then reuse that
-    compiled graph for all subsequent scenarios — every scenario silently ran
-    as scenario 0 (Random).  Result: all 7 scenario bars show identical numbers.
-    FIX: rename the body to _evaluate_chunk_inner (no decorator, pure
-    function), vmappable freely.  A thin @jax.jit evaluate_chunk wrapper is
-    kept only for standalone CLI calls.
-
-  BUG 3 — closest_human clearance used PEOPLE_RADIUS unconditionally:
-    When USE_LEGS=True, info["closest_human"] is distance to the nearest
-    leg circle (radius=LEG_RADIUS), not body centre.  Subtracting
-    ROBOT_RADIUS + PEOPLE_RADIUS gives a wrong (too-small) clearance value
-    in the dashboard's Min Dist metric.
-    FIX: subtract ROBOT_RADIUS + LEG_RADIUS when USE_LEGS=True.
-
-  BUG 4 (minor) — dynamic_reset_stacked and step_stacked_headless each
-    carry their own @jax.jit which conflicts with being called from inside
-    the outer vmap in evaluate_chunk_grid.  These inner JITs are harmless
-    in practice (JAX flattens nested JITs) but add tracing overhead.
-    Left as-is to avoid regressions; documented here for awareness.
-
-GPU optimisations (unchanged from prior version):
-  OPT 1 — N_ENVS=4096; OPT 2 — grid vmap; OPT 3 — device_put params;
-  OPT 4 — XLA_FLAGS Triton GEMM; OPT 5 — block_until_ready warmup;
-  OPT 6 — donate_argnums; OPT 7 — fold_in RNG.
+TRAINING CURVES: A 9th panel plots episode reward over training steps, loaded
+from CSV logs written by jax_ppo.py / SACjax.py / TQCjac.py. If a log file is
+missing the panel shows a "no data" notice instead of crashing.
 """
 
 import os
-
-# ── CUDA / XLA environment — set BEFORE importing JAX ───────────────────────
-os.environ["JAX_PLATFORMS"]               = "cuda,cpu"
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
-os.environ["TF_GPU_ALLOCATOR"]            = "cuda_malloc_async"
-# OPT 4: Triton fused GEMM for Conv1D + Dense layers (faster on Ampere/Ada GPUs)
-os.environ["XLA_FLAGS"] = "--xla_gpu_enable_triton_gemm=true"
-
 import time
-import functools
+import warnings
+
+os.environ["JAX_PLATFORMS"] = "cuda,cpu"
+os.environ["XLA_FLAGS"] = "--xla_gpu_enable_triton_gemm=true"
+warnings.filterwarnings("ignore")
+
 import jax
 import jax.numpy as jnp
 import flax.serialization
@@ -70,172 +29,130 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-import warnings
-warnings.filterwarnings("ignore")
 
-# ── BUG 1 FIX — Mirror USE_LEGS flag from training ───────────────────────────
-# benchmark_eval previously never set jax_env.USE_LEGS, so it inherited the
-# module default (True).  If policies were trained with USE_LEGS=False, the
-# benchmark runs with a completely different LiDAR geometry (2×small leg circles
-# instead of body cylinders) and different collision thresholds — the policy
-# sees sensor data it was never trained on and navigates nearly blind, yet the
-# 100% success appears because the COLLISION geometry also changes (leg circles
-# are tiny, so the robot physically passes through human bodies without
-# triggering a collision, trivially "succeeding").
-# Set this flag to match your training configuration BEFORE any env import.
 import jax_env
-jax_env.USE_LEGS = False   # ← set to True if you trained with --legs
+jax_env.USE_LEGS = True
 
-# ── Environment imports ───────────────────────────────────────────────────────
 from jax_env import ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS, DT, MAX_STEPS
 from jax_env_multi import reset_env, step_env
 from jax_wrappers import StackedEnvState
 from jax_legs import LEG_RADIUS
-
-# ── Network imports — exact classes used during training ──────────────────────
 from jax_network import EndToEndActorCritic
 from SACnetwork import SACActorNetwork
+from TQCeval import TQCActorNetwork
 
-# ── Config ────────────────────────────────────────────────────────────────────
-OBS_SIZE    = 342
-ACTION_DIM  = 2
+# ── Configuration ─────────────────────────────────────────────────────────────
+OBS_SIZE   = 342
+ACTION_DIM = 2
+N_ENVS     = 4096   # parallelism per (scenario, speed) cell — fits in VRAM
 
-# OPT 1: 4096 parallel envs saturates GPU SMs; tune to 2048 if OOM
-N_ENVS      = 4096
-
-MAX_V_TESTS = jnp.array([1.0, 1.5, 2.0])   # kept as jnp for vmap
-SCENARIOS   = jnp.arange(7, dtype=jnp.int32)
-
+MAX_V_TESTS = [0.2, 0.5, 0.75, 1.0, 1.33, 1.66, 2.0]
 N_SCENARIOS = 7
-N_SPEEDS    = 3
+N_SPEEDS    = len(MAX_V_TESTS)
 
-# ── Network singletons ────────────────────────────────────────────────────────
+# Training-curve CSV paths written by each trainer
+TRAINING_LOG_PATHS = {
+    "PPO": "checkpoints/ppo_training_log.csv",
+    "SAC": "checkpoints_sac/sac_training_log.csv",
+    "TQC": "checkpoints_tqc/tqc_training_log.csv",
+}
+
 _ppo_net = EndToEndActorCritic(action_dim=ACTION_DIM)
 _sac_net = SACActorNetwork(action_dim=ACTION_DIM)
+_tqc_net = TQCActorNetwork(action_dim=ACTION_DIM)
 
-
-# ── Action squashing ──────────────────────────────────────────────────────────
+# ── Action Squashing ──────────────────────────────────────────────────────────
 def _squash_ppo(mean, max_v):
     v = jax.nn.sigmoid(mean[..., 0]) * max_v
     w = jnp.tanh(mean[..., 1])
     return jnp.stack([v, w], axis=-1)
 
-def _squash_sac(mean, max_v):
+def _squash_sac_tqc(mean, max_v):
     t = jnp.tanh(mean)
     v = (t[..., 0] + 1.0) * 0.5 * max_v
     w = t[..., 1]
     return jnp.stack([v, w], axis=-1)
 
-
-# ── Environment wrappers ──────────────────────────────────────────────────────
+# ── Environment Wrappers ──────────────────────────────────────────────────────
 @jax.jit
 def dynamic_reset_stacked(key, min_dist, scen_idx, target_max_v):
-    """
-    Reset one env, override max_v, build stacked obs (342,).
-    get_obs single-frame layout: pose(3) + state_vec(9) + lidar(108) = 120.
-    """
     base_obs, base_state = reset_env(key, min_dist, scen_idx)
-
-    pose      = base_obs[0:3]   # (3,)
-    state_vec = base_obs[3:12]  # (9,)
-    lidar     = base_obs[12:]   # (108,)
+    pose      = base_obs[0:3]
+    state_vec = base_obs[3:12]
+    lidar     = base_obs[12:]
 
     base_state = base_state.replace(max_v=target_max_v)
-
     new_state_vec = jnp.array([
-        0.0,
-        0.0,
-        (target_max_v - 0.2) / 1.8,
-        state_vec[3],   # goal_dist_norm
-        state_vec[4],   # goal_align_norm
-        state_vec[5], state_vec[6], state_vec[7], state_vec[8],  # rear_prox x4
+        0.0, 0.0, (target_max_v - 0.2) / 1.8,
+        state_vec[3], state_vec[4],
+        state_vec[5], state_vec[6], state_vec[7], state_vec[8],
     ])
 
-    lidar_stack = jnp.tile(lidar[None, :], (3, 1))  # (3, 108)
-    pose_stack  = jnp.tile(pose[None,  :], (3, 1))  # (3, 3)
-
+    lidar_stack = jnp.tile(lidar[None, :], (3, 1))
+    pose_stack  = jnp.tile(pose[None, :],  (3, 1))
     stacked_state = StackedEnvState(
-        env_state=base_state,
-        lidar_stack=lidar_stack,
-        pose_stack=pose_stack,
+        env_state=base_state, lidar_stack=lidar_stack, pose_stack=pose_stack
     )
-    flat_obs = jnp.concatenate([
-        pose_stack.flatten(), new_state_vec, lidar_stack.flatten()
-    ])
+    flat_obs = jnp.concatenate([pose_stack.flatten(), new_state_vec, lidar_stack.flatten()])
     return flat_obs, stacked_state
 
 
 @jax.jit
 def step_stacked_headless(key, state: StackedEnvState, action):
-    """Single headless step; slices single-frame obs (120,) correctly."""
     base_obs, new_base_state, reward, done, info = step_env(key, state.env_state, action)
-
     new_pose      = base_obs[0:3]
     new_state_vec = base_obs[3:12]
     new_lidar     = base_obs[12:]
 
     new_lidar_stack = jnp.concatenate([state.lidar_stack[1:], new_lidar[None]], axis=0)
     new_pose_stack  = jnp.concatenate([state.pose_stack[1:],  new_pose[None]],  axis=0)
-
     new_stacked_state = StackedEnvState(
-        env_state=new_base_state,
-        lidar_stack=new_lidar_stack,
-        pose_stack=new_pose_stack,
+        env_state=new_base_state, lidar_stack=new_lidar_stack, pose_stack=new_pose_stack
     )
-    flat_obs = jnp.concatenate([
-        new_pose_stack.flatten(), new_state_vec, new_lidar_stack.flatten()
-    ])
+    flat_obs = jnp.concatenate([new_pose_stack.flatten(), new_state_vec, new_lidar_stack.flatten()])
     return flat_obs, new_stacked_state, reward, done, info
 
 
-# ── Core evaluation kernel ────────────────────────────────────────────────────
-# BUG 4 FIX: The original evaluate_chunk was @jax.jit, then called from inside
-# evaluate_chunk_grid's vmap over SCENARIOS. When vmap traces scen_idx as a
-# dynamic value, the inner @jax.jit sees a non-concrete argument — JAX either
-# errors or retraces with a fake concrete value (typically 0), so every scenario
-# runs the same branch (scenario 0 = Random) → 100% success across all layouts.
-# FIX: split into two functions:
-#   _evaluate_chunk_inner — pure function, safe to vmap/scan over, no JIT.
-#   evaluate_chunk        — thin JIT wrapper for standalone (non-grid) calls.
-def _evaluate_chunk_inner(params, net_type: str, scen_idx, target_max_v, rng_key):
-    """
-    Runs N_ENVS full episodes for a single (policy, scenario, max_v).
-    This is vmapped over (scenario, max_v) in evaluate_chunk_grid below.
-    """
-    reset_keys = jax.random.split(rng_key, N_ENVS)
+# ── Core Evaluation Kernel ────────────────────────────────────────────────────
+# Each network type gets its OWN JIT-compiled function so that `params` always
+# belongs to exactly one architecture.  Applying all three networks to the same
+# params (as the previous version did with jnp.where) causes Flax to look for
+# kernel shapes that don't exist in the checkpoint → ScopeParamNotFoundError.
+#
+# All three kernels share the same rollout body; only the forward-pass line
+# differs.  Each is compiled once on first call and reused for all 49 cells.
 
+def _rollout_body(net_apply_fn, squash_fn, params, scen_idx, target_max_v, rng_key):
+    """Inner rollout used by all three per-network eval functions."""
+    reset_keys = jax.random.split(rng_key, N_ENVS)
     obs, state = jax.vmap(dynamic_reset_stacked, in_axes=(0, None, None, None))(
         reset_keys, 3.0, scen_idx, target_max_v
     )
 
     init_dist = jnp.sqrt(
-        (state.env_state.goal_x - state.env_state.x)**2 +
-        (state.env_state.goal_y - state.env_state.y)**2
+        (state.env_state.goal_x - state.env_state.x) ** 2 +
+        (state.env_state.goal_y - state.env_state.y) ** 2
     )
 
     carry = (
         state, obs,
-        jnp.zeros(N_ENVS),           # v_prev
-        jnp.zeros(N_ENVS),           # av_prev
-        jnp.zeros(N_ENVS),           # w_prev
-        jnp.zeros(N_ENVS),           # aw_prev
-        jnp.zeros(N_ENVS),           # path_len
-        jnp.full(N_ENVS, 100.0),     # min_human_dist
-        jnp.ones(N_ENVS, dtype=jnp.bool_),  # active
+        jnp.zeros(N_ENVS), jnp.zeros(N_ENVS),   # v_p, av_p
+        jnp.zeros(N_ENVS), jnp.zeros(N_ENVS),   # w_p, aw_p
+        jnp.zeros(N_ENVS),                        # path_len
+        jnp.full(N_ENVS, 100.0),                  # min_human_dist
+        jnp.ones(N_ENVS, dtype=jnp.bool_),        # active
     )
+
+    human_r = LEG_RADIUS if jax_env.USE_LEGS else PEOPLE_RADIUS
 
     def _step(carry, step_idx):
         state, obs, v_p, av_p, w_p, aw_p, pl, mhd, active = carry
-
-        # OPT 7: fold_in avoids a full split allocation — just XORs counter
         k_step = jax.random.fold_in(rng_key, step_idx)
 
-        if net_type == "PPO":
-            mean, _, _ = _ppo_net.apply({"params": params}, obs)
-            action = jax.vmap(_squash_ppo)(mean, state.env_state.max_v)
-        else:
-            mean, _ = _sac_net.apply({"params": params}, obs)
-            action = jax.vmap(_squash_sac)(mean, state.env_state.max_v)
+        raw_out = net_apply_fn({"params": params}, obs)
+        # PPO returns (mean, logstd, value); SAC/TQC return (mean, log_std)
+        mean = raw_out[0]
+        action = jax.vmap(squash_fn)(mean, state.env_state.max_v)
 
         step_keys = jax.random.split(k_step, N_ENVS)
         next_obs, next_state, _, done, info = jax.vmap(step_stacked_headless)(
@@ -246,32 +163,27 @@ def _evaluate_chunk_inner(params, net_type: str, scen_idx, target_max_v, rng_key
         w  = next_state.env_state.w
         av = (v - v_p) / DT
         aw = (w - w_p) / DT
+
         jerk_v = jnp.where(active, jnp.abs((av - av_p) / DT), 0.0)
         jerk_w = jnp.where(active, jnp.abs((aw - aw_p) / DT), 0.0)
+        pl     = pl + jnp.where(active, v * DT, 0.0)
 
-        pl  = pl  + jnp.where(active, v * DT, 0.0)
-        # BUG 3 FIX: closest_human from info is distance to nearest leg when
-        # USE_LEGS=True (radius=LEG_RADIUS) or to body centre when False
-        # (radius=PEOPLE_RADIUS).  Use the matching clearance so the reported
-        # min_dist metric is consistent with collision geometry.
-        human_r = LEG_RADIUS if jax_env.USE_LEGS else PEOPLE_RADIUS
         ch  = info["closest_human"] - ROBOT_RADIUS - human_r
         mhd = jnp.where(active, jnp.minimum(mhd, ch), mhd)
 
-        g  = info["goal_reached"]
-        c  = info["collision"]
-        pc = info["passive_col"]
+        g  = info["goal_reached"] & active
+        c  = info["collision"]    & active
+        pc = info["passive_col"]  & active
 
         step_data   = (active, done, g, c, pc, jerk_v, jerk_w)
         next_active = active & ~done
         return (next_state, next_obs, v, av, w, aw, pl, mhd, next_active), step_data
 
-    # Scan over step indices so fold_in can use them (OPT 7)
     final_carry, step_data = jax.lax.scan(
         _step, carry, jnp.arange(MAX_STEPS, dtype=jnp.uint32)
     )
     _, _, _, _, _, _, final_pl, final_mhd, _ = final_carry
-    active_mask, dones, goals, cols, pcols, jerks_v, jerks_w = step_data
+    active_mask, _, goals, cols, pcols, jerks_v, jerks_w = step_data
 
     ep_lens = active_mask.sum(axis=0)
     ep_goal = goals.any(axis=0)
@@ -291,54 +203,30 @@ def _evaluate_chunk_inner(params, net_type: str, scen_idx, target_max_v, rng_key
         "act_col":  act_col.astype(jnp.float32),
         "pass_col": pass_col.astype(jnp.float32),
         "timeout":  tmo.astype(jnp.float32),
-        "spl":      spl,
-        "jerk":     avg_jerk,
-        "min_dist": final_mhd,
-        "time":     time_g,
+        "spl": spl, "jerk": avg_jerk, "min_dist": final_mhd, "time": time_g,
     }
 
 
-# Thin JIT wrapper for standalone (single scenario/speed) calls from CLI tools.
-# evaluate_chunk_grid does NOT use this — it calls _evaluate_chunk_inner directly.
-@functools.partial(jax.jit, static_argnums=(1,))
-def evaluate_chunk(params, net_type: str, scen_idx, target_max_v, rng_key):
-    return _evaluate_chunk_inner(params, net_type, scen_idx, target_max_v, rng_key)
+# One JIT kernel per network — params stay within their own architecture scope.
+@jax.jit
+def evaluate_cell_ppo(params, scen_idx: int, target_max_v: float, rng_key):
+    return _rollout_body(_ppo_net.apply, _squash_ppo, params,
+                         scen_idx, target_max_v, rng_key)
+
+@jax.jit
+def evaluate_cell_sac(params, scen_idx: int, target_max_v: float, rng_key):
+    return _rollout_body(_sac_net.apply, _squash_sac_tqc, params,
+                         scen_idx, target_max_v, rng_key)
+
+@jax.jit
+def evaluate_cell_tqc(params, scen_idx: int, target_max_v: float, rng_key):
+    return _rollout_body(_tqc_net.apply, _squash_sac_tqc, params,
+                         scen_idx, target_max_v, rng_key)
+
+_EVAL_FN = {"PPO": evaluate_cell_ppo, "SAC": evaluate_cell_sac, "TQC": evaluate_cell_tqc}
 
 
-@functools.partial(jax.jit, static_argnums=(1,))
-def evaluate_chunk_grid(params, net_type: str, rng_key):
-    """
-    OPT 2: Evaluate ALL 7 scenarios × 3 speeds in a single JIT call.
-
-    Instead of 21 sequential Python for-loop iterations (each paying
-    kernel-launch + Python overhead), we build a (N_SCENARIOS, N_SPEEDS)
-    grid of random keys and vmap _evaluate_chunk_inner over both axes.
-    This keeps everything on-device; the GPU sees one big batched kernel
-    rather than 21 small sequential ones.
-
-    BUG 4 FIX: calls _evaluate_chunk_inner (no inner JIT) so scen_idx
-    stays as a valid traced value through vmap without hitting JIT's
-    concreteness requirement.
-
-    Output shapes: each metric is (N_SCENARIOS, N_SPEEDS, N_ENVS).
-    """
-    # Build a (N_SCENARIOS, N_SPEEDS) grid of independent RNG keys
-    keys_flat  = jax.random.split(rng_key, N_SCENARIOS * N_SPEEDS)
-    keys_grid  = keys_flat.reshape(N_SCENARIOS, N_SPEEDS, 2)
-
-    # vmap over scenarios (axis 0) and speeds (axis 1)
-    def _eval_one(scen_idx, speed_keys):
-        """Evaluate one scenario across all speeds."""
-        def _eval_speed(max_v, key):
-            # Use inner (non-JIT) function — scen_idx is a traced dynamic int here
-            return _evaluate_chunk_inner(params, net_type, scen_idx, max_v, key)
-        return jax.vmap(_eval_speed)(MAX_V_TESTS, speed_keys)
-
-    return jax.vmap(_eval_one)(SCENARIOS, keys_grid)
-    # Returns dict of (N_SCENARIOS, N_SPEEDS, N_ENVS) arrays
-
-
-# ── Utilities ─────────────────────────────────────────────────────────────────
+# ── Checkpoint loading ────────────────────────────────────────────────────────
 def load_checkpoint_safe(path):
     if not os.path.exists(path):
         return None
@@ -348,154 +236,186 @@ def load_checkpoint_safe(path):
     return bundle.get("actor_params", bundle.get("params"))
 
 
-def _params_to_gpu(params):
-    """OPT 3: Pin params once to GPU so every forward pass reads from HBM."""
-    gpu = jax.devices("cuda")[0] if jax.devices("cuda") else jax.devices()[0]
-    return jax.device_put(params, gpu)
-
-
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    # ── Device report ────────────────────────────────────────────────────────
-    try:
-        cuda_devices = jax.devices("cuda")
-        print(f"GPU detected: {cuda_devices[0]}")
-    except RuntimeError:
-        cuda_devices = []
-        print("WARNING: No CUDA GPU found — falling back to CPU (will be slow).")
+    gpu = jax.devices("cuda")[0] if jax.devices("cuda") else jax.devices()[0]
 
-    print(f"Config: N_ENVS={N_ENVS}, scenarios={N_SCENARIOS}, speeds={N_SPEEDS}")
-    total_eps = N_ENVS * N_SCENARIOS * N_SPEEDS
-    print(f"Total episodes per policy: {total_eps:,}")
-
-    # ── Load and pin checkpoints ──────────────────────────────────────────────
     raw_policies = {
-        "PPO": ("PPO", load_checkpoint_safe("checkpoints/ppo_model_best.msgpack")),
-        "SAC": ("SAC", load_checkpoint_safe("checkpoints_sac/sac_best.msgpack")),
-        "TQC": ("TQC", load_checkpoint_safe("checkpoints_tqc/tqc_best.msgpack")),
+        "PPO": load_checkpoint_safe("checkpoints/ppo_model_best.msgpack"),
+        "SAC": load_checkpoint_safe("checkpoints_sac/sac_best.msgpack"),
+        "TQC": load_checkpoint_safe("checkpoints_tqc/tqc_best.msgpack"),
+    }
+    policies = {
+        name: jax.device_put(p, gpu)
+        for name, p in raw_policies.items()
+        if p is not None
     }
 
-    # OPT 3: pin to GPU once
-    policies = {}
-    for name, (net_type, params) in raw_policies.items():
-        if params is None:
-            print(f"  Checkpoint missing for {name}, will skip.")
-            policies[name] = (net_type, None)
-        else:
-            policies[name] = (net_type, _params_to_gpu(params))
-            print(f"  Loaded {name} checkpoint → GPU")
+    if not policies:
+        print("No valid checkpoints found. Please train a model first.")
+        return
 
     rng = jax.random.PRNGKey(42)
 
-    # ── Compile both graph variants ───────────────────────────────────────────
-    print("\nCompiling JAX graphs (this takes ~1-2 min first run)...")
-    dummy_obs = jnp.zeros((1, OBS_SIZE))
-    ppo_dummy = _params_to_gpu(_ppo_net.init(rng, dummy_obs)["params"])
-    sac_dummy = _params_to_gpu(_sac_net.init(rng, dummy_obs)["params"])
+    # ── Warm-up: compile only the kernel(s) we actually have checkpoints for ──
+    print("Compiling evaluation kernels (one per available policy, ~30 s each)...")
+    for p_name, params in policies.items():
+        rng, k_warmup = jax.random.split(rng)
+        jax.block_until_ready(_EVAL_FN[p_name](params, 0, 1.0, k_warmup))
+        print(f"  {p_name} kernel compiled.")
+    print()
 
-    rng, k1, k2 = jax.random.split(rng, 3)
-    # OPT 5: block_until_ready ensures true end-to-end compilation before timing
-    jax.block_until_ready(evaluate_chunk_grid(ppo_dummy, "PPO", k1))
-    jax.block_until_ready(evaluate_chunk_grid(sac_dummy, "SAC", k2))
-    print("  Compilation complete.\n")
+    # ── Sequential evaluation loop ────────────────────────────────────────────
+    results    = []
+    scen_names = {
+        0: "Random", 1: "Parallel", 2: "Perpend", 3: "Circular",
+        4: "Bottleneck", 5: "Intersect", 6: "Groups",
+    }
 
-    # ── Evaluation loop ───────────────────────────────────────────────────────
-    results = []
-    scen_names = {0:"Random", 1:"Parallel", 2:"Perpend", 3:"Circular",
-                  4:"Bottleneck", 5:"Intersect", 6:"Groups"}
-    v_list = [float(v) for v in MAX_V_TESTS.tolist()]
-
-    start_time = time.time()
-
-    for p_name, (net_type, params) in policies.items():
-        if params is None:
-            print(f"Skipping {p_name} (no checkpoint).")
-            continue
-
-        rng, sub_rng = jax.random.split(rng)
-        t0 = time.time()
-        print(f"Evaluating {p_name}...", end=" ", flush=True)
-
-        # OPT 2: one JIT call covers all 21 combos simultaneously
-        grid = evaluate_chunk_grid(params, net_type, sub_rng)
-        # OPT 5: force synchronisation before reporting time
-        grid = jax.device_get(jax.block_until_ready(grid))
-
-        elapsed = time.time() - t0
-        eps_per_sec = total_eps / elapsed
-        print(f"done in {elapsed:.1f}s  ({eps_per_sec:,.0f} episodes/s)")
-
-        # Unpack (N_SCENARIOS, N_SPEEDS, N_ENVS) grid into rows
-        for si, scen in enumerate(range(N_SCENARIOS)):
-            for vi, v_max in enumerate(v_list):
+    print("Executing evaluation grid (sequential cells, parallel envs)...")
+    for p_name, params in policies.items():
+        eval_fn  = _EVAL_FN[p_name]
+        t_policy = time.time()
+        for si in range(N_SCENARIOS):
+            for vi, v_max in enumerate(MAX_V_TESTS):
+                rng, cell_rng = jax.random.split(rng)
+                cell = jax.device_get(jax.block_until_ready(
+                    eval_fn(params, si, float(v_max), cell_rng)
+                ))
                 for i in range(N_ENVS):
                     results.append({
                         "Policy":       p_name,
-                        "Scenario":     scen,
+                        "Scenario":     si,
                         "Max_V":        v_max,
-                        "Success":      grid["success"][si, vi, i],
-                        "Active Col":   grid["act_col"][si, vi, i],
-                        "Passive Col":  grid["pass_col"][si, vi, i],
-                        "Timeout":      grid["timeout"][si, vi, i],
-                        "SPL":          grid["spl"][si, vi, i],
-                        "Jerk":         grid["jerk"][si, vi, i],
-                        "Min Dist":     grid["min_dist"][si, vi, i],
-                        "Time to Goal": grid["time"][si, vi, i],
+                        "Success":      cell["success"][i],
+                        "Active Col":   cell["act_col"][i],
+                        "Passive Col":  cell["pass_col"][i],
+                        "Timeout":      cell["timeout"][i],
+                        "SPL":          cell["spl"][i],
+                        "Jerk":         cell["jerk"][i],
+                        "Min Dist":     cell["min_dist"][i],
+                        "Time to Goal": cell["time"][i],
                     })
+        print(f"  {p_name} done in {time.time() - t_policy:.1f}s")
 
     df = pd.DataFrame(results)
     df.to_csv("evaluation_raw_data.csv", index=False)
-
-    total_time = time.time() - start_time
-    n_policies = sum(1 for _, p in policies.values() if p is not None)
-    grand_total = total_eps * n_policies
-    print(f"\nTotal: {grand_total:,} episodes in {total_time:.1f}s "
-          f"({grand_total/total_time:,.0f} eps/s across all policies)")
+    print("Saved evaluation_raw_data.csv\n")
 
     # ── Dashboard ─────────────────────────────────────────────────────────────
-    print("\nGenerating Dashboard Plots...")
+    print("Generating dashboard...")
     sns.set_theme(style="whitegrid", palette="muted")
-    fig = plt.figure(figsize=(24, 16))
-    fig.suptitle("RL Navigation Policies: Evaluation Dashboard", fontsize=24, weight="bold")
 
-    rate_df = df.groupby("Policy")[["Success","Active Col","Passive Col","Timeout"]].mean().reset_index()
+    # 3 rows × 3 cols = 9 panels; last panel is training curves
+    fig = plt.figure(figsize=(27, 21))
+    fig.suptitle("RL Navigation Policies: Evaluation Dashboard",
+                 fontsize=26, weight="bold")
+
+    # 1. Overall Outcomes
+    rate_df   = df.groupby("Policy")[["Success","Active Col","Passive Col","Timeout"]].mean().reset_index()
     rate_melt = rate_df.melt(id_vars="Policy", var_name="Outcome", value_name="Rate")
     rate_melt["Rate"] *= 100
-
-    ax1 = plt.subplot(2, 3, 1)
+    ax1 = plt.subplot(3, 3, 1)
     sns.barplot(data=rate_melt, x="Outcome", y="Rate", hue="Policy", ax=ax1)
-    ax1.set_title("Overall Episode Outcomes (%)", fontsize=16)
+    ax1.set_title("Overall Episode Outcomes (%)", fontsize=13)
     ax1.set_ylim(0, 100)
 
+    # 2. Success by Scenario
     scen_df = df.groupby(["Scenario","Policy"])["Success"].mean().reset_index()
     scen_df["Success"] *= 100
     scen_df["Scenario_Name"] = scen_df["Scenario"].map(scen_names)
-    ax2 = plt.subplot(2, 3, 2)
+    ax2 = plt.subplot(3, 3, 2)
     sns.barplot(data=scen_df, x="Scenario_Name", y="Success", hue="Policy", ax=ax2)
-    ax2.set_title("Success Rate by Layout Topology", fontsize=16)
+    ax2.set_title("Success Rate by Layout Topology", fontsize=13)
     ax2.set_xticklabels(ax2.get_xticklabels(), rotation=30)
     ax2.set_ylim(0, 100)
 
+    # 3. Success vs Speed
     v_df = df.groupby(["Max_V","Policy"])["Success"].mean().reset_index()
     v_df["Success"] *= 100
-    ax3 = plt.subplot(2, 3, 3)
+    ax3 = plt.subplot(3, 3, 3)
     sns.lineplot(data=v_df, x="Max_V", y="Success", hue="Policy",
-                 marker="o", linewidth=3, markersize=10, ax=ax3)
-    ax3.set_title("Success Rate vs. Robot Max Speed", fontsize=16)
-    ax3.set_xticks(v_list)
+                 marker="o", linewidth=3, markersize=8, ax=ax3)
+    ax3.set_title("Success Rate vs. Robot Max Speed", fontsize=13)
+    ax3.set_xticks(MAX_V_TESTS)
     ax3.set_ylim(0, 100)
 
+    # 4. Active Collisions vs Speed
+    v_col_df = df.groupby(["Max_V","Policy"])["Active Col"].mean().reset_index()
+    v_col_df["Active Col"] *= 100
+    ax4 = plt.subplot(3, 3, 4)
+    sns.lineplot(data=v_col_df, x="Max_V", y="Active Col", hue="Policy",
+                 marker="X", linewidth=3, markersize=8, ax=ax4)
+    ax4.set_title("Active Collisions vs. Robot Max Speed", fontsize=13)
+    ax4.set_xticks(MAX_V_TESTS)
+    ax4.set_ylim(0, 100)
+
     suc = df[df["Success"] == 1.0]
-    ax4 = plt.subplot(2, 3, 4)
-    sns.boxplot(data=suc, x="Policy", y="SPL", hue="Policy", ax=ax4, showfliers=False)
-    ax4.set_title("Success-weighted Path Length (SPL)", fontsize=16)
 
-    ax5 = plt.subplot(2, 3, 5)
-    sns.boxplot(data=suc, x="Policy", y="Time to Goal", hue="Policy", ax=ax5, showfliers=False)
-    ax5.set_title("Time to Reach Goal (seconds)", fontsize=16)
+    # 5. SPL
+    ax5 = plt.subplot(3, 3, 5)
+    sns.boxplot(data=suc, x="Policy", y="SPL", hue="Policy", ax=ax5, showfliers=False)
+    ax5.set_title("Success-weighted Path Length (SPL)", fontsize=13)
 
-    ax6 = plt.subplot(2, 3, 6)
-    sns.boxplot(data=df, x="Policy", y="Jerk", hue="Policy", ax=ax6, showfliers=False)
-    ax6.set_title("Average Kinematic Jerk (Smoothness)", fontsize=16)
+    # 6. Time to Goal
+    ax6 = plt.subplot(3, 3, 6)
+    sns.boxplot(data=suc, x="Policy", y="Time to Goal", hue="Policy",
+                ax=ax6, showfliers=False)
+    ax6.set_title("Time to Reach Goal (seconds)", fontsize=13)
+
+    # 7. Safety Margin vs Speed
+    ax7 = plt.subplot(3, 3, 7)
+    sns.lineplot(data=df, x="Max_V", y="Min Dist", hue="Policy",
+                 marker="^", linewidth=3, markersize=8, ax=ax7)
+    ax7.set_title("Safety Margin (Min Human Dist) vs. Speed", fontsize=13)
+    ax7.axhline(0.0, color="red", linestyle="--", alpha=0.5, label="Collision Threshold")
+    ax7.set_xticks(MAX_V_TESTS)
+    ax7.legend()
+
+    # 8. Jerk
+    ax8 = plt.subplot(3, 3, 8)
+    sns.boxplot(data=df, x="Policy", y="Jerk", hue="Policy",
+                ax=ax8, showfliers=False)
+    ax8.set_title("Average Kinematic Jerk (Smoothness)", fontsize=13)
+
+    # 9. Training Curves — episode reward over training steps
+    ax9 = plt.subplot(3, 3, 9)
+    any_log = False
+    POLICY_COLORS = {"PPO": "#4C72B0", "SAC": "#DD8452", "TQC": "#55A868"}
+    for p_name, log_path in TRAINING_LOG_PATHS.items():
+        if os.path.exists(log_path):
+            try:
+                log_df = pd.read_csv(log_path)
+                # Smooth with a rolling window to reduce noise
+                smoothed = log_df["mean_ep_reward"].rolling(window=10, min_periods=1).mean()
+                ax9.plot(
+                    log_df["step"], smoothed,
+                    label=p_name, linewidth=2.5,
+                    color=POLICY_COLORS.get(p_name),
+                )
+                # Faint raw trace behind it
+                ax9.plot(
+                    log_df["step"], log_df["mean_ep_reward"],
+                    alpha=0.2, linewidth=1,
+                    color=POLICY_COLORS.get(p_name),
+                )
+                any_log = True
+            except Exception as e:
+                print(f"  Warning: could not read {log_path}: {e}")
+
+    if any_log:
+        ax9.set_xlabel("Training Step")
+        ax9.set_ylabel("Mean Episode Reward")
+        ax9.set_title("Episode Reward During Training", fontsize=13)
+        ax9.legend()
+    else:
+        ax9.text(0.5, 0.5,
+                 "No training logs found.\nRun trainers to generate\n"
+                 "checkpoints/*/training_log.csv",
+                 ha="center", va="center", transform=ax9.transAxes,
+                 fontsize=11, color="gray")
+        ax9.set_title("Episode Reward During Training", fontsize=13)
+        ax9.set_axis_off()
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.savefig("Evaluation_Dashboard.png", dpi=300)

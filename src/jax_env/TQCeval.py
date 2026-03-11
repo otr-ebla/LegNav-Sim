@@ -25,6 +25,7 @@ from jax_env import (ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS,
                      NUM_RAYS, MAX_LIDAR_DIST, FOV, MAX_STEPS)
 from jax_env_multi import reset_env, step_env
 from jax_wrappers import make_stacked_env
+from jax_legs import LEG_RADIUS, HIP_WIDTH, SHOE_LENGTH, SHOE_WIDTH  # Add this linez
 
 OBS_SIZE = 342
 ACTION_DIM = 2
@@ -114,6 +115,66 @@ def make_fonts():
         "tiny" : pygame.font.SysFont("monospace", 11),
     }
 
+
+
+# ── Leg Rendering Helpers ─────────────────────────────────────────────────────
+def _read_foot_positions_np(foot_state_np):
+    return foot_state_np[:, 0:2], foot_state_np[:, 2:4]
+
+_SHOE_PALETTE = [
+    (180,  60,  60), ( 60, 130, 220), (220, 160,  30), ( 60, 200, 160),
+    (200,  80, 200), (100, 200,  60), (230, 120,  40), ( 80, 180, 230),
+    (200, 200,  60), (160,  60, 200), ( 50, 200, 100), (220,  80, 130),
+    ( 60, 160, 160), (200, 140,  80), (130,  80, 200), (200,  60,  80),
+    ( 80, 220, 200), (220, 200,  80), (160, 120,  60), (100, 140, 220),
+    (180, 220,  80), (220,  80, 160), ( 80, 120, 200), (200, 160,  60),
+    ( 60, 200, 130),
+]
+
+def _shoe_colour(person_idx):
+    col = _SHOE_PALETTE[person_idx % len(_SHOE_PALETTE)]
+    return col, tuple(max(0, c - 60) for c in col)
+
+def draw_shoe(surface, foot_x, foot_y, theta, colour, border_colour):
+    cos_t = math.cos(theta); sin_t = math.sin(theta)
+    lat_x = -sin_t; lat_y = cos_t
+    half_L = SHOE_LENGTH * 0.5; half_W = SHOE_WIDTH * 0.5
+    cx = foot_x + cos_t * half_L; cy = foot_y + sin_t * half_L
+    corners = [
+        (cx + cos_t*half_L + lat_x*half_W, cy + sin_t*half_L + lat_y*half_W),
+        (cx + cos_t*half_L - lat_x*half_W, cy + sin_t*half_L - lat_y*half_W),
+        (cx - cos_t*half_L - lat_x*half_W, cy - sin_t*half_L - lat_y*half_W),
+        (cx - cos_t*half_L + lat_x*half_W, cy - sin_t*half_L + lat_y*half_W),
+    ]
+    pts = [W(wx, wy) for wx, wy in corners]
+    pygame.draw.polygon(surface, colour, pts)
+    pygame.draw.polygon(surface, border_colour, pts, 1)
+
+def draw_shoes_only(surface, state, foot_state_np):
+    left_legs_np, right_legs_np = _read_foot_positions_np(foot_state_np)
+    for i in range(int(state.people.shape[0])):
+        if float(state.people[i, 10]) < 0: continue
+        theta_h = float(state.people[i, 4])
+        col, border = _shoe_colour(i)
+        draw_shoe(surface, float(left_legs_np[i, 0]), float(left_legs_np[i, 1]), theta_h, col, border)
+        draw_shoe(surface, float(right_legs_np[i, 0]), float(right_legs_np[i, 1]), theta_h, col, border)
+
+def draw_humans(surface, state, foot_state_np, show_arrows):
+    left_legs_np, right_legs_np = _read_foot_positions_np(foot_state_np)
+    for i in range(int(state.people.shape[0])):
+        if float(state.people[i, 10]) < 0: continue
+        shoe_col, _ = _shoe_colour(i)
+        leg_r = max(2, int(LEG_RADIUS * SCALE))
+        
+        lx, ly = W(float(left_legs_np[i, 0]), float(left_legs_np[i, 1]))
+        pygame.draw.circle(surface, tuple(min(255, int(c * 1.1)) for c in shoe_col), (lx, ly), leg_r)
+        pygame.draw.circle(surface, (20, 20, 20), (lx, ly), leg_r, 1)
+        
+        rx_, ry_ = W(float(right_legs_np[i, 0]), float(right_legs_np[i, 1]))
+        pygame.draw.circle(surface, tuple(max(0, int(c * 0.75)) for c in shoe_col), (rx_, ry_), leg_r)
+        pygame.draw.circle(surface, (20, 20, 20), (rx_, ry_), leg_r, 1)
+
+
 # ── Rendering Helpers ─────────────────────────────────────────────────────────
 def draw_star(surface, cx, cy, r_out, r_in, n, color, border=None):
     pts = []
@@ -128,13 +189,23 @@ def draw_lidar(surface, state, raw_lidar, show):
     if not show or raw_lidar is None: return
     rx, ry = W(float(state.x), float(state.y)); theta = float(state.theta); fov = float(FOV)
     angles = theta - fov / 2.0 + np.arange(NUM_RAYS) * fov / (NUM_RAYS - 1)
-    for ang, dist in zip(angles, raw_lidar):
+    
+    # Extract the boolean mask from the CPU state
+    sp_mask = np.array(state.sp_mask)
+
+    for i, (ang, dist) in enumerate(zip(angles, raw_lidar)):
         ex, ey = W(float(state.x) + dist * math.cos(ang), float(state.y) + dist * math.sin(ang))
-        t = max(0.0, 1.0 - dist / MAX_LIDAR_DIST)
-        col = tuple(int(C_RAY_NEAR[i]*t + C_RAY_FAR[i]*(1-t)) for i in range(3))
+        
+        # Draw Salt & Pepper corrupted rays in purple
+        if sp_mask[i]:
+            col = (180, 50, 220)
+        else:
+            t = max(0.0, 1.0 - dist / MAX_LIDAR_DIST)
+            col = tuple(int(C_RAY_NEAR[j]*t + C_RAY_FAR[j]*(1-t)) for j in range(3))
+            
         pygame.draw.line(surface, col, (rx, ry), (ex, ey), 1)
 
-def draw_scene(surface, state, raw_lidar, show_lidar, show_arrows):
+def draw_scene(surface, state, raw_lidar, foot_state_np, show_lidar, show_arrows):
     pygame.draw.rect(surface, C_FLOOR, (0, 0, SIM_SIZE, SIM_SIZE))
     for i in range(int(ROOM_W) + 1):
         sx, _ = W(i, 0); pygame.draw.line(surface, C_GRID, (sx, 0), (sx, SIM_SIZE))
@@ -142,6 +213,7 @@ def draw_scene(surface, state, raw_lidar, show_lidar, show_arrows):
         _, sy = W(0, j); pygame.draw.line(surface, C_GRID, (0, sy), (SIM_SIZE, sy))
     pygame.draw.rect(surface, C_WALL, (0, 0, SIM_SIZE, SIM_SIZE), 3)
 
+    draw_shoes_only(surface, state, foot_state_np)
     draw_lidar(surface, state, raw_lidar, show_lidar)
 
     for box in np.array(state.obs_boxes):
@@ -162,23 +234,7 @@ def draw_scene(surface, state, raw_lidar, show_lidar, show_arrows):
     gx, gy = W(float(state.goal_x), float(state.goal_y))
     draw_star(surface, gx, gy, int(0.30 * SCALE), int(0.12 * SCALE), 5, C_GOAL, C_GOAL2)
 
-    for i in range(int(state.people.shape[0])):
-        px, py = float(state.people[i, 0]), float(state.people[i, 1])
-        vx, vy = float(state.people[i, 2]), float(state.people[i, 3])
-        theta  = float(state.people[i, 4]) 
-        
-        dist_ = float(state.people[i, 5]) > 0.5
-        sx, sy = W(px, py)
-        pr = max(3, int(PEOPLE_RADIUS * SCALE))
-        col = C_PERSON_D if dist_ else C_PERSON
-        
-        pygame.draw.circle(surface, col, (sx, sy), pr)
-        pygame.draw.circle(surface, (20, 20, 20), (sx, sy), pr, 1)
-        
-        speed = math.hypot(vx, vy)
-        if show_arrows and speed > 0.05:
-            ax, ay = W(px + math.cos(theta) * 0.5, py + math.sin(theta) * 0.5)
-            pygame.draw.line(surface, (20, 120, 20), (sx, sy), (ax, ay), 2)
+    draw_humans(surface, state, foot_state_np, show_arrows)
 
     rx, ry = W(float(state.x), float(state.y)); rr = max(4, int(ROBOT_RADIUS * SCALE))
     pygame.draw.circle(surface, C_ROBOT, (rx, ry), rr)
@@ -318,8 +374,12 @@ def main():
         obs, stacked_state, reward, done, info = fast_step(step_rng, stacked_state, env_action)
         ep_reward += float(reward); ep_steps += 1
 
+        # (Inside while True loop)
         cpu_state = jax.device_get(stacked_state.env_state)
         raw_lidar = MAX_LIDAR_DIST - jax.device_get(stacked_state.lidar_stack)[-1] * (MAX_LIDAR_DIST - ROBOT_RADIUS)
+        
+        # Add this line:
+        foot_state_np = np.array(cpu_state.foot_state)
 
         dx = float(cpu_state.goal_x) - float(cpu_state.x)
         dy = float(cpu_state.goal_y) - float(cpu_state.y)
@@ -328,7 +388,8 @@ def main():
         ch = float(info["closest_human"]) - ROBOT_RADIUS - PEOPLE_RADIUS
 
         screen.fill(C_BG)
-        draw_scene(screen, cpu_state, raw_lidar, show_lidar, show_arrows)
+        # Update this line to pass foot_state_np:
+        draw_scene(screen, cpu_state, raw_lidar, foot_state_np, show_lidar, show_arrows)
         draw_panel(screen, fonts, ep, ep_steps, ep_reward, float(cpu_state.v), float(cpu_state.w), gdist, galign, ch, get_stats(), banner, banner_t, current_scenario, evaluation_mode)
 
         if banner_t > 0: banner_t -= 1
@@ -352,4 +413,5 @@ def main():
             rng, reset_rng = jax.random.split(rng)
             obs, stacked_state = fast_reset(reset_rng)
 
-if __name__ == "__main__": main()
+if __name__ == "__main__": 
+    main()

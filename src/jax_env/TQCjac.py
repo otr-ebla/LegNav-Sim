@@ -13,6 +13,7 @@ FIXES for 110k+ FPS & Flexibility:
 """
 
 import os
+import csv
 import argparse
 
 # ── ARGUMENT PARSING ──────────────────────────────────────────────────────────
@@ -38,7 +39,7 @@ import flax.serialization
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-from jax_env import reset_env, step_env
+from jax_env_multi import reset_env, step_env
 from jax_wrappers import make_stacked_env, make_autoreset_env
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
@@ -390,11 +391,20 @@ if __name__ == "__main__":
     hdr = (f"{'Upd':>7} | {'Steps':>10} | {'EpRet':>7} | "
            f"{'Suc%':>5} {'ACo%':>5} {'PCo%':>5} {'Tmo%':>5} | "
            f"{'CritL':>7} {'ActL':>7} {'Alpha':>6} {'LogPi':>6} {'Qmean':>7} | {'FPS':>7} | "
-           f"{'Stage':>5} {'MinDist':>7}")
+           f"{'Time':>8} | {'Stage':>5} {'MinDist':>7}")
     print(hdr); print("─" * len(hdr))
 
     t_start = time.time()
-    
+
+    # ── Training log (CSV) ───────────────────────────────────────────────────
+    _LOG_PATH = "checkpoints_tqc/tqc_training_log.csv"
+    os.makedirs("checkpoints_tqc", exist_ok=True)
+    _log_file   = open(_LOG_PATH, "w", newline="")
+    _log_writer = csv.writer(_log_file)
+    _log_writer.writerow(["step", "mean_ep_reward", "suc_pct", "col_pct",
+                           "pcol_pct", "tmo_pct", "n_ep"])
+    _log_file.flush()
+
     while n_updates < TOTAL_UPDATES:
         t0 = time.time()
         
@@ -429,10 +439,21 @@ if __name__ == "__main__":
         
         fps = (N_ENVS * LOG_EVERY) / (time.time() - t0)
         
+        # Calculate formatted elapsed time
+        elapsed = time.time() - t_start
+        h, rem = divmod(elapsed, 3600)
+        m, s = divmod(rem, 60)
+        time_str = f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
+        
         print(f"{n_updates:>7d} | {total_steps:>10,} | {mean_ret:>7.1f} | "
               f"{suc_pct:>4.1f}% {col_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% | "
               f"{m_crit:>7.4f} {m_act:>7.4f} {m_alph:>6.4f} {m_lpi:>6.3f} {m_qm:>7.3f} | "
-              f"{fps:>7,.0f} | {cur_stage:>5d} {cur_min_dist:>5.1f}m")
+              f"{fps:>7,.0f} | {time_str:>8} | {cur_stage:>5d} {cur_min_dist:>5.1f}m")
+        # ── CSV log row ──────────────────────────────────────────────────────
+        _log_writer.writerow([total_steps, round(mean_ret, 4),
+                               round(suc_pct, 4), round(col_pct, 4),
+                               round(pcol_pct, 4), round(tmo_pct, 4), n_ep])
+        _log_file.flush()
 
         # ── 3. Curriculum Update ──
         if n_ep > 0:
@@ -451,3 +472,5 @@ if __name__ == "__main__":
             save_checkpoint(ap, cp, tp, aos, cos, la, laos, n_updates)
 
     print(f"\nTQC done! {(time.time() - t_start)/3600:.2f}h | Best success: {best_suc:.1f}%")
+    _log_file.close()
+    print(f"Training log saved -> {_LOG_PATH}")

@@ -104,21 +104,66 @@ def generate_scenario(key: jnp.ndarray, min_goal_dist: float, scenario_idx: int 
         return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
 
     # --- 1: PARALLEL TRAFFIC ---
+    # --- 1: PARALLEL TRAFFIC (CORRIDOR) ---
+    # --- 1: PARALLEL TRAFFIC (CORRIDOR) ---
     def _parallel_scen(k):
-        k1, k2, k3, k4 = jax.random.split(k, 4)
-        rx, ry, rtheta = ROOM_W / 2.0, 1.5, jnp.pi / 2.0
-        gx, gy = ROOM_W / 2.0, ROOM_H - 1.5
-        max_v = jax.random.uniform(k1, minval=0.5, maxval=1.5)
+        N_PRL = 8
+        k1, k2, k3 = jax.random.split(k, 3)
+        
+        # Corridor geometry (Room is 12x12. Let's make a 4m wide corridor in the center)
+        corridor_width = 4.0
+        wall_width = (ROOM_W - corridor_width) / 2.0
+        
         obs_circles = jnp.zeros((NUM_OBS_CIR, 3))
         obs_boxes = jnp.zeros((NUM_OBS_BOX, 4))
         
-        px = jax.random.uniform(k2, (NUM_PEOPLE,), minval=1.0, maxval=ROOM_W-1.0)
-        py = jax.random.uniform(k3, (NUM_PEOPLE,), minval=ROOM_H-3.0, maxval=ROOM_H-1.0)
-        g1x, g1y = px, jnp.full((NUM_PEOPLE,), 1.0)
-        people = pack_human(px, py, jnp.full((NUM_PEOPLE,), -jnp.pi/2), g1x, g1y, g1x, g1y)
+        # Left wall
+        obs_boxes = obs_boxes.at[0].set([wall_width / 2.0, ROOM_H / 2.0, wall_width / 2.0, ROOM_H / 2.0])
+        # Right wall
+        obs_boxes = obs_boxes.at[1].set([ROOM_W - wall_width / 2.0, ROOM_H / 2.0, wall_width / 2.0, ROOM_H / 2.0])
+
+        # Robot starts at the BOTTOM, pointing UP
+        rx, ry, rtheta = ROOM_W / 2.0, 1.5, jnp.pi / 2.0
+        gx, gy = ROOM_W / 2.0, ROOM_H - 1.5
+        max_v = jax.random.uniform(k1, minval=0.5, maxval=1.5)
+        
+        # Humans spawn at the TOP (randomly distributed in the corridor width)
+        min_x = ROOM_W / 2.0 - corridor_width / 2.0 + 0.5
+        max_x = ROOM_W / 2.0 + corridor_width / 2.0 - 0.5
+        
+        px = jax.random.uniform(k2, (N_PRL,), minval=min_x, maxval=max_x)
+        
+        # Initial spawn is spread out, explicitly allowing them to spawn below the goal star
+        py = jax.random.uniform(k3, (N_PRL,), minval=ROOM_H - 4.0, maxval=ROOM_H - 1.0)
+        
+        # Their goal is at the BOTTOM of the corridor
+        g1x, g1y = px, jnp.full((N_PRL,), 1.0)
+        
+        # They walk DOWN (-pi/2)
+        people_prl = pack_human(px, py, jnp.full((N_PRL,), -jnp.pi/2), g1x, g1y, g1x, g1y)
+        
+        # Dummy padding to maintain JAX static array shapes (4 dummies)
+        n_pad = NUM_PEOPLE - N_PRL
+        dummy_x  = jnp.full((n_pad,), -999.0)
+        dummy_y  = jnp.full((n_pad,), -999.0)
+        dummy_rows = jnp.stack([
+            dummy_x, dummy_y,
+            jnp.zeros(n_pad), jnp.zeros(n_pad),   # vx, vy
+            jnp.zeros(n_pad), jnp.zeros(n_pad),   # theta, omega
+            dummy_x, dummy_y,                     # g1 == position
+            dummy_x, dummy_y,                     # g2 == position
+            jnp.full((n_pad,), -1.0),             # goal_idx = -1 sentinel
+        ], axis=-1)
+        
+        people = jnp.concatenate([people_prl, dummy_rows], axis=0)
+        
         return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
 
     # --- 2: PERPENDICULAR CROSSING ---
+    # People walk left<->right, bouncing between the two opposite walls.
+    # g1 = target wall ahead, g2 = the wall they came from (for the return leg).
+    # The existing goal_idx toggle (0→1→0→...) in jax_env_multi handles the
+    # back-and-forth automatically once g1 ≠ g2.
     def _perpendicular_scen(k):
         k1, k2, k3, k4 = jax.random.split(k, 4)
         rx, ry, rtheta = jax.random.uniform(k1, minval=1.5, maxval=ROOM_W-1.5), 1.0, jnp.pi / 2.0
@@ -126,14 +171,29 @@ def generate_scenario(key: jnp.ndarray, min_goal_dist: float, scenario_idx: int 
         max_v = jax.random.uniform(k3, minval=0.5, maxval=1.5)
         obs_circles = jnp.zeros((NUM_OBS_CIR, 3))
         obs_boxes = jnp.zeros((NUM_OBS_BOX, 4))
-        
-        py = jax.random.uniform(k4, (NUM_PEOPLE,), minval=1.5, maxval=ROOM_H-1.5)
+
+        # Spread people at random y positions across the room
+        py = jax.random.uniform(k4, (NUM_PEOPLE,), minval=1.5, maxval=ROOM_H - 1.5)
+
+        # Alternate: even-indexed start on the left, odd-indexed on the right
         left_mask = jnp.arange(NUM_PEOPLE) % 2 == 0
+
+        # Spawn position: near the wall they start from
         px = jnp.where(left_mask, 0.6, ROOM_W - 0.6)
-        g1x = jnp.where(left_mask, ROOM_W - 0.6, 0.6)
-        g1y = py
+
+        # g1 = far wall (first target), g2 = near wall (return target)
+        # Left starters → g1 is right wall, g2 is left wall
+        # Right starters → g1 is left wall, g2 is right wall
+        wall_near = jnp.where(left_mask, 0.6,          ROOM_W - 0.6)
+        wall_far  = jnp.where(left_mask, ROOM_W - 0.6, 0.6)
+
+        g1x = wall_far;  g1y = py   # head toward far wall first
+        g2x = wall_near; g2y = py   # then bounce back to near wall
+
+        # Initial heading: left starters face right (0), right starters face left (π)
         angles = jnp.where(left_mask, 0.0, jnp.pi)
-        people = pack_human(px, py, angles, g1x, g1y, g1x, g1y)
+
+        people = pack_human(px, py, angles, g1x, g1y, g2x, g2y)
         return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
 
     # --- 3: CIRCULAR CROSSING ---
@@ -162,6 +222,7 @@ def generate_scenario(key: jnp.ndarray, min_goal_dist: float, scenario_idx: int 
 
     # --- 4: BOTTLENECK ---
     def _bottleneck_scen(k):
+        N_BTL = 6
         k1, k2, k3, k4, k5, k6 = jax.random.split(k, 6)
         gap_center_x = jax.random.uniform(k1, minval=2.5, maxval=ROOM_W-2.5)
         rx, ry, rtheta = ROOM_W / 2.0, 1.5, jnp.pi / 2.0
@@ -172,15 +233,31 @@ def generate_scenario(key: jnp.ndarray, min_goal_dist: float, scenario_idx: int 
         left_w, right_w = gap_center_x - gap_size / 2.0, ROOM_W - (gap_center_x + gap_size / 2.0)
         obs_boxes = jnp.zeros((NUM_OBS_BOX, 4)).at[0].set([left_w / 2.0, wall_y, left_w / 2.0, 0.2]).at[1].set([ROOM_W - right_w / 2.0, wall_y, right_w / 2.0, 0.2])
         
-        px = jax.random.uniform(k3, (NUM_PEOPLE,), minval=1.0, maxval=ROOM_W-1.0)
-        py = jax.random.uniform(k4, (NUM_PEOPLE,), minval=ROOM_H-2.5, maxval=ROOM_H-1.5)
+        px = jax.random.uniform(k3, (N_BTL,), minval=1.0, maxval=ROOM_W-1.0)
+        py = jax.random.uniform(k4, (N_BTL,), minval=ROOM_H-2.5, maxval=ROOM_H-1.5)
         
-        g1x = gap_center_x + jax.random.uniform(k5, (NUM_PEOPLE,), minval=-0.7, maxval=0.7)
-        g1y = jnp.full((NUM_PEOPLE,), wall_y - 0.15)
-        g2x = jax.random.uniform(k6, (NUM_PEOPLE,), minval=1.0, maxval=ROOM_W-1.0)
-        g2y = jnp.full((NUM_PEOPLE,), 1.5)
+        g1x = gap_center_x + jax.random.uniform(k5, (N_BTL,), minval=-0.7, maxval=0.7)
+        g1y = jnp.full((N_BTL,), wall_y - 0.15)
+        g2x = jax.random.uniform(k6, (N_BTL,), minval=1.0, maxval=ROOM_W-1.0)
+        g2y = jnp.full((N_BTL,), 0.0)
         
-        people = pack_human(px, py, jnp.full((NUM_PEOPLE,), -1.57), g1x, g1y, g2x, g2y)
+        people_btl = pack_human(px, py, jnp.full((N_BTL,), -1.57), g1x, g1y, g2x, g2y)
+        # Dummy rows use goal_idx = -1 as a sentinel so jax_env_multi knows to hide
+        # them off-screen rather than respawning or rendering them.
+        # Dummy rows use goal_idx = -1 as a sentinel so jax_env_multi knows to hide
+        # them off-screen rather than respawning or rendering them.
+        n_pad = NUM_PEOPLE - N_BTL
+        dummy_x  = jnp.full((n_pad,), -999.0)
+        dummy_y  = jnp.full((n_pad,), -999.0)
+        dummy_rows = jnp.stack([
+            dummy_x, dummy_y,
+            jnp.zeros(n_pad), jnp.zeros(n_pad),   # vx, vy
+            jnp.zeros(n_pad), jnp.zeros(n_pad),   # theta, omega
+            dummy_x, dummy_y,                      # g1 == position
+            dummy_x, dummy_y,                      # g2 == position
+            jnp.full((n_pad,), -1.0),              # goal_idx = -1 sentinel
+        ], axis=-1)
+        people = jnp.concatenate([people_btl, dummy_rows], axis=0)
         return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
 
     # --- 5: INTERSECTION ---

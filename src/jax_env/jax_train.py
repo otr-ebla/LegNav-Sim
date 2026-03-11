@@ -26,7 +26,8 @@ os.environ["TF_GPU_ALLOCATOR"]            = "cuda_malloc_async"
 import functools
 import jax
 import jax.numpy as jnp
-from jax_env import reset_env, step_env
+#from jax_env import reset_env, step_env
+from jax_env_multi import reset_env, step_env
 from jax_wrappers import make_stacked_env, make_autoreset_env
 from jax_network import scale_actions_batched
 
@@ -47,7 +48,7 @@ GPU_DEVICE = _verify_gpu()
 
 # Config
 NUM_ENVS      = 16384
-ROLLOUT_STEPS = 64
+ROLLOUT_STEPS = 150 #64
 
 # OBS_SIZE: 9 (pose×3) + 9 (state_vec) + 324 (lidar×3) = 342
 OBS_SIZE = 3 * 3 + 9 + 108 * 3    # 342
