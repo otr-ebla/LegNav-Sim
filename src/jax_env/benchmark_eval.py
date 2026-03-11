@@ -181,23 +181,25 @@ def _rollout_body(net_apply_fn, squash_fn, params, scen_idx, target_max_v, rng_k
         pc = info["passive_col"]  & active
 
         # ── Yielding score accumulators ───────────────────────────────────────
-        # For each env: is any human in the yield zone (< YIELD_DIST, forward FOV)?
-        people    = next_state.env_state
-        px        = people.people[:, 0]   # (NUM_PEOPLE,)
-        py_p      = people.people[:, 1]
-        rx        = next_state.env_state.x          # scalar per env — but we're
-        ry        = next_state.env_state.y           # inside vmap so these are scalars
-        rtheta    = next_state.env_state.theta
-        dp_x      = px - rx
-        dp_y      = py_p - ry
-        dists_p   = jnp.sqrt(dp_x**2 + dp_y**2 + 1e-8)
-        rel_ang   = jnp.arctan2(dp_y, dp_x) - rtheta
-        rel_ang   = (rel_ang + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
-        active_p  = next_state.env_state.people[:, 10] >= 0.0
-        in_yz     = (dists_p < YIELD_DIST) & (jnp.abs(rel_ang) < YIELD_FOV) & active_p
-        any_in_yz = jnp.any(in_yz)   # scalar bool for this env
+        # next_state carries batched tensors: x/y/theta shape (N_ENVS,),
+        # people shape (N_ENVS, NUM_PEOPLE, 11).  All ops must be explicitly
+        # batched — no implicit broadcasting across the env dimension.
+        ppl      = next_state.env_state.people          # (N_ENVS, NUM_PEOPLE, 11)
+        px_all   = ppl[:, :, 0]                         # (N_ENVS, NUM_PEOPLE)
+        py_all   = ppl[:, :, 1]
+        rx_b     = next_state.env_state.x[:, None]      # (N_ENVS, 1)
+        ry_b     = next_state.env_state.y[:, None]
+        rth_b    = next_state.env_state.theta[:, None]
+        dp_x     = px_all - rx_b                        # (N_ENVS, NUM_PEOPLE)
+        dp_y     = py_all - ry_b
+        dists_p  = jnp.sqrt(dp_x**2 + dp_y**2 + 1e-8)
+        rel_ang  = jnp.arctan2(dp_y, dp_x) - rth_b
+        rel_ang  = (rel_ang + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
+        active_p = ppl[:, :, 10] >= 0.0                # (N_ENVS, NUM_PEOPLE)
+        in_yz    = (dists_p < YIELD_DIST) & (jnp.abs(rel_ang) < YIELD_FOV) & active_p
+        any_in_yz = jnp.any(in_yz, axis=1)             # (N_ENVS,)
 
-        robot_stopped = v <= 0.1
+        robot_stopped = v <= 0.1                        # (N_ENVS,)
 
         new_yz_steps = yz_steps + jnp.where(active & any_in_yz, 1.0, 0.0)
         new_yc_steps = yc_steps + jnp.where(active & any_in_yz & robot_stopped, 1.0, 0.0)
