@@ -378,7 +378,9 @@ def main():
                 ax=ax8, showfliers=False)
     ax8.set_title("Average Kinematic Jerk (Smoothness)", fontsize=13)
 
-    # 9. Training Curves — episode reward over training steps
+    # 9. Training Curves — episode reward over environment steps
+    # All three trainers now log 'step' as total_env_steps so the x-axis is
+    # comparable: PPO = update × NUM_ENVS × ROLLOUT_STEPS, SAC/TQC = total_steps.
     ax9 = plt.subplot(3, 3, 9)
     any_log = False
     POLICY_COLORS = {"PPO": "#4C72B0", "SAC": "#DD8452", "TQC": "#55A868"}
@@ -386,17 +388,21 @@ def main():
         if os.path.exists(log_path):
             try:
                 log_df = pd.read_csv(log_path)
-                # Smooth with a rolling window to reduce noise
-                smoothed = log_df["mean_ep_reward"].rolling(window=10, min_periods=1).mean()
+                # Convert raw step count → millions of env steps for readability
+                x_millions = log_df["step"] / 1e6
+                # Rolling-window smooth (window proportional to log density)
+                w = max(5, len(log_df) // 30)
+                smoothed = log_df["mean_ep_reward"].rolling(window=w, min_periods=1).mean()
+                # Faint raw trace
                 ax9.plot(
-                    log_df["step"], smoothed,
-                    label=p_name, linewidth=2.5,
+                    x_millions, log_df["mean_ep_reward"],
+                    alpha=0.18, linewidth=1,
                     color=POLICY_COLORS.get(p_name),
                 )
-                # Faint raw trace behind it
+                # Bold smoothed trace
                 ax9.plot(
-                    log_df["step"], log_df["mean_ep_reward"],
-                    alpha=0.2, linewidth=1,
+                    x_millions, smoothed,
+                    label=p_name, linewidth=2.5,
                     color=POLICY_COLORS.get(p_name),
                 )
                 any_log = True
@@ -404,10 +410,11 @@ def main():
                 print(f"  Warning: could not read {log_path}: {e}")
 
     if any_log:
-        ax9.set_xlabel("Training Step")
-        ax9.set_ylabel("Mean Episode Reward")
+        ax9.set_xlabel("Environment Steps (millions)", fontsize=11)
+        ax9.set_ylabel("Mean Episode Reward", fontsize=11)
         ax9.set_title("Episode Reward During Training", fontsize=13)
-        ax9.legend()
+        ax9.axhline(0, color="gray", linestyle=":", linewidth=0.8, alpha=0.6)
+        ax9.legend(fontsize=10)
     else:
         ax9.text(0.5, 0.5,
                  "No training logs found.\nRun trainers to generate\n"
