@@ -76,7 +76,7 @@ LR_START       = 5e-4
 LR_END         = 1e-4
 LR_MIN         = 1e-5
 WARMUP_UPDATES = 5
-TOTAL_UPDATES  = 150
+TOTAL_UPDATES  = 83   # ALIGNED: 83 × 16384 × 150 = 202,137,600 env steps ≈ SAC/TQC 204,800,000
 
 BATCH_SIZE      = NUM_ENVS * ROLLOUT_STEPS
 N_MINIBATCHES   = 256
@@ -427,8 +427,9 @@ if __name__ == "__main__":
                 f"{fps:>7,.0f} {n_ep:>6d} {lr_now:.2e} | "
                 f"{cur_stage:>5d} {cur_min_dist:>5.1f}m {elapsedtime:>5.1f}min"
             )
-            # ── CSV log row ──────────────────────────────────────────────────
-            _log_writer.writerow([update, round(mean_ret, 4),
+            # ── CSV log row — total_env_steps for aligned x-axis ───────────────
+            total_env_steps = (update + 1) * NUM_ENVS * ROLLOUT_STEPS
+            _log_writer.writerow([total_env_steps, round(mean_ret, 4),
                                    round(suc_pct, 4), round(col_pct, 4),
                                    round(pcol_pct, 4), round(tmo_pct, 4), n_ep])
             _log_file.flush()
