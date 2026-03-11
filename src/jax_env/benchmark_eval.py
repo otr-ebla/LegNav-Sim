@@ -306,8 +306,8 @@ def main():
     print("Generating dashboard...")
     sns.set_theme(style="whitegrid", palette="muted")
 
-    # 3 rows × 3 cols = 9 panels; last panel is training curves
-    fig = plt.figure(figsize=(27, 21))
+    # 4 rows × 3 cols = 12 panels (panel 12 unused)
+    fig = plt.figure(figsize=(27, 28))
     fig.suptitle("RL Navigation Policies: Evaluation Dashboard",
                  fontsize=26, weight="bold")
 
@@ -315,7 +315,7 @@ def main():
     rate_df   = df.groupby("Policy")[["Success","Active Col","Passive Col","Timeout"]].mean().reset_index()
     rate_melt = rate_df.melt(id_vars="Policy", var_name="Outcome", value_name="Rate")
     rate_melt["Rate"] *= 100
-    ax1 = plt.subplot(3, 3, 1)
+    ax1 = plt.subplot(4, 3, 1)
     sns.barplot(data=rate_melt, x="Outcome", y="Rate", hue="Policy", ax=ax1)
     ax1.set_title("Overall Episode Outcomes (%)", fontsize=13)
     ax1.set_ylim(0, 100)
@@ -324,7 +324,7 @@ def main():
     scen_df = df.groupby(["Scenario","Policy"])["Success"].mean().reset_index()
     scen_df["Success"] *= 100
     scen_df["Scenario_Name"] = scen_df["Scenario"].map(scen_names)
-    ax2 = plt.subplot(3, 3, 2)
+    ax2 = plt.subplot(4, 3, 2)
     sns.barplot(data=scen_df, x="Scenario_Name", y="Success", hue="Policy", ax=ax2)
     ax2.set_title("Success Rate by Layout Topology", fontsize=13)
     ax2.set_xticklabels(ax2.get_xticklabels(), rotation=30)
@@ -333,7 +333,7 @@ def main():
     # 3. Success vs Speed
     v_df = df.groupby(["Max_V","Policy"])["Success"].mean().reset_index()
     v_df["Success"] *= 100
-    ax3 = plt.subplot(3, 3, 3)
+    ax3 = plt.subplot(4, 3, 3)
     sns.lineplot(data=v_df, x="Max_V", y="Success", hue="Policy",
                  marker="o", linewidth=3, markersize=8, ax=ax3)
     ax3.set_title("Success Rate vs. Robot Max Speed", fontsize=13)
@@ -343,7 +343,7 @@ def main():
     # 4. Active Collisions vs Speed
     v_col_df = df.groupby(["Max_V","Policy"])["Active Col"].mean().reset_index()
     v_col_df["Active Col"] *= 100
-    ax4 = plt.subplot(3, 3, 4)
+    ax4 = plt.subplot(4, 3, 4)
     sns.lineplot(data=v_col_df, x="Max_V", y="Active Col", hue="Policy",
                  marker="X", linewidth=3, markersize=8, ax=ax4)
     ax4.set_title("Active Collisions vs. Robot Max Speed", fontsize=13)
@@ -353,18 +353,18 @@ def main():
     suc = df[df["Success"] == 1.0]
 
     # 5. SPL
-    ax5 = plt.subplot(3, 3, 5)
+    ax5 = plt.subplot(4, 3, 5)
     sns.boxplot(data=suc, x="Policy", y="SPL", hue="Policy", ax=ax5, showfliers=False)
     ax5.set_title("Success-weighted Path Length (SPL)", fontsize=13)
 
     # 6. Time to Goal
-    ax6 = plt.subplot(3, 3, 6)
+    ax6 = plt.subplot(4, 3, 6)
     sns.boxplot(data=suc, x="Policy", y="Time to Goal", hue="Policy",
                 ax=ax6, showfliers=False)
     ax6.set_title("Time to Reach Goal (seconds)", fontsize=13)
 
     # 7. Safety Margin vs Speed
-    ax7 = plt.subplot(3, 3, 7)
+    ax7 = plt.subplot(4, 3, 7)
     sns.lineplot(data=df, x="Max_V", y="Min Dist", hue="Policy",
                  marker="^", linewidth=3, markersize=8, ax=ax7)
     ax7.set_title("Safety Margin (Min Human Dist) vs. Speed", fontsize=13)
@@ -373,7 +373,7 @@ def main():
     ax7.legend()
 
     # 8. Jerk
-    ax8 = plt.subplot(3, 3, 8)
+    ax8 = plt.subplot(4, 3, 8)
     sns.boxplot(data=df, x="Policy", y="Jerk", hue="Policy",
                 ax=ax8, showfliers=False)
     ax8.set_title("Average Kinematic Jerk (Smoothness)", fontsize=13)
@@ -381,7 +381,7 @@ def main():
     # 9. Training Curves — episode reward over environment steps
     # All three trainers now log 'step' as total_env_steps so the x-axis is
     # comparable: PPO = update × NUM_ENVS × ROLLOUT_STEPS, SAC/TQC = total_steps.
-    ax9 = plt.subplot(3, 3, 9)
+    ax9 = plt.subplot(4, 3, 9)
     any_log = False
     POLICY_COLORS = {"PPO": "#4C72B0", "SAC": "#DD8452", "TQC": "#55A868"}
     for p_name, log_path in TRAINING_LOG_PATHS.items():
@@ -423,6 +423,29 @@ def main():
                  fontsize=11, color="gray")
         ax9.set_title("Episode Reward During Training", fontsize=13)
         ax9.set_axis_off()
+
+    # 10. Passive Collisions vs Speed
+    v_pcol_df = df.groupby(["Max_V","Policy"])["Passive Col"].mean().reset_index()
+    v_pcol_df["Passive Col"] *= 100
+    ax10 = plt.subplot(4, 3, 10)
+    sns.lineplot(data=v_pcol_df, x="Max_V", y="Passive Col", hue="Policy",
+                 marker="o", linewidth=3, markersize=8, ax=ax10)
+    ax10.set_title("Passive Collisions vs. Robot Max Speed", fontsize=13)
+    ax10.set_xticks(MAX_V_TESTS)
+    ax10.set_ylim(0, 100)
+
+    # 11. Timeout vs Speed
+    v_tmo_df = df.groupby(["Max_V","Policy"])["Timeout"].mean().reset_index()
+    v_tmo_df["Timeout"] *= 100
+    ax11 = plt.subplot(4, 3, 11)
+    sns.lineplot(data=v_tmo_df, x="Max_V", y="Timeout", hue="Policy",
+                 marker="s", linewidth=3, markersize=8, ax=ax11)
+    ax11.set_title("Timeout Rate vs. Robot Max Speed", fontsize=13)
+    ax11.set_xticks(MAX_V_TESTS)
+    ax11.set_ylim(0, 100)
+
+    # 12. (empty — reserved for future use)
+    plt.subplot(4, 3, 12).set_visible(False)
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.savefig("Evaluation_Dashboard.png", dpi=300)
