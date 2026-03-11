@@ -15,11 +15,13 @@ missing the panel shows a "no data" notice instead of crashing.
 """
 
 import os
+import sys
 import time
 import warnings
 
 os.environ["JAX_PLATFORMS"] = "cuda,cpu"
 os.environ["XLA_FLAGS"] = "--xla_gpu_enable_triton_gemm=true"
+os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"  # suppress pygame banner
 warnings.filterwarnings("ignore")
 
 import jax

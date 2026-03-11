@@ -456,11 +456,12 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
     heading_bon    = HEADING_BONUS * jnp.maximum(0.0, jnp.cos(align_cur)) * \
                      (target_v / jnp.maximum(state.max_v, 1e-3))
 
+    # Comfort penalty scaled with speed: more dangerous to invade comfort at high v
     comfort_pen = -0.15 * jnp.sum(
         jnp.maximum(0.0, 1.0 - dists_p / COMFORT_DIST)
-    )
+    ) * (1.0 + target_v / jnp.maximum(state.max_v, 1e-3))
 
-    YIELD_DIST = 1.2
+    YIELD_DIST = 1.5   # aligned with benchmark_eval.py
     YIELD_FOV  = 1.5708
 
     in_yield_zone      = (dists_p < YIELD_DIST) & (jnp.abs(rel_angles) < YIELD_FOV)
@@ -477,10 +478,15 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
         jnp.where(is_stopped, state.time_stopped + 1, state.time_stopped),
         0,
     )
-    decay = jnp.maximum(0.0, 1.0 - (new_time_stopped / 30.0))
 
-    yield_penalty = -2.5 * urgency * (target_v / jnp.maximum(state.max_v, 1e-3))
-    yield_bonus   =  0.4 * urgency * decay
+    # Speed bonus suppressed in yield zone: stopping should never cost speed points
+    speed_bon_yield = jnp.where(is_yield_situation, 0.0, speed_bon)
+
+    # Yield penalty is absolute (not normalised by max_v):
+    # moving at 2 m/s costs ~5x more than at 0.4 m/s — strong deterrent at any speed
+    yield_penalty = -7.5 * urgency * target_v
+    # Yield bonus: full value while urgency is present, no time-decay
+    yield_bonus   =  0.5 * urgency
 
     yield_reward = jnp.where(
         is_yield_situation,
@@ -489,7 +495,7 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
     )
 
     # ── Terminal Reward Overrides ─────────────────────────────────────────────
-    reward = progress + step_pen + smooth + speed_bon + heading_bon + comfort_pen + yield_reward
+    reward = progress + step_pen + smooth + speed_bon_yield + heading_bon + comfort_pen + yield_reward
 
     reward = jnp.where(goal_reached, 200.0, reward)
     reward = jnp.where(obs_collision  & ~goal_reached, -70.0, reward)
