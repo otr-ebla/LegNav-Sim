@@ -1,398 +1,452 @@
 """
-jax_env_multi.py — Core 2D Navigation Environment with JHSFM
-=============================================================
-PATCH — Leg-pair simulation:
-  reset_env: initialises leg_phases with random offsets.
-  step_env:  advances leg_phases each step via jax_legs.advance_phase().
-  get_obs (from jax_env) already handles USE_LEGS via get_leg_circles().
+jax_eval_multi.py — Interactive Scenario Evaluation
+=====================================================
+PATCH — Leg simulation rendering + CLI flags (same as jax_eval.py patch).
 
-No other changes vs previous version.
+  --legs / --no-legs : toggle leg-pair LiDAR model (default: --legs)
+  --ckpt PATH        : checkpoint file path
+  Keys 0-6           : lock to a scenario
+  Key 7              : random scenario mode
+  Key R              : reset
 """
 
+import argparse
+import os
+os.environ["JAX_PLATFORMS"] = "cpu"
+
+import math
+import functools
+import random
+import pygame
+import numpy as np
 import jax
 import jax.numpy as jnp
-import sys
-import os
-
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, "../../"))
-if project_root not in sys.path:
-    sys.path.append(project_root)
-
-from jax_env import (EnvState, get_obs,
-                     ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS, DT,
-                     MAX_STEPS, GOAL_RADIUS, COMFORT_DIST, COMFORT_COEF,
-                     HEADING_BONUS, PROGRESS_COEF, USE_LEGS)
-from jax_scenarios import generate_scenario
-from jax_legs import advance_feet, init_foot_state, get_leg_circles, get_shoe_boxes
-
-try:
-    from src.jhsfm_utils.JHSFM.jhsfm.hsfm import step as hsfm_step
-    from src.jhsfm_utils.JHSFM.jhsfm.utils import get_standard_humans_parameters
-except ImportError:
-    from jhsfm_utils.JHSFM.jhsfm.hsfm import step as hsfm_step
-    from jhsfm_utils.JHSFM.jhsfm.utils import get_standard_humans_parameters
-
-__all__ = ["reset_env", "step_env", "EnvState", "get_obs"]
-
-HSFM_DT    = 0.05
-N_SUBSTEPS = int(DT / HSFM_DT)
-NUM_PEOPLE = 12
-
-
-def build_hsfm_obstacles(obs_boxes):
-    room_edges = jnp.array([
-        [[0.0, 0.0], [ROOM_W, 0.0]],
-        [[ROOM_W, 0.0], [ROOM_W, ROOM_H]],
-        [[ROOM_W, ROOM_H], [0.0, ROOM_H]],
-        [[0.0, ROOM_H], [0.0, 0.0]]
-    ])
-
-    def box_to_edges(box):
-        cx, cy, hw, hh = box
-        valid = jnp.where(hw > 0.0, 1.0, 0.0)
-        p1 = jnp.array([cx - hw, cy - hh]) * valid
-        p2 = jnp.array([cx + hw, cy - hh]) * valid
-        p3 = jnp.array([cx + hw, cy + hh]) * valid
-        p4 = jnp.array([cx - hw, cy + hh]) * valid
-        return jnp.stack([
-            jnp.stack([p1, p2]), jnp.stack([p2, p3]),
-            jnp.stack([p3, p4]), jnp.stack([p4, p1])
-        ])
-
-    box_edges = jax.vmap(box_to_edges)(obs_boxes)
-    all_edges = jnp.concatenate([room_edges[None, ...], box_edges], axis=0)
-    return jnp.tile(all_edges[None, ...], (NUM_PEOPLE + 1, 1, 1, 1, 1))
-
-
-def reset_env(key: jax.Array, min_goal_dist: float = 3.0, scenario_idx: int = -1):
-    # Split an extra key for the observation noise
-    k_main, k_legs, k_obs = jax.random.split(key, 3)
-
-    rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people = \
-        generate_scenario(k_main, min_goal_dist, scenario_idx)
-
-    # ── NEW: staggered initial gait phases ────────────────────────────────────
-    foot_state = init_foot_state(people, k_legs)
-
-    state = EnvState(
-        x=rx, y=ry, theta=rtheta, v=0.0, w=0.0,
-        goal_x=gx, goal_y=gy, max_v=max_v,
-        people=people, obs_circles=obs_circles, obs_boxes=obs_boxes,
-        time_step=0,
-        foot_state=foot_state,
-        time_stopped=0, # <-- ADDED
-        sp_mask=jnp.zeros(108, dtype=jnp.bool_) # <-- ADDED (NUM_RAYS=108)
-    )
-    
-    # Get initial observation and update mask
-    obs, sp_mask = get_obs(state, k_obs)
-    state = state.replace(sp_mask=sp_mask)
-    return obs, state
-
-
-def step_env(key, state, action):
-    k_step, k_obs = jax.random.split(key)
-    # 1. Robot Kinematics
-    target_v = jnp.clip(action[0], 0.0, state.max_v)
-    target_w = jnp.clip(action[1], -1.0, 1.0)
-
-    mid_theta = state.theta + 0.5 * target_w * DT
-    new_theta = (state.theta + target_w * DT + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
-    raw_x     = state.x + target_v * DT * jnp.cos(mid_theta)
-    raw_y     = state.y + target_v * DT * jnp.sin(mid_theta)
-
-    wall_collision = (raw_x < ROBOT_RADIUS) | (raw_x > ROOM_W - ROBOT_RADIUS) | \
-                     (raw_y < ROBOT_RADIUS) | (raw_y > ROOM_H - ROBOT_RADIUS)
-    new_x = jnp.clip(raw_x, ROBOT_RADIUS, ROOM_W - ROBOT_RADIUS)
-    new_y = jnp.clip(raw_y, ROBOT_RADIUS, ROOM_H - ROBOT_RADIUS)
-
-    # 2. JHSFM substeps
-    hsfm_params      = get_standard_humans_parameters(NUM_PEOPLE + 1)
-    static_obstacles = build_hsfm_obstacles(state.obs_boxes)
-
-    def _hsfm_substep(carry, _):
-        h_state, r_state = carry
-        idx  = state.people[:, 10]
-        g1x, g1y = state.people[:, 6], state.people[:, 7]
-        g2x, g2y = state.people[:, 8], state.people[:, 9]
-        gx   = jnp.where(idx == 0, g1x, g2x)
-        gy   = jnp.where(idx == 0, g1y, g2y)
-        h_goals    = jnp.stack([gx, gy], axis=-1)
-        r_goal     = jnp.array([state.goal_x, state.goal_y])
-        ext_state  = jnp.concatenate([h_state, r_state[None, :]], axis=0)
-        ext_goals  = jnp.concatenate([h_goals, r_goal[None, :]], axis=0)
-        next_ext   = hsfm_step(ext_state, ext_goals, hsfm_params, static_obstacles, HSFM_DT)
-        next_h     = next_ext[:-1]
-        
-        # Do not clamp dummy humans, otherwise they get teleported into the room at x=0.1
-        is_dummy_sub = idx < 0.0
-        clamped_x  = jnp.where(is_dummy_sub, next_h[:, 0], jnp.clip(next_h[:, 0], 0.1, ROOM_W - 0.1))
-        clamped_y  = jnp.where(is_dummy_sub, next_h[:, 1], jnp.clip(next_h[:, 1], 0.1, ROOM_H - 0.1))
-        
-        next_h     = next_h.at[:, 0].set(clamped_x).at[:, 1].set(clamped_y)
-        return (next_h, r_state), None
-
-    h_state_init = state.people[:, :6]
-    r_state_init = jnp.array([new_x, new_y,
-                               target_v * jnp.cos(new_theta),
-                               target_v * jnp.sin(new_theta),
-                               new_theta, target_w])
-    (new_h_state, _), _ = jax.lax.scan(
-        _hsfm_substep, (h_state_init, r_state_init), None, length=N_SUBSTEPS
-    )
-
-    # 3. Waypoint toggle & Respawn Logic
-    idx_cur = state.people[:, 10]
-    g1x, g1y = state.people[:, 6], state.people[:, 7]
-    g2x, g2y = state.people[:, 8], state.people[:, 9]
-    gx_cur   = jnp.where(idx_cur == 0, g1x, g2x)
-    gy_cur   = jnp.where(idx_cur == 0, g1y, g2y)
-    
-    # Check standard waypoint arrival (g1 -> g2 toggle)
-    dist_to_goal = jnp.sqrt((new_h_state[:, 0] - gx_cur)**2 +
-                             (new_h_state[:, 1] - gy_cur)**2)
-                             
-    # Only toggle active humans (idx >= 0) to stop dummies from reviving
-    new_idx = jnp.where((dist_to_goal < 0.5) & (idx_cur >= 0.0), 1.0 - idx_cur, idx_cur)
-
-    # --- ADVANCED RESPAWN LOGIC ---
-    k_respawn1, k_respawn2 = jax.random.split(k_step)
-    is_dummy = state.people[:, 10] < 0.0
-
-    # Explicitly detect the ONLY two scenarios that require top-to-bottom teleportation
-    # Parallel: g1x == g2x and g1y is exactly 1.0
-    is_parallel = (g1x == g2x) & (jnp.abs(g1y - 1.0) < 0.1)
-    
-    # Bottleneck: g2y was lowered to 0.0 outside the room
-    is_bottleneck = jnp.abs(g2y) < 0.1
-    
-    is_teleport_scenario = is_parallel | is_bottleneck
-
-    # Respawn triggers: Only teleport if they reached the bottom AND belong to a teleport scenario
-    reached_bottom = new_h_state[:, 1] < 1.5
-    needs_respawn  = (reached_bottom & is_teleport_scenario) & ~is_dummy
-
-    # Teleport locations (Only used for Parallel and Bottleneck)
-    # Corridor bounds for parallel scenario
-    rand_x_corr = jax.random.uniform(k_respawn1, (NUM_PEOPLE,), minval=4.5, maxval=7.5)
-    # Full room width for bottleneck
-    rand_x_full = jax.random.uniform(k_respawn1, (NUM_PEOPLE,), minval=1.0, maxval=ROOM_W - 1.0)
-    
-    rand_x = jnp.where(is_parallel, rand_x_corr, rand_x_full)
-    rand_y = jax.random.uniform(k_respawn2, (NUM_PEOPLE,), minval=ROOM_H - 1.4, maxval=ROOM_H - 0.2)
-
-    # Reset goal_idx to 0 on respawn so they target g1 first
-    new_idx = jnp.where(needs_respawn, 0.0, new_idx)
-
-    # Dummies stay off-screen permanently
-    dummy_pos = -999.0
-    dummy_x = jnp.full((NUM_PEOPLE,), dummy_pos)
-    dummy_y = jnp.full((NUM_PEOPLE,), dummy_pos)
-
-    final_px = jnp.where(is_dummy, dummy_x,
-               jnp.where(needs_respawn, rand_x, new_h_state[:, 0]))
-    final_py = jnp.where(is_dummy, dummy_y,
-               jnp.where(needs_respawn, rand_y, new_h_state[:, 1]))
-    # Reset velocity to zero on respawn so humans do not arrive with stale momentum
-    final_vx = jnp.where(needs_respawn, 0.0, new_h_state[:, 2])
-    final_vy = jnp.where(needs_respawn, 0.0, new_h_state[:, 3])
-
-    respawned_h_state = jnp.stack([
-        final_px, final_py,
-        final_vx, final_vy,
-        new_h_state[:, 4], new_h_state[:, 5]  # theta, omega unchanged
-    ], axis=-1)
-
-    new_people = jnp.concatenate([respawned_h_state, state.people[:, 6:10], new_idx[:, None]], axis=-1)
-
-    # Advance leg gait phases
-    new_foot_state = advance_feet(state.foot_state, new_people, DT)
-
-    # 4. Distance and Collision Logic
-    prev_dist = jnp.sqrt((state.x - state.goal_x)**2 + (state.y - state.goal_y)**2)
-    new_dist  = jnp.sqrt((new_x  - state.goal_x)**2 + (new_y  - state.goal_y)**2)
-
-    dx_p = new_people[:, 0] - new_x
-    dy_p = new_people[:, 1] - new_y
-    dists_p = jnp.sqrt(dx_p**2 + dy_p**2)
-
-    # Mask out dummy humans (goal_idx == -1) from all distance/collision logic
-    active_mask = new_people[:, 10] >= 0.0
-    dists_p_active = jnp.where(active_mask, dists_p, jnp.inf)
-
-    closest_human = jnp.min(dists_p_active)
-
-    human_col_mask  = (dists_p < (ROBOT_RADIUS + PEOPLE_RADIUS)) & active_mask
-    human_collision = jnp.any(human_col_mask)
-
-    # Active collision: the robot physically ran into a human.
-    # Conditions (ALL must be true for at least one colliding human):
-    #   1. human is within 1.5 m of the robot (proximity)
-    #   2. human is in the forward 180° FOV  (heading_dot > 0)
-    #   3. robot linear velocity >= 0.1 m/s  (robot is moving)
-    #
-    # Passive collision: a human walked into the robot — everything else.
-    # (robot stopped, or human came from behind, or human outside 1.5 m zone)
-
-    heading_dot  = dx_p * jnp.cos(new_theta) + dy_p * jnp.sin(new_theta)
-    in_fwd_fov   = heading_dot > 0.0                       # forward 180° FOV
-    in_prox      = dists_p_active < 1.5                    # within 1.5 m
-    robot_moving = target_v >= 0.1                         # robot is moving
-
-    # A human triggers an active collision if it is colliding AND in FOV AND close
-    active_human = human_col_mask & in_fwd_fov & in_prox
-    any_active   = jnp.any(active_human)
-    active_col   = human_collision & robot_moving & any_active
-    passive_col  = human_collision & ~active_col
-
-    dx_c = state.obs_circles[:, 0] - new_x
-    dy_c = state.obs_circles[:, 1] - new_y
-    closest_cir = jnp.min(jnp.sqrt(dx_c**2 + dy_c**2) - state.obs_circles[:, 2])
-
-    def _box_dist(box):
-        cx, cy, hw, hh = box
-        ddx = jnp.maximum(jnp.abs(new_x - cx) - hw, 0.0)
-        ddy = jnp.maximum(jnp.abs(new_y - cy) - hh, 0.0)
-        return jnp.sqrt(ddx**2 + ddy**2)
-    closest_box = jnp.min(jax.vmap(_box_dist)(state.obs_boxes))
-
-    # Shoe/leg collision: robot must avoid human legs and feet (USE_LEGS=True)
-    # Leg circles: closest distance from robot centre to any leg circle surface
-    if USE_LEGS:
-        leg_circles  = get_leg_circles(new_people, new_foot_state, use_legs=True)
-        shoe_boxes   = get_shoe_boxes(new_people, new_foot_state)
-        # Active-people mask: filter out dummies (goal_idx < 0) for leg collision too
-        _active_leg  = new_people[:, 10] >= 0.0
-        _active_leg2 = jnp.concatenate([_active_leg, _active_leg], axis=0)  # 2N for leg pairs
-
-        dx_leg = leg_circles[:, 0] - new_x
-        dy_leg = leg_circles[:, 1] - new_y
-        dist_legs = jnp.sqrt(dx_leg**2 + dy_leg**2) - leg_circles[:, 2]
-        dist_legs = jnp.where(_active_leg2, dist_legs, jnp.inf)
-        closest_leg = jnp.min(dist_legs)
-
-        dist_shoes = jax.vmap(_box_dist)(shoe_boxes)
-        dist_shoes = jnp.where(_active_leg2, dist_shoes, jnp.inf)
-        closest_shoe = jnp.min(dist_shoes)
-    else:
-        closest_leg  = jnp.inf
-        closest_shoe = jnp.inf
-
-    obs_collision = (closest_cir  < ROBOT_RADIUS) | \
-                    (closest_box  < ROBOT_RADIUS) | \
-                    (closest_leg  < ROBOT_RADIUS) | \
-                    (closest_shoe < ROBOT_RADIUS)
-    collision     = human_collision | obs_collision | wall_collision
-    timeout       = (state.time_step + 1) >= MAX_STEPS
-    goal_reached  = new_dist < GOAL_RADIUS
-    done          = goal_reached | collision | timeout
-
-    # ── 5. Reward ──────────────────────────────────────────────────────────────
-
-    progress  = PROGRESS_COEF * (prev_dist - new_dist)
-    step_pen  = -0.02
-    smooth    = -0.5 * jnp.abs(target_w - state.w)
-    speed_bon = 0.02 * target_v / jnp.maximum(state.max_v, 1e-3)
-
-    goal_angle_cur = jnp.arctan2(state.goal_y - new_y, state.goal_x - new_x)
-    align_cur      = (goal_angle_cur - new_theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
-    heading_bon    = HEADING_BONUS * jnp.maximum(0.0, jnp.cos(align_cur)) * \
-                     (target_v / jnp.maximum(state.max_v, 1e-3))
-
-    # Comfort penalty scaled with speed: more dangerous at high v
-    comfort_pen = -0.15 * jnp.sum(
-        jnp.maximum(0.0, 1.0 - dists_p_active / COMFORT_DIST)
-    ) * (1.0 + target_v / jnp.maximum(state.max_v, 1e-3))
-
-    rel_angles = jnp.arctan2(
-        new_people[:, 1] - new_y,
-        new_people[:, 0] - new_x
-    ) - new_theta
-    rel_angles = (rel_angles + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
-
-    YIELD_DIST = 1.5
-    YIELD_FOV  = 1.57
-
-    in_yield_zone      = (dists_p_active < YIELD_DIST) & (jnp.abs(rel_angles) < YIELD_FOV)
-    is_yield_situation = jnp.any(in_yield_zone)
-
-    closest_yield_dist = jnp.min(jnp.where(in_yield_zone, dists_p_active, 100.0))
-    urgency = jnp.where(
-        is_yield_situation,
-        (YIELD_DIST - closest_yield_dist) / YIELD_DIST,
-        0.0
-    )
-
-    is_stopped = target_v <= 0.1
-
-    new_time_stopped = jnp.where(
-        is_yield_situation,
-        jnp.where(is_stopped, state.time_stopped + 1, state.time_stopped),
-        0,
-    )
-
-    # Speed bonus suppressed in yield zone: stopping must not cost speed points
-    speed_bon = jnp.where(is_yield_situation, 0.0, speed_bon)
-
-    # Yield penalty absolute (not normalised): 2 m/s near human costs ~5x more than 0.4 m/s
-    yield_penalty = -7.5 * urgency * target_v
-    # Yield bonus: full value, no time-decay — robot should hold as long as needed
-    yield_bonus   =  0.5 * urgency
-
-    yield_reward = jnp.where(
-        is_yield_situation,
-        jnp.where(is_stopped, yield_bonus, yield_penalty),
-        0.0
-    )
-
-    approach_rate   = jnp.maximum(
-        0.0,
-        -(new_people[:, 2] * (new_people[:, 0] - new_x) +
-          new_people[:, 3] * (new_people[:, 1] - new_y)) /
-        jnp.maximum(dists_p_active, 0.1)
-    )
-    rob_toward = jnp.maximum(0.0,
-        (jnp.cos(new_theta) * (new_people[:, 0] - new_x) +
-         jnp.sin(new_theta) * (new_people[:, 1] - new_y)) /
-        jnp.maximum(dists_p_active, 0.1)
-    )
-    closing_pen = -0.08 * jnp.sum(
-        jnp.where(dists_p_active < YIELD_DIST,
-                  rob_toward * target_v,
-                  0.0)
-    )
-
-    reward = (progress + step_pen + smooth + speed_bon + heading_bon
-              + comfort_pen + yield_reward + closing_pen)
-
-    reward = jnp.where(goal_reached,                                               200.0, reward)
-    reward = jnp.where(obs_collision  & ~goal_reached,                            -70.0, reward)
-    reward = jnp.where(wall_collision & ~obs_collision & ~goal_reached,           -70.0, reward)
-    reward = jnp.where(active_col  & ~obs_collision & ~wall_collision
-                       & ~goal_reached,                                            -70.0, reward)
-    reward = jnp.where(passive_col & ~obs_collision & ~wall_collision
-                       & ~goal_reached,                                            -20.0, reward)
-    reward = jnp.where(timeout & ~goal_reached & ~collision,                       -8.0, reward)
-
-    new_state = state.replace(
-        x=new_x, y=new_y, theta=new_theta,
-        v=target_v, w=target_w,
-        people=new_people,
-        time_step=state.time_step + 1,
-        foot_state=new_foot_state,
-        time_stopped=new_time_stopped,
-    )
-
-    obs, sp_mask = get_obs(new_state, k_obs) 
-    new_state = new_state.replace(sp_mask=sp_mask)
-
-    info = {
-        "discount":      jnp.where(done, 0.0, 1.0),
-        "goal_reached":  goal_reached,
-        "collision":     collision,
-        "passive_col":   passive_col,
-        "closest_human": closest_human,
-        "sp_mask":       sp_mask,
+import flax.serialization
+
+def _parse_args():
+    p = argparse.ArgumentParser(description="JAX Scenario Evaluation")
+    p.add_argument("--legs",    dest="use_legs", action="store_true",  default=True)
+    p.add_argument("--no-legs", dest="use_legs", action="store_false")
+    p.add_argument("--ckpt",    default="checkpoints/ppo_model_best.msgpack")
+    return p.parse_args()
+
+args = _parse_args()
+
+import jax_env
+jax_env.USE_LEGS = args.use_legs
+
+from jax_env import (ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS,
+                     NUM_RAYS, MAX_LIDAR_DIST, FOV,
+                     NUM_OBS_CIR, NUM_OBS_BOX, MAX_STEPS)
+from jax_env_multi import reset_env, step_env
+from jax_legs import LEG_RADIUS, HIP_WIDTH, SHOE_LENGTH, SHOE_WIDTH
+from jax_wrappers import make_stacked_env
+from jax_network import EndToEndActorCritic, scale_action_to_env
+
+OBS_SIZE = 342
+
+SIM_SIZE   = 800
+PANEL_W    = 300
+WINDOW_W   = SIM_SIZE + PANEL_W
+WINDOW_H   = SIM_SIZE
+SCALE      = SIM_SIZE / max(ROOM_W, ROOM_H)
+FPS_TARGET = 30
+
+C_BG        = (28,  28,  34); C_FLOOR    = (44,  44,  52); C_GRID     = (56,  56,  66)
+C_WALL      = (190, 190, 205); C_ROBOT    = (60,  140, 255); C_ROBOT_H  = (170, 210, 255)
+C_GOAL      = (255, 210,  40); C_GOAL2    = (220, 150,  10)
+C_PERSON    = (70,  200,  80); C_PERSON_D = (255, 160,  40)
+C_LEG_L     = (90,  220, 100); C_LEG_R    = (50,  170,  65)
+C_LEG_DL    = (255, 180,  60); C_LEG_DR   = (200, 130,  30)
+C_BODY_RING = (50,  100,  50)
+C_CIRCLE    = (140,  90,  60); C_CIRCLE_L = (180, 120,  80)
+C_BOX       = ( 90, 110, 145); C_BOX_L    = (120, 145, 185)
+C_RAY_FAR   = ( 50, 200,  50); C_RAY_NEAR = (220,  50,  50)
+C_PANEL     = ( 20,  20,  26); C_TEXT     = (215, 215, 228)
+C_DIM       = (120, 120, 138); C_SUCCESS  = ( 50, 215,  95)
+C_COLLIDE   = (230,  60,  60); C_TIMEOUT  = (210, 165,  50)
+
+
+def W(x, y): return int(x * SCALE), int(SIM_SIZE - y * SCALE)
+
+
+def make_fonts():
+    return {
+        "big"  : pygame.font.SysFont("monospace", 21, bold=True),
+        "mid"  : pygame.font.SysFont("monospace", 15),
+        "small": pygame.font.SysFont("monospace", 13),
+        "tiny" : pygame.font.SysFont("monospace", 11),
     }
-    return obs, new_state, reward, done, info
+
+
+def load_checkpoint(filepath):
+    with open(filepath, "rb") as f: raw = f.read()
+    return flax.serialization.msgpack_restore(raw)["params"]
+
+
+def draw_star(surface, cx, cy, r_out, r_in, n, color, border=None):
+    pts = []
+    for i in range(2 * n):
+        angle = math.radians(-90 + i * 180 / n)
+        r     = r_out if i % 2 == 0 else r_in
+        pts.append((cx + r * math.cos(angle), cy + r * math.sin(angle)))
+    pygame.draw.polygon(surface, color, pts)
+    if border: pygame.draw.polygon(surface, border, pts, 2)
+
+
+def draw_lidar(surface, state, raw_lidar, show):
+    if not show or raw_lidar is None: return
+    rx, ry = W(float(state.x), float(state.y))
+    theta  = float(state.theta)
+    fov    = float(FOV)
+    angles = theta - fov / 2.0 + np.arange(NUM_RAYS) * fov / (NUM_RAYS - 1)
+    
+    # ── NEW: Estrai la maschera del rumore dallo stato CPU ──
+    sp_mask = np.array(state.sp_mask)
+
+    # Usa enumerate per avere l'indice 'i' del raggio
+    for i, (ang, dist) in enumerate(zip(angles, raw_lidar)):
+        ex, ey = W(float(state.x) + dist * math.cos(ang),
+                   float(state.y) + math.sin(ang) * dist)
+        
+        # Se il raggio è colpito dal rumore S&P, coloralo di viola
+        if sp_mask[i]:
+            col = (180, 50, 220)  # Viola
+        else:
+            # Altrimenti usa il normale gradiente rosso/verde
+            t   = max(0.0, 1.0 - dist / MAX_LIDAR_DIST)
+            col = tuple(int(C_RAY_NEAR[j]*t + C_RAY_FAR[j]*(1-t)) for j in range(3))
+            
+        pygame.draw.line(surface, col, (rx, ry), (ex, ey), 1)
+
+
+def _read_foot_positions_np(foot_state_np):
+    """Read world-space foot positions directly from foot_state array.
+    foot_state_np : (N, 10) — [left_xy, right_xy, phase, stance, swing_target_xy, swing_start_xy]
+    Returns left_legs (N,2), right_legs (N,2).
+    """
+    return foot_state_np[:, 0:2], foot_state_np[:, 2:4]
+
+
+# ── Per-person shoe colour palette ───────────────────────────────────────────
+_SHOE_PALETTE = [
+    (180,  60,  60), ( 60, 130, 220), (220, 160,  30), ( 60, 200, 160),
+    (200,  80, 200), (100, 200,  60), (230, 120,  40), ( 80, 180, 230),
+    (200, 200,  60), (160,  60, 200), ( 50, 200, 100), (220,  80, 130),
+    ( 60, 160, 160), (200, 140,  80), (130,  80, 200), (200,  60,  80),
+    ( 80, 220, 200), (220, 200,  80), (160, 120,  60), (100, 140, 220),
+    (180, 220,  80), (220,  80, 160), ( 80, 120, 200), (200, 160,  60),
+    ( 60, 200, 130),
+]
+
+def _shoe_colour(person_idx):
+    """Return (fill_colour, border_colour) for a given person index."""
+    col    = _SHOE_PALETTE[person_idx % len(_SHOE_PALETTE)]
+    border = tuple(max(0, c - 60) for c in col)
+    return col, border
+
+
+def draw_shoe(surface, foot_x, foot_y, theta, colour, border_colour):
+    """
+    Draw a rotated rectangle shoe.
+    Extends forward from the foot centre by SHOE_LENGTH, centred laterally.
+    """
+    cos_t  = math.cos(theta);  sin_t  = math.sin(theta)
+    lat_x  = -sin_t;           lat_y  =  cos_t
+    half_L = SHOE_LENGTH * 0.5
+    half_W = SHOE_WIDTH  * 0.5
+    cx = foot_x + cos_t * half_L
+    cy = foot_y + sin_t * half_L
+    corners = [
+        (cx + cos_t*half_L + lat_x*half_W,  cy + sin_t*half_L + lat_y*half_W),
+        (cx + cos_t*half_L - lat_x*half_W,  cy + sin_t*half_L - lat_y*half_W),
+        (cx - cos_t*half_L - lat_x*half_W,  cy - sin_t*half_L - lat_y*half_W),
+        (cx - cos_t*half_L + lat_x*half_W,  cy - sin_t*half_L + lat_y*half_W),
+    ]
+    pts = [W(wx, wy) for wx, wy in corners]
+    pygame.draw.polygon(surface, colour,       pts)
+    pygame.draw.polygon(surface, border_colour, pts, 1)
+
+
+def draw_shoes_only(surface, state, foot_state_np, use_legs):
+    """Draw just the shoe polygons — called BEFORE lidar so rays render on top."""
+    if not use_legs:
+        return
+    left_legs_np, right_legs_np = _read_foot_positions_np(foot_state_np)
+    n = int(state.people.shape[0])
+    for i in range(n):
+        if float(state.people[i, 10]) < 0:   # dummy sentinel — skip
+            continue
+        theta_h     = float(state.people[i, 4])
+        col, border = _shoe_colour(i)
+        draw_shoe(surface,
+                  float(left_legs_np[i, 0]),  float(left_legs_np[i, 1]),
+                  theta_h, col, border)
+        draw_shoe(surface,
+                  float(right_legs_np[i, 0]), float(right_legs_np[i, 1]),
+                  theta_h, col, border)
+
+
+def draw_humans(surface, state, foot_state_np, show_arrows, use_legs):
+    """Draw all humans with per-person coloured leg circles (or legacy cylinders)."""
+    n = int(state.people.shape[0])
+    if use_legs:
+        left_legs_np, right_legs_np = _read_foot_positions_np(foot_state_np)
+        for i in range(n):
+            if float(state.people[i, 10]) < 0:   # dummy sentinel — skip
+                continue
+            px, py   = float(state.people[i, 0]), float(state.people[i, 1])
+            vx, vy   = float(state.people[i, 2]), float(state.people[i, 3])
+            theta_h  = float(state.people[i, 4])
+            # col[5] = omega in JHSFM people array — not a distracted flag.
+            # We treat all multi-scenario pedestrians as non-distracted for colouring.
+            shoe_col, _ = _shoe_colour(i)
+            leg_r = max(2, int(LEG_RADIUS * SCALE))
+
+            # Left leg — slightly brightened
+            lx, ly = W(float(left_legs_np[i, 0]), float(left_legs_np[i, 1]))
+            lc = tuple(min(255, int(c * 1.1)) for c in shoe_col)
+            pygame.draw.circle(surface, lc, (lx, ly), leg_r)
+            pygame.draw.circle(surface, (20, 20, 20), (lx, ly), leg_r, 1)
+
+            # Right leg — slightly darkened
+            rx_, ry_ = W(float(right_legs_np[i, 0]), float(right_legs_np[i, 1]))
+            rc = tuple(max(0, int(c * 0.75)) for c in shoe_col)
+            pygame.draw.circle(surface, rc, (rx_, ry_), leg_r)
+            pygame.draw.circle(surface, (20, 20, 20), (rx_, ry_), leg_r, 1)
+
+            
+    else:
+        for i in range(n):
+            if float(state.people[i, 10]) < 0:   # dummy sentinel — skip
+                continue
+            px, py   = float(state.people[i, 0]), float(state.people[i, 1])
+            vx, vy   = float(state.people[i, 2]), float(state.people[i, 3])
+            theta_h  = float(state.people[i, 4])
+            sx, sy   = W(px, py)
+            pr       = max(3, int(PEOPLE_RADIUS * SCALE))
+            pygame.draw.circle(surface, C_PERSON, (sx, sy), pr)
+            pygame.draw.circle(surface, (20, 20, 20), (sx, sy), pr, 1)
+            speed = math.hypot(vx, vy)
+            if show_arrows and speed > 0.05:
+                ax, ay = W(px + math.cos(theta_h) * 0.5,
+                           py + math.sin(theta_h) * 0.5)
+                pygame.draw.line(surface, (20, 120, 20), (sx, sy), (ax, ay), 2)
+
+
+def draw_scene(surface, state, raw_lidar, foot_state_np, show_lidar, show_arrows, use_legs):
+    # Background + grid
+    pygame.draw.rect(surface, C_FLOOR, (0, 0, SIM_SIZE, SIM_SIZE))
+    for i in range(int(ROOM_W) + 1):
+        sx, _ = W(i, 0);  pygame.draw.line(surface, C_GRID, (sx, 0), (sx, SIM_SIZE))
+    for j in range(int(ROOM_H) + 1):
+        _, sy = W(0, j);  pygame.draw.line(surface, C_GRID, (0, sy), (SIM_SIZE, sy))
+    pygame.draw.rect(surface, C_WALL, (0, 0, SIM_SIZE, SIM_SIZE), 3)
+
+    # Draw order: shoes → lidar rays → boxes → circles → goal → leg circles → robot
+    # This ensures LiDAR rays are always on top of shoes but under geometry labels.
+    draw_shoes_only(surface, state, foot_state_np, use_legs)
+    draw_lidar(surface, state, raw_lidar, show_lidar)
+
+    for box in np.array(state.obs_boxes):
+        cx, cy, hw, hh = box
+        if hw > 0:
+            sx, sy = W(cx - hw, cy + hh)
+            pygame.draw.rect(surface, C_BOX,   (sx, sy, int(2*hw*SCALE), int(2*hh*SCALE)))
+            pygame.draw.rect(surface, C_BOX_L, (sx, sy, int(2*hw*SCALE), int(2*hh*SCALE)), 2)
+    for cir in np.array(state.obs_circles):
+        cx, cy, r = cir
+        if r > 0:
+            sx, sy = W(cx, cy); pr = max(2, int(r * SCALE))
+            pygame.draw.circle(surface, C_CIRCLE,   (sx, sy), pr)
+            pygame.draw.circle(surface, C_CIRCLE_L, (sx, sy), pr, 2)
+
+    gx, gy = W(float(state.goal_x), float(state.goal_y))
+    draw_star(surface, gx, gy, int(0.30*SCALE), int(0.12*SCALE), 5, C_GOAL, C_GOAL2)
+
+    # Leg circles drawn last among humans so they sit on top of shoes
+    draw_humans(surface, state, foot_state_np, show_arrows, use_legs)
+
+    rx, ry = W(float(state.x), float(state.y)); rr = max(4, int(ROBOT_RADIUS * SCALE))
+    pygame.draw.circle(surface, C_ROBOT,   (rx, ry), rr)
+    pygame.draw.circle(surface, C_ROBOT_H, (rx, ry), rr, 2)
+    hx, hy = W(float(state.x) + ROBOT_RADIUS*3*math.cos(float(state.theta)),
+               float(state.y) + ROBOT_RADIUS*3*math.sin(float(state.theta)))
+    pygame.draw.line(surface, C_ROBOT_H, (rx, ry), (hx, hy), 3)
+
+
+def draw_panel(surface, fonts, ep, step, ep_ret, v, w, goal_dist, goal_align,
+               ch, stats, banner, banner_t, scen_idx, eval_mode, use_legs):
+    pygame.draw.rect(surface, C_PANEL, (SIM_SIZE, 0, PANEL_W, WINDOW_H))
+    pygame.draw.line(surface, C_WALL, (SIM_SIZE, 0), (SIM_SIZE, WINDOW_H), 2)
+    y = 10; lh = 19; x0 = SIM_SIZE + 10
+
+    def txt(s, col=C_TEXT, font="mid"):
+        nonlocal y; surface.blit(fonts[font].render(s, True, col), (x0, y)); y += lh
+    def sep():
+        nonlocal y
+        pygame.draw.line(surface, C_DIM, (x0, y+3), (x0+PANEL_W-20, y+3), 1); y += 10
+
+    txt("─ EVALUATION ─", C_TEXT, "big"); y += 2; sep()
+    leg_mode = "LEG-PAIR" if use_legs else "CYLINDER"
+    scen_name = {0:"Random",1:"Parallel",2:"Perpend",3:"Circular",
+                 4:"Bottleneck",5:"Intersect",6:"Groups"}.get(scen_idx, "?")
+    mode_text = "[RANDOM]" if eval_mode == "random" else "[FIXED]"
+    txt(f"{mode_text} {leg_mode}", C_DIM, "small")
+    txt(f"Scen     {scen_name}", C_SUCCESS, "mid")
+    txt(f"Episode  {ep:>5d}"); txt(f"Step     {step:>4d}"); sep()
+    txt(f"v     {v:>+6.3f} m/s"); txt(f"w     {w:>+6.3f} rad/s"); sep()
+    txt(f"Goal  {goal_dist:>5.2f} m")
+    txt(f"Align {math.degrees(goal_align):>+5.1f}°")
+    txt(f"Human {ch:>5.2f} m"); sep()
+    txt(f"Ep ret {ep_ret:>+7.2f}", C_GOAL, "mid"); sep()
+    txt("── Last 50 episodes ─", C_DIM, "small"); y += 2
+    txt(f"  Success  {stats['suc']:>5.1f}%",  C_SUCCESS, "mid")
+    txt(f"  Collision{stats['col']:>5.1f}%",  C_COLLIDE, "mid")
+    txt(f"  Pass. Col{stats['pcol']:>5.1f}%", (200,100,100), "mid")
+    txt(f"  Timeout  {stats['tmo']:>5.1f}%",  C_TIMEOUT, "mid"); sep()
+    txt("0-6 lock  7 random  R reset", C_DIM, "tiny")
+    txt("L lidar  H arrows  Q quit",   C_DIM, "tiny")
+
+    if banner_t > 0:
+        label, col = {
+            "success"    :("✓  GOAL REACHED", C_SUCCESS),
+            "collision"  :("X  COLLISION",    C_COLLIDE),
+            "passive_col":("🚶 PASSIVE COL",  (200,100,100)),
+            "timeout"    :("⏱  TIMEOUT",      C_TIMEOUT),
+        }.get(banner, ("", C_TEXT))
+        if label:
+            surf = fonts["big"].render(label, True, col)
+            bx = SIM_SIZE//2 - surf.get_width()//2
+            by = SIM_SIZE//2 - surf.get_height()//2
+            bg = pygame.Surface((surf.get_width()+24, surf.get_height()+12))
+            bg.fill((20,20,26)); bg.set_alpha(220)
+            surface.blit(bg, (bx-12,by-6)); surface.blit(surf,(bx,by))
+
+
+def main():
+    use_legs = args.use_legs
+    print(f"🚀 JAX Modular Scenario Evaluation")
+    print(f"   Human model: {'LEG-PAIR' if use_legs else 'CYLINDER'}")
+
+    network = EndToEndActorCritic(action_dim=2)
+    rng = jax.random.PRNGKey(0)
+    params = network.init(jax.random.split(rng)[1], jnp.zeros((1, OBS_SIZE)))["params"]
+
+    try:
+        params = load_checkpoint(args.ckpt)
+        print(f"✅ Loaded weights from {args.ckpt}")
+    except FileNotFoundError:
+        print(f"⚠️  No checkpoint — running random policy.")
+
+    def build_fast_reset(scen_idx):
+        bound_reset = functools.partial(reset_env, scenario_idx=scen_idx)
+        rs, ss = make_stacked_env(bound_reset, step_env, stack_dim=3)
+        return jax.jit(rs), jax.jit(ss)
+
+    # ----- Scenarios -----
+    # 1 = parallel, 2 = perpendicular, 3 = circular, 4 = bottleneck, 5 = intersect, 6 = groups, 0 = random each episode
+
+
+    evaluation_mode  = "random"#"fixed" # "random"
+    current_scenario = random.randint(0, 6)
+    fast_reset, fast_step = build_fast_reset(current_scenario)
+
+    pygame.init()
+    screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
+    mode_str = "LEGS" if use_legs else "CYLINDERS"
+    pygame.display.set_caption(f"JAX Scenarios — Evaluation [{mode_str}]")
+    clock = pygame.time.Clock(); fonts = make_fonts()
+
+    rng, reset_rng = jax.random.split(rng)
+    obs, stacked_state = fast_reset(reset_rng)
+
+    ep=0; ep_steps=0; ep_reward=0.0; ep_hist=[]
+    paused=False; show_lidar=True; show_arrows=True; fps=FPS_TARGET
+    banner=""; banner_t=0
+
+    def get_stats():
+        if not ep_hist: return {"suc":0.,"col":0.,"tmo":0.,"pcol":0.,"ret":0.}
+        w = np.array(ep_hist[-50:])
+        return {"suc":w[:,1].mean()*100,"col":w[:,2].mean()*100,
+                "tmo":w[:,3].mean()*100,"pcol":w[:,4].mean()*100,"ret":w[:,0].mean()}
+
+    print("🎮 Keys 0-6 lock scenario, 7=random, Q=quit")
+
+    while True:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT: pygame.quit(); return
+            if event.type == pygame.KEYDOWN:
+                if event.key in (pygame.K_q, pygame.K_ESCAPE): pygame.quit(); return
+                if event.key == pygame.K_SPACE: paused = not paused
+                if event.key == pygame.K_l:     show_lidar = not show_lidar
+                if event.key == pygame.K_h:     show_arrows = not show_arrows
+                if pygame.K_0 <= event.key <= pygame.K_6:
+                    evaluation_mode = "fixed"
+                    current_scenario = event.key - pygame.K_0
+                    fast_reset, fast_step = build_fast_reset(current_scenario)
+                    rng, reset_rng = jax.random.split(rng)
+                    obs, stacked_state = fast_reset(reset_rng)
+                    ep_reward=0.0; ep_steps=0; banner_t=0
+                if event.key == pygame.K_7:
+                    evaluation_mode = "random"
+                    current_scenario = random.randint(0, 6)
+                    fast_reset, fast_step = build_fast_reset(current_scenario)
+                    rng, reset_rng = jax.random.split(rng)
+                    obs, stacked_state = fast_reset(reset_rng)
+                    ep_reward=0.0; ep_steps=0; banner_t=0
+                if event.key == pygame.K_r:
+                    rng, reset_rng = jax.random.split(rng)
+                    obs, stacked_state = fast_reset(reset_rng)
+                    ep_reward=0.0; ep_steps=0; banner_t=0
+
+        if paused: clock.tick(10); continue
+
+        mean, _, _ = network.apply({"params": params}, obs[None])
+        env_action = scale_action_to_env(
+            jnp.squeeze(mean, axis=0), float(stacked_state.env_state.max_v))
+
+        rng, step_rng = jax.random.split(rng)
+        obs, stacked_state, reward, done, info = fast_step(step_rng, stacked_state, env_action)
+        ep_reward += float(reward); ep_steps += 1
+
+        cpu_state = jax.device_get(stacked_state.env_state)
+        raw_lidar = MAX_LIDAR_DIST - jax.device_get(stacked_state.lidar_stack)[-1] * \
+                    (MAX_LIDAR_DIST - ROBOT_RADIUS)
+        foot_state_np = np.array(cpu_state.foot_state)
+
+        dx = float(cpu_state.goal_x) - float(cpu_state.x)
+        dy = float(cpu_state.goal_y) - float(cpu_state.y)
+        gdist  = math.hypot(dx, dy)
+        galign = (math.atan2(dy, dx) - float(cpu_state.theta) + math.pi) % (2*math.pi) - math.pi
+        ch     = float(info["closest_human"]) - ROBOT_RADIUS - PEOPLE_RADIUS
+
+        screen.fill(C_BG)
+        draw_scene(screen, cpu_state, raw_lidar, foot_state_np,
+                   show_lidar, show_arrows, use_legs)
+        draw_panel(screen, fonts, ep, ep_steps, ep_reward,
+                   float(cpu_state.v), float(cpu_state.w),
+                   gdist, galign, ch, get_stats(), banner, banner_t,
+                   current_scenario, evaluation_mode, use_legs)
+
+        if banner_t > 0: banner_t -= 1
+        pygame.display.flip(); clock.tick(fps)
+
+        if done:
+            goal = bool(info["goal_reached"]); col = bool(info["collision"])
+            pcol = bool(info["passive_col"]); active_col = col and not pcol
+            tmo  = not goal and not col
+            banner   = "success" if goal else ("collision" if active_col else \
+                        ("passive_col" if pcol else "timeout"))
+            banner_t = fps * 2
+            ep_hist.append((ep_reward, float(goal), float(active_col), float(tmo), float(pcol)))
+            if evaluation_mode == "random":
+                current_scenario = random.randint(0, 6)
+                fast_reset, fast_step = build_fast_reset(current_scenario)
+            ep+=1; ep_reward=0.0; ep_steps=0
+            rng, reset_rng = jax.random.split(rng)
+            obs, stacked_state = fast_reset(reset_rng)
+
+
+if __name__ == "__main__":
+    main()

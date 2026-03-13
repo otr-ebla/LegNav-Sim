@@ -40,8 +40,9 @@ from jax_env_multi import reset_env, step_env
 from jax_wrappers import StackedEnvState
 from jax_legs import LEG_RADIUS
 from jax_network import EndToEndActorCritic
-from SACnetwork import SACActorNetwork
-from TQCeval import TQCActorNetwork
+from SACjax import ObsEncoder as _SACEncoder, ActorHead as _SACHead
+import flax.linen as nn
+from TQCjac import TQCActorNetwork as _TQCActorNetwork
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 OBS_SIZE   = 342
@@ -59,9 +60,20 @@ TRAINING_LOG_PATHS = {
     "TQC": "checkpoints_tqc/tqc_training_log.csv",
 }
 
-_ppo_net = EndToEndActorCritic(action_dim=ACTION_DIM)
-_sac_net = SACActorNetwork(action_dim=ACTION_DIM)
-_tqc_net = TQCActorNetwork(action_dim=ACTION_DIM)
+_ppo_net     = EndToEndActorCritic(action_dim=ACTION_DIM)
+_sac_enc     = _SACEncoder()
+_sac_head    = _SACHead(action_dim=ACTION_DIM)
+_tqc_net = _TQCActorNetwork()  # monolithic — ObsEncoder_0/ inside actor_params
+
+# _rollout_body calls net_apply_fn({"params": params}, obs) for ALL networks.
+# Both _sac_apply and _tqc_apply mirror that Flax convention:
+#   variables["params"] = {"enc": enc_params, "head": head_params}
+def _sac_apply(variables, obs):
+    p    = variables["params"]
+    feat = _sac_enc.apply({"params": p["enc"]}, obs)
+    return _sac_head.apply({"params": p["head"]}, feat)
+
+
 
 # ── Action Squashing ──────────────────────────────────────────────────────────
 def _squash_ppo(mean, max_v):
@@ -259,7 +271,7 @@ def evaluate_cell_ppo(params, scen_idx: int, target_max_v: float, rng_key):
 
 @jax.jit
 def evaluate_cell_sac(params, scen_idx: int, target_max_v: float, rng_key):
-    return _rollout_body(_sac_net.apply, _squash_sac_tqc, params,
+    return _rollout_body(_sac_apply, _squash_sac_tqc, params,
                          scen_idx, target_max_v, rng_key)
 
 @jax.jit
@@ -271,24 +283,53 @@ _EVAL_FN = {"PPO": evaluate_cell_ppo, "SAC": evaluate_cell_sac, "TQC": evaluate_
 
 
 # ── Checkpoint loading ────────────────────────────────────────────────────────
-def load_checkpoint_safe(path):
+def load_checkpoint_safe(path, p_name, dummy_params):
     if not os.path.exists(path):
         return None
     with open(path, "rb") as f:
         raw = f.read()
+    
     bundle = flax.serialization.msgpack_restore(raw)
-    return bundle.get("actor_params", bundle.get("params"))
+    
+    # PPO è stato addestrato e salvato come un singolo blocco unificato
+    if p_name == "PPO":
+        if "actor_params" in bundle: return bundle["actor_params"]
+        if "params" in bundle: return bundle["params"]
+        return bundle
+        
+    # SAC: checkpoint salvato come due pytree separati da SACjax.py.
+    # Ricostruiamo un dict con chiavi fisse "enc"/"head" usate da _sac_apply.
+    # SAC: saved as actor_enc_params + actor_head_params by SACjax.py
+    if p_name == "SAC":
+        if "actor_enc_params" in bundle and "actor_head_params" in bundle:
+            return {"enc": bundle["actor_enc_params"], "head": bundle["actor_head_params"]}
+        raise KeyError(f"SAC checkpoint unexpected keys: {list(bundle.keys())}")
+
+    # TQC: monolithic checkpoint — actor_params has ObsEncoder_0/ + Dense_0/1.
+    if p_name == "TQC":
+        if "actor_params" in bundle:
+            return bundle["actor_params"]
+        raise KeyError(f"TQC checkpoint unexpected keys: {list(bundle.keys())}")
+            
+    return bundle
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     gpu = jax.devices("cuda")[0] if jax.devices("cuda") else jax.devices()[0]
 
+    # 1. Generiamo i parametri fittizi per scoprire la struttura esatta richiesta da Flax
+    rng_init = jax.random.PRNGKey(0)
+    dummy_obs = jnp.zeros((1, OBS_SIZE))
+    ppo_dummy = _ppo_net.init(rng_init, dummy_obs)["params"]
+
+    # 2. Carichiamo mappando le vecchie chiavi sulle nuove strutture
     raw_policies = {
-        "PPO": load_checkpoint_safe("checkpoints/ppo_model_best.msgpack"),
-        "SAC": load_checkpoint_safe("checkpoints_sac/sac_best.msgpack"),
-        "TQC": load_checkpoint_safe("checkpoints_tqc/tqc_best.msgpack"),
+        "PPO": load_checkpoint_safe("checkpoints/ppo_model_best.msgpack", "PPO", ppo_dummy),
+        "SAC": load_checkpoint_safe("checkpoints_sac/sac_best.msgpack", "SAC", None),
+        "TQC": load_checkpoint_safe("checkpoints_tqc/tqc_best.msgpack", "TQC", None),
     }
+    
     policies = {
         name: jax.device_put(p, gpu)
         for name, p in raw_policies.items()

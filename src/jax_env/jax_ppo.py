@@ -76,7 +76,7 @@ LR_START       = 5e-4
 LR_END         = 1e-4
 LR_MIN         = 1e-5
 WARMUP_UPDATES = 5
-TOTAL_UPDATES  = 83   # ALIGNED: 83 × 16384 × 150 = 202,137,600 env steps ≈ SAC/TQC 204,800,000
+TOTAL_UPDATES  = 160   # ALIGNED: 83 × 16384 × 150 = 202,137,600 env steps ≈ SAC/TQC 204,800,000
 
 BATCH_SIZE      = NUM_ENVS * ROLLOUT_STEPS
 N_MINIBATCHES   = 256
@@ -328,7 +328,7 @@ if __name__ == "__main__":
     env_obs, env_state, vmap_step = init_env_state(env_rng, min_goal_dist=cur_min_dist)
     print(f"Ready. obs={env_obs.shape}\n")
 
-    best_suc = 85.0   # FIX: was 65.0 — hardcoded floor meant no checkpoint was ever
+    best_suc = 92.0   # FIX: was 65.0 — hardcoded floor meant no checkpoint was ever
                      # written when the run peaked at 61.8%. Now saves from the first
                      # improvement, then only on new highs.
 
@@ -415,7 +415,7 @@ if __name__ == "__main__":
 
         fps = BATCH_SIZE / (time.time() - t0)
 
-        if update % 10 == 0:
+        if update % 1 == 0:
             p_loss, v_loss, entropy = aux
             lr_now = float(scheduler(update * _OPT_STEPS_PER_UPDATE))
             elapsedtime = (time.time() - t_start)/60.0
