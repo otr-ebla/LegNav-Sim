@@ -381,7 +381,7 @@ if __name__ == "__main__":
     env_obs, env_state, vmap_step = init_env_state(env_rng, min_goal_dist=cur_min_dist)
     replay_buf  = make_buffer(BUFFER_CAP)
     total_steps, n_updates = 0, 0
-    best_suc = 60.0
+    best_suc = 44.0
 
     print("Warming up buffer (filling with random actions)...")
     for _ in range((WARMUP_STEPS // N_ENVS) + 1):

@@ -221,14 +221,29 @@ def generate_scenario(key: jnp.ndarray, min_goal_dist: float, scenario_idx: int 
         return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
 
     # --- 4: BOTTLENECK ---
+    # --- 4: BOTTLENECK ---
     def _bottleneck_scen(k):
-        N_BTL = 6
-        k1, k2, k3, k4, k5, k6 = jax.random.split(k, 6)
+        N_BTL = 5
+        k1, k2, k3, k4, k5, k6, k7 = jax.random.split(k, 7)
         gap_center_x = jax.random.uniform(k1, minval=2.5, maxval=ROOM_W-2.5)
-        rx, ry, rtheta = ROOM_W / 2.0, 1.5, jnp.pi / 2.0
+        
+        # Sample an initial random X coordinate
+        rx_raw = jax.random.uniform(k7, minval=1.0, maxval=ROOM_W-1.0)
+        
+        # Evaluate distance to the gap center
+        dist_to_gap = rx_raw - gap_center_x
+        in_zone = jnp.abs(dist_to_gap) < 1.5
+        
+        # If inside the exclusion zone, push it strictly outside to the nearest side
+        push_dir = jnp.where(dist_to_gap >= 0.0, 1.0, -1.0)
+        rx = jnp.where(in_zone, gap_center_x + push_dir * 1.5, rx_raw)
+        rx = jnp.clip(rx, 1.0, ROOM_W - 1.0)
+        
+        ry, rtheta = 1.5, jnp.pi / 2.0
         gx, gy = gap_center_x, ROOM_H - 1.5
         max_v = jax.random.uniform(k2, minval=0.5, maxval=1.5)
         obs_circles = jnp.zeros((NUM_OBS_CIR, 3))
+        
         gap_size, wall_y = 1.8, ROOM_H / 2.0
         left_w, right_w = gap_center_x - gap_size / 2.0, ROOM_W - (gap_center_x + gap_size / 2.0)
         obs_boxes = jnp.zeros((NUM_OBS_BOX, 4)).at[0].set([left_w / 2.0, wall_y, left_w / 2.0, 0.2]).at[1].set([ROOM_W - right_w / 2.0, wall_y, right_w / 2.0, 0.2])
@@ -236,16 +251,14 @@ def generate_scenario(key: jnp.ndarray, min_goal_dist: float, scenario_idx: int 
         px = jax.random.uniform(k3, (N_BTL,), minval=1.0, maxval=ROOM_W-1.0)
         py = jax.random.uniform(k4, (N_BTL,), minval=ROOM_H-2.5, maxval=ROOM_H-1.5)
         
-        g1x = gap_center_x + jax.random.uniform(k5, (N_BTL,), minval=-0.7, maxval=0.7)
+        g1x = gap_center_x + jax.random.uniform(k5, (N_BTL,), minval=-0.5, maxval=0.5)
         g1y = jnp.full((N_BTL,), wall_y - 0.15)
         g2x = jax.random.uniform(k6, (N_BTL,), minval=1.0, maxval=ROOM_W-1.0)
         g2y = jnp.full((N_BTL,), 0.0)
         
         people_btl = pack_human(px, py, jnp.full((N_BTL,), -1.57), g1x, g1y, g2x, g2y)
-        # Dummy rows use goal_idx = -1 as a sentinel so jax_env_multi knows to hide
-        # them off-screen rather than respawning or rendering them.
-        # Dummy rows use goal_idx = -1 as a sentinel so jax_env_multi knows to hide
-        # them off-screen rather than respawning or rendering them.
+        
+        # Dummy rows use goal_idx = -1 as a sentinel
         n_pad = NUM_PEOPLE - N_BTL
         dummy_x  = jnp.full((n_pad,), -999.0)
         dummy_y  = jnp.full((n_pad,), -999.0)
@@ -258,6 +271,7 @@ def generate_scenario(key: jnp.ndarray, min_goal_dist: float, scenario_idx: int 
             jnp.full((n_pad,), -1.0),              # goal_idx = -1 sentinel
         ], axis=-1)
         people = jnp.concatenate([people_btl, dummy_rows], axis=0)
+        
         return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
 
     # --- 5: INTERSECTION ---

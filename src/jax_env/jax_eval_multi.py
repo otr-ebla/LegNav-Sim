@@ -1,13 +1,5 @@
 """
 jax_eval_multi.py — Interactive Scenario Evaluation
-=====================================================
-PATCH — Leg simulation rendering + CLI flags (same as jax_eval.py patch).
-
-  --legs / --no-legs : toggle leg-pair LiDAR model (default: --legs)
-  --ckpt PATH        : checkpoint file path
-  Keys 0-6           : lock to a scenario
-  Key 7              : random scenario mode
-  Key R              : reset
 """
 
 import argparse
@@ -101,19 +93,19 @@ def draw_lidar(surface, state, raw_lidar, show):
     fov    = float(FOV)
     angles = theta - fov / 2.0 + np.arange(NUM_RAYS) * fov / (NUM_RAYS - 1)
     
-    # ── NEW: Estrai la maschera del rumore dallo stato CPU ──
+    # ── NEW: Extract the noise mask from the CPU state ──
     sp_mask = np.array(state.sp_mask)
 
-    # Usa enumerate per avere l'indice 'i' del raggio
+    # Use enumerate to get the ray index 'i'
     for i, (ang, dist) in enumerate(zip(angles, raw_lidar)):
         ex, ey = W(float(state.x) + dist * math.cos(ang),
                    float(state.y) + math.sin(ang) * dist)
         
-        # Se il raggio è colpito dal rumore S&P, coloralo di viola
+        # If the ray is hit by S&P noise, color it purple
         if sp_mask[i]:
-            col = (180, 50, 220)  # Viola
+            col = (180, 50, 220)  # Purple
         else:
-            # Altrimenti usa il normale gradiente rosso/verde
+            # Otherwise use the normal red/green gradient
             t   = max(0.0, 1.0 - dist / MAX_LIDAR_DIST)
             col = tuple(int(C_RAY_NEAR[j]*t + C_RAY_FAR[j]*(1-t)) for j in range(3))
             
@@ -341,7 +333,8 @@ def main():
 
     def build_fast_reset(scen_idx):
         bound_reset = functools.partial(reset_env, scenario_idx=scen_idx)
-        rs, ss = make_stacked_env(bound_reset, step_env, stack_dim=3)
+        # ghost_robot=False: during evaluation humans see the robot and dodge it.
+        rs, ss = make_stacked_env(bound_reset, step_env, stack_dim=3, ghost_robot=False)
         return jax.jit(rs), jax.jit(ss)
 
     # ----- Scenarios -----
@@ -369,7 +362,8 @@ def main():
         if not ep_hist: return {"suc":0.,"col":0.,"tmo":0.,"pcol":0.,"ret":0.}
         w = np.array(ep_hist[-50:])
         return {"suc":w[:,1].mean()*100,"col":w[:,2].mean()*100,
-                "tmo":w[:,3].mean()*100,"pcol":w[:,4].mean()*100,"ret":w[:,0].mean()}
+                "tmo":w[:,3].mean()*100,"pcol":w[:,4].mean()*100,
+                "ret":w[:,0].mean()}
 
     print("🎮 Keys 0-6 lock scenario, 7=random, Q=quit")
 
@@ -407,6 +401,8 @@ def main():
             jnp.squeeze(mean, axis=0), float(stacked_state.env_state.max_v))
 
         rng, step_rng = jax.random.split(rng)
+        # ghost_robot=False is baked into fast_step via make_stacked_env(ghost_robot=False)
+        # above — no need to pass it here at runtime.
         obs, stacked_state, reward, done, info = fast_step(step_rng, stacked_state, env_action)
         ep_reward += float(reward); ep_steps += 1
 
@@ -440,10 +436,18 @@ def main():
                         ("passive_col" if pcol else "timeout"))
             banner_t = fps * 2
             ep_hist.append((ep_reward, float(goal), float(active_col), float(tmo), float(pcol)))
+            
             if evaluation_mode == "random":
                 current_scenario = random.randint(0, 6)
                 fast_reset, fast_step = build_fast_reset(current_scenario)
             ep+=1; ep_reward=0.0; ep_steps=0
+
+            if ep >= 300:
+                print(f"\n✅ Evaluation completed: 300 episodes reached.")
+                s = get_stats()
+                print(f"Final Statistics -> Success: {s['suc']:.1f}% | Collisions: {s['col']:.1f}% | Pass. Col: {s['pcol']:.1f}% | Timeout: {s['tmo']:.1f}%")
+                pygame.quit()
+
             rng, reset_rng = jax.random.split(rng)
             obs, stacked_state = fast_reset(reset_rng)
 

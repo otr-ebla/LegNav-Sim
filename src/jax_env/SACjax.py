@@ -106,8 +106,8 @@ CKPT_PATH = f"{CKPT_DIR}/sac_best.msgpack"
 def _check_gpu():
     num_devices = jax.device_count(backend='gpu')
     if num_devices >= 2:
-        target_gpu = jax.devices('gpu')[0]
-        print(f"Found {num_devices} GPU(s). Using CudaDevice(0)")
+        target_gpu = jax.devices('gpu')[1]
+        print(f"Found {num_devices} GPU(s). Using CudaDevice(1)")
     elif num_devices == 1:
         target_gpu = jax.devices('gpu')[0]
         print(f"Found {num_devices} GPU(s). Using CudaDevice(0)")
@@ -586,7 +586,7 @@ if __name__ == "__main__":
     replay_buf  = make_buffer(BUFFER_CAP)
     total_steps = 0
     n_updates   = 0
-    best_suc    = -1.0
+    best_suc    = 45
     best_ret    = -1e9
 
     # ── Warmup: fill buffer with RANDOM actions ───────────────────────────────

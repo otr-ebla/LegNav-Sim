@@ -42,10 +42,20 @@ parser = argparse.ArgumentParser(description="JAX PPO Training")
 parser.add_argument("--gpu", type=str, default="0", choices=["0", "1"], help="Target GPU ID (0 or 1)")
 args, _ = parser.parse_known_args()
 
-os.environ["JAX_PLATFORMS"]               = "cuda"
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
-os.environ["TF_GPU_ALLOCATOR"]            = "cuda_malloc_async"
-os.environ["CUDA_VISIBLE_DEVICES"]        = args.gpu
+# ── GPU memory configuration ─────────────────────────────────────────────────
+# Use the BFC allocator (default JAX behaviour) — NOT "platform".
+# "platform" allocates per-buffer from the OS, bypasses JAX's memory pool,
+# and causes fragmentation + CUDA_ILLEGAL_ADDRESS when the pool is exhausted.
+# BFC pre-reserves a fraction of VRAM and manages it internally.
+#
+# XLA_PYTHON_CLIENT_MEM_FRACTION=0.88 reserves 88% of VRAM (~8.8 GB on a
+# 10 GB card), leaving ~1.2 GB for the CUDA driver, cuDNN workspace, and OS.
+# Do NOT set XLA_PYTHON_CLIENT_ALLOCATOR — absence means BFC (the safe default).
+os.environ["CUDA_VISIBLE_DEVICES"]           = args.gpu
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.88"
+# cuda_malloc_async reduces driver-level fragmentation without changing the
+# JAX allocator — safe to keep.
+os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
 
 import time
 import warnings
@@ -67,20 +77,26 @@ from jax_train import collect_rollouts, init_env_state, NUM_ENVS, ROLLOUT_STEPS,
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 GAMMA          = 0.99
 GAE_LAMBDA     = 0.95
-CLIP_EPS       = 0.2    # FIX: was 0.25 — too aggressive for continuous-action nav
+CLIP_EPS       = 0.2
 VF_COEF        = 0.25
-ENTROPY_COEF   = 0.003
+# ENTROPY_COEF raised 0.003→0.01: entropy collapsed from H=0.38 to H=-0.30
+# by upd 55 with the old value — policy was prematurily converging.
+ENTROPY_COEF   = 0.01
 MAX_GRAD_NORM  = 0.5
 PPO_EPOCHS     = 6
 LR_START       = 5e-4
 LR_END         = 1e-4
 LR_MIN         = 1e-5
 WARMUP_UPDATES = 5
-TOTAL_UPDATES  = 160   # ALIGNED: 83 × 16384 × 150 = 202,137,600 env steps ≈ SAC/TQC 204,800,000
+# TOTAL_UPDATES: 128 × 16384 × 96 = 201,326,592 ≈ 200M env steps
+TOTAL_UPDATES  = 500
 
-BATCH_SIZE      = NUM_ENVS * ROLLOUT_STEPS
-N_MINIBATCHES   = 256
-MINI_BATCH_SIZE = BATCH_SIZE // N_MINIBATCHES
+BATCH_SIZE      = NUM_ENVS * ROLLOUT_STEPS          # 8192 × 64 = 524,288
+# N_MINIBATCHES=64: MBS = 524288/64 = 8192 — matches GPU L2 cache working set
+# well on 10 GB cards. Previous 128 minibatches × 16384 envs = 12288 MBS,
+# but 16384 envs was already OOM before minibatching.
+N_MINIBATCHES   = 64
+MINI_BATCH_SIZE = BATCH_SIZE // N_MINIBATCHES       # 8192
 
 assert BATCH_SIZE % N_MINIBATCHES == 0, (
     f"BATCH_SIZE={BATCH_SIZE} not divisible by N_MINIBATCHES={N_MINIBATCHES}."
@@ -90,21 +106,36 @@ assert BATCH_SIZE % N_MINIBATCHES == 0, (
 # jax.lax.scan, so the optax step counter advances by that factor per update.
 # The scheduler must be expressed in true optimizer-step units, otherwise
 # warmup exhausts in update 0 and LR collapses to LR_END by update 1-2.
-_OPT_STEPS_PER_UPDATE = PPO_EPOCHS * N_MINIBATCHES   # 6 × 200 = 1200
-_WARMUP_OPT_STEPS     = WARMUP_UPDATES * _OPT_STEPS_PER_UPDATE   # 12_000
-_TOTAL_OPT_STEPS      = TOTAL_UPDATES  * _OPT_STEPS_PER_UPDATE   # 480_000
+_OPT_STEPS_PER_UPDATE = PPO_EPOCHS * N_MINIBATCHES   # 6 × 64 = 384
+_WARMUP_OPT_STEPS     = WARMUP_UPDATES * _OPT_STEPS_PER_UPDATE   # 1_920
+_TOTAL_OPT_STEPS      = TOTAL_UPDATES  * _OPT_STEPS_PER_UPDATE   # 49_152
 
 network = EndToEndActorCritic(action_dim=2)
 
 # ── Curriculum ────────────────────────────────────────────────────────────────
+# Each entry: (suc_pct_threshold, min_goal_dist)
 CURRICULUM_STAGES = [
     (10.0, 1.5),
     (20.0, 2.5),
     (35.0, 4.0),
-    (50.0, 6.5),
-    (65.0, 8.0),
+    (45.0, 5.0),   # intermediate stage — old 4.0m→6.5m jump caused stall
+    (55.0, 6.5),
+    (68.0, 8.0),
     (101., 9.0),
 ]
+
+GHOST_PROB_STAGES = [
+    (35.0, 1.0),
+    (55.0, 0.8),
+    (68.0, 0.6),
+    (101., 0.4),
+]
+
+def curriculum_ghost_prob(suc_pct: float) -> float:
+    for threshold, prob in GHOST_PROB_STAGES:
+        if suc_pct < threshold:
+            return prob
+    return GHOST_PROB_STAGES[-1][1]
 
 def curriculum_min_goal_dist(suc_pct: float) -> float:
     for threshold, dist in CURRICULUM_STAGES:
@@ -319,22 +350,24 @@ if __name__ == "__main__":
     # ── Curriculum state ──────────────────────────────────────────────────────
     cur_min_dist = curriculum_min_goal_dist(0.0)
     cur_stage    = _curriculum_stage(0.0)
+    cur_ghost    = curriculum_ghost_prob(0.0)   # ghost_prob for current stage
     rolling_suc  = 0.0   # FIX Issue #10: EMA alpha raised to 0.1 below
 
-    print(f"Curriculum: starting stage {cur_stage}, min_goal_dist={cur_min_dist:.1f} m")
+    print(f"Curriculum: starting stage {cur_stage}, min_goal_dist={cur_min_dist:.1f} m, ghost_prob={cur_ghost:.1f}")
 
     print("Initialising environments...")
     # FIX Bug #3: init_env_state returns vmap_step; thread it into collect_rollouts.
-    env_obs, env_state, vmap_step = init_env_state(env_rng, min_goal_dist=cur_min_dist)
+    env_obs, env_state, vmap_step = init_env_state(env_rng, min_goal_dist=cur_min_dist,
+                                                    ghost_prob=cur_ghost)
     print(f"Ready. obs={env_obs.shape}\n")
 
-    best_suc = 92.0   # FIX: was 65.0 — hardcoded floor meant no checkpoint was ever
+    best_suc = 44.0   # FIX: was 65.0 — hardcoded floor meant no checkpoint was ever
                      # written when the run peaked at 61.8%. Now saves from the first
                      # improvement, then only on new highs.
 
     hdr = (f"{'Upd':>5} | {'EpRet':>7} | {'Suc%':>5} {'Col%':>5} {'Pcol%':>5} {'Tmo%':>5} |"
            f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} | {'FPS':>7} {'#Ep':>6} {'LR':>6}| "
-           f"{'Stage':>5} {'MinDist':>7} {'Time':>6}")
+           f"{'Stage':>5} {'MinDist':>7} {'Ghost':>6} {'Time':>6}")
     print(hdr)
     print("─" * len(hdr))
 
@@ -389,16 +422,23 @@ if __name__ == "__main__":
 
         new_min_dist = curriculum_min_goal_dist(rolling_suc)
         new_stage    = _curriculum_stage(rolling_suc)
+        new_ghost    = curriculum_ghost_prob(rolling_suc)
 
-        if new_min_dist > cur_min_dist:
+        # Reinitialise envs if either goal distance OR ghost_prob changed.
+        # ghost_prob change means make_stacked_env needs to be rebuilt with a new
+        # closure — the vmap_step object changes, triggering JAX retrace.
+        if new_min_dist > cur_min_dist or new_ghost < cur_ghost:
             cur_min_dist = new_min_dist
             cur_stage    = new_stage
-            
+            cur_ghost    = new_ghost
 
             rng, reinit_rng = jax.random.split(rng)
-            # FIX Bug #3: capture the new vmap_step returned by init_env_state.
+            # FIX Bug #3: capture new vmap_step; also passes updated ghost_prob.
             env_obs, env_state, vmap_step = init_env_state(reinit_rng,
-                                                           min_goal_dist=cur_min_dist)
+                                                            min_goal_dist=cur_min_dist,
+                                                            ghost_prob=cur_ghost)
+            print(f"  → Curriculum reinit: stage={cur_stage}, dist={cur_min_dist:.1f}m, "
+                  f"ghost_prob={cur_ghost:.1f}")
 
         _, _, last_val = network.apply({"params": train_state[0]}, env_obs)
         advantages, returns = compute_gae(rewards, values, dones, last_val)
@@ -415,7 +455,7 @@ if __name__ == "__main__":
 
         fps = BATCH_SIZE / (time.time() - t0)
 
-        if update % 1 == 0:
+        if update % 5 == 0:
             p_loss, v_loss, entropy = aux
             lr_now = float(scheduler(update * _OPT_STEPS_PER_UPDATE))
             elapsedtime = (time.time() - t_start)/60.0
@@ -425,7 +465,7 @@ if __name__ == "__main__":
                 f"{float(mean_loss):>7.4f} {float(p_loss):>6.3f} "
                 f"{float(v_loss):>6.3f} {float(entropy):>6.3f} | "
                 f"{fps:>7,.0f} {n_ep:>6d} {lr_now:.2e} | "
-                f"{cur_stage:>5d} {cur_min_dist:>5.1f}m {elapsedtime:>5.1f}min"
+                f"{cur_stage:>5d} {cur_min_dist:>5.1f}m {cur_ghost:>5.1f}g {elapsedtime:>5.1f}min"
             )
             # ── CSV log row — total_env_steps for aligned x-axis ───────────────
             total_env_steps = (update + 1) * NUM_ENVS * ROLLOUT_STEPS
