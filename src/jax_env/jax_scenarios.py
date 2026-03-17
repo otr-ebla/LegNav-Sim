@@ -110,7 +110,7 @@ def generate_scenario(key: jnp.ndarray, min_goal_dist: float, scenario_idx: int 
         N_PRL = 8
         k1, k2, k3 = jax.random.split(k, 3)
         
-        # Corridor geometry (Room is 12x12. Let's make a 4m wide corridor in the center)
+        # Corridor geometry (Room is 12x12. 4m wide corridor in the center)
         corridor_width = 4.0
         wall_width = (ROOM_W - corridor_width) / 2.0
         
@@ -122,27 +122,25 @@ def generate_scenario(key: jnp.ndarray, min_goal_dist: float, scenario_idx: int 
         # Right wall
         obs_boxes = obs_boxes.at[1].set([ROOM_W - wall_width / 2.0, ROOM_H / 2.0, wall_width / 2.0, ROOM_H / 2.0])
 
-        # Robot starts at the BOTTOM, pointing UP
         rx, ry, rtheta = ROOM_W / 2.0, 1.5, jnp.pi / 2.0
         gx, gy = ROOM_W / 2.0, ROOM_H - 1.5
         max_v = jax.random.uniform(k1, minval=0.5, maxval=1.5)
         
-        # Humans spawn at the TOP (randomly distributed in the corridor width)
-        min_x = ROOM_W / 2.0 - corridor_width / 2.0 + 0.5
-        max_x = ROOM_W / 2.0 + corridor_width / 2.0 - 0.5
+        # 2 humans spawn directly adjacent to the walls (4.5 and 7.5)
+        px_walls = jnp.array([4.5, 7.5])
+        # The remaining 6 humans spawn randomly in the middle lanes (4.8 to 7.2)
+        px_random = jax.random.uniform(k2, (N_PRL - 2,), minval=4.8, maxval=7.2)
+        px = jnp.concatenate([px_walls, px_random])
         
-        px = jax.random.uniform(k2, (N_PRL,), minval=min_x, maxval=max_x)
-        
-        # Initial spawn is spread out, explicitly allowing them to spawn below the goal star
         py = jax.random.uniform(k3, (N_PRL,), minval=ROOM_H - 4.0, maxval=ROOM_H - 1.0)
         
-        # Their goal is at the BOTTOM of the corridor
+        # Their goal is at the BOTTOM of the corridor, staying in their lane
         g1x, g1y = px, jnp.full((N_PRL,), 1.0)
         
         # They walk DOWN (-pi/2)
         people_prl = pack_human(px, py, jnp.full((N_PRL,), -jnp.pi/2), g1x, g1y, g1x, g1y)
         
-        # Dummy padding to maintain JAX static array shapes (4 dummies)
+        # Dummy padding
         n_pad = NUM_PEOPLE - N_PRL
         dummy_x  = jnp.full((n_pad,), -999.0)
         dummy_y  = jnp.full((n_pad,), -999.0)

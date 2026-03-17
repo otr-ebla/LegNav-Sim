@@ -84,7 +84,7 @@ GAMMA          = 0.99
 TAU            = 0.005
 LR             = 3e-4
 TARGET_ENTROPY = -1.0   # softer target: better exploration than -|A| = -2.0
-TOTAL_UPDATES  = 100_000
+TOTAL_UPDATES  = 200_000
 LOG_EVERY      = 500        # scan length inside train_chunk; also log + checkpoint interval
 
 # Reward normalisation: env emits rewards in [-70, +200].
@@ -586,7 +586,7 @@ if __name__ == "__main__":
     replay_buf  = make_buffer(BUFFER_CAP)
     total_steps = 0
     n_updates   = 0
-    best_suc    = 45
+    best_suc    = 49.5
     best_ret    = -1e9
 
     # ── Warmup: fill buffer with RANDOM actions ───────────────────────────────
@@ -681,8 +681,9 @@ if __name__ == "__main__":
 
         # Save best model: primary = success rate, tie-break = episode reward
         # Save best model: primary = success rate, tie-break = episode reward
+        # Save best model: primary = success rate, tie-break = episode reward
         is_better = (suc_pct > best_suc) or (suc_pct == best_suc and mean_ret > best_ret)
-        if is_better and n_ep > 0 and suc_pct > 90.0:
+        if is_better and n_ep > 0:
             best_suc = suc_pct
             best_ret = mean_ret
             save_checkpoint(aep, ahp, cep, chp, tep, thp,

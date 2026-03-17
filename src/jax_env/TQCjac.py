@@ -53,7 +53,7 @@ GAMMA          = 0.99
 TAU            = 0.005
 LR             = 3e-4
 TARGET_ENTROPY = -float(ACTION_DIM)   
-TOTAL_UPDATES  = 100_000
+TOTAL_UPDATES  = 200_000
 LOG_EVERY      = 500
 SAVE_EVERY     = 5000
 

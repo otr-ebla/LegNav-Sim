@@ -37,14 +37,14 @@ _R_GOAL          =  200.0   # reference: +200
 _R_OBS_COL       =  -70.0   # reference: -70 (static collision)
 _R_WALL_COL      =  -70.0   # reference: -70
 _R_ACTIVE_COL    =  -70.0   # reference: -70 (active human collision)
-_R_PASSIVE_COL   =  -40.0   # reference: -40 (passive human collision)
+_R_PASSIVE_COL   =  -15.0   # reference: -40 (passive human collision)
 _R_TIMEOUT       =   -5.0   # reference: -5
 
 # Progress shaping (reference: 2.5 * delta_dist)
 _PROGRESS_COEF   =   2.5
 
 # Step penalty (reference: -0.005)
-_STEP_PEN        =  -0.005
+_STEP_PEN        =  -0.05
 
 # Jerk penalty — quadratic (reference: -1.5 * (delta_w)^2)
 _JERK_WEIGHT     =   1.5
@@ -55,7 +55,7 @@ _DIST_PERSONAL   =   1.2    # m
 _DIST_SOCIAL     =   2.0    # m
 
 # A. Proxemic penalty: -2.0 * exp(-2.0 * safety_margin)  [only when moving]
-_PROXEMIC_COEF   =   2.0
+_PROXEMIC_COEF   =   0.5
 _PROXEMIC_DECAY  =   2.0
 
 # B. Overspeed penalty: -5.0 * (v - safe_speed)^2  [when dist < PERSONAL]
@@ -71,8 +71,8 @@ _FWD_RAY_HALF_WIDTH    = 8
 
 # Yield logic (keep — adds stop-and-go behaviour absent in reference)
 _YIELD_PENALTY   =  -3.0
-_YIELD_BONUS     =   1.0
-_RESUME_BONUS    =   1.5
+_YIELD_BONUS     =   10.0
+_RESUME_BONUS    =   4.5
 _RESUME_MIN_DIST =   0.8
 N_SUBSTEPS = int(DT / HSFM_DT)
 NUM_PEOPLE = 12
@@ -224,6 +224,7 @@ def step_env(key, state, action, ghost_robot: bool = True):
                         1.0 - idx_cur, idx_cur)
 
     # --- ADVANCED RESPAWN LOGIC ---
+    # --- ADVANCED RESPAWN LOGIC ---
     k_respawn1, k_respawn2 = jax.random.split(k_step)
     is_dummy = state.people[:, 10] < 0.0
 
@@ -234,9 +235,17 @@ def step_env(key, state, action, ghost_robot: bool = True):
     reached_bottom = new_h_state[:, 1] < 1.5
     needs_respawn  = (reached_bottom & is_teleport_scenario) & ~is_dummy
 
-    rand_x_corr = jax.random.uniform(k_respawn1, (NUM_PEOPLE,), minval=4.5, maxval=7.5)
+    # Generate random X coordinates (narrowed for the middle lanes)
+    rand_x_corr = jax.random.uniform(k_respawn1, (NUM_PEOPLE,), minval=4.8, maxval=7.2)
     rand_x_full = jax.random.uniform(k_respawn1, (NUM_PEOPLE,), minval=1.0, maxval=ROOM_W - 1.0)
-    rand_x = jnp.where(is_parallel, rand_x_corr, rand_x_full)
+    
+    # Identify wall-walkers in the parallel scenario (spawned exactly at 4.5 or 7.5)
+    is_wall_walker = (jnp.abs(g1x - 4.5) < 0.1) | (jnp.abs(g1x - 7.5) < 0.1)
+    
+    # Wall-walkers keep their exact lane (g1x), others get randomized inside the corridor
+    rand_x_prl = jnp.where(is_wall_walker, g1x, rand_x_corr)
+    rand_x = jnp.where(is_parallel, rand_x_prl, rand_x_full)
+    
     rand_y = jax.random.uniform(k_respawn2, (NUM_PEOPLE,),
                                 minval=ROOM_H - 1.4, maxval=ROOM_H - 0.2)
 
