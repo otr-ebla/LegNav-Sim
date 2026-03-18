@@ -106,7 +106,7 @@ def generate_scenario(key: jnp.ndarray, min_goal_dist: float, scenario_idx: int 
     # --- 1: PARALLEL TRAFFIC (CORRIDOR) ---
     # --- 1: PARALLEL TRAFFIC (CORRIDOR) ---
     def _parallel_scen(k):
-        N_PRL = 6
+        N_PRL = 5
         k1, k2, k3, k4, k5, k_gx, k_rx = jax.random.split(k, 7)
         
         # Corridor geometry (Room is 12x12. 4m wide corridor in the center)

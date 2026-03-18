@@ -78,6 +78,14 @@ STATE_VEC_SIZE  = 9   # v, w, max_v_norm, goal_dist, goal_align, rear_prox×4
 _MAX_GOAL_DIST  = math.sqrt(ROOM_W**2 + ROOM_H**2)
 SINGLE_OBS_SIZE = 3 + STATE_VEC_SIZE + NUM_RAYS   # 120
 
+# ── Human idle / stop-and-go behaviour ─────────────────────────────────────────────
+# Each step an active human has P_HUMAN_STOP probability of starting a stop.
+# Duration is uniform in [STOP_MIN_STEPS, STOP_MAX_STEPS]. During a stop
+# vx=vy=0 (velocity clamped after update_all_humans).
+P_HUMAN_STOP    = 0.003   # ~0.3 % per step → avg one stop every ~22 s at dt=0.15
+STOP_MIN_STEPS  = 25       # 1.05 s minimum pause
+STOP_MAX_STEPS  = 60      # 6.0  s maximum pause
+
 
 @struct.dataclass
 class EnvState:
@@ -94,9 +102,10 @@ class EnvState:
     obs_boxes:   jnp.ndarray   # (NUM_OBS_BOX, 4)  [cx, cy, hw, hh]
     time_step:   jnp.int32
     # ── NEW: per-human gait phase ────────────────────────────────────────────
-    foot_state:  jnp.ndarray   # (NUM_PEOPLE, 10) — planted-foot gait state
-    time_stopped: jnp.int32
-    sp_mask:      jnp.ndarray   # (NUM_RAYS,)  -
+    foot_state:         jnp.ndarray   # (NUM_PEOPLE, 10) — planted-foot gait state
+    time_stopped:       jnp.int32
+    sp_mask:            jnp.ndarray   # (NUM_RAYS,)
+    human_stop_timers:  jnp.ndarray   # (NUM_PEOPLE,) int32 — steps remaining in current idle pause
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -336,7 +345,8 @@ def reset_env(key: jnp.ndarray, min_goal_dist: float = DEFAULT_MIN_GOAL_DIST):
         time_step=0,
         foot_state=foot_state,
         time_stopped=0,
-        sp_mask=jnp.zeros(NUM_RAYS, dtype=jnp.bool_)
+        sp_mask=jnp.zeros(NUM_RAYS, dtype=jnp.bool_),
+        human_stop_timers=jnp.zeros(NUM_PEOPLE, dtype=jnp.int32),
     )
 
     obs, sp_mask = get_obs(state, k_obs)
@@ -372,6 +382,34 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
         ROOM_W, ROOM_H, PEOPLE_RADIUS,
         state.obs_circles, state.obs_boxes
     )
+
+    # ── Human stop-and-go ───────────────────────────────────────────────────────
+    # Timers in state.human_stop_timers > 0 → human is in idle pause.
+    # Each step: decrement active timers; for humans whose timer just
+    # hit 0, sample whether to start a new stop (P_HUMAN_STOP) and draw
+    # a random duration.  All JIT-compatible — no Python control flow on
+    # traced values.
+    stop_key             = jax.random.fold_in(human_key, 0xAB57)
+    stop_roll    = jax.random.uniform(stop_key, (NUM_PEOPLE,))          # U[0,1)
+    dur_keys     = jax.random.split(stop_key, NUM_PEOPLE)
+    stop_dur     = jax.vmap(lambda k: jax.random.randint(
+        k, (), STOP_MIN_STEPS, STOP_MAX_STEPS + 1))(dur_keys)           # (N,) int
+
+    prev_timers  = state.human_stop_timers                               # (N,)
+    in_stop      = prev_timers > 0                                       # currently paused
+    new_timers   = jnp.where(in_stop, prev_timers - 1, 0)               # decrement
+
+    # Humans whose timer just expired AND roll < P_HUMAN_STOP start a new stop
+    start_stop   = ~in_stop & (stop_roll < P_HUMAN_STOP)
+    new_timers   = jnp.where(start_stop, stop_dur, new_timers)
+
+    # Still paused after decrement = should be frozen this step
+    is_stopped_h = new_timers > 0                                        # (N,)
+
+    # Clamp velocity to zero for stopped humans (vx col 2, vy col 3)
+    frozen_vx    = jnp.where(is_stopped_h, 0.0, new_people[:, 2])
+    frozen_vy    = jnp.where(is_stopped_h, 0.0, new_people[:, 3])
+    new_people   = new_people.at[:, 2].set(frozen_vx).at[:, 3].set(frozen_vy)
 
     # ── Advance leg gait phases ───────────────────────────────────────────────
     new_foot_state = advance_feet(state.foot_state, new_people, dt)
@@ -547,6 +585,7 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
         time_step=state.time_step + 1,
         foot_state=new_foot_state,
         time_stopped=new_time_stopped,
+        human_stop_timers=new_timers,
     )
 
     obs, sp_mask = get_obs(new_state, k_obs)

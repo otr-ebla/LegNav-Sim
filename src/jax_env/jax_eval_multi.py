@@ -399,8 +399,8 @@ def main():
     # 1 = parallel, 2 = perpendicular, 3 = circular, 4 = bottleneck, 5 = intersect, 6 = groups, 0 = random each episode
 
 
-    evaluation_mode  = "fixed" # "random"
-    current_scenario = 1#random.randint(0, 6)
+    evaluation_mode  = "random"
+    current_scenario = random.randint(0, 6)
     fast_reset, fast_step = build_fast_reset(current_scenario)
 
     pygame.init()

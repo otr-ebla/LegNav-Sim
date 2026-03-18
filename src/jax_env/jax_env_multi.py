@@ -15,7 +15,8 @@ if project_root not in sys.path:
 from jax_env import (EnvState, get_obs,
                      ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS, DT,
                      MAX_STEPS, GOAL_RADIUS,
-                     HEADING_BONUS, PROGRESS_COEF, USE_LEGS)
+                     HEADING_BONUS, PROGRESS_COEF, USE_LEGS,
+                     P_HUMAN_STOP, STOP_MIN_STEPS, STOP_MAX_STEPS)
 from jax_scenarios import generate_scenario
 from jax_legs import advance_feet, init_foot_state, get_shoe_boxes, get_leg_positions, LEG_RADIUS as _LEG_R
 
@@ -113,7 +114,7 @@ def reset_env(key: jax.Array, min_goal_dist: float = 3.0, scenario_idx: int = -1
     rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people = \
         generate_scenario(k_main, min_goal_dist, scenario_idx)
     
-    max_v = 0.8
+    #max_v = 0.8
 
     foot_state = init_foot_state(people, k_legs)
 
@@ -124,7 +125,8 @@ def reset_env(key: jax.Array, min_goal_dist: float = 3.0, scenario_idx: int = -1
         time_step=0,
         foot_state=foot_state,
         time_stopped=0,
-        sp_mask=jnp.zeros(108, dtype=jnp.bool_)
+        sp_mask=jnp.zeros(108, dtype=jnp.bool_),
+        human_stop_timers=jnp.zeros(NUM_PEOPLE, dtype=jnp.int32),
     )
 
     obs, sp_mask = get_obs(state, k_obs)
@@ -271,6 +273,33 @@ def step_env(key, state, action, ghost_robot: bool = True):
     new_people = jnp.concatenate(
         [respawned_h_state, state.people[:, 6:10], new_idx[:, None]], axis=-1
     )
+
+    # ── Human stop-and-go ──────────────────────────────────────────────────────
+    # Timers > 0 → human is in idle pause this step. Dummy humans (idx < 0)
+    # are never frozen. Velocities clamped after respawn so a freshly
+    # teleported human is never accidentally frozen.
+    stop_key = jax.random.fold_in(k_step, 0xAB57)
+
+    stop_roll  = jax.random.uniform(stop_key, (NUM_PEOPLE,))
+    dur_keys   = jax.random.split(stop_key, NUM_PEOPLE)
+    stop_dur   = jax.vmap(lambda k: jax.random.randint(
+        k, (), STOP_MIN_STEPS, STOP_MAX_STEPS + 1))(dur_keys)
+
+    prev_timers  = state.human_stop_timers
+    in_stop      = prev_timers > 0
+    new_timers   = jnp.where(in_stop, prev_timers - 1, 0)
+    start_stop   = ~in_stop & (stop_roll < P_HUMAN_STOP)
+    new_timers   = jnp.where(start_stop, stop_dur, new_timers)
+    is_stopped_h = new_timers > 0
+
+    # Only freeze active (non-dummy) humans; never freeze respawned ones
+    active_mask_stop = (new_people[:, 10] >= 0.0) & ~needs_respawn
+    freeze           = is_stopped_h & active_mask_stop
+
+    # Clamp px=0,1 vx=2, vy=3, omega=5 for stopped humans
+    new_people = new_people.at[:, 2].set(jnp.where(freeze, 0.0, new_people[:, 2]))
+    new_people = new_people.at[:, 3].set(jnp.where(freeze, 0.0, new_people[:, 3]))
+    new_people = new_people.at[:, 5].set(jnp.where(freeze, 0.0, new_people[:, 5]))
 
     # 1. Advance the continuous gait phase for everyone
     advanced_foot_state = advance_feet(state.foot_state, new_people, DT)
@@ -508,6 +537,7 @@ def step_env(key, state, action, ghost_robot: bool = True):
         time_step=state.time_step + 1,
         foot_state=new_foot_state,
         time_stopped=new_time_stopped,
+        human_stop_timers=new_timers,
     )
 
     obs, sp_mask = get_obs(new_state, k_obs)
