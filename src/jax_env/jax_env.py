@@ -44,12 +44,12 @@ import jax.numpy as jnp
 from flax import struct
 from jax_physics import compute_lidar
 from jax_humans import update_all_humans
-from jax_legs import get_leg_circles, get_shoe_boxes, advance_feet, init_foot_state
+from jax_legs import get_leg_circles, get_shoe_boxes, advance_feet, init_foot_state, LEG_RADIUS
 
 # ── Feature flag ──────────────────────────────────────────────────────────────
 # Flip this to False for cylinder-model baseline/ablation training.
 # Eval scripts can override: import jax_env; jax_env.USE_LEGS = False
-USE_LEGS = True
+USE_LEGS = False
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 DT             = 0.15
@@ -62,7 +62,7 @@ NUM_OBS_BOX    = 7
 ROOM_W         = 12.0
 ROOM_H         = 12.0
 ROBOT_RADIUS   = 0.2
-PEOPLE_RADIUS  = 0.2
+PEOPLE_RADIUS  = 0.4
 MAX_LIDAR_DIST = 12.0
 FOV            = math.pi         # 180° forward-facing LiDAR
 GOAL_RADIUS    = 0.3
@@ -94,7 +94,7 @@ class EnvState:
     obs_boxes:   jnp.ndarray   # (NUM_OBS_BOX, 4)  [cx, cy, hw, hh]
     time_step:   jnp.int32
     # ── NEW: per-human gait phase ────────────────────────────────────────────
-    foot_state:  jnp.ndarray   # (NUM_PEOPLE, 8) — planted-foot gait state
+    foot_state:  jnp.ndarray   # (NUM_PEOPLE, 10) — planted-foot gait state
     time_stopped: jnp.int32
     sp_mask:      jnp.ndarray   # (NUM_RAYS,)  -
 
@@ -389,23 +389,31 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
     rel_angles   = (human_angles - new_theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
 
     # ── Human Collisions (Active vs Passive) ─────────────────────────────────
-    # Active collision: robot hit a human.
-    #   ALL three conditions must hold for at least one colliding human:
-    #     1. physical contact           — dists_p < ROBOT_RADIUS + PEOPLE_RADIUS
-    #     2. human in forward 180° FOV  — |rel_angle| < π/2
-    #     3. human within 1.5 m         — dists_p < 1.5
-    #     4. robot moving               — v >= 0.1 m/s
-    # Passive collision: human walked into the robot — everything else.
-    col_mask    = dists_p < (ROBOT_RADIUS + PEOPLE_RADIUS)
+    # USE_LEGS=False: circle-vs-circle model.
+    #   Collision = robot circle overlaps human body circle (radius PEOPLE_RADIUS).
+    #
+    # USE_LEGS=True: shoe-box model.
+    #   Human body collision threshold is tightened to LEG_RADIUS (the actual
+    #   simulated geometry) because the shoe AABBs already capture the main
+    #   contact surface. Body-circle hits at this threshold represent only
+    #   direct leg/torso contact that slipped past the shoe AABB check.
+    #   Shoe-box contacts (active/passive) are computed separately below and
+    #   merged into the final active_col / passive_col flags.
     is_in_front = jnp.abs(rel_angles) < (jnp.pi / 2.0)   # forward 180° FOV
     in_prox     = dists_p < 1.5                            # within 1.5 m
     is_moving   = target_v >= 0.1                          # robot moving
 
+    if USE_LEGS:
+        body_thresh = ROBOT_RADIUS + LEG_RADIUS
+    else:
+        body_thresh = ROBOT_RADIUS + PEOPLE_RADIUS
+
+    col_mask     = dists_p < body_thresh
     active_mask  = col_mask & is_in_front & in_prox & is_moving
     passive_mask = col_mask & ~active_mask
 
-    active_col  = jnp.any(active_mask)
-    passive_col = jnp.any(passive_mask)
+    active_col_body  = jnp.any(active_mask)
+    passive_col_body = jnp.any(passive_mask)
 
     # ── Obstacle Collisions ───────────────────────────────────────────────────
     dx_c = state.obs_circles[:, 0] - new_x
@@ -419,14 +427,41 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
         return jnp.sqrt(ddx**2 + ddy**2)
     closest_box = jnp.min(jax.vmap(_box_dist)(state.obs_boxes))
 
-    # Shoe boxes — treat as obstacles when USE_LEGS=True
-    if USE_LEGS:
-        shoe_boxes_step = get_shoe_boxes(new_people, new_foot_state)
-        closest_shoe = jnp.min(jax.vmap(_box_dist)(shoe_boxes_step))
-    else:
-        closest_shoe = jnp.inf
+    obs_collision = (closest_cir < ROBOT_RADIUS) | (closest_box < ROBOT_RADIUS)
 
-    obs_collision = (closest_cir < ROBOT_RADIUS) | (closest_box < ROBOT_RADIUS) | (closest_shoe < ROBOT_RADIUS)
+    # ── Shoe-box collisions — USE_LEGS=True only ──────────────────────────────
+    # When USE_LEGS=True the shoe AABB is the primary human contact surface.
+    # Each shoe contact is classified active/passive with the same logic as
+    # body contacts (owner heading dot-product + proximity + robot speed).
+    if USE_LEGS:
+        shoe_boxes_step  = get_shoe_boxes(new_people, new_foot_state)   # (2N, 4)
+        shoe_dists_raw   = jax.vmap(_box_dist)(shoe_boxes_step)         # (2N,)
+
+        # Map each shoe to its owner: left shoes 0..N-1, right shoes N..2N-1
+        N_p            = new_people.shape[0]
+        owner_idx      = jnp.concatenate([jnp.arange(N_p), jnp.arange(N_p)])
+        shoe_dists     = shoe_dists_raw                                 # no dummy mask in jax_env
+
+        shoe_col_mask  = shoe_dists < ROBOT_RADIUS                     # (2N,)
+        any_shoe_col   = jnp.any(shoe_col_mask)
+
+        owner_in_front = is_in_front[owner_idx]
+        owner_in_prox  = in_prox[owner_idx]
+
+        active_shoe    = shoe_col_mask & owner_in_front & owner_in_prox & is_moving
+        active_col_shoe  = jnp.any(active_shoe)
+        passive_col_shoe = any_shoe_col & ~active_col_shoe
+    else:
+        any_shoe_col     = jnp.array(False)
+        active_col_shoe  = jnp.array(False)
+        passive_col_shoe = jnp.array(False)
+
+    # Merge body + shoe collision flags
+    # active_col / passive_col cover ONLY human contacts.
+    # Wall and static-obstacle contacts are always in obs_collision /
+    # wall_collision and NEVER bleed into passive_col.
+    active_col  = active_col_body  | active_col_shoe
+    passive_col = (passive_col_body | passive_col_shoe) & ~obs_collision & ~wall_collision
 
     # ── End of Episode Flags ──────────────────────────────────────────────────
     collision    = active_col | passive_col | obs_collision | wall_collision

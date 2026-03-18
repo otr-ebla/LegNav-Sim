@@ -28,7 +28,7 @@ except ImportError:
 
 __all__ = ["reset_env", "step_env", "EnvState", "get_obs"]
 
-HSFM_DT    = 0.05
+HSFM_DT    = 0.01
 
 # ── Reward constants — aligned with reference Python env ─────────────────────
 
@@ -112,6 +112,8 @@ def reset_env(key: jax.Array, min_goal_dist: float = 3.0, scenario_idx: int = -1
 
     rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people = \
         generate_scenario(k_main, min_goal_dist, scenario_idx)
+    
+    max_v = 0.8
 
     foot_state = init_foot_state(people, k_legs)
 
@@ -224,10 +226,10 @@ def step_env(key, state, action, ghost_robot: bool = True):
                         1.0 - idx_cur, idx_cur)
 
     # --- ADVANCED RESPAWN LOGIC ---
-    # --- ADVANCED RESPAWN LOGIC ---
     k_respawn1, k_respawn2 = jax.random.split(k_step)
     is_dummy = state.people[:, 10] < 0.0
 
+    # SYNCED: g1y is firmly back to 1.0. This reactivates the teleportation!
     is_parallel     = (g1x == g2x) & (jnp.abs(g1y - 1.0) < 0.1)
     is_bottleneck   = jnp.abs(g2y) < 0.1
     is_teleport_scenario = is_parallel | is_bottleneck
@@ -246,8 +248,7 @@ def step_env(key, state, action, ghost_robot: bool = True):
     rand_x_prl = jnp.where(is_wall_walker, g1x, rand_x_corr)
     rand_x = jnp.where(is_parallel, rand_x_prl, rand_x_full)
     
-    rand_y = jax.random.uniform(k_respawn2, (NUM_PEOPLE,),
-                                minval=ROOM_H - 1.4, maxval=ROOM_H - 0.2)
+    rand_y = jnp.full((NUM_PEOPLE,), ROOM_H - 0.2)
 
     new_idx = jnp.where(needs_respawn, 0.0, new_idx)
 
@@ -271,8 +272,14 @@ def step_env(key, state, action, ghost_robot: bool = True):
         [respawned_h_state, state.people[:, 6:10], new_idx[:, None]], axis=-1
     )
 
-    # Advance leg gait phases
-    new_foot_state = advance_feet(state.foot_state, new_people, DT)
+    # 1. Advance the continuous gait phase for everyone
+    advanced_foot_state = advance_feet(state.foot_state, new_people, DT)
+    
+    # 2. Generate a clean set of feet perfectly centered under the new body coordinates
+    fresh_foot_state = init_foot_state(new_people, k_respawn2) 
+    
+    # 3. Overwrite the foot state ONLY for humans that just teleported
+    new_foot_state = jnp.where(needs_respawn[:, None], fresh_foot_state, advanced_foot_state)
 
     # ── 4. Distance helpers ───────────────────────────────────────────────────
     prev_dist = jnp.sqrt((state.x - state.goal_x)**2 + (state.y - state.goal_y)**2)
@@ -280,9 +287,9 @@ def step_env(key, state, action, ghost_robot: bool = True):
 
     left_xy, right_xy = get_leg_positions(new_foot_state)   # (N,2) each
 
-    # Average leg position (center) for reward and body collision logic
-    center_x = (left_xy[:, 0] + right_xy[:, 0]) * 0.5
-    center_y = (left_xy[:, 1] + right_xy[:, 1]) * 0.5
+    # --- MODIFIED: Use stable JHSFM body coordinates for the center ---
+    center_x = new_people[:, 0]
+    center_y = new_people[:, 1]
 
     dx_p = center_x - new_x
     dy_p = center_y - new_y
@@ -293,26 +300,35 @@ def step_env(key, state, action, ghost_robot: bool = True):
     dists_p_active = jnp.where(active_mask, dists_p, jnp.inf)
     closest_human  = jnp.min(dists_p_active)
 
-    # ── 5. Collision Detection ─────────────────────────────────────────────────
-
-    # ── 5a. Human body collisions (active vs passive) ──────────────────────────
-    # dists_p is the distance to the leg center, so we revert to PEOPLE_RADIUS
-    # as the body collision threshold to accurately represent the human's physical space.
-    human_col_mask  = (dists_p < (ROBOT_RADIUS + PEOPLE_RADIUS)) & active_mask
-    human_collision = jnp.any(human_col_mask)
+    # ── 5. Collision Detection ───────────────────────────────────────────────────
 
     heading_dot  = dx_p * jnp.cos(new_theta) + dy_p * jnp.sin(new_theta)
     in_fwd_fov   = heading_dot > 0.0       # human is ahead of the robot
     in_prox      = dists_p_active < 1.5    # within 1.5 m
     robot_moving = target_v >= 0.1         # robot is moving
 
+    # ── 5a. Human body collisions (active vs passive) ──────────────────────────
+    # USE_LEGS=False: circle-vs-circle model.
+    #   Threshold = ROBOT_RADIUS + PEOPLE_RADIUS (full body cylinders).
+    #
+    # USE_LEGS=True: shoe-box model is the primary contact surface (see 5c).
+    #   Body threshold is tightened to ROBOT_RADIUS + LEG_RADIUS to catch only
+    #   direct leg/torso contacts that slip past the shoe AABB.
+    if USE_LEGS:
+        body_thresh = ROBOT_RADIUS + _LEG_R
+    else:
+        body_thresh = ROBOT_RADIUS + PEOPLE_RADIUS
+
+    human_col_mask  = (dists_p < body_thresh) & active_mask
+    human_collision = jnp.any(human_col_mask)
+
     # Active body collision: robot moved into a human that was in front & close
-    active_body  = human_col_mask & in_fwd_fov & in_prox
+    active_body     = human_col_mask & in_fwd_fov & in_prox
     any_active_body = jnp.any(active_body)
     active_col_body  = human_collision & robot_moving & any_active_body
     passive_col_body = human_collision & ~active_col_body
 
-    # ── 5b. Static obstacle collisions ────────────────────────────────────────
+    # ── 5b. Static obstacle collisions ────────────────────────────────────────────
     dx_c = state.obs_circles[:, 0] - new_x
     dy_c = state.obs_circles[:, 1] - new_y
     closest_cir = jnp.min(jnp.sqrt(dx_c**2 + dy_c**2) - state.obs_circles[:, 2])
@@ -327,9 +343,12 @@ def step_env(key, state, action, ghost_robot: bool = True):
 
     static_obs_collision = (closest_cir < ROBOT_RADIUS) | (closest_box < ROBOT_RADIUS)
 
-    # ── 5c. Shoe-box collisions (USE_LEGS guard, resolved at trace time) ───────
-    # Each shoe contact is classified active/passive using the same logic as body
+    # ── 5c. Shoe-box collisions (USE_LEGS=True only, resolved at trace time) ───
+    # When USE_LEGS=True the shoe AABB is the primary human contact surface.
+    # Each shoe contact is classified active/passive with the same logic as body
     # contacts: active if robot was moving toward the shoe's owner and v >= 0.1.
+    # When USE_LEGS=False these flags are all False — collision uses the body
+    # circle threshold from 5a instead.
     if USE_LEGS:
         shoe_boxes = get_shoe_boxes(new_people, new_foot_state)   # (2*N, 4)
 
@@ -346,13 +365,11 @@ def step_env(key, state, action, ghost_robot: bool = True):
         shoe_collision_mask = shoe_dists < ROBOT_RADIUS                     # (2N,)
         any_shoe_col        = jnp.any(shoe_collision_mask)
 
-        # The owner_heading_dot and owner_in_prox logic correctly reflect the 
-        # center-based heading geometry for classifying active/passive.
         owner_heading_dot = heading_dot[owner_idx]   # (2N,)
         owner_in_fwd      = owner_heading_dot > 0.0
         owner_in_prox     = dists_p_active[owner_idx] < 1.5
 
-        active_shoe   = shoe_collision_mask & owner_in_fwd & owner_in_prox
+        active_shoe      = shoe_collision_mask & owner_in_fwd & owner_in_prox
         any_active_shoe  = jnp.any(active_shoe)
         active_col_shoe  = any_shoe_col & robot_moving & any_active_shoe
         passive_col_shoe = any_shoe_col & ~active_col_shoe
@@ -361,13 +378,14 @@ def step_env(key, state, action, ghost_robot: bool = True):
         active_col_shoe  = jnp.array(False)
         passive_col_shoe = jnp.array(False)
 
-    # ── 5d. Aggregate collision flags ─────────────────────────────────────────
-    # Shoe collisions are part of human collisions (not static obstacles).
+    # ── 5d. Aggregate collision flags ─────────────────────────────────────────────
     obs_collision = static_obs_collision
 
-    # Combined active / passive flags (body OR shoe)
+    # active_col / passive_col cover ONLY human contacts.
+    # Wall and static-obstacle contacts are always in obs_collision /
+    # wall_collision and NEVER bleed into passive_col.
     active_col  = active_col_body  | active_col_shoe
-    passive_col = passive_col_body | passive_col_shoe
+    passive_col = (passive_col_body | passive_col_shoe) & ~obs_collision & ~wall_collision
 
     collision    = human_collision | any_shoe_col | obs_collision | wall_collision
     timeout      = (state.time_step + 1) >= MAX_STEPS

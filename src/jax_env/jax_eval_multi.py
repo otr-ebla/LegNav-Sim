@@ -20,6 +20,11 @@ def _parse_args():
     p.add_argument("--legs",    dest="use_legs", action="store_true",  default=True)
     p.add_argument("--no-legs", dest="use_legs", action="store_false")
     p.add_argument("--ckpt",    default="checkpoints/ppo_model_best.msgpack")
+    
+    # --- ADDED: Ghost body flag ---
+    p.add_argument("--ghost-body", action="store_true", help="Draw the JHSFM body cylinder as a ghost ring")
+    
+    # (jax_eval.py will also have the --scenario argument here)
     return p.parse_args()
 
 args = _parse_args()
@@ -179,7 +184,7 @@ def draw_shoes_only(surface, state, foot_state_np, use_legs):
                   theta_h, col, border)
 
 
-def draw_humans(surface, state, foot_state_np, show_arrows, use_legs):
+def draw_humans(surface, state, foot_state_np, show_arrows, use_legs, show_body):
     """Draw all humans with per-person coloured leg circles (or legacy cylinders)."""
     n = int(state.people.shape[0])
     if use_legs:
@@ -190,6 +195,13 @@ def draw_humans(surface, state, foot_state_np, show_arrows, use_legs):
             px, py   = float(state.people[i, 0]), float(state.people[i, 1])
             vx, vy   = float(state.people[i, 2]), float(state.people[i, 3])
             theta_h  = float(state.people[i, 4])
+
+            # --- ADDED: Draw the ghost body circle if active ---
+            if show_body:
+                sx, sy = W(px, py)
+                body_r = max(3, int(PEOPLE_RADIUS * SCALE))
+                pygame.draw.circle(surface, C_BODY_RING, (sx, sy), body_r, 1)
+
             # col[5] = omega in JHSFM people array — not a distracted flag.
             # We treat all multi-scenario pedestrians as non-distracted for colouring.
             shoe_col, _ = _shoe_colour(i)
@@ -217,8 +229,11 @@ def draw_humans(surface, state, foot_state_np, show_arrows, use_legs):
             theta_h  = float(state.people[i, 4])
             sx, sy   = W(px, py)
             pr       = max(3, int(PEOPLE_RADIUS * SCALE))
-            pygame.draw.circle(surface, C_PERSON, (sx, sy), pr)
-            pygame.draw.circle(surface, (20, 20, 20), (sx, sy), pr, 1)
+            # Use per-person palette colour (same as leg mode) for visual
+            # consistency regardless of USE_LEGS.
+            shoe_col, border_col = _shoe_colour(i)
+            pygame.draw.circle(surface, shoe_col, (sx, sy), pr)
+            pygame.draw.circle(surface, border_col, (sx, sy), pr, 1)
             speed = math.hypot(vx, vy)
             if show_arrows and speed > 0.05:
                 ax, ay = W(px + math.cos(theta_h) * 0.5,
@@ -226,7 +241,7 @@ def draw_humans(surface, state, foot_state_np, show_arrows, use_legs):
                 pygame.draw.line(surface, (20, 120, 20), (sx, sy), (ax, ay), 2)
 
 
-def draw_scene(surface, state, raw_lidar, foot_state_np, show_lidar, show_arrows, use_legs):
+def draw_scene(surface, state, raw_lidar, foot_state_np, show_lidar, show_arrows, use_legs, show_body):
     # Background + grid
     pygame.draw.rect(surface, C_FLOOR, (0, 0, SIM_SIZE, SIM_SIZE))
     for i in range(int(ROOM_W) + 1):
@@ -257,7 +272,7 @@ def draw_scene(surface, state, raw_lidar, foot_state_np, show_lidar, show_arrows
     draw_star(surface, gx, gy, int(0.30*SCALE), int(0.12*SCALE), 5, C_GOAL, C_GOAL2)
 
     # Leg circles drawn last among humans so they sit on top of shoes
-    draw_humans(surface, state, foot_state_np, show_arrows, use_legs)
+    draw_humans(surface, state, foot_state_np, show_arrows, use_legs, show_body)
 
     rx, ry = W(float(state.x), float(state.y)); rr = max(4, int(ROBOT_RADIUS * SCALE))
     pygame.draw.circle(surface, C_ROBOT,   (rx, ry), rr)
@@ -267,8 +282,8 @@ def draw_scene(surface, state, raw_lidar, foot_state_np, show_lidar, show_arrows
     pygame.draw.line(surface, C_ROBOT_H, (rx, ry), (hx, hy), 3)
 
 
-def draw_panel(surface, fonts, ep, step, ep_ret, v, w, goal_dist, goal_align,
-               ch, stats, banner, banner_t, scen_idx, eval_mode, use_legs):
+def draw_panel(surface, fonts, ep, step, ep_ret, max_v, v, w, goal_dist, goal_align,
+               ch, stats, banner, banner_t, scen_idx, eval_mode, use_legs, raw_lidar, sp_mask):
     pygame.draw.rect(surface, C_PANEL, (SIM_SIZE, 0, PANEL_W, WINDOW_H))
     pygame.draw.line(surface, C_WALL, (SIM_SIZE, 0), (SIM_SIZE, WINDOW_H), 2)
     y = 10; lh = 19; x0 = SIM_SIZE + 10
@@ -287,6 +302,8 @@ def draw_panel(surface, fonts, ep, step, ep_ret, v, w, goal_dist, goal_align,
     txt(f"{mode_text} {leg_mode}", C_DIM, "small")
     txt(f"Scen     {scen_name}", C_SUCCESS, "mid")
     txt(f"Episode  {ep:>5d}"); txt(f"Step     {step:>4d}"); sep()
+    # --- ADDED: max_v row (aligned with v and w) ---
+    txt(f"max_v {max_v:>+6.3f} m/s")
     txt(f"v     {v:>+6.3f} m/s"); txt(f"w     {w:>+6.3f} rad/s"); sep()
     txt(f"Goal  {goal_dist:>5.2f} m")
     txt(f"Align {math.degrees(goal_align):>+5.1f}°")
@@ -309,11 +326,52 @@ def draw_panel(surface, fonts, ep, step, ep_ret, v, w, goal_dist, goal_align,
         }.get(banner, ("", C_TEXT))
         if label:
             surf = fonts["big"].render(label, True, col)
-            bx = SIM_SIZE//2 - surf.get_width()//2
-            by = SIM_SIZE//2 - surf.get_height()//2
+            
+            # --- MODIFIED: Position banner above the radar chart in the panel ---
+            radar_r = 130
+            
+            # Center horizontally in the side panel
+            bx = SIM_SIZE + (PANEL_W // 2) - (surf.get_width() // 2)
+            
+            # Place vertically just above the radar's top edge
+            radar_top_y = WINDOW_H - (radar_r * 2) - 20
+            by = radar_top_y - surf.get_height() - 20 
+            
             bg = pygame.Surface((surf.get_width()+24, surf.get_height()+12))
             bg.fill((20,20,26)); bg.set_alpha(220)
-            surface.blit(bg, (bx-12,by-6)); surface.blit(surf,(bx,by))
+            surface.blit(bg, (bx-12,by-6))
+            surface.blit(surf,(bx,by))
+
+
+    # --- ADDED: Vectorized Radar Polar Chart ---
+    if raw_lidar is not None:
+        radar_r = 130 
+        radar_cx = SIM_SIZE + (PANEL_W // 2)
+        radar_cy = WINDOW_H - radar_r - 20
+        
+        # Draw dark background and scale rings
+        pygame.draw.circle(surface, (15, 15, 20), (radar_cx, radar_cy), radar_r)
+        pygame.draw.circle(surface, (50, 50, 60), (radar_cx, radar_cy), radar_r, 1)
+        pygame.draw.circle(surface, (50, 50, 60), (radar_cx, radar_cy), int(radar_r * 0.66), 1)
+        pygame.draw.circle(surface, (50, 50, 60), (radar_cx, radar_cy), int(radar_r * 0.33), 1)
+        
+        # Draw robot at center
+        pygame.draw.circle(surface, C_ROBOT, (radar_cx, radar_cy), 3)
+        
+        num_rays = len(raw_lidar)
+        angles = np.linspace(FOV/2, -FOV/2, num_rays) - math.pi/2
+        
+        dists_norm = (raw_lidar / MAX_LIDAR_DIST) * radar_r
+        xs = radar_cx + np.cos(angles) * dists_norm
+        ys = radar_cy + np.sin(angles) * dists_norm
+        
+        # --- MODIFIED: Color S&P full-scale rays purple ---
+        for i, (rx, ry) in enumerate(zip(xs, ys)):
+            # Check if this specific ray is corrupted by S&P noise and is at max distance
+            if sp_mask[i] and raw_lidar[i] >= MAX_LIDAR_DIST - 0.1:
+                pygame.draw.circle(surface, (180, 50, 220), (int(rx), int(ry)), 2)
+            else:
+                pygame.draw.circle(surface, (220, 50, 50), (int(rx), int(ry)), 2)
 
 
 def main():
@@ -356,6 +414,9 @@ def main():
 
     ep=0; ep_steps=0; ep_reward=0.0; ep_hist=[]
     paused=False; show_lidar=True; show_arrows=True; fps=FPS_TARGET
+
+    show_body = args.ghost_body
+
     banner=""; banner_t=0
 
     def get_stats():
@@ -375,6 +436,7 @@ def main():
                 if event.key == pygame.K_SPACE: paused = not paused
                 if event.key == pygame.K_l:     show_lidar = not show_lidar
                 if event.key == pygame.K_h:     show_arrows = not show_arrows
+                if event.key == pygame.K_b:     show_body = not show_body
                 if pygame.K_0 <= event.key <= pygame.K_6:
                     evaluation_mode = "fixed"
                     current_scenario = event.key - pygame.K_0
@@ -419,11 +481,15 @@ def main():
 
         screen.fill(C_BG)
         draw_scene(screen, cpu_state, raw_lidar, foot_state_np,
-                   show_lidar, show_arrows, use_legs)
+                   show_lidar, show_arrows, use_legs, show_body)
+        
+        sp_mask = np.array(cpu_state.sp_mask)  # Extract S&P noise mask for panel display
+
         draw_panel(screen, fonts, ep, ep_steps, ep_reward,
+                   float(cpu_state.max_v),
                    float(cpu_state.v), float(cpu_state.w),
                    gdist, galign, ch, get_stats(), banner, banner_t,
-                   current_scenario, evaluation_mode, use_legs)
+                   current_scenario, evaluation_mode, use_legs, raw_lidar, sp_mask)
 
         if banner_t > 0: banner_t -= 1
         pygame.display.flip(); clock.tick(fps)

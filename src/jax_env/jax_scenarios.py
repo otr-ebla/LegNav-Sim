@@ -103,12 +103,11 @@ def generate_scenario(key: jnp.ndarray, min_goal_dist: float, scenario_idx: int 
         people = jax.vmap(init_person)(jax.random.split(k7, NUM_PEOPLE))
         return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
 
-    # --- 1: PARALLEL TRAFFIC ---
     # --- 1: PARALLEL TRAFFIC (CORRIDOR) ---
     # --- 1: PARALLEL TRAFFIC (CORRIDOR) ---
     def _parallel_scen(k):
-        N_PRL = 8
-        k1, k2, k3 = jax.random.split(k, 3)
+        N_PRL = 6
+        k1, k2, k3, k4, k5, k_gx, k_rx = jax.random.split(k, 7)
         
         # Corridor geometry (Room is 12x12. 4m wide corridor in the center)
         corridor_width = 4.0
@@ -122,20 +121,56 @@ def generate_scenario(key: jnp.ndarray, min_goal_dist: float, scenario_idx: int 
         # Right wall
         obs_boxes = obs_boxes.at[1].set([ROOM_W - wall_width / 2.0, ROOM_H / 2.0, wall_width / 2.0, ROOM_H / 2.0])
 
-        rx, ry, rtheta = ROOM_W / 2.0, 1.5, jnp.pi / 2.0
-        gx, gy = ROOM_W / 2.0, ROOM_H - 1.5
+        rx, ry, rtheta = jax.random.uniform(k_rx, minval=4.8, maxval=7.2), 0.4, jnp.pi / 2.0
+        
+        # Robot Goal
+        gx = jax.random.uniform(k_gx, minval=4.3, maxval=7.8)
+        gy = ROOM_H - 4.0
         max_v = jax.random.uniform(k1, minval=0.5, maxval=1.5)
         
         # 2 humans spawn directly adjacent to the walls (4.5 and 7.5)
         px_walls = jnp.array([4.5, 7.5])
-        # The remaining 6 humans spawn randomly in the middle lanes (4.8 to 7.2)
-        px_random = jax.random.uniform(k2, (N_PRL - 2,), minval=4.8, maxval=7.2)
+        
+        # Loop condition: Keep resampling if any two humans are closer than 1.0m
+        def _cond(carry):
+            px_rand, py, key, i = carry
+            px_all = jnp.concatenate([px_walls, px_rand])
+            dx = px_all[:, None] - px_all[None, :]
+            dy = py[:, None] - py[None, :]
+            # Add 100 to the diagonal so we don't count self-distance as a collision
+            dist = jnp.sqrt(dx**2 + dy**2) + jnp.eye(N_PRL) * 100.0
+            return (jnp.min(dist) < 1.0) & (i < MAX_RESAMPLE_ITERS)
+
+        # Loop body: Resample internal X positions and ALL Y positions
+        # Loop body: Resample internal X positions and ALL Y positions
+        def _body(carry):
+            px_rand, py, key, i = carry
+            key, k_x, k_y = jax.random.split(key, 3)
+            new_px_rand = jax.random.uniform(k_x, (N_PRL - 2,), minval=4.8, maxval=7.2)
+            
+            # --- MODIFIED: Spawn at least 2m ahead of the robot (ry + 2.0) ---
+            new_py = jax.random.uniform(k_y, (N_PRL,), minval=ry + 3.0, maxval=ROOM_H - 0.2)
+            
+            return new_px_rand, new_py, key, i + 1
+
+        # Initial random guess
+        px_rand_init = jax.random.uniform(k2, (N_PRL - 2,), minval=4.8, maxval=7.2)
+        
+        # --- MODIFIED: Initial guess also constrained to ry + 2.0 ---
+        py_init = jax.random.uniform(k3, (N_PRL,), minval=ry + 2.0, maxval=ROOM_H - 1.0)
+
+        # Execute the vectorized rejection sampling
+        px_random, py, _, _ = jax.lax.while_loop(_cond, _body, (px_rand_init, py_init, k4, 0))
+        
         px = jnp.concatenate([px_walls, px_random])
         
-        py = jax.random.uniform(k3, (N_PRL,), minval=ROOM_H - 4.0, maxval=ROOM_H - 1.0)
+        # Human Goal targets: wall walkers go straight down, inner flow crosses lanes randomly
+        g1x_walls = px_walls  
+        g1x_random = jax.random.uniform(k5, (N_PRL - 2,), minval=4.8, maxval=7.2) 
+        g1x = jnp.concatenate([g1x_walls, g1x_random])
         
-        # Their goal is at the BOTTOM of the corridor, staying in their lane
-        g1x, g1y = px, jnp.full((N_PRL,), 1.0)
+        # Fixed goal height to trigger teleportation in jax_env_multi.py
+        g1y = jnp.full((N_PRL,), 1.0)
         
         # They walk DOWN (-pi/2)
         people_prl = pack_human(px, py, jnp.full((N_PRL,), -jnp.pi/2), g1x, g1y, g1x, g1y)

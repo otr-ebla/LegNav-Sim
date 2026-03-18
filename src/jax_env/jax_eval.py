@@ -264,7 +264,7 @@ def draw_humans(surface, state, foot_state_np, show_arrows, use_legs):
 
    
     else:
-        # Legacy single-cylinder rendering
+        # Single-cylinder rendering — same per-person palette colour as leg mode
         for i in range(n_people):
             px, py   = float(state.people[i, 0]), float(state.people[i, 1])
             vx, vy   = float(state.people[i, 2]), float(state.people[i, 3])
@@ -272,9 +272,13 @@ def draw_humans(surface, state, foot_state_np, show_arrows, use_legs):
             dist_    = float(state.people[i, 5]) > 0.5
             sx, sy   = W(px, py)
             pr       = max(3, int(PEOPLE_RADIUS * SCALE))
-            col      = C_PERSON_D if dist_ else C_PERSON
+            # Use per-person palette colour (same as leg mode) so visuals are
+            # consistent regardless of USE_LEGS.  Distracted persons get their
+            # palette colour darkened by 40 % to remain distinguishable.
+            shoe_col, border_col = _shoe_colour(i)
+            col = tuple(max(0, int(c * 0.6)) for c in shoe_col) if dist_ else shoe_col
             pygame.draw.circle(surface, col, (sx, sy), pr)
-            pygame.draw.circle(surface, (20, 20, 20), (sx, sy), pr, 1)
+            pygame.draw.circle(surface, border_col, (sx, sy), pr, 1)
             speed = math.hypot(vx, vy)
             if show_arrows and speed > 0.05:
                 ax, ay = W(px + math.cos(theta_h) * 0.5, py + math.sin(theta_h) * 0.5)
@@ -283,7 +287,7 @@ def draw_humans(surface, state, foot_state_np, show_arrows, use_legs):
 
 def _read_foot_positions_np(foot_state_np):
     """Read world-space foot positions directly from foot_state array.
-    foot_state_np : (N, 8)  — [left_xy, right_xy, phase, stance, swing_target_xy]
+    foot_state_np : (N, 10) — [left_xy, right_xy, phase, stance, swing_target_xy, swing_start_xy]
     Returns left_legs (N,2), right_legs (N,2) — already in world space, no math needed.
     """
     return foot_state_np[:, 0:2], foot_state_np[:, 2:4]

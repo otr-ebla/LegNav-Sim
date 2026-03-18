@@ -43,9 +43,10 @@ import jax.numpy as jnp
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 LEG_RADIUS   = 0.11     # m   — LiDAR cross-section
+PEOPLE_RADIUS = 0.20    # m   — body cylinder radius (mirrors jax_env.PEOPLE_RADIUS)
 HIP_WIDTH    = 0.25     # m   — lateral separation between feet
 STEP_SPEED   = 2.5      # m/s — reference speed for cadence scaling
-STEP_FREQ    = 5        # half-steps/s — lower = longer, more visible strides
+STEP_FREQ    = 3.5        # half-steps/s — lower = longer, more visible strides
 SPEED_THRESH = 0.1    # m/s — below this, feet freeze
 
 # Shoe geometry
@@ -288,7 +289,6 @@ def get_leg_circles(
         all_r = jnp.full((2 * N,), LEG_RADIUS)
         return jnp.stack([all_x, all_y, all_r], axis=-1)   # (2N, 3)
     else:
-        from jax_env import PEOPLE_RADIUS
         return jnp.stack([
             people[:, 0],
             people[:, 1],
