@@ -21,10 +21,12 @@ from jax_scenarios import generate_scenario
 from jax_legs import advance_feet, init_foot_state, get_shoe_boxes, get_leg_positions, LEG_RADIUS as _LEG_R
 
 try:
-    from src.jhsfm_utils.JHSFM.jhsfm.hsfm import step as hsfm_step
+    #from src.jhsfm_utils.JHSFM.jhsfm.hsfm import step as hsfm_step
+    from src.jhsfm_utils.JHSFM.jhsfm.hsfm_diff import step as hsfm_step
     from src.jhsfm_utils.JHSFM.jhsfm.utils import get_standard_humans_parameters
 except ImportError:
-    from jhsfm_utils.JHSFM.jhsfm.hsfm import step as hsfm_step
+    #from jhsfm_utils.JHSFM.jhsfm.hsfm import step as hsfm_step
+    from src.jhsfm_utils.JHSFM.jhsfm.hsfm_diff import step as hsfm_step
     from jhsfm_utils.JHSFM.jhsfm.utils import get_standard_humans_parameters
 
 __all__ = ["reset_env", "step_env", "EnvState", "get_obs"]
