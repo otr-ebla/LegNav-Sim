@@ -15,7 +15,7 @@ if project_root not in sys.path:
 from jax_env import (EnvState, get_obs,
                      ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS, DT,
                      MAX_STEPS, GOAL_RADIUS,
-                     HEADING_BONUS, PROGRESS_COEF, USE_LEGS,
+                     USE_LEGS,
                      P_HUMAN_STOP, STOP_MIN_STEPS, STOP_MAX_STEPS)
 from jax_scenarios import generate_scenario
 from jax_legs import advance_feet, init_foot_state, get_shoe_boxes, get_leg_positions, LEG_RADIUS as _LEG_R
@@ -31,73 +31,66 @@ __all__ = ["reset_env", "step_env", "EnvState", "get_obs"]
 
 HSFM_DT    = 0.01
 
-# ── Reward constants — aligned with reference Python env ─────────────────────
-
-# Terminal rewards (matches reference step() function)
-_R_GOAL          =  200.0   # reference: +200
-_R_OBS_COL       =  -70.0   # reference: -70 (static collision)
-_R_WALL_COL      =  -70.0   # reference: -70
-_R_ACTIVE_COL    =  -70.0   # reference: -70 (active human collision)
-_R_PASSIVE_COL   =  -15.0   # reference: -40 (passive human collision)
-_R_TIMEOUT       =   -5.0   # reference: -5
-
-# Progress shaping (reference: 2.5 * delta_dist)
-_PROGRESS_COEF   =   2.5
-
-# Step penalty (reference: -0.005)
-_STEP_PEN        =  -0.05
-
-# Jerk penalty — quadratic (reference: -1.5 * (delta_w)^2)
-_JERK_WEIGHT     =   1.5
-
-# Social reward zones (reference: DIST_INTIMATE/PERSONAL/SOCIAL)
-_DIST_INTIMATE   =   0.45   # m
-_DIST_PERSONAL   =   1.2    # m
-_DIST_SOCIAL     =   2.0    # m
-
-# A. Proxemic penalty: -2.0 * exp(-2.0 * safety_margin)  [only when moving]
-_PROXEMIC_COEF   =   0.5
-_PROXEMIC_DECAY  =   2.0
-
-# B. Overspeed penalty: -5.0 * (v - safe_speed)^2  [when dist < PERSONAL]
-_OVERSPEED_COEF  =   5.0
-
-# C. Aim penalty: -0.5 * (1 - d/D_social)  [|rel_angle| < 0.5 and v > 0.2]
-_AIM_COEF        =   0.5
-_AIM_FOV         =   0.5    # rad ≈ 28.6°
-
-# Heading bonus gate (keep — prevents heading bonus fighting obstacle avoidance)
-HEADING_CLEARANCE_DIST = 3.0
-_FWD_RAY_HALF_WIDTH    = 8
-
-# Yield logic (keep — adds stop-and-go behaviour absent in reference)
-_YIELD_PENALTY   =  -3.0
-_YIELD_BONUS     =   10.0
-_RESUME_BONUS    =   4.5
-_RESUME_MIN_DIST =   0.8
-
-# ── Escape reward — awarded when robot resumes movement in a clear direction ──
-# After stopping near humans (time_stopped >= _ESCAPE_MIN_STOP_STEPS), the
-# robot must find and move toward the "escape direction": the repulsive
-# resultant from all nearby humans.  This incentivises smart departure
-# rather than re-entering the crowd.
+# ── Reward constants ─────────────────────────────────────────────────────────
 #
-# _ESCAPE_BONUS   : reward per step the robot moves well-aligned with escape dir
-#                   (dot product > _ESCAPE_ALIGN_THRESH)
-# _ESCAPE_PENALTY : penalty per step the robot moves back toward the crowd
-#                   (negative dot product) after having just stopped
-# _ESCAPE_MIN_STOP_STEPS : minimum consecutive stopped steps before escape
-#                           logic activates — avoids spurious triggers on
-#                           micro-pauses
-# _ESCAPE_ALIGN_THRESH   : minimum cos(angle) between heading and escape dir
-#                           to earn the bonus (filters near-orthogonal exits)
-# _ESCAPE_ZONE_DIST      : radius around robot used to build escape direction
-#                           (should be >= YIELD_DIST so same humans are used)
-_ESCAPE_BONUS          =   6.0
-_ESCAPE_PENALTY        =  -4.0
-_ESCAPE_MIN_STOP_STEPS =   3       # ~0.45 s at dt=0.15 — genuine stop
-_ESCAPE_ALIGN_THRESH   =   0.3     # cos(~72°) — fairly wide acceptance cone
-_ESCAPE_ZONE_DIST      =   2.0     # m — same as _DIST_SOCIAL
+# Design philosophy: minimal hand-engineering, maximal emergence.
+#
+# The core reward is:
+#
+#   social_progress = Δdist_to_goal × clearance_factor(closest_human)
+#
+# where clearance_factor ∈ [0,1] is a smooth sigmoid that:
+#   → equals ~1 when the robot is comfortably far from all humans
+#   → drops toward 0 as it enters the personal-space zone
+#   → reaches 0 at the intimate zone boundary
+#
+# This single multiplicative term encodes the social priority rule:
+# "yield to humans" emerges because progress near humans is worth almost
+# nothing, so the policy learns that detouring around them (even at a
+# distance cost) is better than passing through.  Stopping to let a
+# crossing human pass also becomes rational: zero progress × anything = 0,
+# whereas waiting a few steps and then resuming full progress is better.
+#
+# No separate yield/escape/proxemic/overspeed/aim terms are needed.
+# The jerk penalty keeps trajectories smooth (humans walk smoothly).
+# Terminal rewards remain for hard constraints.
+
+# Terminal rewards
+_R_GOAL        =  200.0
+_R_OBS_COL     =  -70.0
+_R_WALL_COL    =  -70.0
+_R_ACTIVE_COL  =  -70.0
+_R_PASSIVE_COL =  -15.0
+_R_TIMEOUT     =   -5.0
+
+# Progress scaling — how much a metre of progress toward goal is worth
+# when the robot is in completely open space (clearance_factor = 1).
+_PROGRESS_COEF =   3.0
+
+# Step penalty — small constant cost per timestep, encourages efficiency.
+_STEP_PEN      =  -0.02
+
+# Jerk penalty — discourages angular velocity changes (smooth paths).
+# Larger than before because smoothness is the only trajectory shaping left.
+_JERK_WEIGHT   =   2.0
+
+# ── Clearance factor parameters ───────────────────────────────────────────────
+# clearance_factor(d) = sigmoid((d - _CF_CENTER) / _CF_SLOPE)
+#
+#   _CF_CENTER : distance at which clearance_factor = 0.5 [m]
+#                Set to personal space boundary (~1.2 m).
+#                At this distance the progress reward is halved.
+#   _CF_SLOPE  : controls steepness of the sigmoid [m]
+#                Smaller → sharper boundary; larger → softer gradient.
+#                0.4 m gives a transition from ~0.1 to ~0.9 over ~1.8 m.
+#
+# Intuition for the policy:
+#   d > 2.0 m  → clearance_factor ≈ 0.95  → almost full progress reward
+#   d = 1.2 m  → clearance_factor = 0.50  → progress halved → slow down
+#   d = 0.7 m  → clearance_factor ≈ 0.10  → progress worth almost nothing → stop/detour
+#   d < 0.5 m  → clearance_factor ≈ 0.02  → collision imminent, no progress matters
+_CF_CENTER = 1.2   # m — personal space boundary (Hall 1966)
+_CF_SLOPE  = 0.4   # m — sigmoid steepness
 N_SUBSTEPS = int(DT / HSFM_DT)
 NUM_PEOPLE = 12
 
@@ -150,6 +143,7 @@ def reset_env(key: jax.Array, min_goal_dist: float = 3.0, scenario_idx: int = -1
         time_stopped=0,
         sp_mask=jnp.zeros(108, dtype=jnp.bool_),
         human_stop_timers=jnp.zeros(NUM_PEOPLE, dtype=jnp.int32),
+        escape_timer=0,
     )
 
     obs, sp_mask = get_obs(state, k_obs)
@@ -444,185 +438,54 @@ def step_env(key, state, action, ghost_robot: bool = True):
     goal_reached = new_dist < GOAL_RADIUS
     done         = goal_reached | collision | timeout
 
-    # ── 6. Reward — aligned with reference Python env ─────────────────────────
-
-    # — 6a. Progress + step penalty + jerk (quadratic, matches reference) ------
-    progress = _PROGRESS_COEF * (prev_dist - new_dist)    # 2.5 * delta_dist
-    step_pen = _STEP_PEN                                   # -0.005
-    jerk_pen = -_JERK_WEIGHT * (target_w - state.w) ** 2  # -1.5 * (delta_w)^2
-
-    # — 6b. Heading bonus gated by forward clearance (JAX addition) ------------
-    fwd_clearance  = jnp.clip(closest_human / HEADING_CLEARANCE_DIST, 0.0, 1.0)
-    goal_angle_cur = jnp.arctan2(state.goal_y - new_y, state.goal_x - new_x)
-    align_cur      = (goal_angle_cur - new_theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
-    heading_bon    = (HEADING_BONUS
-                      * jnp.maximum(0.0, jnp.cos(align_cur))
-                      * (target_v / jnp.maximum(state.max_v, 1e-3))
-                      * fwd_clearance)
-
-    # — 6c. Social reward (matches reference 4A + 4B + 4C) --------------------
-    # closest_rel_angle: angle to the center of the nearest human.
-    nearest_idx       = jnp.argmin(dists_p_active)
-    closest_rel_angle = jnp.arctan2(dy_p[nearest_idx], dx_p[nearest_idx]) - new_theta
-    closest_rel_angle = (closest_rel_angle + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
-
-    in_social_zone = closest_human < _DIST_SOCIAL
-
-    # A. Proxemic penalty (exponential, only when moving)
-    safety_margin  = jnp.maximum(0.0, closest_human - PEOPLE_RADIUS - ROBOT_RADIUS)
-    proxemic_pen   = _PROXEMIC_COEF * jnp.exp(-_PROXEMIC_DECAY * safety_margin)
-    social_a       = jnp.where(in_social_zone & (target_v > 0.1), -proxemic_pen, 0.0)
-
-    # B. Overspeed penalty: -5 * (v - safe_speed)^2 when dist < PERSONAL
-    safe_speed = 0.3 + jnp.clip(closest_human - _DIST_INTIMATE, 0.0, None) * 0.8
-    overspeed  = jnp.maximum(0.0, target_v - safe_speed)
-    social_b   = jnp.where(closest_human < _DIST_PERSONAL,
-                            -_OVERSPEED_COEF * overspeed ** 2, 0.0)
-
-    # C. Aim penalty: pointing at human while moving
-    social_c = jnp.where(
-        in_social_zone & (jnp.abs(closest_rel_angle) < _AIM_FOV) & (target_v > 0.2),
-        -_AIM_COEF * (1.0 - closest_human / _DIST_SOCIAL),
-        0.0
-    )
-
-    social_reward = social_a + social_b + social_c
-
-    # — 6d. Yield reward (JAX addition — stop-and-go near crossing humans) -----
-    rel_angles = jnp.arctan2(
-        new_people[:, 1] - new_y,
-        new_people[:, 0] - new_x
-    ) - new_theta
-    rel_angles = (rel_angles + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
-
-    YIELD_DIST = 1.5
-    YIELD_FOV  = 1.57
-
-    in_yield_zone      = (dists_p_active < YIELD_DIST) & (jnp.abs(rel_angles) < YIELD_FOV)
-    is_yield_situation = jnp.any(in_yield_zone)
-
-    closest_yield_dist = jnp.min(jnp.where(in_yield_zone, dists_p_active, 100.0))
-    urgency = jnp.where(
-        is_yield_situation,
-        (YIELD_DIST - closest_yield_dist) / YIELD_DIST,
-        0.0
-    )
-
-    is_stopped = target_v <= 0.1
-
-    new_time_stopped = jnp.where(
-        is_yield_situation,
-        jnp.where(is_stopped, state.time_stopped + 1, state.time_stopped),
-        0,
-    )
-
-    was_in_yield     = state.time_stopped > 0
-    yield_cleared    = was_in_yield & ~is_yield_situation
-    was_close_enough = closest_yield_dist < _RESUME_MIN_DIST
-    resume_bonus     = jnp.where(
-        yield_cleared & ~is_stopped & was_close_enough,
-        _RESUME_BONUS, 0.0
-    )
-
-    decay         = jnp.maximum(0.0, 1.0 - (new_time_stopped / 20.0))
-    moving_frac   = target_v / jnp.maximum(state.max_v, 1e-3)
-    yield_penalty = _YIELD_PENALTY * urgency * moving_frac
-    yield_bonus   = _YIELD_BONUS   * urgency * decay
-
-    yield_reward = jnp.where(
-        is_yield_situation,
-        jnp.where(is_stopped, yield_bonus, yield_penalty),
-        0.0
-    )
-
-    # — 6e. Escape reward — smart departure after a genuine stop ---------------
+    # ── 6. Reward ─────────────────────────────────────────────────────────────
     #
-    # Motivation: the yield logic rewards stopping near humans but gives no
-    # signal for *how* to resume.  Without this, the policy learns to stop
-    # and then blunder back into the crowd.  The escape reward shapes the
-    # departure direction by:
-    #   (1) computing an "escape direction" — the repulsive resultant of all
-    #       humans within _ESCAPE_ZONE_DIST, weighted by 1/distance;
-    #   (2) rewarding heading alignment with that direction while the robot
-    #       is moving (v > 0.1) after having genuinely stopped.
+    # One multiplicative reward term + jerk + step cost + terminals.
+    # No hand-crafted yield/escape/proxemic/overspeed/aim logic.
     #
-    # Conditions for activation:
-    #   • The robot was stopped for >= _ESCAPE_MIN_STOP_STEPS (genuine yield,
-    #     not a micro-pause from jitter).
-    #   • The robot is now moving (target_v > 0.1) — escape in progress.
-    #   • There is at least one active human within _ESCAPE_ZONE_DIST (i.e.
-    #     an escape direction is well-defined; zero-human case → no reward).
+    # social_progress = Δdist × clearance_factor(closest_human)
     #
-    # The escape direction is the *opposite* of the repulsive resultant, so it
-    # points away from the crowd centre-of-mass (weighted by proximity).
-    # We then project the robot's current heading onto it and gate by
-    # _ESCAPE_ALIGN_THRESH to accept only reasonably aligned departures.
+    # clearance_factor is a sigmoid in the robot-human distance, centred on
+    # the personal-space boundary (~1.2 m).  The policy learns from this
+    # single signal that:
+    #
+    #   • Being near a human while moving earns almost no progress reward
+    #     → it spontaneously learns to give space (proxemics).
+    #   • Stopping to let a crossing human pass and then resuming is better
+    #     than pushing through → yield behaviour emerges.
+    #   • Detouring around a stationary human is better than stopping
+    #     → bypass behaviour emerges without explicit classification.
+    #   • Smooth, efficient paths maximise cumulative reward
+    #     → jerk penalty reinforces trajectory smoothness.
 
-    # Build escape direction from all active humans within _ESCAPE_ZONE_DIST
-    # dx_p / dy_p already computed above (human - robot, world frame).
-    in_escape_zone = (dists_p_active < _ESCAPE_ZONE_DIST)   # (NUM_PEOPLE,)
+    # — 6a. Clearance factor: sigmoid((d - center) / slope) ∈ (0, 1) ----------
+    # Uses the edge-to-edge clearance (subtract radii) so the curve is
+    # anchored to actual physical contact distance, not centre-to-centre.
+    edge_to_edge   = jnp.maximum(0.0, closest_human - PEOPLE_RADIUS - ROBOT_RADIUS)
+    clearance_factor = jax.nn.sigmoid((edge_to_edge - _CF_CENTER) / _CF_SLOPE)
 
-    # Weight each human by 1/distance (closer humans matter more).
-    # Humans outside the zone contribute zero weight.
-    inv_dist_escape = jnp.where(
-        in_escape_zone,
-        1.0 / jnp.maximum(dists_p_active, 0.1),
-        0.0
-    )                                                         # (NUM_PEOPLE,)
+    # — 6b. Social progress ------------------------------------------------
+    progress         = prev_dist - new_dist                         # Δdist [m]
+    social_progress  = _PROGRESS_COEF * progress * clearance_factor
 
-    # Repulsive resultant: sum of (robot − human) unit vectors × weight.
-    # dx_p = human_x − robot_x, so repulsion direction is (−dx_p, −dy_p).
-    rep_x = jnp.sum(-dx_p * inv_dist_escape)   # away from humans
-    rep_y = jnp.sum(-dy_p * inv_dist_escape)
+    # — 6c. Step penalty + jerk penalty ------------------------------------
+    step_pen = _STEP_PEN
+    jerk_pen = -_JERK_WEIGHT * (target_w - state.w) ** 2
 
-    rep_mag = jnp.sqrt(rep_x ** 2 + rep_y ** 2) + 1e-7
-    esc_nx  = rep_x / rep_mag                  # escape direction unit vector
-    esc_ny  = rep_y / rep_mag
+    # — 6d. Total step reward ----------------------------------------------
+    reward = social_progress + step_pen + jerk_pen
 
-    # Project robot heading onto escape direction
-    robot_hx = jnp.cos(new_theta)
-    robot_hy = jnp.sin(new_theta)
-    escape_alignment = robot_hx * esc_nx + robot_hy * esc_ny   # cos(angle)
-
-    # Activation conditions (all must be true simultaneously)
-    had_genuine_stop  = state.time_stopped >= _ESCAPE_MIN_STOP_STEPS
-    is_now_moving     = target_v > 0.1
-    humans_nearby     = jnp.any(in_escape_zone)
-
-    escape_active = had_genuine_stop & is_now_moving & humans_nearby
-
-    # Reward: positive when well-aligned, negative when heading back into crowd
-    escape_reward = jnp.where(
-        escape_active,
-        jnp.where(
-            escape_alignment > _ESCAPE_ALIGN_THRESH,
-            _ESCAPE_BONUS  * escape_alignment,          # good exit direction
-            jnp.where(
-                escape_alignment < -_ESCAPE_ALIGN_THRESH,
-                _ESCAPE_PENALTY * (-escape_alignment),  # heading back in
-                0.0                                     # neutral / sideways
-            )
-        ),
-        0.0
-    )
-
-    # — 6f. Total step reward --------------------------------------------------
-    reward = (progress + step_pen + jerk_pen + heading_bon
-              + social_reward + yield_reward + resume_bonus + escape_reward)
-
-    # — 6g. Terminal overrides (priority: goal > obs > wall > active > passive > timeout)
-    reward = jnp.where(goal_reached,
-                       _R_GOAL, reward)           # +200
-    reward = jnp.where(obs_collision & ~goal_reached,
-                       _R_OBS_COL, reward)        # -70
+    # — 6e. Terminal overrides (priority: goal > obs > wall > human > timeout)
+    reward = jnp.where(goal_reached,   _R_GOAL,        reward)
+    reward = jnp.where(obs_collision  & ~goal_reached,  _R_OBS_COL,    reward)
     reward = jnp.where(wall_collision & ~obs_collision & ~goal_reached,
-                       _R_WALL_COL, reward)       # -70
+                       _R_WALL_COL, reward)
     reward = jnp.where(active_col  & ~obs_collision & ~wall_collision & ~goal_reached,
-                       _R_ACTIVE_COL, reward)     # -70
+                       _R_ACTIVE_COL,  reward)
     reward = jnp.where(passive_col & ~obs_collision & ~wall_collision & ~goal_reached,
-                       _R_PASSIVE_COL, reward)    # -40
+                       _R_PASSIVE_COL, reward)
     reward = jnp.where(timeout & ~goal_reached & ~collision,
-                       _R_TIMEOUT, reward)        # -5
+                       _R_TIMEOUT, reward)
 
     new_state = state.replace(
         x=new_x, y=new_y, theta=new_theta,
@@ -630,8 +493,9 @@ def step_env(key, state, action, ghost_robot: bool = True):
         people=new_people,
         time_step=state.time_step + 1,
         foot_state=new_foot_state,
-        time_stopped=new_time_stopped,
+        time_stopped=jnp.int32(0),    # unused in new reward; kept for compat
         human_stop_timers=new_timers,
+        escape_timer=jnp.int32(0),    # unused in new reward; kept for compat
     )
 
     obs, sp_mask = get_obs(new_state, k_obs)

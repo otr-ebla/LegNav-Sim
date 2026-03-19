@@ -102,10 +102,11 @@ class EnvState:
     obs_boxes:   jnp.ndarray   # (NUM_OBS_BOX, 4)  [cx, cy, hw, hh]
     time_step:   jnp.int32
     # ── NEW: per-human gait phase ────────────────────────────────────────────
-    foot_state:         jnp.ndarray   # (NUM_PEOPLE, 10) — planted-foot gait state
+    foot_state:         jnp.ndarray
     time_stopped:       jnp.int32
-    sp_mask:            jnp.ndarray   # (NUM_RAYS,)
-    human_stop_timers:  jnp.ndarray   # (NUM_PEOPLE,) int32 — steps remaining in current idle pause
+    sp_mask:            jnp.ndarray
+    human_stop_timers:  jnp.ndarray
+    escape_timer:       jnp.int32     # unused in new reward; kept for checkpoint compat
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -347,6 +348,7 @@ def reset_env(key: jnp.ndarray, min_goal_dist: float = DEFAULT_MIN_GOAL_DIST):
         time_stopped=0,
         sp_mask=jnp.zeros(NUM_RAYS, dtype=jnp.bool_),
         human_stop_timers=jnp.zeros(NUM_PEOPLE, dtype=jnp.int32),
+        escape_timer=0,
     )
 
     obs, sp_mask = get_obs(state, k_obs)
