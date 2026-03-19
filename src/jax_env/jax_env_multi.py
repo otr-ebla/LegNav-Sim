@@ -75,6 +75,29 @@ _YIELD_PENALTY   =  -3.0
 _YIELD_BONUS     =   10.0
 _RESUME_BONUS    =   4.5
 _RESUME_MIN_DIST =   0.8
+
+# ── Escape reward — awarded when robot resumes movement in a clear direction ──
+# After stopping near humans (time_stopped >= _ESCAPE_MIN_STOP_STEPS), the
+# robot must find and move toward the "escape direction": the repulsive
+# resultant from all nearby humans.  This incentivises smart departure
+# rather than re-entering the crowd.
+#
+# _ESCAPE_BONUS   : reward per step the robot moves well-aligned with escape dir
+#                   (dot product > _ESCAPE_ALIGN_THRESH)
+# _ESCAPE_PENALTY : penalty per step the robot moves back toward the crowd
+#                   (negative dot product) after having just stopped
+# _ESCAPE_MIN_STOP_STEPS : minimum consecutive stopped steps before escape
+#                           logic activates — avoids spurious triggers on
+#                           micro-pauses
+# _ESCAPE_ALIGN_THRESH   : minimum cos(angle) between heading and escape dir
+#                           to earn the bonus (filters near-orthogonal exits)
+# _ESCAPE_ZONE_DIST      : radius around robot used to build escape direction
+#                           (should be >= YIELD_DIST so same humans are used)
+_ESCAPE_BONUS          =   6.0
+_ESCAPE_PENALTY        =  -4.0
+_ESCAPE_MIN_STOP_STEPS =   3       # ~0.45 s at dt=0.15 — genuine stop
+_ESCAPE_ALIGN_THRESH   =   0.3     # cos(~72°) — fairly wide acceptance cone
+_ESCAPE_ZONE_DIST      =   2.0     # m — same as _DIST_SOCIAL
 N_SUBSTEPS = int(DT / HSFM_DT)
 NUM_PEOPLE = 12
 
@@ -512,11 +535,82 @@ def step_env(key, state, action, ghost_robot: bool = True):
         0.0
     )
 
-    # — 6e. Total step reward --------------------------------------------------
-    reward = (progress + step_pen + jerk_pen + heading_bon
-              + social_reward + yield_reward + resume_bonus)
+    # — 6e. Escape reward — smart departure after a genuine stop ---------------
+    #
+    # Motivation: the yield logic rewards stopping near humans but gives no
+    # signal for *how* to resume.  Without this, the policy learns to stop
+    # and then blunder back into the crowd.  The escape reward shapes the
+    # departure direction by:
+    #   (1) computing an "escape direction" — the repulsive resultant of all
+    #       humans within _ESCAPE_ZONE_DIST, weighted by 1/distance;
+    #   (2) rewarding heading alignment with that direction while the robot
+    #       is moving (v > 0.1) after having genuinely stopped.
+    #
+    # Conditions for activation:
+    #   • The robot was stopped for >= _ESCAPE_MIN_STOP_STEPS (genuine yield,
+    #     not a micro-pause from jitter).
+    #   • The robot is now moving (target_v > 0.1) — escape in progress.
+    #   • There is at least one active human within _ESCAPE_ZONE_DIST (i.e.
+    #     an escape direction is well-defined; zero-human case → no reward).
+    #
+    # The escape direction is the *opposite* of the repulsive resultant, so it
+    # points away from the crowd centre-of-mass (weighted by proximity).
+    # We then project the robot's current heading onto it and gate by
+    # _ESCAPE_ALIGN_THRESH to accept only reasonably aligned departures.
 
-    # — 6f. Terminal overrides (priority: goal > obs > wall > active > passive > timeout)
+    # Build escape direction from all active humans within _ESCAPE_ZONE_DIST
+    # dx_p / dy_p already computed above (human - robot, world frame).
+    in_escape_zone = (dists_p_active < _ESCAPE_ZONE_DIST)   # (NUM_PEOPLE,)
+
+    # Weight each human by 1/distance (closer humans matter more).
+    # Humans outside the zone contribute zero weight.
+    inv_dist_escape = jnp.where(
+        in_escape_zone,
+        1.0 / jnp.maximum(dists_p_active, 0.1),
+        0.0
+    )                                                         # (NUM_PEOPLE,)
+
+    # Repulsive resultant: sum of (robot − human) unit vectors × weight.
+    # dx_p = human_x − robot_x, so repulsion direction is (−dx_p, −dy_p).
+    rep_x = jnp.sum(-dx_p * inv_dist_escape)   # away from humans
+    rep_y = jnp.sum(-dy_p * inv_dist_escape)
+
+    rep_mag = jnp.sqrt(rep_x ** 2 + rep_y ** 2) + 1e-7
+    esc_nx  = rep_x / rep_mag                  # escape direction unit vector
+    esc_ny  = rep_y / rep_mag
+
+    # Project robot heading onto escape direction
+    robot_hx = jnp.cos(new_theta)
+    robot_hy = jnp.sin(new_theta)
+    escape_alignment = robot_hx * esc_nx + robot_hy * esc_ny   # cos(angle)
+
+    # Activation conditions (all must be true simultaneously)
+    had_genuine_stop  = state.time_stopped >= _ESCAPE_MIN_STOP_STEPS
+    is_now_moving     = target_v > 0.1
+    humans_nearby     = jnp.any(in_escape_zone)
+
+    escape_active = had_genuine_stop & is_now_moving & humans_nearby
+
+    # Reward: positive when well-aligned, negative when heading back into crowd
+    escape_reward = jnp.where(
+        escape_active,
+        jnp.where(
+            escape_alignment > _ESCAPE_ALIGN_THRESH,
+            _ESCAPE_BONUS  * escape_alignment,          # good exit direction
+            jnp.where(
+                escape_alignment < -_ESCAPE_ALIGN_THRESH,
+                _ESCAPE_PENALTY * (-escape_alignment),  # heading back in
+                0.0                                     # neutral / sideways
+            )
+        ),
+        0.0
+    )
+
+    # — 6f. Total step reward --------------------------------------------------
+    reward = (progress + step_pen + jerk_pen + heading_bon
+              + social_reward + yield_reward + resume_bonus + escape_reward)
+
+    # — 6g. Terminal overrides (priority: goal > obs > wall > active > passive > timeout)
     reward = jnp.where(goal_reached,
                        _R_GOAL, reward)           # +200
     reward = jnp.where(obs_collision & ~goal_reached,
