@@ -353,14 +353,14 @@ def _critic_loss_fn(
 
 # ── Step di update SHAC (JIT-compilato) ──────────────────────────────────────
 
-@functools.partial(jax.jit, static_argnums=(2, 3, 6, 7))
+@functools.partial(jax.jit, static_argnums=(2, 3, 4, 5, 6, 7))
 def shac_update_step(
     shac_state:       SHACTrainState,
     env_data:         Tuple,   # (init_obs_batch, init_state_batch, rng_keys)
     actor_apply,               # static: funzione apply della rete actor
     critic_apply,              # static: funzione apply del critico
-    actor_optimizer,           # ottimizzatore actor
-    critic_optimizer,          # ottimizzatore critico
+    actor_optimizer,           # static: oggetto optax (non è un array JAX)
+    critic_optimizer,          # static: oggetto optax (non è un array JAX)
     horizon:          int,     # static: H corrente
     ghost_robot:      bool,    # static: modalità ghost
 ):
