@@ -218,10 +218,7 @@ def _rollout_body(net_apply_fn, squash_fn, params, scen_idx, target_max_v, rng_k
         new_yz_steps = yz_steps + jnp.where(active & any_in_yz, 1.0, 0.0)
         new_yc_steps = yc_steps + jnp.where(active & any_in_yz & robot_stopped, 1.0, 0.0)
 
-        # Surface distance = centre-to-centre minus both radii.
-        # Matches the convention used by safety_margin in jax_env_multi.
-        ch_surf = ch   # already computed above as info["closest_human"] - ROBOT_RADIUS - human_r
-        step_data   = (active, done, g, c, pc, jerk_v, jerk_w, ch_surf, v)
+        step_data   = (active, done, g, c, pc, jerk_v, jerk_w, ch, v)
         next_active = active & ~done
         return (next_state, next_obs, v, av, w, aw, pl, mhd, next_active,
                 new_yz_steps, new_yc_steps), step_data
@@ -231,8 +228,6 @@ def _rollout_body(net_apply_fn, squash_fn, params, scen_idx, target_max_v, rng_k
     )
     _, _, _, _, _, _, final_pl, final_mhd, _, final_yz, final_yc = final_carry
     active_mask, _, goals, cols, pcols, jerks_v, jerks_w, step_dists, step_vs = step_data
-    # step_dists / step_vs : (MAX_STEPS, N_ENVS) — surface distance & linear speed
-    # at each step for every env. active_mask gates out post-done steps below.
 
     ep_lens = active_mask.sum(axis=0)
     ep_goal = goals.any(axis=0)
@@ -255,10 +250,8 @@ def _rollout_body(net_apply_fn, squash_fn, params, scen_idx, target_max_v, rng_k
         jnp.nan,
     )
 
-    # Mask post-done steps so they don't pollute the scatter (use NaN).
-    # active_mask[t, e] = True while episode e is still running at step t.
-    step_dists_masked = jnp.where(active_mask, step_dists, jnp.nan)  # (T, N)
-    step_vs_masked    = jnp.where(active_mask, step_vs,    jnp.nan)  # (T, N)
+    step_dists = jnp.where(active_mask, step_dists, jnp.nan)  # (T, N)
+    step_vs    = jnp.where(active_mask, step_vs,    jnp.nan)  # (T, N)
 
     return {
         "success":     ep_goal.astype(jnp.float32),
@@ -270,8 +263,8 @@ def _rollout_body(net_apply_fn, squash_fn, params, scen_idx, target_max_v, rng_k
         "min_dist":    final_mhd,
         "time":        time_g,
         "yield_score": yield_score,
-        "step_dists":  step_dists_masked,   # (MAX_STEPS, N_ENVS) surface dist
-        "step_vs":     step_vs_masked,       # (MAX_STEPS, N_ENVS) linear speed
+        "step_dists":  step_dists,   # (MAX_STEPS, N_ENVS)
+        "step_vs":     step_vs,      # (MAX_STEPS, N_ENVS)
     }
 
 
@@ -363,9 +356,8 @@ def main():
     print()
 
     # ── Sequential evaluation loop ────────────────────────────────────────────
-    results    = []
-    # Per-policy lists of (dist, v) pairs for the proximity-speed scatter
-    scatter_data: dict[str, tuple[list, list]] = {}
+    results      = []
+    scatter_data = {}   # {policy_name: (dists_array, vs_array)}
     scen_names = {
         0: "Random", 1: "Parallel", 2: "Perpend", 3: "Circular",
         4: "Bottleneck", 5: "Intersect", 6: "Groups",
@@ -375,20 +367,18 @@ def main():
     for p_name, params in policies.items():
         eval_fn  = _EVAL_FN[p_name]
         t_policy = time.time()
-        scatter_data[p_name] = ([], [])   # (dists_list, vs_list)
+        _sd_list, _sv_list = [], []
         for si in range(N_SCENARIOS):
             for vi, v_max in enumerate(MAX_V_TESTS):
                 rng, cell_rng = jax.random.split(rng)
                 cell = jax.device_get(jax.block_until_ready(
                     eval_fn(params, si, float(v_max), cell_rng)
                 ))
-                # Collect scatter points: flatten (MAX_STEPS, N_ENVS) → 1-D,
-                # drop NaN (post-done or no-human steps).
-                sd = cell["step_dists"].ravel()   # (T*N,)
+                sd = cell["step_dists"].ravel()
                 sv = cell["step_vs"].ravel()
-                valid = np.isfinite(sd) & np.isfinite(sv)
-                scatter_data[p_name][0].append(sd[valid])
-                scatter_data[p_name][1].append(sv[valid])
+                ok = np.isfinite(sd) & np.isfinite(sv)
+                _sd_list.append(sd[ok])
+                _sv_list.append(sv[ok])
                 for i in range(N_ENVS):
                     results.append({
                         "Policy":        p_name,
@@ -404,6 +394,10 @@ def main():
                         "Time to Goal":  cell["time"][i],
                         "Yield Score":   cell["yield_score"][i],
                     })
+        scatter_data[p_name] = (
+            np.concatenate(_sd_list),
+            np.concatenate(_sv_list),
+        )
         print(f"  {p_name} done in {time.time() - t_policy:.1f}s")
 
     df = pd.DataFrame(results)
@@ -587,134 +581,74 @@ def main():
     plt.savefig("Evaluation_Dashboard.png", dpi=300)
     print("Saved 'Evaluation_Dashboard.png'")
 
-    # ── Proximity-Speed Scatter ───────────────────────────────────────────
-    _plot_proximity_speed_scatter(scatter_data)
+    _plot_proximity_speed(scatter_data)
 
 
-def _plot_proximity_speed_scatter(scatter_data: dict):
+def _plot_proximity_speed(scatter_data: dict):
     """
-    One panel per policy: scatter of (min human surface distance, linear speed)
-    for every active timestep across all episodes, scenarios and speed caps.
-
-    Overlaid statistics:
-      • Median speed  in bins of 0.25 m    (thick solid line)
-      • 25th-75th percentile band           (shaded)
-      • 10th & 90th percentile lines        (dashed)
-      • Pearson r and point count in legend
-      • Vertical dashed lines at 0 m (collision) and 0.5 m (comfort)
+    One panel per policy: raw scatter of every active timestep across all
+    episodes, scenarios and speed caps.
+    x = surface distance to nearest human (m)  — negative means collision
+    y = robot linear speed at that moment (m/s)
     """
-    import matplotlib.gridspec as gridspec
-    from scipy import stats as sp_stats
-
     policies = list(scatter_data.keys())
-    n_pol    = len(policies)
-    if n_pol == 0:
+    if not policies:
         return
 
     POLICY_COLORS = {"PPO": "#4C72B0", "SAC": "#DD8452", "TQC": "#55A868"}
-    BIN_WIDTH  = 0.25   # m  — width of each distance bin for statistics
-    BIN_EDGES  = np.arange(-0.5, 4.0 + BIN_WIDTH, BIN_WIDTH)
-    BIN_CENTS  = (BIN_EDGES[:-1] + BIN_EDGES[1:]) * 0.5
-    MAX_SCATTER_PTS = 80_000   # cap per policy to keep the PNG manageable
+    MAX_PTS = 120_000   # sub-sample per policy so the PNG stays manageable
 
     fig, axes = plt.subplots(
-        1, n_pol,
-        figsize=(9 * n_pol, 8),
+        1, len(policies),
+        figsize=(8 * len(policies), 7),
         sharey=True, squeeze=False
     )
     fig.suptitle(
-        "Linear Speed vs. Proximity to Nearest Human\n"
-        "(all active timesteps, all scenarios and speed caps)",
-        fontsize=16, weight="bold"
+        "Linear Speed vs. Distance to Nearest Human\n"
+        "(all active timesteps · all scenarios · all speed caps)",
+        fontsize=15, weight="bold"
     )
 
-    for col_idx, p_name in enumerate(policies):
-        ax = axes[0, col_idx]
+    for col, p_name in enumerate(policies):
+        ax    = axes[0, col]
         color = POLICY_COLORS.get(p_name, "#888888")
+        dists, vs = scatter_data[p_name]
 
-        dists_all = np.concatenate(scatter_data[p_name][0])
-        vs_all    = np.concatenate(scatter_data[p_name][1])
+        # Discard anything outside plausible physical range
+        ok    = (dists >= -0.3) & (dists <= 4.0) & (vs >= 0.0) & (vs <= 2.05)
+        dists = dists[ok]
+        vs    = vs[ok]
+        n     = len(dists)
 
-        # Clip extreme outliers (sensor noise / edge artefacts)
-        keep = (dists_all >= -0.5) & (dists_all <= 4.0) & (vs_all >= 0.0) & (vs_all <= 2.0)
-        dists_all = dists_all[keep]
-        vs_all    = vs_all[keep]
+        # Sub-sample for rendering
+        if n > MAX_PTS:
+            rng_sc = np.random.default_rng(0)
+            idx    = rng_sc.choice(n, MAX_PTS, replace=False)
+            dists, vs = dists[idx], vs[idx]
 
-        n_total = len(dists_all)
-
-        # Sub-sample for scatter rendering (keeps file size reasonable)
-        if n_total > MAX_SCATTER_PTS:
-            idx = np.random.choice(n_total, MAX_SCATTER_PTS, replace=False)
-            d_plot, v_plot = dists_all[idx], vs_all[idx]
-        else:
-            d_plot, v_plot = dists_all, vs_all
-
-        # ── Scatter ───────────────────────────────────────────────────────
         ax.scatter(
-            d_plot, v_plot,
-            s=2, alpha=0.07, color=color, rasterized=True,
-            label=f"Steps (n={n_total:,})"
+            dists, vs,
+            s=1.5, alpha=0.08, color=color,
+            rasterized=True
         )
 
-        # ── Binned statistics ─────────────────────────────────────────────
-        medians = np.full(len(BIN_CENTS), np.nan)
-        p10     = np.full(len(BIN_CENTS), np.nan)
-        p25     = np.full(len(BIN_CENTS), np.nan)
-        p75     = np.full(len(BIN_CENTS), np.nan)
-        p90     = np.full(len(BIN_CENTS), np.nan)
+        # Reference lines
+        ax.axvline(0.0, color="red",    lw=1.5, ls="--", alpha=0.8,
+                   label="Collision (0 m)")
+        ax.axvline(0.5, color="orange", lw=1.2, ls=":",  alpha=0.7,
+                   label="Comfort (0.5 m)")
 
-        for bi, (lo, hi) in enumerate(zip(BIN_EDGES[:-1], BIN_EDGES[1:])):
-            mask = (dists_all >= lo) & (dists_all < hi)
-            if mask.sum() >= 10:   # need at least 10 pts for reliable stats
-                v_bin       = vs_all[mask]
-                medians[bi] = np.median(v_bin)
-                p10[bi]     = np.percentile(v_bin, 10)
-                p25[bi]     = np.percentile(v_bin, 25)
-                p75[bi]     = np.percentile(v_bin, 75)
-                p90[bi]     = np.percentile(v_bin, 90)
-
-        valid_bins = np.isfinite(medians)
-        bc = BIN_CENTS[valid_bins]
-
-        ax.fill_between(bc, p25[valid_bins], p75[valid_bins],
-                         alpha=0.30, color=color, label="IQR (25–75 %)")
-        ax.plot(bc, medians[valid_bins],
-                color=color, linewidth=3.0, label="Median speed")
-        ax.plot(bc, p10[valid_bins],
-                color=color, linewidth=1.5, linestyle="--", alpha=0.7, label="10th / 90th %ile")
-        ax.plot(bc, p90[valid_bins],
-                color=color, linewidth=1.5, linestyle="--", alpha=0.7)
-
-        # ── Pearson r ─────────────────────────────────────────────────────
-        if len(dists_all) > 2:
-            r, pval = sp_stats.pearsonr(dists_all, vs_all)
-            sign = "+" if r >= 0 else ""
-            ax.text(
-                0.97, 0.05,
-                f"Pearson r = {sign}{r:.3f}\np = {pval:.1e}",
-                transform=ax.transAxes,
-                ha="right", va="bottom", fontsize=10,
-                bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8)
-            )
-
-        # ── Reference lines ───────────────────────────────────────────────
-        ax.axvline(0.0,  color="red",    linestyle="--", linewidth=1.5,
-                   alpha=0.8, label="Collision boundary (0 m)")
-        ax.axvline(0.5,  color="orange", linestyle=":",  linewidth=1.5,
-                   alpha=0.8, label="Comfort boundary (0.5 m)")
-
-        # ── Axes formatting ───────────────────────────────────────────────
-        ax.set_xlim(-0.3, 3.5)
-        ax.set_ylim(0.0, 2.05)
+        ax.set_xlim(-0.2, 3.8)
+        ax.set_ylim(-0.05, 2.1)
         ax.set_xlabel("Surface distance to nearest human (m)", fontsize=12)
-        if col_idx == 0:
+        if col == 0:
             ax.set_ylabel("Linear speed (m/s)", fontsize=12)
-        ax.set_title(p_name, fontsize=14, weight="bold")
-        ax.legend(fontsize=8, loc="upper left")
-        ax.grid(True, alpha=0.3)
+        ax.set_title(f"{p_name}  —  {n:,} pts", fontsize=13, weight="bold")
+        ax.legend(fontsize=9, loc="upper left")
+        ax.grid(True, alpha=0.25)
 
     plt.tight_layout()
-    plt.savefig("proximity_speed_scatter.png", dpi=200)
+    plt.savefig("proximity_speed_scatter.png", dpi=180)
     print("Saved 'proximity_speed_scatter.png'")
     plt.close(fig)
 

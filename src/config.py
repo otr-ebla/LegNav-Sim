@@ -14,7 +14,7 @@ class SimConfig:
     ROOM_SIDE_LENGTH = 10.0  # meters
     ROOM_SIZE = (ROOM_SIDE_LENGTH, ROOM_SIDE_LENGTH)  # meters
     MAX_STEPS = 1000
-    HUMANS_RADIUS = 0.2  # meters
+    HUMANS_RADIUS = 0.4  # meters
     HUMANS_VELOCITY = 1.0 # m/s
     NUM_OBSTACLES = 25
     NUM_HUMANS = 5
