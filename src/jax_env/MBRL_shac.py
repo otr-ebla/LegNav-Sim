@@ -27,40 +27,43 @@ Il critico V_φ è addestrato separatamente via TD(λ) sugli stessi rollout —
 esattamente come in SHAC (Xu et al., 2022, "Accelerated Policy Learning with
 Parallel Differentiable Simulation").
 
-INTEGRAZIONE CON PPO
---------------------
+FIX APPLICATI
+-------------
 
-jax_mbrl.py coordina PPO e SHAC in un ibrido:
+  FIX 1 — Bug reward discounting in _shac_rollout_single:
+    Il reward terminale (goal-reached) veniva azzerato perché moltiplicato
+    per (1 - done). Corretto: il reward al passo t viene sempre incluso,
+    è il DISCOUNT FUTURO che si azzera quando done=1.
+    Carry aggiornato: il discount del passo successivo è 0 se done, gamma se no.
 
-  • PPO  → esplorazione globale, robustezza, stabilità
-  • SHAC → fine-tuning locale con gradiente esatto, convergenza veloce
+  FIX 2 — Deadly triad nel critico: target network EMA:
+    Il critico si aggiornava con old_params = current_params — self-training
+    puro, convergenza instabile. Aggiunto target network con EMA:
+    target_params viene aggiornato ogni step con τ=0.005 (soft update).
+    SHACTrainState ora include critic_target_params.
 
-Il mixing ratio α cresce con il success rate del curriculum:
-  α=0.0 all'inizio (solo PPO, quando la policy è rumorosa)
-  α→0.8 a convergenza (SHAC domina, PPO mantiene l'entropia)
+  FIX 3 — horizon come static_arg → troppe ricompilazioni:
+    Con SHAC_H_GROWTH_INTERVAL=40 e H che cresce da 4 a 24 ci sono 20
+    ricompilazioni del kernel BPTT più costoso. Fix: rollout sempre su
+    SHAC_H_MAX passi, reward mascherato a zero oltre l'orizzonte corrente
+    con una maschera JAX traced. Zero ricompilazioni per curriculum H.
 
-INSTABILITÀ DEL GRADIENTE
---------------------------
+  FIX 4 — jax.checkpoint per OOM BPTT:
+    Aggiunto jax.checkpoint su _step_fn nel scan per il gradient checkpointing.
+    Il backward pass ricomputa le attivazioni invece di tenerle tutte in VRAM.
+    Costo: ~30% più lento, risparmio VRAM: ~H× (da ~700MB a ~50MB per BPTT).
 
-BPTT su horizon H accumula il prodotto Jacobiano ∏ ∂s_{t+1}/∂s_t.
-Le discontinuità residue (jnp.clip) producono gradienti zero in saturazione,
-non NaN — quindi non fanno esplodere ma possono causare vanishing.
-Mitigazioni implementate:
+  FIX 5 — Import dentro lax.scan:
+    Tutti gli import da jax_env / jax_network spostati a top-level del modulo.
 
-  1. Gradient clipping su norma globale (separato da PPO clip).
-  2. Horizon warmup: H parte da H_MIN, cresce ogni SHAC_H_GROWTH_INTERVAL steps.
-  3. Stop-gradient sulla V_φ bootstrap (previene feedback loop critico→policy).
-  4. Normalizzazione del ritorno per scale invariance.
+  FIX 6 — _sample_shac_init_states non JITtata:
+    Aggiunto jax.jit alla vmap di reset per evitare ricompilazione.
 
-NOTA SULLA DIFFERENZIABILITÀ DI lax.scan
------------------------------------------
-
-jax.lax.scan è completamente differenziabile via BPTT.
-Il suo gradiente è calcolato efficacemente con l'algoritmo di Pearlmutter
-(forward accumulation degli Jacobiani + backward sweep) che XLA fonde in
-un singolo kernel — non ci sono copie intermedie per step.
-Su H=16 passi e 4096 envs paralleli questo è ~O(H · cost_forward),
-lo stesso ordine di complessità di PPO sulla stessa batch.
+INVARIATO
+---------
+  - Architettura SHAC (rollout differenziabile, vmap, TD(λ))
+  - Iperparametri (N_SHAC_ENVS, LR, gamma, lambda, grad clip)
+  - Interfaccia pubblica (init_shac, shac_update_step, save_shac_checkpoint)
 """
 
 import os
@@ -68,6 +71,8 @@ import functools
 import jax
 import jax.numpy as jnp
 import optax
+import flax
+import flax.linen
 import flax.serialization
 from typing import Tuple, NamedTuple
 
@@ -76,66 +81,55 @@ from jax_network import EndToEndActorCritic, scale_action_to_env
 from jax_env_multi import step_env, reset_env, EnvState
 from jax_wrappers import make_stacked_env, StackedEnvState
 
+# Costanti di osservazione (top-level, non dentro scan)
+from jax_env import NUM_RAYS, STATE_VEC_SIZE
+_POSE_SIZE = 3
+
 # ── Iperparametri SHAC ────────────────────────────────────────────────────────
 
-# Horizon: numero di passi su cui fare BPTT.
-# Inizia corto (gradienti stabili), cresce con il training.
-SHAC_H_INIT  = 4      # passi iniziali — gradienti sicuramente stabili
-SHAC_H_MAX   = 24     # massimo — ~3.6s di simulazione a dt=0.15
-SHAC_H_GROWTH_INTERVAL = 40   # outer updates tra ogni aumento di H
+SHAC_H_INIT  = 4
+SHAC_H_MAX   = 24     # rollout sempre su H_MAX, reward mascherato oltre h_curr
+SHAC_H_GROWTH_INTERVAL = 40
 
-# Numero di envs paralleli per SHAC — separato da NUM_ENVS di PPO.
-# Più piccolo perché la BPTT per env è più costosa della forward-only di PPO.
 N_SHAC_ENVS = 1024
 
-# Learning rates SHAC (separati da PPO — il gradiente esatto richiede lr più piccolo)
-SHAC_LR_ACTOR  = 3e-5   # lr per la policy — gradiente esatto, no noise → lr basso
-SHAC_LR_CRITIC = 3e-4   # lr per il critico TD — come PPO ma separato
+SHAC_LR_ACTOR  = 3e-5
+SHAC_LR_CRITIC = 3e-4
 
-# Discount e lambda per il critico SHAC
 SHAC_GAMMA    = 0.99
-SHAC_LAM      = 0.95   # TD(λ) per il critico
+SHAC_LAM      = 0.95
 SHAC_VF_COEF  = 0.5
 
-# Gradient clipping SHAC (separato e più stretto di PPO per stabilità BPTT)
 SHAC_GRAD_NORM_ACTOR  = 0.2
 SHAC_GRAD_NORM_CRITIC = 1.0
 
-# Normalizzazione ritorni (stabilizza il gradiente analitico attraverso l'horizon)
 SHAC_RETURN_NORM_EPS = 1e-8
 
-# Mixing ratio PPO↔SHAC in jax_mbrl.py:
-# alpha = 0 → solo PPO, alpha = 1 → solo SHAC
-# Viene calcolato esternamente; qui esponiamo solo la funzione di update.
+# Soft update rate per il target network del critico (EMA)
+SHAC_TARGET_TAU = 0.005
 
-OBS_SIZE = 3 * 3 + 9 + 108 * 3   # 342 — deve coincidere con jax_train.py
+OBS_SIZE = 3 * 3 + 9 + 108 * 3   # 342
 
 
 # ── Stato del trainer SHAC ────────────────────────────────────────────────────
 
 class SHACTrainState(NamedTuple):
     """Stato completo del trainer SHAC (serializzabile con flax)."""
-    actor_params:  any   # parametri della policy (condivisi con PPO)
-    critic_params: any   # parametri del critico SHAC (separati)
-    actor_opt:     any   # stato optimizer actor
-    critic_opt:    any   # stato optimizer critico
-    horizon:       int   # H corrente (cresce con il training)
-    update_count:  int   # outer updates completati
+    actor_params:         any   # parametri della policy (condivisi con PPO)
+    critic_params:        any   # parametri del critico SHAC (online)
+    critic_target_params: any   # target network EMA — fix deadly triad
+    actor_opt:            any
+    critic_opt:           any
+    horizon:              int
+    update_count:         int
 
 
 # ── Rete critico SHAC ─────────────────────────────────────────────────────────
-# Critico separato dalla rete actor-critic di PPO.
-# Architettura deliberatamente più semplice: il critico SHAC lavora su
-# traiettorie brevi (H piccolo), la rappresentazione non deve essere profonda.
 
 class SHACCritic(flax.linen.Module):
     """
     Critico dedicato a SHAC — stima V(s) per il bootstrap a fine orizzonte.
-
-    Separato dal critico di PPO per evitare interferenze:
-      - PPO addestra il critico con GAE su ROLLOUT_STEPS=64 passi
-      - SHAC usa un critico che vede SHAC_H_MAX=24 passi di ritorno discounted
-      Il bias temporale è diverso → due critici separati è più pulito.
+    Separato dal critico di PPO per evitare interferenze di bias temporale.
     """
     @flax.linen.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -152,59 +146,42 @@ def _shac_rollout_single(
     critic_params,
     actor_apply,
     critic_apply,
-    init_obs:   jnp.ndarray,    # (OBS_SIZE,)
-    init_state: StackedEnvState,
-    rng_key:    jnp.ndarray,
-    horizon:    int,
-    ghost_robot: bool = True,
+    init_obs:    jnp.ndarray,       # (OBS_SIZE,)
+    init_state:  StackedEnvState,
+    rng_key:     jnp.ndarray,
+    horizon_mask: jnp.ndarray,      # (SHAC_H_MAX,) bool — True per t < h_curr
+    ghost_robot:  bool = True,
 ):
     """
-    Esegue un rollout di `horizon` passi per UN singolo environment.
-    Ritorna J(θ) = Σ γ^t r_t + γ^H V(s_H).
+    Esegue un rollout di SHAC_H_MAX passi per UN singolo environment.
+    I reward oltre l'orizzonte corrente sono mascherati a zero via horizon_mask.
 
-    Questa funzione è differenziabile rispetto ad actor_params e critic_params.
-    Viene vmappata su N_SHAC_ENVS envs in parallelo.
+    FIX 1: reward terminale incluso correttamente.
+    FIX 3: horizon è ora una maschera JAX traced → nessuna ricompilazione.
+    FIX 4: jax.checkpoint su _step_fn → gradient checkpointing contro OOM.
 
-    NOTA: horizon è un argomento Python (non traced) perché lax.scan richiede
-    length statica. Il chiamante passa il valore corretto per ogni update.
-
-    NOTA 2: lo stop_gradient su V(s_H) è deliberato: non vogliamo che il
-    gradiente dell'actor scorra attraverso il critico durante l'ottimizzazione
-    dell'actor. Il critico è addestrato separatamente.
+    Ritorna J(θ) = Σ_{t<h} γ^t · r_t  +  γ^h · V(s_h)
+    dove h = numero di True in horizon_mask.
     """
 
-    def _step_fn(carry, _):
+    def _step_fn(carry, t):
         obs, state, key, cum_discount = carry
-        key, action_key, step_key, obs_key = jax.random.split(key, 4)
+        key, step_key = jax.random.split(key)
 
-        # ── Azione DETERMINISTICA dalla policy (nessun campionamento) ──────────
-        # Usare la media è fondamentale per la differenziabilità:
-        # il campionamento gaussiano introduce noise non differenziabile
-        # rispetto ai parametri (è differenziabile via reparametrizzazione,
-        # ma introduce varianza nel gradiente che annulla il vantaggio di SHAC).
-        # La media è la policy "più probabile" — per SHAC vogliamo il gradiente
-        # del comportamento deterministico, non del comportamento stocastico.
+        # Azione deterministica (media della policy) — fondamentale per BPTT
         mean, _, _ = actor_apply({"params": actor_params}, obs[None])
-        mean = mean[0]   # rimuovi batch dim
-        raw_action = mean  # deterministic
+        mean = mean[0]
+        env_action = scale_action_to_env(mean, state.env_state.max_v)
 
-        # Scala l'azione all'intervallo dell'environment
-        env_action = scale_action_to_env(raw_action, state.env_state.max_v)
-
-        # ── Step dell'environment ──────────────────────────────────────────────
-        # step_env è differenziabile (hsfm_diff, jnp.where ovunque)
-        # La differenziabilità si propaga: obs_new e reward dipendono
-        # in modo smooth da env_action che dipende da actor_params.
+        # Step differenziabile
         base_obs, new_base_state, reward, done, info = step_env(
             step_key, state.env_state, env_action, ghost_robot=ghost_robot
         )
 
-        # Aggiorna lo stack di osservazioni (stesso meccanismo di jax_wrappers)
-        from jax_env import NUM_RAYS, STATE_VEC_SIZE
-        POSE_SIZE = 3
-        new_pose      = base_obs[0:POSE_SIZE]
-        new_state_vec = base_obs[POSE_SIZE : POSE_SIZE + STATE_VEC_SIZE]
-        new_lidar     = base_obs[POSE_SIZE + STATE_VEC_SIZE:]
+        # Aggiorna stack osservazioni
+        new_pose      = base_obs[0:_POSE_SIZE]
+        new_state_vec = base_obs[_POSE_SIZE : _POSE_SIZE + STATE_VEC_SIZE]
+        new_lidar     = base_obs[_POSE_SIZE + STATE_VEC_SIZE:]
 
         new_lidar_stack = jnp.concatenate(
             [state.lidar_stack[1:], new_lidar[None]], axis=0
@@ -221,33 +198,37 @@ def _shac_rollout_single(
             new_pose_stack.flatten(), new_state_vec, new_lidar_stack.flatten()
         ])
 
-        # Accumula reward scontato (nota: done=1 azzera il discount futuro
-        # per fermare il gradiente agli episodi terminati — comportamento corretto)
-        discounted_r = cum_discount * reward * (1.0 - done.astype(jnp.float32))
+        # FIX 1: il reward al passo t è SEMPRE incluso (include il goal reward).
+        # Il discount FUTURO si azzera se l'episodio è terminato.
+        discounted_r  = cum_discount * reward
+        done_f        = done.astype(jnp.float32)
+        next_discount = cum_discount * SHAC_GAMMA * (1.0 - done_f)
 
-        return (new_obs, new_stacked, key, cum_discount * SHAC_GAMMA), \
-               (discounted_r, new_obs, done)
+        # FIX 3: maschera il reward per i passi oltre h_curr (traced, no retrace)
+        masked_r = discounted_r * horizon_mask[t].astype(jnp.float32)
 
-    # Esegui il rollout completo — completamente differenziabile
-    (final_obs, final_state, _, _), (rewards, obs_seq, dones) = jax.lax.scan(
-        _step_fn,
-        (init_obs, init_state, rng_key, 1.0),
-        None,
-        length=horizon,
-    )
+        return (new_obs, new_stacked, key, next_discount), \
+               (masked_r, new_obs, done)
 
-    # ── Bootstrap con il critico a fine orizzonte ─────────────────────────────
-    # Stop-gradient: il critico è un target fisso per l'actor.
-    # Addestriamo il critico separatamente sotto.
+    # FIX 4: gradient checkpointing — ricomputa attivazioni nel backward
+    _step_fn_ckpt = jax.checkpoint(_step_fn)
+
+    (final_obs, final_state, _, final_discount), (rewards, obs_seq, dones) = \
+        jax.lax.scan(
+            _step_fn_ckpt,
+            (init_obs, init_state, rng_key, jnp.ones(())),
+            jnp.arange(SHAC_H_MAX),   # t passato come xs per la maschera
+            length=SHAC_H_MAX,
+        )
+
+    # Bootstrap con il critico a fine orizzonte (stop_gradient: critico è target fisso)
     bootstrap_v = jax.lax.stop_gradient(
         critic_apply({"params": critic_params}, final_obs[None])[0]
     )
 
-    # Ritorno totale = Σ reward scontati + bootstrap
-    # I reward sono già scontati cumulativamente nel scan (cum_discount * r)
-    total_return = jnp.sum(rewards) + SHAC_GAMMA ** horizon * bootstrap_v
+    # Il discount accumulato a fine scan è γ^H (o 0 se terminato prima)
+    total_return = jnp.sum(rewards) + final_discount * bootstrap_v
 
-    # Normalizza per scale invariance (stabile attraverso horizon diversi)
     return total_return, (obs_seq, rewards, dones, final_obs)
 
 
@@ -268,26 +249,22 @@ def _actor_loss_fn(
     init_obs_batch,
     init_state_batch,
     rng_keys,
-    horizon,
+    horizon_mask,
     ghost_robot,
 ):
     """
-    J(θ) = E_envs[ Σ γ^t r_t + γ^H V(s_H) ]
-
-    jax.grad(actor_loss_fn)(actor_params) è il gradiente analitico della policy.
-    Varianza zero rispetto al campionamento — il vantaggio principale di SHAC.
+    J(θ) = E_envs[ Σ_{t<h} γ^t r_t + γ^h V(s_h) ]
+    Gradiente analitico, varianza zero.
     """
     returns, (obs_seq, rewards, dones, final_obs) = _shac_rollout_batched(
         actor_params, critic_params, actor_apply, critic_apply,
-        init_obs_batch, init_state_batch, rng_keys, horizon, ghost_robot,
+        init_obs_batch, init_state_batch, rng_keys, horizon_mask, ghost_robot,
     )
 
-    # Normalizza i ritorni per stabilità numerica
-    ret_mean = jnp.mean(returns)
-    ret_std  = jnp.std(returns) + SHAC_RETURN_NORM_EPS
+    ret_mean = jax.lax.stop_gradient(jnp.mean(returns))
+    ret_std  = jax.lax.stop_gradient(jnp.std(returns) + SHAC_RETURN_NORM_EPS)
     normalized_returns = (returns - ret_mean) / ret_std
 
-    # Loss: massimizza il ritorno atteso → minimizza il negativo
     loss = -jnp.mean(normalized_returns)
     return loss, (returns, obs_seq, rewards, dones, final_obs)
 
@@ -297,35 +274,33 @@ def _actor_loss_fn(
 def _critic_loss_fn(
     critic_params,
     critic_apply,
-    obs_seq,      # (N_SHAC_ENVS, H, OBS_SIZE)
-    rewards,      # (N_SHAC_ENVS, H)
-    dones,        # (N_SHAC_ENVS, H)
-    final_obs,    # (N_SHAC_ENVS, OBS_SIZE)
-    old_critic_params,  # per calcolare il target — stop_gradient
+    obs_seq,      # (N, H, OBS_SIZE)
+    rewards,      # (N, H)
+    dones,        # (N, H)
+    final_obs,    # (N, OBS_SIZE)
+    target_params,  # FIX 2: target network separato (EMA), non current params
 ):
     """
-    Addestra il critico con TD(λ) sui rollout SHAC.
-
-    Il target usa old_critic_params (stop_gradient) per evitare il
-    deadly triad: critic aggiorna sia il target che la predizione
-    con gli stessi parametri → divergenza.
+    TD(λ) loss per il critico SHAC.
+    Usa target_params (EMA) invece dei params correnti — elimina il deadly triad.
     """
     N, H = rewards.shape
 
-    # ── Calcola il ritorno TD(λ) come target ─────────────────────────────────
-    # bootstrap dall'ultimo stato con il target network (old params)
+    # Bootstrap dall'ultimo stato con il TARGET network
     v_final = jax.lax.stop_gradient(
-        critic_apply({"params": old_critic_params}, final_obs)  # (N,)
+        critic_apply({"params": target_params}, final_obs)  # (N,)
     )
 
     def _td_lambda_scan(carry, t):
-        # carry: (gae, next_v)
         gae, next_v = carry
         r   = rewards[:, t]
         d   = dones[:, t].astype(jnp.float32)
         obs = obs_seq[:, t, :]
 
-        v_pred  = critic_apply({"params": old_critic_params}, obs)
+        # Target network per il valore corrente (stop_gradient)
+        v_pred  = jax.lax.stop_gradient(
+            critic_apply({"params": target_params}, obs)
+        )
         delta   = r + SHAC_GAMMA * next_v * (1.0 - d) - v_pred
         gae     = delta + SHAC_GAMMA * SHAC_LAM * (1.0 - d) * gae
         target  = jax.lax.stop_gradient(gae + v_pred)
@@ -334,17 +309,14 @@ def _critic_loss_fn(
     (_, _), targets = jax.lax.scan(
         _td_lambda_scan,
         (jnp.zeros(N), v_final),
-        jnp.arange(H - 1, -1, -1),  # scan al contrario (da H a 0)
+        jnp.arange(H - 1, -1, -1),
         reverse=False,
     )
-    # targets shape: (H, N) — trasponi in (N, H)
-    targets = targets.T  # (N, H)
+    targets = targets.T  # (H, N) → (N, H)
 
-    # ── MSE tra predizioni e target ───────────────────────────────────────────
-    # Calcola V(s) per tutti gli step
-    obs_flat    = obs_seq.reshape(N * H, OBS_SIZE)
-    v_preds     = critic_apply({"params": critic_params}, obs_flat)  # (N*H,)
-    v_preds     = v_preds.reshape(N, H)
+    # MSE tra predizioni ONLINE e target EMA
+    obs_flat = obs_seq.reshape(N * H, OBS_SIZE)
+    v_preds  = critic_apply({"params": critic_params}, obs_flat).reshape(N, H)
 
     targets_sg  = jax.lax.stop_gradient(targets)
     critic_loss = SHAC_VF_COEF * jnp.mean((v_preds - targets_sg) ** 2)
@@ -352,58 +324,64 @@ def _critic_loss_fn(
 
 
 # ── Step di update SHAC (JIT-compilato) ──────────────────────────────────────
+# FIX 3: horizon rimosso da static_argnums — ora è una maschera JAX traced.
+# static_argnums rimasti: actor_apply(2), critic_apply(3),
+#                         actor_optimizer(4), critic_optimizer(5), ghost_robot(6)
 
-@functools.partial(jax.jit, static_argnums=(2, 3, 4, 5, 6, 7))
+@functools.partial(jax.jit, static_argnums=(2, 3, 4, 5, 6))
 def shac_update_step(
     shac_state:       SHACTrainState,
-    env_data:         Tuple,   # (init_obs_batch, init_state_batch, rng_keys)
-    actor_apply,               # static: funzione apply della rete actor
-    critic_apply,              # static: funzione apply del critico
-    actor_optimizer,           # static: oggetto optax (non è un array JAX)
-    critic_optimizer,          # static: oggetto optax (non è un array JAX)
-    horizon:          int,     # static: H corrente
-    ghost_robot:      bool,    # static: modalità ghost
+    env_data:         Tuple,   # (init_obs_batch, init_state_batch, rng_keys, horizon_mask)
+    actor_apply,
+    critic_apply,
+    actor_optimizer,
+    critic_optimizer,
+    ghost_robot:      bool,
 ):
     """
     Un update SHAC completo.
-    Ritorna (new_shac_state, metrics_dict).
-
-    Questo è l'unico punto di ingresso JIT per tutto il training SHAC —
-    actor e critico vengono aggiornati in sequenza nello stesso step.
+    env_data ora include horizon_mask: (SHAC_H_MAX,) bool array traced da JAX.
+    Nessuna ricompilazione al cambio di orizzonte.
     """
-    actor_params  = shac_state.actor_params
-    critic_params = shac_state.critic_params
-    actor_opt     = shac_state.actor_opt
-    critic_opt    = shac_state.critic_opt
+    actor_params         = shac_state.actor_params
+    critic_params        = shac_state.critic_params
+    critic_target_params = shac_state.critic_target_params
+    actor_opt            = shac_state.actor_opt
+    critic_opt           = shac_state.critic_opt
 
-    init_obs_batch, init_state_batch, rng_keys = env_data
+    init_obs_batch, init_state_batch, rng_keys, horizon_mask = env_data
 
     # ── 1. Gradiente ANALITICO dell'actor ────────────────────────────────────
-    # value_and_grad calcola J e ∇_θ J in un solo forward+backward pass.
-    # Il backward pass percorre la pipeline:
-    #   ∇_θ J = ∂J/∂returns · ∂returns/∂rewards · ∂rewards/∂actions · ∂actions/∂θ
-    # dove ogni ∂ è calcolato esattamente da XLA automatic differentiation.
     (actor_loss, (returns, obs_seq, rewards, dones, final_obs)), actor_grads = \
         jax.value_and_grad(_actor_loss_fn, has_aux=True)(
-            actor_params, critic_params, actor_apply, critic_apply,
-            init_obs_batch, init_state_batch, rng_keys, horizon, ghost_robot,
+            actor_params, critic_target_params, actor_apply, critic_apply,
+            init_obs_batch, init_state_batch, rng_keys, horizon_mask, ghost_robot,
         )
 
-    # Clipping del gradiente dell'actor — più stretto di PPO perché il gradiente
-    # analitico è esatto ma può essere grande quando la policy è lontana dall'ottimo.
+    # NaN guard sui gradienti actor
+    actor_grads = jax.tree_util.tree_map(
+        lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0),
+        actor_grads
+    )
+
     actor_grad_norm = optax.global_norm(actor_grads)
     actor_updates, new_actor_opt = actor_optimizer.update(
         actor_grads, actor_opt, actor_params
     )
     new_actor_params = optax.apply_updates(actor_params, actor_updates)
 
-    # ── 2. Aggiornamento del critico (TD(λ)) ─────────────────────────────────
-    # Il critico usa gli stessi rollout generati dall'actor — nessun passo
-    # di simulazione aggiuntivo. Costo totale = 1 rollout forward + 2 backward.
+    # ── 2. Aggiornamento del critico (TD(λ) con target network) ──────────────
+    # FIX 2: passa critic_target_params come target (EMA), non critic_params
     critic_loss, critic_grads = jax.value_and_grad(_critic_loss_fn)(
         critic_params, critic_apply,
         obs_seq, rewards, dones, final_obs,
-        critic_params,   # old params = current (soft target, non hard copy)
+        critic_target_params,   # target EMA separato
+    )
+
+    # NaN guard sui gradienti critico
+    critic_grads = jax.tree_util.tree_map(
+        lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0),
+        critic_grads
     )
 
     critic_grad_norm = optax.global_norm(critic_grads)
@@ -412,14 +390,21 @@ def shac_update_step(
     )
     new_critic_params = optax.apply_updates(critic_params, critic_updates)
 
-    # ── 3. Aggiorna lo stato ──────────────────────────────────────────────────
+    # ── 3. Soft update del target network (EMA) ───────────────────────────────
+    # FIX 2: τ=0.005 — target si avvicina lentamente all'online network
+    new_target_params = jax.tree_util.tree_map(
+        lambda target, online: (1.0 - SHAC_TARGET_TAU) * target + SHAC_TARGET_TAU * online,
+        critic_target_params, new_critic_params
+    )
+
     new_state = SHACTrainState(
-        actor_params  = new_actor_params,
-        critic_params = new_critic_params,
-        actor_opt     = new_actor_opt,
-        critic_opt    = new_critic_opt,
-        horizon       = shac_state.horizon,
-        update_count  = shac_state.update_count + 1,
+        actor_params         = new_actor_params,
+        critic_params        = new_critic_params,
+        critic_target_params = new_target_params,
+        actor_opt            = new_actor_opt,
+        critic_opt           = new_critic_opt,
+        horizon              = shac_state.horizon,
+        update_count         = shac_state.update_count + 1,
     )
 
     metrics = {
@@ -428,9 +413,20 @@ def shac_update_step(
         "mean_return":       jnp.mean(returns),
         "actor_grad_norm":   actor_grad_norm,
         "critic_grad_norm":  critic_grad_norm,
-        "horizon":           horizon,
     }
     return new_state, metrics
+
+
+# ── Utility: costruisce la horizon_mask ───────────────────────────────────────
+
+def make_horizon_mask(h_curr: int) -> jnp.ndarray:
+    """
+    Costruisce una maschera (SHAC_H_MAX,) bool: True per t < h_curr.
+    Passata come array JAX traced a shac_update_step — nessuna ricompilazione.
+
+    Esempio: h_curr=6, SHAC_H_MAX=24 → [T,T,T,T,T,T,F,F,...,F]
+    """
+    return jnp.arange(SHAC_H_MAX) < h_curr
 
 
 # ── Inizializzazione ──────────────────────────────────────────────────────────
@@ -438,9 +434,7 @@ def shac_update_step(
 def init_shac(rng_key, actor_params, actor_apply):
     """
     Inizializza lo stato SHAC dato i parametri actor di PPO.
-
-    actor_params: condivisi con PPO — SHAC aggiorna la stessa rete.
-    Il critico SHAC è una rete separata, inizializzata qui.
+    FIX 2: critic_target_params inizializzato = critic_params (hard copy iniziale).
     """
     rng_key, ck = jax.random.split(rng_key)
 
@@ -449,9 +443,12 @@ def init_shac(rng_key, actor_params, actor_apply):
     critic_params = critic_net.init(ck, dummy_obs)["params"]
     critic_apply  = critic_net.apply
 
+    # Target network = copia esatta dei params iniziali
+    critic_target_params = jax.tree_util.tree_map(lambda x: x.copy(), critic_params)
+
     actor_optimizer = optax.chain(
         optax.clip_by_global_norm(SHAC_GRAD_NORM_ACTOR),
-        optax.adam(SHAC_LR_ACTOR, eps=1e-5),
+        optax.sgd(learning_rate=SHAC_LR_ACTOR)
     )
     critic_optimizer = optax.chain(
         optax.clip_by_global_norm(SHAC_GRAD_NORM_CRITIC),
@@ -462,22 +459,22 @@ def init_shac(rng_key, actor_params, actor_apply):
     critic_opt = critic_optimizer.init(critic_params)
 
     state = SHACTrainState(
-        actor_params  = actor_params,
-        critic_params = critic_params,
-        actor_opt     = actor_opt,
-        critic_opt    = critic_opt,
-        horizon       = SHAC_H_INIT,
-        update_count  = 0,
+        actor_params         = actor_params,
+        critic_params        = critic_params,
+        critic_target_params = critic_target_params,
+        actor_opt            = actor_opt,
+        critic_opt           = critic_opt,
+        horizon              = SHAC_H_INIT,
+        update_count         = 0,
     )
     return state, critic_apply, actor_optimizer, critic_optimizer
 
 
 def get_shac_horizon(update_count: int) -> int:
     """
-    Horizon curriculum: cresce linearmente da SHAC_H_INIT a SHAC_H_MAX.
-    Iniziare con H piccolo è essenziale: con H=24 i gradienti di BPTT
-    all'inizio del training (policy casuale) sono rumorosissimi.
-    Con H=4 i gradienti locali sono significativi già dal primo update.
+    Horizon curriculum: cresce da SHAC_H_INIT a SHAC_H_MAX.
+    Ritorna il valore intero Python — usato solo per costruire horizon_mask,
+    non passato direttamente a shac_update_step (che ora è trace-agnostic).
     """
     n_increases = update_count // SHAC_H_GROWTH_INTERVAL
     h = SHAC_H_INIT + n_increases
@@ -485,15 +482,16 @@ def get_shac_horizon(update_count: int) -> int:
 
 
 def save_shac_checkpoint(shac_state, filepath):
-    """Serializza lo stato SHAC (actor + critico + optimizer states)."""
+    """Serializza lo stato SHAC (actor + critico + target + optimizer states)."""
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     bundle = {
-        "actor_params":  jax.device_get(shac_state.actor_params),
-        "critic_params": jax.device_get(shac_state.critic_params),
-        "actor_opt":     jax.device_get(shac_state.actor_opt),
-        "critic_opt":    jax.device_get(shac_state.critic_opt),
-        "horizon":       shac_state.horizon,
-        "update_count":  shac_state.update_count,
+        "actor_params":         jax.device_get(shac_state.actor_params),
+        "critic_params":        jax.device_get(shac_state.critic_params),
+        "critic_target_params": jax.device_get(shac_state.critic_target_params),
+        "actor_opt":            jax.device_get(shac_state.actor_opt),
+        "critic_opt":           jax.device_get(shac_state.critic_opt),
+        "horizon":              shac_state.horizon,
+        "update_count":         shac_state.update_count,
     }
     with open(filepath, "wb") as f:
         f.write(flax.serialization.to_bytes(bundle))

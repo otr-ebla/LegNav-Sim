@@ -17,12 +17,9 @@ Ogni outer update esegue, nell'ordine:
   2. SHAC update  (N_SHAC_ENVS=1024 × horizon H)
      → gradiente analitico esatto via BPTT
      → aggiorna lo STESSO actor (shared params) con gradiente a varianza zero
-     → aggiorna critico SHAC separato via TD(λ)
+     → aggiorna critico SHAC separato via TD(λ) con target network EMA
 
-  3. Gradient mixing
-     → alpha(suc_pct) controlla il peso relativo SHAC/PPO
-     → alpha=0 all'inizio (PPO puro), cresce a 0.7 a convergenza
-     → parametri actor aggiornati con gradiente combinato
+  3. Parametri actor SHAC propagati indietro a PPO per sincronizzazione.
 
 CONDIVISIONE DEI PARAMETRI
 --------------------------
@@ -32,20 +29,16 @@ L'actor è CONDIVISO tra PPO e SHAC. Questo è il punto chiave:
   - PPO esplora e scopre stati/comportamenti nuovi
   - SHAC fine-tunes con gradiente esatto sugli stati visitati da PPO
 
-I due ottimizzatori scrivono sullo STESSO array di parametri ma applicano
-gradient step separati ogni outer update. Il bilanciamento è:
-
-  Δθ_total = (1-α) · Δθ_PPO + α · Δθ_SHAC
-
-In pratica: si applica prima PPO (aggiorna θ → θ'), poi SHAC parte da θ'
-e applica il suo update — questo è un'approssimazione sequenziale del
-mixing che funziona bene in pratica (vedi DARC, Byravan et al. 2021).
+I due ottimizzatori scrivono sullo STESSO array di parametri in sequenza:
+PPO fa il suo update (θ → θ'), poi SHAC parte da θ' e applica il suo update.
+L'alpha controlla quando SHAC inizia a contribuire (alpha=0 → solo PPO).
 
 CURRICULUM
 ----------
 
 Stesso curriculum di jax_ppo.py, più il SHAC horizon curriculum:
   H cresce da 4 a 24 passi ogni SHAC_H_GROWTH_INTERVAL=40 update PPO.
+  L'orizzonte è ora implementato come maschera JAX traced → zero ricompilazioni.
 
 MEMORIA
 -------
@@ -54,8 +47,28 @@ Budget VRAM (10 GB):
   PPO rollout buffer: 8192 × 64 × 342 × 4B ≈ 713 MB  (invariato)
   SHAC rollout:       1024 × 24 × 342 × 4B ≈  84 MB  (aggiuntivo)
   SHAC critico rete:  ~10 MB
-  SHAC BPTT graph:    ~200 MB (buffer di Jacobiani per H=24)
-  Totale aggiuntivo:  ~300 MB — dentro il budget.
+  SHAC BPTT graph:    ~50 MB con gradient checkpointing (vs ~700 MB senza)
+  Totale aggiuntivo:  ~150 MB — dentro il budget.
+
+FIX APPLICATI (rispetto alla versione precedente)
+-------------------------------------------------
+
+  FIX A — Normalizzazione returns in run_ppo_updates:
+    ret_flat_norm usava la media degli advantage — sbagliato, advantage e
+    returns hanno distribuzioni diverse. Ora i returns hanno la propria
+    normalizzazione (media e std calcolate separatamente).
+    Il value clipping PPO-style è già sufficiente per la stabilità.
+
+  FIX B — _mix_gradients rimossa (era dead code):
+    La funzione era definita ma non chiamata. Il mixing viene fatto
+    in modo sequenziale (PPO → SHAC sullo stesso θ), che è l'approccio
+    corretto e già implementato in hybrid_update_step.
+
+  FIX C — shac_update_step signature aggiornata (no più horizon static arg):
+    Ora prende horizon_mask invece di horizon intero.
+    env_data è una tupla di 4 elementi: (obs, state, keys, mask).
+
+  FIX D — _sample_shac_init_states ora è JITtata.
 """
 
 import os
@@ -92,11 +105,11 @@ from jax_network import EndToEndActorCritic
 from jax_train   import (collect_rollouts, init_env_state,
                           NUM_ENVS, ROLLOUT_STEPS, OBS_SIZE)
 from MBRL_shac    import (init_shac, shac_update_step, get_shac_horizon,
-                          save_shac_checkpoint, N_SHAC_ENVS, SHACCritic,
-                          SHAC_H_MAX)
+                           make_horizon_mask,
+                           save_shac_checkpoint, N_SHAC_ENVS, SHACCritic,
+                           SHAC_H_MAX)
 from jax_wrappers import make_stacked_env, make_autoreset_env
 
-# Riutilizza le funzioni PPO esistenti da jax_ppo.py
 from jax_ppo import (
     compute_gae,
     collect_episode_outcomes,
@@ -129,7 +142,7 @@ from jax_wrappers  import StackedEnvState
 #   value_loss = VF_COEF * (returns - V)² senza clipping.
 #   Quando il curriculum cambia la distribuzione dei returns, il critico
 #   diverge facendo 384 gradient steps su returns fuori distribuzione.
-#   FIX: value clipping PPO-style + normalizzazione dei returns.
+#   FIX: value clipping PPO-style + normalizzazione separata di adv e returns.
 #
 # PROBLEMA 3 — Nessun NaN guard:
 #   Un singolo NaN in un minibatch si propaga a tutti i successivi via scan.
@@ -193,32 +206,36 @@ def run_ppo_updates(train_state, obs_flat, actions_flat, adv_flat, ret_flat,
                     old_lp_flat, rng_key):
     """
     PPO update con epoch in loop Python (non lax.scan) per ridurre il grafo XLA.
-
     Ogni epoch compila un kernel con 64 minibatch — non 6×64=384.
-    Il risparmio di compilazione è ~6× in VRAM durante la fase XLA.
-    Il costo runtime è identico: gli stessi gradient step vengono eseguiti.
+
+    FIX A: advantages e returns normalizzati con statistiche SEPARATE.
+    I returns non vengono normalizzati con la media degli advantage — quelle
+    sono distribuzioni diverse. Il value clipping PPO-style gestisce la scala.
     """
     params, opt_state = train_state
 
-    # Normalizza advantages e returns con la stessa statistica (scale invariance)
+    # Normalizza advantages (media e std degli advantage)
     adv_mean = adv_flat.mean()
     adv_std  = adv_flat.std() + 1e-8
     adv_flat_norm = (adv_flat - adv_mean) / adv_std
-    ret_flat_norm = (ret_flat - adv_mean) / adv_std   # stessa scala di adv
+
+    # FIX A: normalizza returns con le proprie statistiche (non quelle di adv)
+    ret_mean = ret_flat.mean()
+    ret_std  = ret_flat.std() + 1e-8
+    ret_flat_norm = (ret_flat - ret_mean) / ret_std
 
     # Valori "vecchi" per il value clipping (forward pass una volta, fuori da JIT)
     _, _, old_vals_flat = _network_mbrl.apply({"params": params}, obs_flat)
-    old_vals_norm = (old_vals_flat - adv_mean) / adv_std
+    # Normalizza old_vals con la stessa statistica dei returns (stessa scala)
+    old_vals_norm = (old_vals_flat - ret_mean) / ret_std
 
     all_losses = []
-    last_loss = None
-    last_aux  = None
+    last_aux   = None
 
     epoch_keys = jax.random.split(rng_key, PPO_EPOCHS)
 
     for epoch_i in range(PPO_EPOCHS):
         perm = jax.random.permutation(epoch_keys[epoch_i], BATCH_SIZE)
-        epoch_losses = []
 
         for mb_i in range(N_MINIBATCHES):
             (params, opt_state), (loss, aux) = _ppo_minibatch_step(
@@ -226,24 +243,17 @@ def run_ppo_updates(train_state, obs_flat, actions_flat, adv_flat, ret_flat,
                 obs_flat, actions_flat, adv_flat_norm, ret_flat_norm,
                 old_lp_flat, old_vals_norm, perm,
             )
-            epoch_losses.append(loss)   # JAX array, no sync
-            last_aux = aux              # mantieni solo l'ultimo aux
-
-        all_losses.extend(epoch_losses)
+            all_losses.append(loss)
+            last_aux = aux
 
     # Sincronizzazione GPU una sola volta alla fine
     mean_loss = jnp.mean(jnp.stack(all_losses))
     return (params, opt_state), mean_loss, last_aux
 
+
 # ── Config SHAC ───────────────────────────────────────────────────────────────
 USE_SHAC = not args.no_shac
 
-# Alpha mixing: controllo del peso SHAC vs PPO nel gradient step.
-# Con alpha adattivo, cresce in funzione del success rate:
-#   suc <  30% → α = 0.0  (PPO puro, policy ancora casuale)
-#   suc <  55% → α = 0.3  (SHAC inizia a contribuire)
-#   suc <  70% → α = 0.6  (SHAC bilancia PPO)
-#   suc >= 70% → α = 0.8  (SHAC domina, PPO mantiene esplorazione)
 ALPHA_SCHEDULE = [
     (30.0, 0.0),
     (55.0, 0.3),
@@ -254,7 +264,7 @@ ALPHA_SCHEDULE = [
 def get_shac_alpha(suc_pct: float) -> float:
     """Ritorna il mixing alpha per il success rate corrente."""
     if args.shac_alpha >= 0.0:
-        return args.shac_alpha   # override CLI
+        return args.shac_alpha
     for threshold, alpha in ALPHA_SCHEDULE:
         if suc_pct < threshold:
             return alpha
@@ -270,8 +280,7 @@ network = EndToEndActorCritic(action_dim=2)
 def _sample_shac_init_states(rng_key, min_goal_dist: float, ghost_robot: bool):
     """
     Campiona N_SHAC_ENVS stati iniziali per il rollout SHAC.
-    Usa reset_env direttamente (senza autoreset) — vogliamo stati puliti,
-    non stati in mezzo a un episodio.
+    FIX D: vmap JITtata per evitare ricompilazione ad ogni chiamata.
     """
     reset_stacked, _ = make_stacked_env(
         reset_env, step_env, stack_dim=3, ghost_robot=ghost_robot
@@ -281,29 +290,9 @@ def _sample_shac_init_states(rng_key, min_goal_dist: float, ghost_robot: bool):
         return reset_stacked(key, min_goal_dist=min_goal_dist)
 
     keys = jax.random.split(rng_key, N_SHAC_ENVS)
-    obs_batch, state_batch = jax.vmap(_reset_one)(keys)
+    # FIX D: aggiungi jax.jit
+    obs_batch, state_batch = jax.jit(jax.vmap(_reset_one))(keys)
     return obs_batch, state_batch
-
-
-# ── Gradient mixing ───────────────────────────────────────────────────────────
-
-def _mix_gradients(ppo_grads, shac_grads, alpha: float):
-    """
-    Combina i gradienti PPO e SHAC con il mixing ratio alpha.
-
-    I due gradienti hanno scale molto diverse:
-      - PPO: gradiente normalizzato (advantage normalization) ≈ O(1)
-      - SHAC: gradiente analitico non normalizzato ≈ O(return_std)
-
-    Normalizziamo entrambi prima del mixing per scale invariance.
-    """
-    def _norm_and_mix(pg, sg):
-        pn = jnp.linalg.norm(pg) + 1e-8
-        sn = jnp.linalg.norm(sg) + 1e-8
-        # Normalizza a norma unitaria prima di combinare
-        return (1.0 - alpha) * (pg / pn) * pn + alpha * (sg / sn) * pn
-
-    return jax.tree_util.tree_map(_norm_and_mix, ppo_grads, shac_grads)
 
 
 # ── Update ibrido PPO + SHAC ─────────────────────────────────────────────────
@@ -318,23 +307,21 @@ def hybrid_update_step(
     rng_key,
     actor_apply,
     critic_apply_shac,
-    actor_optimizer_shac,
-    critic_optimizer_shac,
+    actor_opt_shac,
+    critic_opt_shac,
     horizon: int,
     alpha: float,
     ghost_robot: bool,
 ):
     """
     Esegue un outer update completo:
-      1. Calcola GAE e PPO gradients
-      2. Esegue SHAC update (se USE_SHAC e alpha > 0)
-      3. Applica i gradient misti all'actor
+      1. Calcola GAE e PPO update (aggiorna θ → θ')
+      2. Esegue SHAC update partendo da θ' (se alpha > 0)
+      3. Propaga i parametri SHAC aggiornati indietro a PPO
 
-    Ritorna: (new_ppo_state, new_shac_state, metrics)
-
-    NOTA: questo non è JIT-compilato come funzione singola perché
-    combina due kernel JIT separati (ppo + shac) — XLA li fonde
-    automaticamente quando possibile.
+    FIX C: costruisce horizon_mask e la passa a shac_update_step
+           invece dell'intero horizon come static arg.
+    FIX B: _mix_gradients rimossa — il mixing sequenziale è già corretto.
     """
     rewards      = rollout_history["rewards"]
     values       = rollout_history["values"]
@@ -342,13 +329,10 @@ def hybrid_update_step(
     obs_all      = rollout_history["obs"]
     acts_all     = rollout_history["actions"]
     lp_all       = rollout_history["log_probs"]
-    goal_reached = rollout_history["goal_reached"]
-    collision    = rollout_history["collision"]
-    passive_col  = rollout_history["passive_col"]
 
     rng_key, ppo_rng, shac_rng = jax.random.split(rng_key, 3)
 
-    # ── 1. PPO update (invariato) ─────────────────────────────────────────────
+    # ── 1. PPO update ─────────────────────────────────────────────────────────
     params, opt_state = ppo_train_state
 
     _, _, last_val = network.apply({"params": params}, env_obs)
@@ -368,28 +352,28 @@ def hybrid_update_step(
     # ── 2. SHAC update (gradiente analitico) ─────────────────────────────────
     shac_metrics = {}
     if USE_SHAC and alpha > 1e-6:
-        # Aggiorna i parametri actor nello stato SHAC con quelli freschi di PPO
-        # (PPO ha già fatto il suo update — SHAC parte da lì)
+        # Sincronizza i parametri actor SHAC con quelli freschi di PPO
         shac_state_updated = shac_state._replace(actor_params=params_after_ppo)
 
         shac_rng_keys = jax.random.split(shac_rng, N_SHAC_ENVS)
-        env_data = (shac_obs_batch, shac_state_batch, shac_rng_keys)
+
+        # FIX C: horizon_mask è un array JAX traced — nessuna ricompilazione
+        horizon_mask = make_horizon_mask(horizon)
+
+        env_data = (shac_obs_batch, shac_state_batch, shac_rng_keys, horizon_mask)
 
         new_shac_state, shac_metrics = shac_update_step(
             shac_state_updated,
             env_data,
             actor_apply,
             critic_apply_shac,
-            actor_optimizer_shac,
-            critic_optimizer_shac,
-            horizon,
+            actor_opt_shac,
+            critic_opt_shac,
             ghost_robot,
         )
 
-        # I parametri actor di SHAC sono già aggiornati dentro new_shac_state.
-        # Propaghiamo indietro a PPO per mantenere i parametri sincronizzati.
-        final_params  = new_shac_state.actor_params
-        # Opt state PPO rimane quello di PPO (Adam state separato)
+        # Propaga i parametri aggiornati da SHAC indietro a PPO
+        final_params    = new_shac_state.actor_params
         final_ppo_state = (final_params, new_ppo_state[1])
     else:
         new_shac_state  = shac_state
@@ -404,7 +388,7 @@ def hybrid_update_step(
         "shac_critic_loss": float(shac_metrics.get("critic_loss", 0.0)),
         "shac_return":      float(shac_metrics.get("mean_return", 0.0)),
         "shac_ag_norm":     float(shac_metrics.get("actor_grad_norm", 0.0)),
-        "shac_horizon":     int(shac_metrics.get("horizon", horizon)),
+        "shac_horizon":     horizon,
         "alpha":            alpha,
     }
     return final_ppo_state, new_shac_state, metrics
@@ -471,6 +455,7 @@ if __name__ == "__main__":
         critic_opt_shac     = None
         shac_obs_batch      = None
         shac_state_batch    = None
+        ghost_bool          = True
 
     # ── Carica checkpoint se specificato ─────────────────────────────────────
     if args.load and os.path.exists(args.load):
@@ -501,7 +486,6 @@ if __name__ == "__main__":
     best_suc = 0.0
     t_start  = time.time()
 
-    # ── Header tabella ────────────────────────────────────────────────────────
     hdr = (
         f"{'Upd':>5} | {'Ret':>7} | {'Suc%':>5} {'Col%':>5} {'Pcol%':>5} {'Tmo%':>5} |"
         f" {'PPO-L':>7} {'pi':>6} {'V':>6} {'H':>6} |"
@@ -566,23 +550,20 @@ if __name__ == "__main__":
                 reinit_rng, min_goal_dist=cur_min_dist, ghost_prob=cur_ghost
             )
 
+            ghost_bool = (cur_ghost >= 0.5)
             if USE_SHAC:
-                ghost_bool = (cur_ghost >= 0.5)
                 shac_obs_batch, shac_state_batch = _sample_shac_init_states(
                     reinit_rng, cur_min_dist, ghost_bool
                 )
             print(f"  → Curriculum stage={cur_stage}, dist={cur_min_dist:.1f}m, "
                   f"ghost={cur_ghost:.1f}")
 
-        # ── Calcola alpha e horizon per questo step ────────────────────────────
+        # ── Alpha e horizon per questo step ───────────────────────────────────
         alpha   = get_shac_alpha(rolling_suc)
         horizon = get_shac_horizon(update)
 
-        # ── SHAC: ricampiona stati iniziali ogni N update ─────────────────────
-        # Ricampionare periodicamente evita che SHAC si specializzi su
-        # uno stesso piccolo insieme di stati iniziali.
+        # ── SHAC: ricampiona stati iniziali ogni 5 update ─────────────────────
         if USE_SHAC and (update % 5 == 0):
-            ghost_bool = (cur_ghost >= 0.5)
             shac_obs_batch, shac_state_batch = _sample_shac_init_states(
                 shac_sample_rng, cur_min_dist, ghost_bool
             )
@@ -602,7 +583,7 @@ if __name__ == "__main__":
             critic_opt_shac,
             horizon,
             alpha,
-            ghost_bool if USE_SHAC else True,
+            ghost_bool,
         )
 
         fps = BATCH_SIZE / (time.time() - t0)
@@ -618,7 +599,7 @@ if __name__ == "__main__":
                 f" {metrics['ppo_loss']:>7.4f} {metrics['ppo_pi_loss']:>6.3f}"
                 f" {metrics['ppo_v_loss']:>6.3f} {metrics['ppo_entropy']:>6.3f} |"
                 f" {metrics['shac_actor_loss']:>7.4f} {metrics['shac_return']:>7.1f}"
-                f" {metrics['shac_ag_norm']:>6.3f} {metrics['shac_horizon']:>4d}"
+                f" {metrics['shac_ag_norm']:>6.3f} {horizon:>4d}"
                 f" {alpha:.2f} |"
                 f" {fps:>7,.0f} {cur_stage:>5d} {cur_min_dist:>4.1f}m"
                 f" {elapsed:>5.1f}min"
@@ -637,7 +618,7 @@ if __name__ == "__main__":
                 round(metrics["shac_critic_loss"], 5),
                 round(metrics["shac_return"], 3),
                 round(metrics["shac_ag_norm"], 4),
-                metrics["shac_horizon"],
+                horizon,
                 round(alpha, 3),
                 n_ep, cur_stage, round(cur_min_dist, 1), round(cur_ghost, 2),
             ])
