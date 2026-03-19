@@ -91,7 +91,7 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 from jax_network import EndToEndActorCritic
 from jax_train   import (collect_rollouts, init_env_state,
                           NUM_ENVS, ROLLOUT_STEPS, OBS_SIZE)
-from jax_shac    import (init_shac, shac_update_step, get_shac_horizon,
+from MBRL_shac    import (init_shac, shac_update_step, get_shac_horizon,
                           save_shac_checkpoint, N_SHAC_ENVS, SHACCritic,
                           SHAC_H_MAX)
 from jax_wrappers import make_stacked_env, make_autoreset_env
