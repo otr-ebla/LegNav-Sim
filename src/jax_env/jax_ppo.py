@@ -89,7 +89,7 @@ LR_END         = 1e-4
 LR_MIN         = 1e-5
 WARMUP_UPDATES = 5
 # TOTAL_UPDATES: 128 × 16384 × 96 = 201,326,592 ≈ 200M env steps
-TOTAL_UPDATES  = 800
+TOTAL_UPDATES  = 400
 
 BATCH_SIZE      = NUM_ENVS * ROLLOUT_STEPS          # 8192 × 64 = 524,288
 # N_MINIBATCHES=64: MBS = 524288/64 = 8192 — matches GPU L2 cache working set
