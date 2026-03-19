@@ -1,5 +1,5 @@
 """
-jax_diff_utils.py — Differentiability Patches & Direct Metric Optimization
+MBRL_diff_utils.py — Differentiability Patches & Direct Metric Optimization
 ===========================================================================
 
 Due funzionalità:

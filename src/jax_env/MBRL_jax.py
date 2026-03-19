@@ -298,7 +298,8 @@ if __name__ == "__main__":
     print(f"  SHAC: {'ENABLED' if USE_SHAC else 'DISABLED'}")
     if USE_SHAC:
         print(f"  SHAC envs={N_SHAC_ENVS}, H_init={4}, H_max={SHAC_H_MAX}")
-        print(f"  Alpha: {'adaptive' if args.shac_alpha < 0 else args.shac_alpha:.2f}")
+        alpha_str = "adaptive" if args.shac_alpha < 0 else f"{args.shac_alpha:.2f}"
+        print(f"  Alpha: {alpha_str}")
     print(f"  PPO:  envs={NUM_ENVS}, steps={ROLLOUT_STEPS}, batch={BATCH_SIZE:,}")
     print(f"{'='*70}\n")
 
