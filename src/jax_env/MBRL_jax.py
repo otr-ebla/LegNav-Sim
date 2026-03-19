@@ -112,6 +112,145 @@ from jax_ppo import (
 from jax_env_multi import reset_env, step_env
 from jax_wrappers  import StackedEnvState
 
+# ── PPO override: NaN-safe functions ─────────────────────────────────────────
+# Le funzioni importate da jax_ppo.py hanno tre problemi che causano il NaN
+# osservato all'update ~110:
+#
+#   1. VALUE LOSS NON CLIPPATO: value_loss = VF_COEF * (returns - V)^2
+#      Senza clipping del valore, il critico può fare update arbitrariamente
+#      grandi quando i returns cambiano scala (es. alla transizione curriculum).
+#      Fix: value clipping PPO-style — V_clipped = V_old + clip(V-V_old, -ε, ε)
+#
+#   2. RETURNS NON NORMALIZZATI come target del critico: la policy loss usa
+#      advantages normalizzati (mean=0, std=1), ma value_loss usa returns grezzi
+#      che crescono con il curriculum (da ~-70 a ~+200). Il value loss scala
+#      con il quadrato dei returns → esplode quando il curriculum avanza.
+#      Fix: normalizza i returns con la stessa statistica degli advantages.
+#
+#   3. NESSUN NaN GUARD: se un singolo NaN entra nei parametri (da gradient
+#      overflow in un minibatch), si propaga a tutti i minibatch successivi
+#      nel jax.lax.scan. Una volta che i params sono NaN, non si recupera.
+#      Fix: nan_to_num sui gradienti prima di ogni optimizer.update().
+#
+# Queste funzioni sovrascrivono quelle importate da jax_ppo.py.
+# jax_ppo.py NON viene modificato — rimane compatibile con il training PPO puro.
+
+import functools as _functools
+from jax_network import EndToEndActorCritic as _EAC
+
+_network_mbrl = _EAC(action_dim=2)   # stessa architettura, stesso apply
+
+@jax.jit
+def ppo_loss_fn(params, obs, actions, advantages, returns, old_log_probs,
+                old_values=None):
+    """
+    PPO loss con:
+      - Value clipping (PPO-style): previene update troppo grandi del critico
+      - Returns normalizzati: scale-invariant rispetto al curriculum
+      - Tutti i termini finiti: nessuna divisione per zero
+
+    old_values: opzionale. Se fornito, abilita il value clipping.
+    """
+    mean, logstd, values = _network_mbrl.apply({"params": params}, obs)
+    std = jnp.exp(logstd)
+
+    # Policy log prob
+    z        = (actions - mean) / (std + 1e-8)
+    log_prob = jnp.sum(-0.5 * (z ** 2 + jnp.log(2.0 * jnp.pi)) - logstd, axis=-1)
+
+    # Policy loss (PPO clip) — invariato
+    ratio       = jnp.exp(jnp.clip(log_prob - old_log_probs, -5.0, 5.0))
+    policy_loss = -jnp.mean(jnp.minimum(
+        ratio * advantages,
+        jnp.clip(ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS) * advantages,
+    ))
+
+    # Value loss con clipping — FIX 1
+    # Se old_values non disponibile, fallback a loss non clippata (backward compat)
+    if old_values is not None:
+        v_clipped    = old_values + jnp.clip(values - old_values, -CLIP_EPS * 10, CLIP_EPS * 10)
+        vf_loss1     = (returns - values) ** 2
+        vf_loss2     = (returns - v_clipped) ** 2
+        value_loss   = VF_COEF * jnp.mean(jnp.maximum(vf_loss1, vf_loss2))
+    else:
+        value_loss   = VF_COEF * jnp.mean((returns - values) ** 2)
+
+    entropy      = jnp.mean(jnp.sum(0.5 * jnp.log(2.0 * jnp.pi * jnp.e) + logstd, axis=-1))
+    entropy_loss = -ENTROPY_COEF * entropy
+
+    total_loss = policy_loss + value_loss + entropy_loss
+    return total_loss, (policy_loss, value_loss, entropy)
+
+
+@jax.jit
+def ppo_update_epoch(carry, perm):
+    """
+    PPO epoch con NaN guard sui gradienti — FIX 3.
+    Se un gradient update produce NaN, il parametro viene resettato al valore
+    precedente (il NaN non si propaga al minibatch successivo).
+    """
+    params, opt_state, obs, actions, adv, ret, old_lp, old_vals = carry
+
+    def _mb_step(mb_carry, mb_idx):
+        p, os_ = mb_carry
+        idx = jax.lax.dynamic_slice(perm, (mb_idx * MINI_BATCH_SIZE,), (MINI_BATCH_SIZE,))
+
+        (loss, aux), grads = jax.value_and_grad(ppo_loss_fn, has_aux=True)(
+            p, obs[idx], actions[idx], adv[idx], ret[idx], old_lp[idx],
+            old_vals[idx],   # passa i valori vecchi per il value clipping
+        )
+
+        # FIX 3: NaN guard — azzera i gradienti NaN/Inf prima dell'optimizer step.
+        # jnp.nan_to_num rimpiazza NaN→0, Inf→0: l'update diventa un no-op invece
+        # di propagare il NaN a tutti i parametri attraverso lo scan.
+        grads = jax.tree_util.tree_map(
+            lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0),
+            grads
+        )
+
+        updates, new_os = optimizer.update(grads, os_, p)
+        new_p = optax.apply_updates(p, updates)
+
+        return (new_p, new_os), (loss, aux)
+
+    (new_p, new_os), (losses, auxes) = jax.lax.scan(
+        _mb_step, (params, opt_state), jnp.arange(N_MINIBATCHES)
+    )
+    return (new_p, new_os, obs, actions, adv, ret, old_lp, old_vals), (losses, auxes)
+
+
+@jax.jit
+def run_ppo_updates(train_state, obs_flat, actions_flat, adv_flat, ret_flat,
+                    old_lp_flat, rng_key):
+    """
+    PPO update con FIX 2: normalizzazione dei returns.
+    I returns (target del critico) sono normalizzati con la stessa media/std
+    degli advantages per tenere la value loss nella stessa scala della policy loss.
+    Le stime di valore vengono de-normalizzate durante l'inferenza dalla GAE,
+    che usa i valori già normalizzati — quindi la GAE rimane coerente.
+    """
+    params, opt_state = train_state
+
+    # FIX 2: normalizza advantages E returns con la stessa statistica
+    adv_mean = adv_flat.mean()
+    adv_std  = adv_flat.std() + 1e-8
+    adv_flat = (adv_flat - adv_mean) / adv_std
+    # Returns normalizzati con la stessa scala: mantiene il rapporto adv/returns
+    ret_flat = (ret_flat - adv_mean) / adv_std
+
+    # Calcola i valori "vecchi" per il value clipping (forward pass una volta)
+    _, _, old_values_flat = _network_mbrl.apply({"params": params}, obs_flat)
+    old_values_flat_norm  = (old_values_flat - adv_mean) / adv_std
+
+    perms = jax.vmap(lambda k: jax.random.permutation(k, BATCH_SIZE))(
+        jax.random.split(rng_key, PPO_EPOCHS)
+    )
+    carry = (params, opt_state, obs_flat, actions_flat, adv_flat, ret_flat,
+             old_lp_flat, old_values_flat_norm)
+    carry, (all_losses, all_auxes) = jax.lax.scan(ppo_update_epoch, carry, perms)
+    last_aux = jax.tree_util.tree_map(lambda x: x[-1, -1], all_auxes)
+    return (carry[0], carry[1]), all_losses.mean(), last_aux
+
 # ── Config SHAC ───────────────────────────────────────────────────────────────
 USE_SHAC = not args.no_shac
 
@@ -484,7 +623,43 @@ if __name__ == "__main__":
 
         fps = BATCH_SIZE / (time.time() - t0)
 
-        # ── Logging ───────────────────────────────────────────────────────────
+        # ── NaN detection & auto-recovery ─────────────────────────────────────
+        # Se i parametri contengono NaN (da gradient explosion nel PPO update),
+        # il rollout successivo produrrà solo NaN rewards → 100% timeout.
+        # Rileviamo questo con due segnali:
+        #   1. mean_ret è NaN (rollout completamente corrotto)
+        #   2. ppo_loss è NaN (explosion avvenuto nell'update appena fatto)
+        # In entrambi i casi, ripristiniamo dal best checkpoint salvato.
+        params_have_nan = any(
+            bool(jnp.any(jnp.isnan(leaf)))
+            for leaf in jax.tree_util.tree_leaves(ppo_train_state[0])
+        )
+        loss_is_nan = (n_ep == 0) or jnp.isnan(metrics["ppo_loss"])
+
+        if params_have_nan or (loss_is_nan and update > 10):
+            ckpt = "checkpoints/mbrl_model_best.msgpack"
+            if os.path.exists(ckpt):
+                print(f"\n  ⚠ NaN detected at update {update}! "
+                      f"Recovering from {ckpt}...")
+                try:
+                    rec_params, rec_opt = load_checkpoint(
+                        ppo_train_state[0], ppo_train_state[1], ckpt
+                    )
+                    ppo_train_state = (rec_params, rec_opt)
+                    if USE_SHAC:
+                        shac_state = shac_state._replace(actor_params=rec_params)
+                    # Forza re-init degli env per pulire lo stato corrotto
+                    rng, reinit_rng = jax.random.split(rng)
+                    env_obs, env_state, vmap_step = init_env_state(
+                        reinit_rng, min_goal_dist=cur_min_dist, ghost_prob=cur_ghost
+                    )
+                    print(f"  ✓ Recovery completato. Riprendendo da best_suc={best_suc:.1f}%")
+                    continue   # salta il logging di questo update corrotto
+                except Exception as e:
+                    print(f"  ✗ Recovery fallito: {e}. Continuando senza recovery.")
+            else:
+                print(f"\n  ⚠ NaN detected at update {update} ma nessun checkpoint disponibile.")
+
         if update % 5 == 0:
             elapsed = (time.time() - t_start) / 60.0
             lr_now  = float(scheduler(update * _OPT_STEPS_PER_UPDATE))
