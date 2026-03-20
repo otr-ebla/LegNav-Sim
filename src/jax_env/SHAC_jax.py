@@ -120,42 +120,50 @@ H_MAX           = args.h_max
 H_GROWTH        = 30       # update tra ogni +1 orizzonte
 TOTAL_UPDATES   = args.updates
 
-LR_ACTOR        = 3e-4
-LR_CRITIC       = 1e-3
-GRAD_CLIP_ACTOR = 1.0
-GRAD_CLIP_CRITIC= 2.0
+LR_ACTOR        = 1e-4    # abbassato: con AGN esplosivo (>100) serve lr basso
+LR_CRITIC       = 3e-4    # abbassato proporzionalmente
+GRAD_CLIP_ACTOR = 0.5     # più conservativo: BPTT su cinematica unicycle
+                           # produce gradienti O(H) — clip basso è essenziale
+GRAD_CLIP_CRITIC= 1.0
 
 GAMMA           = 0.99
 LAM             = 0.95
-TAU             = 0.005    # soft update target network
+TAU             = 0.005
 VF_COEF         = 0.5
 
-# Ricampiona stati iniziali ogni N update (evita overfitting su pochi stati)
+# Ricampiona stati iniziali ogni N update
 RESAMPLE_INTERVAL = 3
 
 # ── Curriculum ────────────────────────────────────────────────────────────────
-# Soglie su reward medio rolling EMA (alpha=0.05, ~20 update lag).
-# Valori approssimati: reward -60 = random, 0 = spesso raggiunge goal,
-# +50 = navigazione efficiente e sociale.
+# Il curriculum usa il return PER STEP (return/H), non il return totale.
+# Questo normalizza rispetto all'orizzonte crescente:
+#   return_totale = H × reward_per_step  →  reward_per_step è invariante a H.
+#
+# Calibrazione:
+#   reward/step ≈ -5   : policy random (collide sempre)
+#   reward/step ≈ -2   : inizia a evitare le collisioni
+#   reward/step ≈ -0.5 : raggiunge il goal con qualche collisione
+#   reward/step ≈  0   : navigazione base competente
+#   reward/step ≈ +1   : navigazione sociale buona
 CURRICULUM = [
-    # (rolling_reward_threshold, min_goal_dist)
-    (-20.0, 1.5),
-    ( 10.0, 2.5),
-    ( 30.0, 4.0),
-    ( 50.0, 5.5),
-    ( 70.0, 7.0),
-    (101.0, 9.0),
+    # (rolling_reward_per_step_threshold, min_goal_dist)
+    (-1.5, 1.5),   # policy random → inizia qui
+    (-0.5, 2.5),   # evita collisioni, spesso raggiunge goal a 1.5m
+    ( 0.0, 4.0),   # navigazione base a 2.5m
+    ( 0.5, 5.5),
+    ( 1.0, 7.0),
+    ( 2.0, 9.0),
 ]
 
-def curriculum_dist(rolling_ret: float) -> float:
+def curriculum_dist(rolling_ret_per_step: float) -> float:
     for thresh, dist in CURRICULUM:
-        if rolling_ret < thresh:
+        if rolling_ret_per_step < thresh:
             return dist
     return CURRICULUM[-1][1]
 
-def curriculum_stage(rolling_ret: float) -> int:
+def curriculum_stage(rolling_ret_per_step: float) -> int:
     for i, (thresh, _) in enumerate(CURRICULUM):
-        if rolling_ret < thresh:
+        if rolling_ret_per_step < thresh:
             return i
     return len(CURRICULUM) - 1
 
@@ -209,7 +217,12 @@ def _diff_reward(new_state_sg, prev_x, prev_y, prev_theta, prev_w,
 
     social_progress = _PROGRESS_COEF * progress * cf
     jerk_pen        = -_JERK_WEIGHT * (w - prev_w) ** 2
-    r               = social_progress + _STEP_PEN + jerk_pen
+    # Rimuovi _STEP_PEN dal reward differenziabile:
+    # Con _STEP_PEN=-0.02 e H=32, il robot impara v=0 per minimizzare
+    # i passi (ogni passo "costa" -0.02, stare fermo ne evita molti).
+    # Il penalty per step è utile nell'env reale per efficienza, ma nel
+    # grafo BPTT crea un attractor a v=0 che impedisce l'apprendimento.
+    r               = social_progress + jerk_pen
 
     wall_d  = jnp.minimum(
         jnp.minimum(new_x_diff - ROBOT_RADIUS, ROOM_W - ROBOT_RADIUS - new_x_diff),
@@ -313,7 +326,14 @@ def _rollout_single(actor_params, critic_params, actor_apply, critic_apply,
     bootstrap = jax.lax.stop_gradient(
         critic_apply({"params": critic_params}, final_obs[None])[0]
     )
-    total_return = jnp.sum(rewards) + final_disc * bootstrap
+    # Normalizza per H_MAX: rende il return invariante all'orizzonte crescente.
+    # Senza normalizzazione, total_return scala con H (da -24 a -96 solo
+    # per costruzione) e il curriculum basato su return non funziona mai.
+    # Con normalizzazione, return/step è una metrica stabile e confrontabile
+    # tra diversi valori di H durante il curriculum orizzonte.
+    n_active = jnp.sum(horizon_mask).astype(jnp.float32)
+    n_active = jnp.maximum(n_active, 1.0)
+    total_return = (jnp.sum(rewards) + final_disc * bootstrap) / n_active
     return total_return, (obs_seq, rewards, dones, final_obs)
 
 
@@ -543,15 +563,15 @@ if __name__ == "__main__":
     critic_target_params = jax.tree_util.tree_map(lambda x: x.copy(), critic_params)
 
     # LR schedule: warmup 50 update → decay fino a LR/10
-    _WARMUP  = 50
+    _WARMUP  = 100   # warmup più lungo: BPTT ha alta varianza nelle prime iterazioni
     _sched_a = optax.join_schedules(
-        [optax.linear_schedule(LR_ACTOR * 0.1, LR_ACTOR, _WARMUP),
-         optax.cosine_decay_schedule(LR_ACTOR, TOTAL_UPDATES - _WARMUP, alpha=0.1)],
+        [optax.linear_schedule(LR_ACTOR * 0.01, LR_ACTOR, _WARMUP),
+         optax.cosine_decay_schedule(LR_ACTOR, TOTAL_UPDATES - _WARMUP, alpha=0.05)],
         [_WARMUP]
     )
     _sched_c = optax.join_schedules(
-        [optax.linear_schedule(LR_CRITIC * 0.1, LR_CRITIC, _WARMUP),
-         optax.cosine_decay_schedule(LR_CRITIC, TOTAL_UPDATES - _WARMUP, alpha=0.1)],
+        [optax.linear_schedule(LR_CRITIC * 0.01, LR_CRITIC, _WARMUP),
+         optax.cosine_decay_schedule(LR_CRITIC, TOTAL_UPDATES - _WARMUP, alpha=0.05)],
         [_WARMUP]
     )
 
@@ -589,7 +609,7 @@ if __name__ == "__main__":
             print(f"Caricamento fallito ({e}), partenza da zero.")
 
     # ── Curriculum iniziale ───────────────────────────────────────────────────
-    rolling_ret  = -80.0   # stima iniziale pessimistica
+    rolling_ret  = -5.0    # stima iniziale in unità reward/step
     cur_dist     = curriculum_dist(rolling_ret)
     cur_stage    = curriculum_stage(rolling_ret)
 
@@ -690,6 +710,7 @@ if __name__ == "__main__":
         fps = env_steps_per_update / (time.time() - t0)
 
         # EMA reward rolling (lag ~20 update con alpha=0.05)
+        # rolling_ret ora è reward/step (normalizzato per H)
         rolling_ret = 0.95 * rolling_ret + 0.05 * mean_ret
 
         # ── Curriculum ────────────────────────────────────────────────────────
