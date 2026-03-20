@@ -330,67 +330,79 @@ def _critic_loss(critic_params, critic_apply,
 
 # ── Compiled update step ───────────────────────────────────────────────────────
 
-@jax.jit
-def _update_step(actor_params, critic_params, critic_target_params,
-                 actor_opt_state, critic_opt_state,
-                 obs_batch, state_batch, keys, horizon_mask,
-                 actor_apply, critic_apply,
-                 actor_optimizer, critic_optimizer,
-                 ghost_robot: bool):
+def make_update_step(actor_apply, critic_apply,
+                     actor_optimizer, critic_optimizer,
+                     ghost_robot: bool):
     """
-    Un outer update completo:
-      1. jax.value_and_grad su J(θ) → aggiorna actor
-      2. _critic_loss su stessi rollout → aggiorna critico
-      3. Soft update target network
+    Costruisce e compila (JIT) il kernel di update completo.
+    actor_apply, critic_apply, actor_optimizer, critic_optimizer e ghost_robot
+    sono valori Python statici — vengono "baked in" via closure invece di
+    essere passati come argomenti. Questo evita il TypeError di JAX che non
+    sa come trattare metodi Python come array astratti.
 
-    Tutto in un unico kernel JIT — zero overhead Python per update.
+    Ritorna una funzione JIT-compilata con firma:
+        update_fn(actor_params, critic_params, critic_target_params,
+                  actor_opt_state, critic_opt_state,
+                  obs_batch, state_batch, keys, horizon_mask)
     """
-    # ── 1. Actor update ───────────────────────────────────────────────────────
-    (a_loss, (returns, (obs_seq, rewards, dones, final_obs))), a_grads = \
-        jax.value_and_grad(_actor_loss, has_aux=True)(
-            actor_params, critic_params, actor_apply, critic_apply,
-            obs_batch, state_batch, keys, horizon_mask, ghost_robot,
+    @jax.jit
+    def _update_step(actor_params, critic_params, critic_target_params,
+                     actor_opt_state, critic_opt_state,
+                     obs_batch, state_batch, keys, horizon_mask):
+        """
+        Un outer update completo:
+          1. jax.value_and_grad su J(θ) → aggiorna actor
+          2. _critic_loss su stessi rollout → aggiorna critico
+          3. Soft update target network
+        """
+        # ── 1. Actor update ───────────────────────────────────────────────────
+        (a_loss, (returns, (obs_seq, rewards, dones, final_obs))), a_grads = \
+            jax.value_and_grad(_actor_loss, has_aux=True)(
+                actor_params, critic_params, actor_apply, critic_apply,
+                obs_batch, state_batch, keys, horizon_mask, ghost_robot,
+            )
+
+        a_grads = jax.tree_util.tree_map(
+            lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), a_grads
+        )
+        a_grad_norm = optax.global_norm(a_grads)
+        a_updates, new_a_opt = actor_optimizer.update(
+            a_grads, actor_opt_state, actor_params
+        )
+        new_actor_params = optax.apply_updates(actor_params, a_updates)
+
+        # ── 2. Critic update ──────────────────────────────────────────────────
+        c_loss, c_grads = jax.value_and_grad(_critic_loss)(
+            critic_params, critic_apply,
+            obs_seq, rewards, dones, final_obs, critic_target_params,
+        )
+        c_grads = jax.tree_util.tree_map(
+            lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), c_grads
+        )
+        c_grad_norm = optax.global_norm(c_grads)
+        c_updates, new_c_opt = critic_optimizer.update(
+            c_grads, critic_opt_state, critic_params
+        )
+        new_critic_params = optax.apply_updates(critic_params, c_updates)
+
+        # ── 3. Soft update target ─────────────────────────────────────────────
+        new_target_params = jax.tree_util.tree_map(
+            lambda tgt, online: (1.0 - TAU) * tgt + TAU * online,
+            critic_target_params, new_critic_params
         )
 
-    a_grads = jax.tree_util.tree_map(
-        lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), a_grads
-    )
-    a_grad_norm = optax.global_norm(a_grads)
-    a_updates, new_a_opt = actor_optimizer.update(
-        a_grads, actor_opt_state, actor_params
-    )
-    new_actor_params = optax.apply_updates(actor_params, a_updates)
+        metrics = {
+            "actor_loss":       a_loss,
+            "critic_loss":      c_loss,
+            "mean_return":      jnp.mean(returns),
+            "actor_gn":         a_grad_norm,
+            "critic_gn":        c_grad_norm,
+            "mean_reward_step": jnp.mean(rewards),
+        }
+        return (new_actor_params, new_critic_params, new_target_params,
+                new_a_opt, new_c_opt, metrics)
 
-    # ── 2. Critic update ──────────────────────────────────────────────────────
-    c_loss, c_grads = jax.value_and_grad(_critic_loss)(
-        critic_params, critic_apply,
-        obs_seq, rewards, dones, final_obs, critic_target_params,
-    )
-    c_grads = jax.tree_util.tree_map(
-        lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), c_grads
-    )
-    c_grad_norm = optax.global_norm(c_grads)
-    c_updates, new_c_opt = critic_optimizer.update(
-        c_grads, critic_opt_state, critic_params
-    )
-    new_critic_params = optax.apply_updates(critic_params, c_updates)
-
-    # ── 3. Soft update target ─────────────────────────────────────────────────
-    new_target_params = jax.tree_util.tree_map(
-        lambda tgt, online: (1.0 - TAU) * tgt + TAU * online,
-        critic_target_params, new_critic_params
-    )
-
-    metrics = {
-        "actor_loss":    a_loss,
-        "critic_loss":   c_loss,
-        "mean_return":   jnp.mean(returns),
-        "actor_gn":      a_grad_norm,
-        "critic_gn":     c_grad_norm,
-        "mean_reward_step": jnp.mean(rewards),   # reward medio per step
-    }
-    return (new_actor_params, new_critic_params, new_target_params,
-            new_a_opt, new_c_opt, metrics)
+    return _update_step
 
 
 # ── Reset cache ───────────────────────────────────────────────────────────────
@@ -511,6 +523,13 @@ if __name__ == "__main__":
     actor_opt_state  = actor_optimizer.init(actor_params)
     critic_opt_state = critic_optimizer.init(critic_params)
 
+    # Compila il kernel di update (bake-in apply/optimizer/ghost_robot via closure)
+    update_step = make_update_step(
+        actor_net.apply, critic_net.apply,
+        actor_optimizer, critic_optimizer,
+        ghost_robot,
+    )
+
     # ── Carica checkpoint se richiesto ────────────────────────────────────────
     if args.load and os.path.exists(args.load):
         try:
@@ -519,6 +538,8 @@ if __name__ == "__main__":
                 actor_params, critic_params, critic_target_params,
                 actor_opt_state, critic_opt_state, args.load
             )
+            # Ricostruisci update_step con i params caricati
+            # (gli optimizer state sono già aggiornati, il kernel rimane lo stesso)
             print(f"Checkpoint caricato da {args.load}")
         except Exception as e:
             print(f"Caricamento fallito ({e}), partenza da zero.")
@@ -602,13 +623,10 @@ if __name__ == "__main__":
 
         # ── Update ────────────────────────────────────────────────────────────
         (actor_params, critic_params, critic_target_params,
-         actor_opt_state, critic_opt_state, metrics) = _update_step(
+         actor_opt_state, critic_opt_state, metrics) = update_step(
             actor_params, critic_params, critic_target_params,
             actor_opt_state, critic_opt_state,
             obs_batch, state_batch, step_keys, horizon_mask,
-            actor_net.apply, critic_net.apply,
-            actor_optimizer, critic_optimizer,
-            ghost_robot,
         )
 
         mean_ret    = float(metrics["mean_return"])
