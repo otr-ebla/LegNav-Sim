@@ -59,10 +59,10 @@ HSFM_DT    = 0.01
 
 # Terminal rewards
 _R_GOAL        =  200.0
-_R_OBS_COL     =  -70.0
-_R_WALL_COL    =  -70.0
-_R_ACTIVE_COL  =  -70.0
-_R_PASSIVE_COL =  -15.0
+_R_OBS_COL     =  -90.0
+_R_WALL_COL    =  -90.0
+_R_ACTIVE_COL  =  -90.0
+_R_PASSIVE_COL =  -60.0
 _R_TIMEOUT     =   -5.0
 
 # Progress scaling — how much a metre of progress toward goal is worth

@@ -153,6 +153,30 @@ _network_mbrl = _EAC(action_dim=2)
 
 
 @jax.jit
+def _forward_minibatch(params, obs_chunk):
+    """
+    Forward pass su un singolo minibatch — ritorna solo i valori.
+    Usato per calcolare old_vals_flat in chunk senza materializzare
+    l'intero batch piatto (524288 × 342) in una sola operazione.
+    524288 × 342 × 32 float → 3.38 GiB per la conv intermedia — OOM.
+    Processando MINI_BATCH_SIZE=8192 righe per volta: ~52 MB — OK.
+    """
+    _, _, values = _network_mbrl.apply({"params": params}, obs_chunk)
+    return values
+
+
+def _compute_old_vals_chunked(params, obs_flat):
+    """
+    Calcola old_vals sull'intero batch piatto processando MINI_BATCH_SIZE
+    righe per volta con un loop Python. Zero overhead di compilazione:
+    _forward_minibatch è già JIT-compilata e riusa lo stesso kernel.
+    """
+    chunks = obs_flat.reshape(N_MINIBATCHES, MINI_BATCH_SIZE, OBS_SIZE)
+    vals   = [_forward_minibatch(params, chunks[i]) for i in range(N_MINIBATCHES)]
+    return jnp.concatenate(vals, axis=0)   # (BATCH_SIZE,)
+
+
+@jax.jit
 def _ppo_minibatch_step(carry, mb_idx,
                         obs, actions, adv, ret, old_lp, old_vals, perm):
     """
@@ -224,8 +248,11 @@ def run_ppo_updates(train_state, obs_flat, actions_flat, adv_flat, ret_flat,
     ret_std  = ret_flat.std() + 1e-8
     ret_flat_norm = (ret_flat - ret_mean) / ret_std
 
-    # Valori "vecchi" per il value clipping (forward pass una volta, fuori da JIT)
-    _, _, old_vals_flat = _network_mbrl.apply({"params": params}, obs_flat)
+    # Valori "vecchi" per il value clipping.
+    # NON fare apply su obs_flat intero (524288 x 342) — la conv intermedia
+    # richiede ~3.38 GiB e va in OOM su 10 GB VRAM.
+    # Processo in chunk da MINI_BATCH_SIZE=8192 righe (~52 MB per chunk).
+    old_vals_flat = _compute_old_vals_chunked(params, obs_flat)
     # Normalizza old_vals con la stessa statistica dei returns (stessa scala)
     old_vals_norm = (old_vals_flat - ret_mean) / ret_std
 
@@ -255,10 +282,15 @@ def run_ppo_updates(train_state, obs_flat, actions_flat, adv_flat, ret_flat,
 USE_SHAC = not args.no_shac
 
 ALPHA_SCHEDULE = [
-    (30.0, 0.0),
-    (55.0, 0.3),
-    (70.0, 0.6),
-    (101., 0.8),
+    # FIX 3: soglie abbassate.
+    # Con il vecchio schedule (30/55/70%) SHAC non si attivava mai:
+    # suc_pct restava <12% e alpha rimaneva 0.0 per tutto il training.
+    # Con passive_col non piu terminale (jax_env_multi.py FIX 1)
+    # suc_pct cresce prima — ma partiamo conservativi.
+    (5.0,  0.0),   # <5%: policy casuale, BPTT rumoroso
+    (15.0, 0.2),   # 5-15%: SHAC inizia a contribuire
+    (35.0, 0.5),   # 15-35%: bilancia PPO
+    (101., 0.8),   # >35%: SHAC domina
 ]
 
 def get_shac_alpha(suc_pct: float) -> float:
