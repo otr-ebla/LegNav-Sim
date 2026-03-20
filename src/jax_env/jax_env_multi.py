@@ -1,5 +1,14 @@
 """
 jax_env_multi.py — Core 2D Navigation Environment with JHSFM
+
+FIXES vs previous version:
+
+  FIX #5 — passive_col penalty ridotta da -60 a -20:
+    La passive_col si verifica quando il robot è fermo e un umano ci cammina
+    sopra. Il robot non può evitarla. Una penalità di -60 era sproporzionata
+    e incoraggiava la policy a muoversi freneticamente vicino agli umani per
+    "scappare" invece di navigare efficientemente. Con -20 rimane un segnale
+    negativo (non stare in mezzo al traffico) senza dominare il reward.
 """
 
 import jax
@@ -62,7 +71,13 @@ _R_GOAL        =  200.0
 _R_OBS_COL     =  -90.0
 _R_WALL_COL    =  -90.0
 _R_ACTIVE_COL  =  -90.0
-_R_PASSIVE_COL =  -60.0
+# FIX #5: ridotto da -60 a -20. La passive_col avviene quando il robot è
+# FERMO e un umano gli cammina sopra — il robot non può fare molto per
+# evitarla. Una penalità di -60 (quasi pari alla active_col) era sproporzionata
+# e insegnava alla policy a muoversi freneticamente per "scappare" dagli umani
+# invece di navigare efficientemente. Con -20 rimane un segnale negativo
+# (incentiva a non stare in mezzo al traffico) senza dominare il reward.
+_R_PASSIVE_COL =  -20.0
 _R_TIMEOUT     =   -5.0
 
 # Progress scaling — how much a metre of progress toward goal is worth

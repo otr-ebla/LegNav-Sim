@@ -29,7 +29,15 @@ FIXES vs previous version:
     scheduler now spans the correct real optimizer-step range.
     lr_now display is also fixed to query scheduler at the true step.
 
-  All previous hyperparameters, curriculum stages, and PPO logic are carried.
+  FIX — Curriculum thresholds alzate (Bug #3):
+    Le vecchie soglie (10%, 20%, 35%...) facevano scattare il curriculum
+    troppo presto. Con rolling_suc EMA α=0.1 un singolo rollout fortunato
+    a ~11% poteva portare rolling_suc oltre la soglia del 10%, saltando
+    al distanza 2.5m prima che il comportamento base fosse consolidato.
+    Fix: soglie alzate a (25%, 38%, 50%...) — ogni stage richiede ~2×
+    il successo del precedente. GHOST_PROB_STAGES allineate di conseguenza.
+
+  All previous hyperparameters and PPO logic are carried.
 """
 
 import os
@@ -114,20 +122,30 @@ network = EndToEndActorCritic(action_dim=2)
 
 # ── Curriculum ────────────────────────────────────────────────────────────────
 # Each entry: (suc_pct_threshold, min_goal_dist)
+# FIX #3: soglie alzate per evitare curriculum prematuro.
+# Con le vecchie soglie (10%, 20%, 35%...) la policy saltava allo stage
+# successivo con success rate ancora troppo bassa (~11% → stage 1).
+# Il robot non aveva consolidato il comportamento base prima di dover
+# navigare distanze più lunghe, causando regressione immediata post-jump.
+# Nuove soglie: ogni stage richiede ~2x il successo precedente;
+# il primo stage (1.5m→2.5m) ora richiede 25% invece di 10%.
 CURRICULUM_STAGES = [
-    (10.0, 1.5),
-    (20.0, 2.5),
-    (35.0, 4.0),
-    (45.0, 5.0),   # intermediate stage — old 4.0m→6.5m jump caused stall
-    (55.0, 6.5),
-    (68.0, 8.0),
+    (25.0, 1.5),
+    (38.0, 2.5),
+    (50.0, 4.0),
+    (60.0, 5.0),   # intermediate stage — old 4.0m→6.5m jump caused stall
+    (70.0, 6.5),
+    (80.0, 8.0),
     (101., 9.0),
 ]
 
 GHOST_PROB_STAGES = [
-    (35.0, 1.0),
-    (55.0, 0.8),
-    (68.0, 0.6),
+    # FIX #3: allineate alle nuove soglie curriculum.
+    # Il ghost inizia a degradare solo dopo che la policy è stabile (≥50%),
+    # non a 35% come prima quando era ancora in fase di consolidamento.
+    (50.0, 1.0),
+    (65.0, 0.8),
+    (78.0, 0.6),
     (101., 0.4),
 ]
 

@@ -69,6 +69,18 @@ FIX APPLICATI (rispetto alla versione precedente)
     env_data è una tupla di 4 elementi: (obs, state, keys, mask).
 
   FIX D — _sample_shac_init_states ora è JITtata.
+
+  FIX E — old_vals normalizzati con propria µ/σ (Bug #1):
+    old_vals_flat veniva normalizzato con ret_mean/ret_std (media e std dei
+    returns). Poiché old_vals e returns hanno distribuzioni diverse, il clip
+    PPO-style ±10 agiva su una scala sbagliata rendendolo di fatto inattivo.
+    Fix: old_vals hanno la propria normalizzazione separata (ov_mean, ov_std).
+
+  FIX F — Reset Adam moments PPO dopo sync SHAC→PPO (Bug #2):
+    SHAC aggiorna θ′→θ′′ con il proprio ottimizzatore Adam (lr=3e-5).
+    Propagare θ′′ a PPO mantenendo l'opt_state calibrato su θ′ causa bias
+    sistematici nel momento Adam → entropia alta, policy quasi-uniforme.
+    Fix: optimizer.init(final_params) re-inizializza i momenti dopo ogni sync.
 """
 
 import os
@@ -236,7 +248,16 @@ def run_ppo_updates(train_state, obs_flat, actions_flat, adv_flat, ret_flat,
         s = i * MINI_BATCH_SIZE
         old_vals_chunks.append(_old_vals_chunk(params, obs_flat[s : s + MINI_BATCH_SIZE]))
     old_vals_flat = jnp.concatenate(old_vals_chunks, axis=0)
-    old_vals_norm = (old_vals_flat - ret_mean) / ret_std
+    # FIX #1: normalizza old_vals con la PROPRIA µ/σ, non quella dei returns.
+    # old_vals sono predizioni del value network; returns sono target GAE.
+    # Le loro distribuzioni differiscono, specialmente all'inizio del training
+    # o dopo un curriculum jump. Usare ret_mean/ret_std per normalizzare old_vals
+    # sposta lo zero del clipping PPO-style, rendendo il clip ±10 inattivo
+    # (±10 su scala normalizzata ≈ ±10σ_returns in unità reali → nessun freno
+    # alla deriva del critico quando la distribuzione dei returns cambia).
+    ov_mean = old_vals_flat.mean()
+    ov_std  = old_vals_flat.std() + 1e-8
+    old_vals_norm = (old_vals_flat - ov_mean) / ov_std
 
     all_losses = []
     last_aux   = None
@@ -406,9 +427,19 @@ def hybrid_update_step(
         # dove abbiamo horizon come intero Python dal curriculum.
         new_shac_state = new_shac_state._replace(horizon=horizon)
 
-        # Propaga i parametri aggiornati da SHAC indietro a PPO
+        # Propaga i parametri aggiornati da SHAC indietro a PPO.
+        # FIX #2: quando SHAC sposta θ′→θ′′ con il proprio ottimizzatore Adam
+        # (lr=3e-5), l'opt_state di PPO rimane calibrato su θ′ — i momenti del
+        # primo/secondo ordine di Adam ricordano gradienti che non corrispondono
+        # più alla posizione corrente dei parametri. Questo produce update biasati
+        # al passo successivo e mantiene l'entropia alta (policy quasi-uniforme).
+        # Fix: re-inizializza l'opt_state di PPO sui nuovi parametri θ′′.
+        # Il costo è la perdita del momentum accumulato, ma è necessario per
+        # coerenza. In pratica, con lr PPO=5e-4 e lr SHAC=3e-5, SHAC sposta i
+        # params di ~0.3% — il warm-up del momentum Adam è rapido (~10 update).
         final_params    = new_shac_state.actor_params
-        final_ppo_state = (final_params, new_ppo_state[1])
+        new_opt_state   = optimizer.init(final_params)   # reset Adam moments
+        final_ppo_state = (final_params, new_opt_state)
     else:
         new_shac_state  = shac_state
         final_ppo_state = new_ppo_state
