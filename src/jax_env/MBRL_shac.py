@@ -217,21 +217,17 @@ def _shac_rollout_single(
         return (new_obs, new_stacked, key, next_discount), \
                (masked_r, new_obs, done_f)
 
-    # OOM FIX: jax.remat + unroll=1.
-    # jax.checkpoint() non protegge dalla compilazione AOT: XLA deve
-    # materializzare il grafo vmap(scan(H=24, N=512)) intero in memoria
-    # prima di generare il kernel CUDA → picco da 4 GB → OOM al 1° step.
+    # OOM+GRADIENT FIX: remat(policy=None) + unroll=1.
     #
-    # A) jax.remat con policy dots_with_no_batch_dims_saveable:
-    #    salva solo scalari/1D, ricomputa le attivazioni CNN nel backward.
-    # B) unroll=1: XLA compila 1 step di loop invece di srotolarlo H=24 volte.
-    #    Riduce il grafo da O(H·N·params) a O(N·params). Fix principale OOM.
-    #    Costo runtime: ~5% più lento per loop overhead; trascurabile.
-    try:
-        _policy = jax.checkpoint_policies.dots_with_no_batch_dims_saveable
-    except AttributeError:
-        _policy = None  # JAX < 0.4.14: fallback senza policy
-    _step_fn_ckpt = jax.remat(_step_fn, policy=_policy)
+    # PERCHÉ policy=None e non dots_with_no_batch_dims_saveable:
+    # La policy aggressiva salva solo scalari/prodotti-punto senza batch dim.
+    # Le azioni del network (shape action_dim,) vengono marcate "da ricomputare"
+    # in un contesto dove actor_params non è più nella catena di differenziazione
+    # → ∂action/∂θ = 0 → ∂J/∂θ = 0 → GN=0.000 per tutto il training.
+    # policy=None salva tutte le attivazioni: gradiente garantito.
+    #
+    # unroll=1 riduce il grafo XLA da O(H·N·params) a O(N·params): fix OOM.
+    _step_fn_ckpt = jax.remat(_step_fn, policy=None)
 
     (final_obs, final_state, _, final_discount), (rewards, obs_seq, dones) = \
         jax.lax.scan(
@@ -456,6 +452,38 @@ def shac_update_step(
 
 
 # ── Utility: costruisce la horizon_mask ───────────────────────────────────────
+
+
+def verify_shac_gradient(shac_state, actor_apply, critic_apply,
+                         obs_batch, state_batch, ghost_robot: bool = True) -> float:
+    """
+    Esegue un rollout SHAC su H=4 passi su 32 env e stampa ‖∇θ J‖.
+    Chiama dopo init_shac per confermare che il gradiente fluisca.
+    Ritorna float(grad_norm) — deve essere > 0.
+
+    FIX: state_batch è un StackedEnvState (flax struct dataclass), non
+    subscriptable con [:32]. Usa jax.tree_util.tree_map per sliciare.
+    """
+    mask  = make_horizon_mask(4)
+    n     = min(32, obs_batch.shape[0])
+    keys  = jax.random.split(jax.random.PRNGKey(0), n)
+    obs32 = obs_batch[:n]
+    # Slicea il pytree correttamente — funziona con qualsiasi struct dataclass
+    state32 = jax.tree_util.tree_map(lambda x: x[:n], state_batch)
+
+    def _test_loss(params):
+        returns, _ = _shac_rollout_batched(
+            params, shac_state.critic_params,
+            actor_apply, critic_apply,
+            obs32, state32, keys, mask, ghost_robot,
+        )
+        return -jnp.mean(returns)
+
+    grads = jax.grad(_test_loss)(shac_state.actor_params)
+    norm  = float(optax.global_norm(grads))
+    status = "OK — gradiente fluisce" if norm > 1e-8 else "PROBLEMA — gradiente zero!"
+    print(f"  [verify_shac_gradient] ‖∇θ J‖ = {norm:.4e}  ({status})")
+    return norm
 
 def make_horizon_mask(h_curr: int) -> jnp.ndarray:
     """

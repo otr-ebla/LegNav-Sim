@@ -72,7 +72,6 @@ FIX APPLICATI (rispetto alla versione precedente)
 """
 
 import os
-import functools
 import csv
 import time
 import argparse
@@ -110,7 +109,7 @@ from jax_network import EndToEndActorCritic
 from jax_train   import (collect_rollouts, init_env_state,
                           NUM_ENVS, ROLLOUT_STEPS, OBS_SIZE)
 from MBRL_shac    import (init_shac, shac_update_step, get_shac_horizon,
-                           make_horizon_mask,
+                           make_horizon_mask, verify_shac_gradient,
                            save_shac_checkpoint, N_SHAC_ENVS, SHACCritic,
                            SHAC_H_MAX)
 from jax_wrappers import make_stacked_env, make_autoreset_env
@@ -162,11 +161,9 @@ def _ppo_minibatch_step(carry, obs_mb, actions_mb, adv_mb, ret_mb, old_lp_mb, ol
     """
     Un singolo minibatch step PPO. Riceve il minibatch GIÀ ESTRATTO.
 
-    OOM FIX: il vecchio codice riceveva obs intero (524288, 342) + indice e
-    faceva obs[idx] dentro il JIT. XLA vedeva il tensore pieno come input
-    statico → autotuning della conv su 524k campioni → 3.38 GB OOM.
-    Fix: la slice viene fatta in Python PRIMA di chiamare il JIT.
-    Il kernel vede solo (MINI_BATCH_SIZE, 342) → autotuner usa ~1/64 della VRAM.
+    OOM FIX: il vecchio codice riceveva obs intero (524288,342) + indice dynamic_slice.
+    XLA vedeva il tensore pieno → autotuning conv su 524k campioni → 3.38 GB OOM.
+    Fix: slice in Python prima del JIT → kernel vede solo (MINI_BATCH_SIZE, 342).
     """
     params, opt_state = carry
 
@@ -183,7 +180,6 @@ def _ppo_minibatch_step(carry, obs_mb, actions_mb, adv_mb, ret_mb, old_lp_mb, ol
             jnp.clip(ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS) * adv_mb,
         ))
 
-        # Value clipping: previene update troppo grandi del critico
         v_clipped = old_vals_mb + jnp.clip(values - old_vals_mb, -10.0, 10.0)
         vf_loss   = VF_COEF * jnp.mean(jnp.maximum(
             (ret_mb - values) ** 2,
@@ -198,7 +194,6 @@ def _ppo_minibatch_step(carry, obs_mb, actions_mb, adv_mb, ret_mb, old_lp_mb, ol
 
     (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
 
-    # NaN guard
     grads = jax.tree_util.tree_map(
         lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0),
         grads
@@ -211,7 +206,7 @@ def _ppo_minibatch_step(carry, obs_mb, actions_mb, adv_mb, ret_mb, old_lp_mb, ol
 
 @jax.jit
 def _old_vals_chunk(params, obs_chunk):
-    """Forward pass su un chunk — JIT separato per non ricompilare ad ogni chunk."""
+    """Forward pass su un chunk — JIT su (MINI_BATCH_SIZE, OBS_SIZE), non sull'intero batch."""
     _, _, v = _network_mbrl.apply({"params": params}, obs_chunk)
     return v
 
@@ -221,57 +216,41 @@ def run_ppo_updates(train_state, obs_flat, actions_flat, adv_flat, ret_flat,
     """
     PPO update con minibatch pre-estratti in Python.
 
-    OOM FIX: il vecchio codice passava obs_flat intero (524288, 342) al JIT,
-    causando un autotuning XLA della conv su 524k campioni → 3.38 GB → OOM.
-    Fix:
-      1. old_vals calcolato a chunk di MINI_BATCH_SIZE (non sull'intero batch).
-      2. La slice del minibatch viene fatta in Python PRIMA del JIT, così
-         _ppo_minibatch_step vede solo tensori (MINI_BATCH_SIZE, ...) → 64x
-         meno VRAM per l'autotuner della conv.
-
-    FIX A: advantages e returns normalizzati con statistiche SEPARATE.
+    OOM FIX: old_vals calcolato a chunk di MINI_BATCH_SIZE (non sull'intero batch
+    da 524k campioni che triggera l'autotuner conv XLA → 3.38 GB OOM).
+    Slicing del minibatch in Python prima del JIT per lo stesso motivo.
     """
     params, opt_state = train_state
 
-    # Normalizza advantages
     adv_mean = adv_flat.mean()
     adv_std  = adv_flat.std() + 1e-8
     adv_flat_norm = (adv_flat - adv_mean) / adv_std
 
-    # FIX A: normalizza returns con le proprie statistiche
     ret_mean = ret_flat.mean()
     ret_std  = ret_flat.std() + 1e-8
     ret_flat_norm = (ret_flat - ret_mean) / ret_std
 
-    # OOM FIX: old_vals calcolato a chunk di MINI_BATCH_SIZE invece dell'intero batch.
-    # Ogni chunk è (MINI_BATCH_SIZE, 342) → autotuner conv usa ~1/64 della VRAM.
+    # old_vals a chunk: ogni chunk (MINI_BATCH_SIZE, 342) → autotuner OK
     old_vals_chunks = []
     for i in range(N_MINIBATCHES):
-        start = i * MINI_BATCH_SIZE
-        chunk_v = _old_vals_chunk(params, obs_flat[start : start + MINI_BATCH_SIZE])
-        old_vals_chunks.append(chunk_v)
+        s = i * MINI_BATCH_SIZE
+        old_vals_chunks.append(_old_vals_chunk(params, obs_flat[s : s + MINI_BATCH_SIZE]))
     old_vals_flat = jnp.concatenate(old_vals_chunks, axis=0)
     old_vals_norm = (old_vals_flat - ret_mean) / ret_std
 
     all_losses = []
     last_aux   = None
-
     epoch_keys = jax.random.split(rng_key, PPO_EPOCHS)
 
     for epoch_i in range(PPO_EPOCHS):
         perm = jax.random.permutation(epoch_keys[epoch_i], BATCH_SIZE)
-
         for mb_i in range(N_MINIBATCHES):
-            # OOM FIX: estrai il minibatch in Python (non dentro il JIT)
             idx = perm[mb_i * MINI_BATCH_SIZE : (mb_i + 1) * MINI_BATCH_SIZE]
             (params, opt_state), (loss, aux) = _ppo_minibatch_step(
                 (params, opt_state),
-                obs_flat[idx],
-                actions_flat[idx],
-                adv_flat_norm[idx],
-                ret_flat_norm[idx],
-                old_lp_flat[idx],
-                old_vals_norm[idx],
+                obs_flat[idx], actions_flat[idx],
+                adv_flat_norm[idx], ret_flat_norm[idx],
+                old_lp_flat[idx], old_vals_norm[idx],
             )
             all_losses.append(loss)
             last_aux = aux
