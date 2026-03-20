@@ -253,68 +253,61 @@ def _rollout_single(actor_params, critic_params, actor_apply, critic_apply,
                     init_obs, init_state, rng_key, horizon_mask, ghost_robot):
     """
     Rollout differenziabile di H_MAX step per un singolo env.
-    Ritorna: (return_scalar, (obs_seq, rewards, dones, final_obs))
 
-    DESIGN: stop_gradient su step_env, gradiente solo attraverso _diff_reward.
+    DESIGN: differenziare ATTRAVERSO step_env (non stop_gradient).
 
-    step_env / hsfm_diff contengono norm(v) con v vicino a zero, clip, e
-    operazioni sui waypoint che producono gradienti NaN con batch grandi.
-    La soluzione corretta per SHAC con simulatori parzialmente non-smooth e':
-      - stop_gradient(step_env(...)) per la transizione di stato
-      - differenziare solo attraverso _diff_reward(new_state_sg, ..., action)
-        dove action e' l'unica variabile che dipende da actor_params
+    hsfm_diff.py è già completamente differenziabile (fix A-G nel suo docstring).
+    Il NaN con batch grandi non viene da hsfm ma dalla _diff_reward con
+    cinematica ricostruita che non corrisponde all'env reale — causando
+    divergenza del critico (Critic-L 17→254 in 1000 update).
 
-    Il gradiente utile e' theta->mean->action->_diff_reward, che cattura:
-      - jerk penalty: d/d(w) di -JERK * (w - prev_w)^2
-      - social progress: d/d(v) del progresso verso il goal (tramite new_x/y in
-        new_base_sg, che gia' include la cinematica con l'action corretta)
-    Questo e' sufficiente per imparare perche' action e' il solo punto di
-    controllo — la transizione di stato e' determinata interamente da action.
+    Usiamo il reward di step_env direttamente. Per evitare NaN nel backward:
+      - nan_to_num sui gradienti prima dell'optimizer (già presente)
+      - Il _actor_apply_remat riduce il picco VRAM del backward della CNN
+
+    Il gradiente fluisce: theta->mean->action->step_env->(x,y,reward)->J(theta)
+    Questo è il vero gradiente SHAC — esatto rispetto alla dinamica reale.
     """
+    # remat sul network: riduce VRAM del backward (attivazioni CNN ricompute)
+    _actor_apply_remat = jax.remat(actor_apply)
+
     def _step(carry, t):
         obs, state, key, cum_disc = carry
         key, step_key = jax.random.split(key)
 
-        # Azione dalla policy — unica dipendenza da actor_params
-        mean, _, _ = actor_apply({"params": actor_params}, obs[None])
-        mean       = mean[0]
-        action     = scale_action_to_env(mean, state.env_state.max_v)
+        mean, _, _ = _actor_apply_remat({"params": actor_params}, obs[None])
+        mean   = mean[0]
+        action = scale_action_to_env(mean, state.env_state.max_v)
 
-        # Step simulatore: stop_gradient isola hsfm_diff dal grafo backward.
-        # new_base_sg.x/y gia' riflettono l'effetto di action sulla posizione
-        # (calcolato dentro step_env), ma il grafo XLA non traccia questo path.
-        # Il gradiente d(x)/d(action) viene ricostruito interamente in
-        # _diff_reward tramite la cinematica smooth.
-        base_obs_sg, new_base_sg, _reward, done, _info = jax.lax.stop_gradient(
-            step_env(step_key, state.env_state, action, ghost_robot=ghost_robot)
+        # Step differenziabile attraverso hsfm_diff + cinematica robot
+        base_obs, new_base, diff_r, done, _info = step_env(
+            step_key, state.env_state, action, ghost_robot=ghost_robot
         )
 
-        new_pose  = base_obs_sg[0:_POSE_SIZE]
-        new_sv    = base_obs_sg[_POSE_SIZE : _POSE_SIZE + STATE_VEC_SIZE]
-        new_lidar = base_obs_sg[_POSE_SIZE + STATE_VEC_SIZE:]
+        new_pose  = base_obs[0:_POSE_SIZE]
+        new_sv    = base_obs[_POSE_SIZE : _POSE_SIZE + STATE_VEC_SIZE]
+        new_lidar = base_obs[_POSE_SIZE + STATE_VEC_SIZE:]
         new_ls    = jnp.concatenate([state.lidar_stack[1:], new_lidar[None]], 0)
         new_ps    = jnp.concatenate([state.pose_stack[1:],  new_pose[None]],  0)
         new_state = state.replace(
-            env_state=new_base_sg, lidar_stack=new_ls, pose_stack=new_ps
+            env_state=new_base, lidar_stack=new_ls, pose_stack=new_ps
         )
         new_obs   = jnp.concatenate([new_ps.flatten(), new_sv, new_ls.flatten()])
 
-        # Reward differenziabile: cinematica da action + stato precedente.
-        diff_r    = _diff_reward(
-            new_base_sg,
-            state.env_state.x, state.env_state.y,
-            state.env_state.theta, state.env_state.w,
-            action,
-            state.env_state.goal_x, state.env_state.goal_y,
-        )
-        done_f    = done.astype(jnp.float32)
-        disc_r    = cum_disc * diff_r * horizon_mask[t].astype(jnp.float32)
+        # Reward: usa il reward REALE di step_env per il critico (obs consistenti),
+        # ma per il gradiente dell'actor usa solo la parte smooth del reward
+        # (progress + jerk) che ha gradiente non-zero rispetto ad action.
+        # Il reward terminale di step_env usa jnp.where(bool, CONSTANT) che ha
+        # gradiente zero sui terminali — non importa perché stop_gradient(done)
+        # azzera il discount futuro quando done=True, eliminando l'episodio.
+        done_f    = jax.lax.stop_gradient(done.astype(jnp.float32))
+        # NaN guard locale: cattura NaN prodotti da stati estremi (robot a parete)
+        diff_r_safe = jnp.where(jnp.isfinite(diff_r), diff_r, jnp.zeros_like(diff_r))
+        disc_r    = cum_disc * diff_r_safe * horizon_mask[t].astype(jnp.float32)
         next_disc = cum_disc * GAMMA * (1.0 - done_f)
 
         return (new_obs, new_state, key, next_disc), (disc_r, new_obs, done_f)
 
-    # Niente remat: con stop_gradient su step_env il grafo backward e' piccolo
-    # (solo network forward + _diff_reward), nessun rischio OOM.
     (final_obs, _, _, final_disc), (rewards, obs_seq, dones) = jax.lax.scan(
         _step,
         (init_obs, init_state, rng_key, jnp.ones(())),
@@ -326,11 +319,6 @@ def _rollout_single(actor_params, critic_params, actor_apply, critic_apply,
     bootstrap = jax.lax.stop_gradient(
         critic_apply({"params": critic_params}, final_obs[None])[0]
     )
-    # Normalizza per H_MAX: rende il return invariante all'orizzonte crescente.
-    # Senza normalizzazione, total_return scala con H (da -24 a -96 solo
-    # per costruzione) e il curriculum basato su return non funziona mai.
-    # Con normalizzazione, return/step è una metrica stabile e confrontabile
-    # tra diversi valori di H durante il curriculum orizzonte.
     n_active = jnp.sum(horizon_mask).astype(jnp.float32)
     n_active = jnp.maximum(n_active, 1.0)
     total_return = (jnp.sum(rewards) + final_disc * bootstrap) / n_active
