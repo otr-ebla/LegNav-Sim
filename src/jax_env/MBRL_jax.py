@@ -72,6 +72,7 @@ FIX APPLICATI (rispetto alla versione precedente)
 """
 
 import os
+import functools
 import csv
 import time
 import argparse
@@ -157,34 +158,36 @@ _network_mbrl = _EAC(action_dim=2)
 
 
 @jax.jit
-def _ppo_minibatch_step(carry, mb_idx,
-                        obs, actions, adv, ret, old_lp, old_vals, perm):
+def _ppo_minibatch_step(carry, obs_mb, actions_mb, adv_mb, ret_mb, old_lp_mb, old_vals_mb):
     """
-    Un singolo minibatch step PPO. JIT-compilato standalone (non dentro scan).
-    Il grafo è piccolo: MINI_BATCH_SIZE × OBS_SIZE attivazioni.
+    Un singolo minibatch step PPO. Riceve il minibatch GIÀ ESTRATTO.
+
+    OOM FIX: il vecchio codice riceveva obs intero (524288, 342) + indice e
+    faceva obs[idx] dentro il JIT. XLA vedeva il tensore pieno come input
+    statico → autotuning della conv su 524k campioni → 3.38 GB OOM.
+    Fix: la slice viene fatta in Python PRIMA di chiamare il JIT.
+    Il kernel vede solo (MINI_BATCH_SIZE, 342) → autotuner usa ~1/64 della VRAM.
     """
     params, opt_state = carry
-    idx = jax.lax.dynamic_slice(perm, (mb_idx * MINI_BATCH_SIZE,), (MINI_BATCH_SIZE,))
 
     def loss_fn(p):
-        mean, logstd, values = _network_mbrl.apply({"params": p}, obs[idx])
+        mean, logstd, values = _network_mbrl.apply({"params": p}, obs_mb)
         std = jnp.exp(logstd)
 
-        z        = (actions[idx] - mean) / (std + 1e-8)
+        z        = (actions_mb - mean) / (std + 1e-8)
         log_prob = jnp.sum(-0.5 * (z**2 + jnp.log(2.0 * jnp.pi)) - logstd, axis=-1)
 
-        ratio       = jnp.exp(jnp.clip(log_prob - old_lp[idx], -5.0, 5.0))
+        ratio       = jnp.exp(jnp.clip(log_prob - old_lp_mb, -5.0, 5.0))
         policy_loss = -jnp.mean(jnp.minimum(
-            ratio * adv[idx],
-            jnp.clip(ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS) * adv[idx],
+            ratio * adv_mb,
+            jnp.clip(ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS) * adv_mb,
         ))
 
         # Value clipping: previene update troppo grandi del critico
-        v_old     = old_vals[idx]
-        v_clipped = v_old + jnp.clip(values - v_old, -10.0, 10.0)
+        v_clipped = old_vals_mb + jnp.clip(values - old_vals_mb, -10.0, 10.0)
         vf_loss   = VF_COEF * jnp.mean(jnp.maximum(
-            (ret[idx] - values) ** 2,
-            (ret[idx] - v_clipped) ** 2,
+            (ret_mb - values) ** 2,
+            (ret_mb - v_clipped) ** 2,
         ))
 
         entropy      = jnp.mean(jnp.sum(0.5 * jnp.log(2.0 * jnp.pi * jnp.e) + logstd, axis=-1))
@@ -195,7 +198,7 @@ def _ppo_minibatch_step(carry, mb_idx,
 
     (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
 
-    # NaN guard: azzera gradienti NaN/Inf → l'update diventa no-op
+    # NaN guard
     grads = jax.tree_util.tree_map(
         lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0),
         grads
@@ -206,31 +209,48 @@ def _ppo_minibatch_step(carry, mb_idx,
     return (new_params, new_opt), (loss, aux)
 
 
+@jax.jit
+def _old_vals_chunk(params, obs_chunk):
+    """Forward pass su un chunk — JIT separato per non ricompilare ad ogni chunk."""
+    _, _, v = _network_mbrl.apply({"params": params}, obs_chunk)
+    return v
+
+
 def run_ppo_updates(train_state, obs_flat, actions_flat, adv_flat, ret_flat,
                     old_lp_flat, rng_key):
     """
-    PPO update con epoch in loop Python (non lax.scan) per ridurre il grafo XLA.
-    Ogni epoch compila un kernel con 64 minibatch — non 6×64=384.
+    PPO update con minibatch pre-estratti in Python.
+
+    OOM FIX: il vecchio codice passava obs_flat intero (524288, 342) al JIT,
+    causando un autotuning XLA della conv su 524k campioni → 3.38 GB → OOM.
+    Fix:
+      1. old_vals calcolato a chunk di MINI_BATCH_SIZE (non sull'intero batch).
+      2. La slice del minibatch viene fatta in Python PRIMA del JIT, così
+         _ppo_minibatch_step vede solo tensori (MINI_BATCH_SIZE, ...) → 64x
+         meno VRAM per l'autotuner della conv.
 
     FIX A: advantages e returns normalizzati con statistiche SEPARATE.
-    I returns non vengono normalizzati con la media degli advantage — quelle
-    sono distribuzioni diverse. Il value clipping PPO-style gestisce la scala.
     """
     params, opt_state = train_state
 
-    # Normalizza advantages (media e std degli advantage)
+    # Normalizza advantages
     adv_mean = adv_flat.mean()
     adv_std  = adv_flat.std() + 1e-8
     adv_flat_norm = (adv_flat - adv_mean) / adv_std
 
-    # FIX A: normalizza returns con le proprie statistiche (non quelle di adv)
+    # FIX A: normalizza returns con le proprie statistiche
     ret_mean = ret_flat.mean()
     ret_std  = ret_flat.std() + 1e-8
     ret_flat_norm = (ret_flat - ret_mean) / ret_std
 
-    # Valori "vecchi" per il value clipping (forward pass una volta, fuori da JIT)
-    _, _, old_vals_flat = _network_mbrl.apply({"params": params}, obs_flat)
-    # Normalizza old_vals con la stessa statistica dei returns (stessa scala)
+    # OOM FIX: old_vals calcolato a chunk di MINI_BATCH_SIZE invece dell'intero batch.
+    # Ogni chunk è (MINI_BATCH_SIZE, 342) → autotuner conv usa ~1/64 della VRAM.
+    old_vals_chunks = []
+    for i in range(N_MINIBATCHES):
+        start = i * MINI_BATCH_SIZE
+        chunk_v = _old_vals_chunk(params, obs_flat[start : start + MINI_BATCH_SIZE])
+        old_vals_chunks.append(chunk_v)
+    old_vals_flat = jnp.concatenate(old_vals_chunks, axis=0)
     old_vals_norm = (old_vals_flat - ret_mean) / ret_std
 
     all_losses = []
@@ -242,15 +262,20 @@ def run_ppo_updates(train_state, obs_flat, actions_flat, adv_flat, ret_flat,
         perm = jax.random.permutation(epoch_keys[epoch_i], BATCH_SIZE)
 
         for mb_i in range(N_MINIBATCHES):
+            # OOM FIX: estrai il minibatch in Python (non dentro il JIT)
+            idx = perm[mb_i * MINI_BATCH_SIZE : (mb_i + 1) * MINI_BATCH_SIZE]
             (params, opt_state), (loss, aux) = _ppo_minibatch_step(
-                (params, opt_state), jnp.int32(mb_i),
-                obs_flat, actions_flat, adv_flat_norm, ret_flat_norm,
-                old_lp_flat, old_vals_norm, perm,
+                (params, opt_state),
+                obs_flat[idx],
+                actions_flat[idx],
+                adv_flat_norm[idx],
+                ret_flat_norm[idx],
+                old_lp_flat[idx],
+                old_vals_norm[idx],
             )
             all_losses.append(loss)
             last_aux = aux
 
-    # Sincronizzazione GPU una sola volta alla fine
     mean_loss = jnp.mean(jnp.stack(all_losses))
     return (params, opt_state), mean_loss, last_aux
 
