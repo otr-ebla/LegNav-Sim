@@ -482,6 +482,17 @@ if __name__ == "__main__":
         )
         print(f"SHAC pronto. obs_batch={shac_obs_batch.shape}, "
               f"H_init={get_shac_horizon(0)}")
+        print("Verifica gradient flow SHAC...")
+        _gn = verify_shac_gradient(
+            shac_state, network.apply, critic_apply_shac,
+            shac_obs_batch, shac_state_batch, ghost_bool
+        )
+        if _gn < 1e-8:
+            raise RuntimeError(
+                "Gradiente SHAC ancora zero dopo il fix reward smooth.\n"
+                "Controlla: 1) step_env usa jnp.where non lax.cond?\n"
+                "           2) tutte le obs sono differenziabili?"
+            )
     else:
         shac_state          = None
         critic_apply_shac   = None

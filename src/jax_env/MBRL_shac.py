@@ -143,6 +143,81 @@ class SHACCritic(flax.linen.Module):
 
 # ── Core differenziabile: rollout SHAC ───────────────────────────────────────
 
+
+# ── Reward differenziabile per SHAC ──────────────────────────────────────────
+#
+# PROBLEMA ROOT CAUSE: il reward di step_env usa jnp.where(collision, CONSTANT, ...)
+# Con 81% di collisioni al primo step, praticamente ogni traiettoria termina con
+# reward = costante (-70.0) → ∂reward/∂action = 0 → GN=0 per tutto il training.
+#
+# La soluzione è ricalcolare il reward in modo fully differenziabile:
+#   - progress × clearance_factor  (smooth, differenziabile rispetto a x,y)
+#   - penalità jerk                (differenziabile rispetto a w)
+#   - bonus goal smooth            (sigmoid invece di where)
+#   - penalità collision smooth    (sigmoid invece di where)
+#
+# Questi usano lo stato del simulatore DOPO lo step differenziabile,
+# quindi ∂reward/∂action fluisce correttamente.
+
+from jax_env_multi import (ROBOT_RADIUS, PEOPLE_RADIUS, ROOM_W, ROOM_H,
+                            GOAL_RADIUS, _R_GOAL, _R_OBS_COL, _R_WALL_COL,
+                            _R_ACTIVE_COL, _PROGRESS_COEF, _STEP_PEN,
+                            _JERK_WEIGHT, _CF_CENTER)
+_CF_SLOPE_SHAC = 0.3   # stesso valore di jax_env_multi
+
+def _shac_diff_reward(
+    new_state,        # EnvState dopo lo step
+    prev_x: jnp.ndarray,
+    prev_y: jnp.ndarray,
+    prev_w: jnp.ndarray,
+    action:  jnp.ndarray,  # [v, w] già scalati
+) -> jnp.ndarray:
+    """
+    Reward fully differenziabile per SHAC BPTT.
+    Sostituisce i jnp.where(bool_condition, CONSTANT) con approssimazioni smooth.
+    """
+    new_x = new_state.x
+    new_y = new_state.y
+
+    # Progress verso il goal
+    prev_dist = jnp.sqrt((prev_x - new_state.goal_x)**2 + (prev_y - new_state.goal_y)**2 + 1e-8)
+    new_dist  = jnp.sqrt((new_x  - new_state.goal_x)**2 + (new_y  - new_state.goal_y)**2 + 1e-8)
+    progress  = prev_dist - new_dist
+
+    # Clearance factor (smooth sigmoid, differenziabile)
+    active_mask = new_state.people[:, 10] >= 0.0
+    dx_p = new_state.people[:, 0] - new_x
+    dy_p = new_state.people[:, 1] - new_y
+    dists_p = jnp.sqrt(dx_p**2 + dy_p**2 + 1e-8)
+    dists_p_active = jnp.where(active_mask, dists_p, jnp.inf)
+    closest_human = jnp.min(dists_p_active)
+    edge_to_edge = jnp.maximum(0.0, closest_human - PEOPLE_RADIUS - ROBOT_RADIUS)
+    clearance_factor = jax.nn.sigmoid((edge_to_edge - _CF_CENTER) / _CF_SLOPE_SHAC)
+
+    social_progress = _PROGRESS_COEF * progress * clearance_factor
+    step_pen = _STEP_PEN
+    jerk_pen = -_JERK_WEIGHT * (action[1] - prev_w) ** 2
+    reward = social_progress + step_pen + jerk_pen
+
+    # Terminal reward: smooth sigmoid invece di jnp.where(bool, CONSTANT)
+    # Goal: sigmoid centrato su GOAL_RADIUS (smooth ≈ 1 quando vicino al goal)
+    goal_smooth = jax.nn.sigmoid(20.0 * (GOAL_RADIUS - new_dist))
+    reward = reward + _R_GOAL * goal_smooth
+
+    # Collision con muri: distanza dal bordo
+    wall_dist = jnp.minimum(
+        jnp.minimum(new_x - ROBOT_RADIUS, ROOM_W - ROBOT_RADIUS - new_x),
+        jnp.minimum(new_y - ROBOT_RADIUS, ROOM_H - ROBOT_RADIUS - new_y),
+    )
+    wall_smooth = jax.nn.sigmoid(-20.0 * wall_dist)
+    reward = reward + _R_WALL_COL * wall_smooth
+
+    # Collision con umani: smooth proximity penalty
+    human_smooth = jax.nn.sigmoid(20.0 * (ROBOT_RADIUS + PEOPLE_RADIUS - closest_human))
+    reward = reward + _R_ACTIVE_COL * human_smooth
+
+    return reward
+
 def _shac_rollout_single(
     actor_params,
     critic_params,
@@ -200,10 +275,18 @@ def _shac_rollout_single(
             new_pose_stack.flatten(), new_state_vec, new_lidar_stack.flatten()
         ])
 
-        # FIX 1: il reward al passo t è SEMPRE incluso (include il goal reward).
-        # Il discount FUTURO si azzera se l'episodio è terminato.
-        discounted_r  = cum_discount * reward
-        done_f        = done.astype(jnp.float32)
+        # GRADIENT FIX: sostituisci reward di step_env con versione differenziabile.
+        # step_env usa jnp.where(collision_bool, CONSTANT) → gradiente zero
+        # quando collision=True (81% dei casi all'inizio). Con reward smooth
+        # il gradiente fluisce sempre: ∂reward/∂action ≠ 0 in ogni stato.
+        prev_x = obs[0]   # pose_stack[-1] = posizione corrente
+        prev_y = obs[1]
+        prev_w = state.env_state.w
+        diff_r = _shac_diff_reward(new_base_state, prev_x, prev_y, prev_w, env_action)
+        # Usa reward differenziabile per BPTT, stop_gradient su done
+        # (done contiene confronti booleani, non si può differenziare)
+        done_f        = jax.lax.stop_gradient(done.astype(jnp.float32))
+        discounted_r  = cum_discount * diff_r
         next_discount = cum_discount * SHAC_GAMMA * (1.0 - done_f)
 
         # FIX 3: maschera il reward per i passi oltre h_curr (traced, no retrace)
