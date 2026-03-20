@@ -291,9 +291,12 @@ def _actor_loss(actor_params, critic_params, actor_apply, critic_apply,
         actor_params, critic_params, actor_apply, critic_apply,
         obs_batch, state_batch, keys, horizon_mask, ghost_robot,
     )
-    # Baseline con stop_gradient: riduce varianza senza azzerare la loss
-    baseline = jax.lax.stop_gradient(jnp.mean(returns))
-    loss = -jnp.mean(returns - baseline)
+    # Loss = -mean(returns). Il segno negativo perché vogliamo massimizzare J.
+    # NON sottrarre la baseline qui: mean(x - mean(x)) = 0 per definizione
+    # → loss sempre zero. La stabilità del gradiente è già garantita da
+    # clip_by_global_norm nell'optimizer. La loss loggata sarà il return medio
+    # negato — valori tipici: da -80 (random) verso 0/positivo (policy buona).
+    loss = -jnp.mean(returns)
     return loss, (returns, aux)
 
 
