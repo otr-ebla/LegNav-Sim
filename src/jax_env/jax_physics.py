@@ -69,7 +69,7 @@ def _intersect_ray_circle_scalar(ray_x, ray_y, dx, dy, cx, cy, r):
     c  = fx * fx + fy * fy - r * r
     disc = b * b - 4.0 * c
 
-    sqrt_disc = jnp.sqrt(jnp.maximum(0.0, disc))
+    sqrt_disc = jnp.sqrt(jnp.maximum(1e-8, disc))
     t1 = (-b - sqrt_disc) * 0.5
     t2 = (-b + sqrt_disc) * 0.5
 
@@ -102,8 +102,11 @@ def _get_ray_circles_intersections(x0, y0, dx, dy, circles):
 def _intersect_ray_aabb_scalar(x0, y0, dx, dy, bx, by, bw, bh):
     """Slab method: single ray vs single axis-aligned box."""
     eps = 1e-7
-    idx = 1.0 / jnp.where(jnp.abs(dx) < eps, jnp.sign(dx) * eps + eps, dx)
-    idy = 1.0 / jnp.where(jnp.abs(dy) < eps, jnp.sign(dy) * eps + eps, dy)
+    # Prevent jnp.sign(0) from returning 0 and causing 1.0/0.0
+    safe_dx = jnp.where(jnp.abs(dx) < eps, eps * jnp.sign(dx + 1e-8), dx)
+    safe_dy = jnp.where(jnp.abs(dy) < eps, eps * jnp.sign(dy + 1e-8), dy)
+    idx = 1.0 / safe_dx
+    idy = 1.0 / safe_dy
 
     tx1 = (bx - bw - x0) * idx
     tx2 = (bx + bw - x0) * idx

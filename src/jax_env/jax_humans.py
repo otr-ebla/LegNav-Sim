@@ -202,7 +202,7 @@ def _update_one(human, key, all_humans, obs_circles, obs_boxes,
 
     # Waypoint management
     wp_y    = _wpx_to_wpy(wp_x, room_h)
-    dist_wp = jnp.sqrt((px-wp_x)**2 + (py-wp_y)**2)
+    dist_wp = jnp.sqrt((px-wp_x)**2 + (py-wp_y)**2 + 1e-8)
     need_wp = (dist_wp < _WAYPOINT_R) | (wp_x < 0.0)
     nwpx, nwpy = _sample_wp(k_wp, room_w, room_h)
     wp_x = jnp.where(need_wp, nwpx, wp_x)
@@ -216,7 +216,7 @@ def _update_one(human, key, all_humans, obs_circles, obs_boxes,
     def hf(i):
         opx, opy = all_humans[i,0], all_humans[i,1]
         fx, fy = _human_force(px, py, vx, vy, opx, opy, radius)
-        is_self = jnp.sqrt((px-opx)**2 + (py-opy)**2) < 1e-3
+        is_self = jnp.sqrt((px-opx)**2 + (py-opy)**2 + 1e-8) < 1e-3
         return jnp.where(is_self, 0.0, fx), jnp.where(is_self, 0.0, fy)
     hfxs, hfys = jax.vmap(hf)(jnp.arange(N))
     hfx, hfy = jnp.sum(hfxs), jnp.sum(hfys)
@@ -231,7 +231,7 @@ def _update_one(human, key, all_humans, obs_circles, obs_boxes,
     ax = gfx + hfx + wfx + cfx + bfx + rfx
     ay = gfy + hfy + wfy + cfy + bfy + rfy
     a_max = MAX_SPEED / dt      # never change velocity by more than MAX_SPEED in one step
-    amag  = jnp.sqrt(ax*ax + ay*ay) + _EPS
+    amag  = jnp.sqrt(ax*ax + ay*ay + 1e-8) + _EPS
     ax    = jnp.where(amag > a_max, ax * a_max / amag, ax)
     ay    = jnp.where(amag > a_max, ay * a_max / amag, ay)
 
@@ -240,7 +240,7 @@ def _update_one(human, key, all_humans, obs_circles, obs_boxes,
     new_vy = vy + ay * dt
 
     # Clamp speed
-    spd    = jnp.sqrt(new_vx**2 + new_vy**2) + _EPS
+    spd    = jnp.sqrt(new_vx**2 + new_vy**2 + 1e-8) + _EPS
     new_vx = jnp.where(spd > MAX_SPEED, new_vx * MAX_SPEED / spd, new_vx)
     new_vy = jnp.where(spd > MAX_SPEED, new_vy * MAX_SPEED / spd, new_vy)
 

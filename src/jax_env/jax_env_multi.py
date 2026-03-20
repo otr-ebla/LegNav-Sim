@@ -240,7 +240,7 @@ def step_env(key, state, action, ghost_robot: bool = True):
     gy_cur   = jnp.where(idx_cur == 0, g1y, g2y)
 
     dist_to_goal = jnp.sqrt((new_h_state[:, 0] - gx_cur)**2 +
-                             (new_h_state[:, 1] - gy_cur)**2)
+                             (new_h_state[:, 1] - gy_cur)**2 + 1e-8)
 
     # Only toggle active humans (idx >= 0) to stop dummies from reviving
     new_idx = jnp.where((dist_to_goal < 0.5) & (idx_cur >= 0.0),
@@ -330,8 +330,8 @@ def step_env(key, state, action, ghost_robot: bool = True):
     new_foot_state = jnp.where(needs_respawn[:, None], fresh_foot_state, advanced_foot_state)
 
     # ── 4. Distance helpers ───────────────────────────────────────────────────
-    prev_dist = jnp.sqrt((state.x - state.goal_x)**2 + (state.y - state.goal_y)**2)
-    new_dist  = jnp.sqrt((new_x  - state.goal_x)**2 + (new_y  - state.goal_y)**2)
+    prev_dist = jnp.sqrt((state.x - state.goal_x)**2 + (state.y - state.goal_y)**2 + 1e-8)
+    new_dist  = jnp.sqrt((new_x  - state.goal_x)**2 + (new_y  - state.goal_y)**2 + 1e-8)
 
     left_xy, right_xy = get_leg_positions(new_foot_state)   # (N,2) each
 
@@ -341,7 +341,7 @@ def step_env(key, state, action, ghost_robot: bool = True):
 
     dx_p = center_x - new_x
     dy_p = center_y - new_y
-    dists_p = jnp.sqrt(dx_p**2 + dy_p**2)
+    dists_p = jnp.sqrt(dx_p**2 + dy_p**2 + 1e-8)
 
     # Mask dummies from all distance/collision logic
     active_mask    = new_people[:, 10] >= 0.0
@@ -379,13 +379,13 @@ def step_env(key, state, action, ghost_robot: bool = True):
     # ── 5b. Static obstacle collisions ────────────────────────────────────────────
     dx_c = state.obs_circles[:, 0] - new_x
     dy_c = state.obs_circles[:, 1] - new_y
-    closest_cir = jnp.min(jnp.sqrt(dx_c**2 + dy_c**2) - state.obs_circles[:, 2])
+    closest_cir = jnp.min(jnp.sqrt(dx_c**2 + dy_c**2 + 1e-8) - state.obs_circles[:, 2])
 
     def _box_dist(box):
         cx, cy, hw, hh = box
         ddx = jnp.maximum(jnp.abs(new_x - cx) - hw, 0.0)
         ddy = jnp.maximum(jnp.abs(new_y - cy) - hh, 0.0)
-        return jnp.sqrt(ddx**2 + ddy**2)
+        return jnp.sqrt(ddx**2 + ddy**2 + 1e-8)
 
     closest_box = jnp.min(jax.vmap(_box_dist)(state.obs_boxes))
 

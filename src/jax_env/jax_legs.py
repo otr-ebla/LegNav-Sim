@@ -171,7 +171,7 @@ def _update_single(fs_i, person_i, dt):
     vx    = person_i[2]
     vy    = person_i[3]
     theta = person_i[4]
-    speed = jnp.sqrt(vx**2 + vy**2)
+    speed = jnp.sqrt(vx**2 + vy**2 + 1e-8)
 
     body_xy = jnp.array([px, py])
     fwd, lat = _fwd_lat(theta[None])   # (1,2)

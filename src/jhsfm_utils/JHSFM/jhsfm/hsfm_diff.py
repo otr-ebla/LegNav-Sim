@@ -314,10 +314,18 @@ def single_update(
     obstacle_force = raw_obstacle_force / jnp.maximum(num_real, 1.0)
 
     # ── Torque ────────────────────────────────────────────────────────────────
+    # ── Torque ────────────────────────────────────────────────────────────────
     input_force = desired_force + social_force + obstacle_force
-    # FIX G
+    
+    # NEW: Prevent arctan2(0,0) NaN gradient
+    input_force_safe = jnp.where(
+        jnp.sum(jnp.abs(input_force)) < 1e-8,
+        jnp.array([1e-8, 1e-8]),
+        input_force
+    )
+    
     input_force_norm  = safe_norm(input_force)
-    input_force_angle = jnp.arctan2(input_force[1], input_force[0])
+    input_force_angle = jnp.arctan2(input_force_safe[1], input_force_safe[0])
     inertia  = (self_parameters[1] * self_parameters[0] ** 2) / 2.0
     k_theta  = inertia * self_parameters[17] * input_force_norm
     # FIX G: safe_norm inside sqrt — avoids sqrt(0) which has infinite gradient
