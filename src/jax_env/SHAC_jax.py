@@ -165,20 +165,43 @@ def curriculum_stage(rolling_ret: float) -> int:
 _CF_SLOPE_DIFF = 0.3
 
 def _diff_reward(new_state, prev_x, prev_y, prev_w, action):
-    """Reward completamente differenziabile per BPTT."""
+    """
+    Reward completamente differenziabile per BPTT.
+
+    FIX NaN con batch grandi (>2048 env):
+    Tre sorgenti identificate:
+
+    FIX 1 — jnp.sqrt(x + 1e-8):
+      ∂sqrt/∂x = 1/(2*sqrt(x+eps)). Se x ≈ 0 e eps=1e-8 il gradiente
+      è ~1.6e4, e con 4096 env in parallelo anche un solo campione a x=0
+      fa saltare la norma del gradiente a NaN. Soluzione: eps alzato a
+      1e-6 + clip dell'argomento a >= 1e-6 prima di sqrt.
+
+    FIX 2 — jnp.min(dists_act) con tutti dummy (tutti inf):
+      jnp.min([inf,...]) = inf → sigmoid(20*(r - inf)) ha backward NaN
+      su CUDA float32. Soluzione: sostituisci inf con 30.0 (fuori stanza).
+
+    FIX 3 — sigmoid(20 * x) con |x| > ~40:
+      L'argomento supera il range float32 utile → NaN nel backward.
+      Soluzione: clip degli input a [-20, 20] prima di sigmoid
+      (sigmoid è già saturata a 0/1 in quel range).
+    """
     new_x, new_y = new_state.x, new_state.y
 
-    prev_dist = jnp.sqrt((prev_x - new_state.goal_x)**2 +
-                          (prev_y - new_state.goal_y)**2 + 1e-8)
-    new_dist  = jnp.sqrt((new_x  - new_state.goal_x)**2 +
-                          (new_y  - new_state.goal_y)**2 + 1e-8)
+    # FIX 1: safe_dist con eps=1e-6 e clip argomento
+    def _safe_dist_sq(ax, ay, bx, by):
+        return jnp.maximum((ax - bx)**2 + (ay - by)**2, 1e-6)
+
+    prev_dist = jnp.sqrt(_safe_dist_sq(prev_x, prev_y, new_state.goal_x, new_state.goal_y))
+    new_dist  = jnp.sqrt(_safe_dist_sq(new_x,  new_y,  new_state.goal_x, new_state.goal_y))
     progress  = prev_dist - new_dist
 
     active    = new_state.people[:, 10] >= 0.0
     dx_p      = new_state.people[:, 0] - new_x
     dy_p      = new_state.people[:, 1] - new_y
-    dists_p   = jnp.sqrt(dx_p**2 + dy_p**2 + 1e-8)
-    dists_act = jnp.where(active, dists_p, jnp.inf)
+    dists_p   = jnp.sqrt(jnp.maximum(dx_p**2 + dy_p**2, 1e-6))
+    # FIX 2: 30.0 invece di jnp.inf per i dummy
+    dists_act = jnp.where(active, dists_p, 30.0)
     closest   = jnp.min(dists_act)
 
     edge      = jnp.maximum(0.0, closest - PEOPLE_RADIUS - ROBOT_RADIUS)
@@ -188,14 +211,14 @@ def _diff_reward(new_state, prev_x, prev_y, prev_w, action):
     jerk_pen        = -_JERK_WEIGHT * (action[1] - prev_w) ** 2
     r               = social_progress + _STEP_PEN + jerk_pen
 
-    # Terminali smooth
-    goal_s  = jax.nn.sigmoid(20.0 * (GOAL_RADIUS - new_dist))
+    # FIX 3: clip input sigmoid a [-20, 20]
     wall_d  = jnp.minimum(
         jnp.minimum(new_x - ROBOT_RADIUS, ROOM_W - ROBOT_RADIUS - new_x),
         jnp.minimum(new_y - ROBOT_RADIUS, ROOM_H - ROBOT_RADIUS - new_y),
     )
-    wall_s  = jax.nn.sigmoid(-20.0 * wall_d)
-    human_s = jax.nn.sigmoid(20.0 * (ROBOT_RADIUS + PEOPLE_RADIUS - closest))
+    goal_s  = jax.nn.sigmoid(jnp.clip(20.0 * (GOAL_RADIUS  - new_dist),  -20.0, 20.0))
+    wall_s  = jax.nn.sigmoid(jnp.clip(-20.0 * wall_d,                     -20.0, 20.0))
+    human_s = jax.nn.sigmoid(jnp.clip(20.0 * (ROBOT_RADIUS + PEOPLE_RADIUS - closest), -20.0, 20.0))
 
     r = r + _R_GOAL * goal_s + _R_WALL_COL * wall_s + _R_ACTIVE_COL * human_s
     return jnp.where(jnp.isfinite(r), r, jnp.zeros_like(r))
