@@ -146,39 +146,24 @@ def _shac_rollout_single(
     critic_params,
     actor_apply,
     critic_apply,
-    init_obs:    jnp.ndarray,       # (OBS_SIZE,)
+    init_obs:    jnp.ndarray,       
     init_state:  StackedEnvState,
     rng_key:     jnp.ndarray,
-    horizon_mask: jnp.ndarray,      # (SHAC_H_MAX,) bool — True per t < h_curr
+    horizon_mask: jnp.ndarray,      
     ghost_robot:  bool = True,
 ):
-    """
-    Esegue un rollout di SHAC_H_MAX passi per UN singolo environment.
-    I reward oltre l'orizzonte corrente sono mascherati a zero via horizon_mask.
-
-    FIX 1: reward terminale incluso correttamente.
-    FIX 3: horizon è ora una maschera JAX traced → nessuna ricompilazione.
-    FIX 4: jax.checkpoint su _step_fn → gradient checkpointing contro OOM.
-
-    Ritorna J(θ) = Σ_{t<h} γ^t · r_t  +  γ^h · V(s_h)
-    dove h = numero di True in horizon_mask.
-    """
-
     def _step_fn(carry, t):
         obs, state, key, cum_discount = carry
         key, step_key = jax.random.split(key)
 
-        # Azione deterministica (media della policy) — fondamentale per BPTT
         mean, _, _ = actor_apply({"params": actor_params}, obs[None])
         mean = mean[0]
         env_action = scale_action_to_env(mean, state.env_state.max_v)
 
-        # Step differenziabile
         base_obs, new_base_state, reward, done, info = step_env(
             step_key, state.env_state, env_action, ghost_robot=ghost_robot
         )
 
-        # Aggiorna stack osservazioni
         new_pose      = base_obs[0:_POSE_SIZE]
         new_state_vec = base_obs[_POSE_SIZE : _POSE_SIZE + STATE_VEC_SIZE]
         new_lidar     = base_obs[_POSE_SIZE + STATE_VEC_SIZE:]
@@ -198,38 +183,48 @@ def _shac_rollout_single(
             new_pose_stack.flatten(), new_state_vec, new_lidar_stack.flatten()
         ])
 
-        # FIX 1: il reward al passo t è SEMPRE incluso (include il goal reward).
-        # Il discount FUTURO si azzera se l'episodio è terminato.
-        discounted_r  = cum_discount * reward
         done_f        = done.astype(jnp.float32)
         next_discount = cum_discount * SHAC_GAMMA * (1.0 - done_f)
 
-        # FIX 3: maschera il reward per i passi oltre h_curr (traced, no retrace)
-        masked_r = discounted_r * horizon_mask[t].astype(jnp.float32)
-
+        # Rimuoviamo la maschera qui: ritorniamo il reward REALE e il cum_discount
         return (new_obs, new_stacked, key, next_discount), \
-               (masked_r, new_obs, done)
+               (reward, new_obs, done, cum_discount)
 
-    # FIX 4: gradient checkpointing — ricomputa attivazioni nel backward
     _step_fn_ckpt = jax.checkpoint(_step_fn)
 
-    (final_obs, final_state, _, final_discount), (rewards, obs_seq, dones) = \
+    (final_obs, final_state, _, final_discount), (rewards, obs_seq, dones, cum_discounts) = \
         jax.lax.scan(
             _step_fn_ckpt,
             (init_obs, init_state, rng_key, jnp.ones(())),
-            jnp.arange(SHAC_H_MAX),   # t passato come xs per la maschera
+            jnp.arange(SHAC_H_MAX),
             length=SHAC_H_MAX,
         )
 
-    # Bootstrap con il critico a fine orizzonte (stop_gradient: critico è target fisso)
+    # ── Dinamica estrazione del Bootstrap ──
+    h_curr = jnp.sum(horizon_mask).astype(jnp.int32)
+    h_idx  = jnp.maximum(0, h_curr - 1)
+
+    bootstrap_obs = obs_seq[h_idx]
+    # Sconto applicato al passo h_curr: gamma^h_curr * prod(1-done)
+    bootstrap_discount = cum_discounts[h_idx] * SHAC_GAMMA * (1.0 - dones[h_idx].astype(jnp.float32))
+
     bootstrap_v = jax.lax.stop_gradient(
-        critic_apply({"params": critic_params}, final_obs[None])[0]
+        critic_apply({"params": critic_params}, bootstrap_obs[None])[0]
     )
 
-    # Il discount accumulato a fine scan è γ^H (o 0 se terminato prima)
-    total_return = jnp.sum(rewards) + final_discount * bootstrap_v
+    # ── Calcolo ritorno Actor (curriculum) ──
+    masked_rewards = rewards * horizon_mask.astype(jnp.float32)
+    discounted_masked_rewards = masked_rewards * cum_discounts
+    actor_return = jnp.sum(discounted_masked_rewards) + bootstrap_discount * bootstrap_v
 
-    return total_return, (obs_seq, rewards, dones, final_obs)
+    # Restituiamo i rewards REALI all'esterno, non quelli mascherati!
+    return actor_return, (obs_seq, rewards, dones, final_obs)
+
+
+
+
+
+
 
 
 # vmap su N_SHAC_ENVS envs
