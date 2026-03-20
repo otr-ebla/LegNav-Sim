@@ -138,23 +138,15 @@ GRAD_CLIP_CRITIC= 1.0
 
 GAMMA           = 0.99
 LAM             = 0.95
-# TAU=0.005 was too slow: target network ≈ online network after only ~200 updates.
-# With BPTT the actor shifts the state distribution every update, so the target
-# needs to track the online network faster. 0.02 gives ~50-update lag — fast
-# enough to stabilise targets, slow enough to prevent oscillation.
-TAU             = 0.02
+TAU             = 0.02    # was 0.005: too slow, target ≈ online after ~200 updates
 VF_COEF         = 0.5
 
-# Number of critic gradient steps per outer update.
-# Single critic update per actor update is too few for SHAC: the actor moves
-# the state distribution on every step, so the critic needs multiple passes
-# to converge before it provides a useful bootstrap signal.
-# 4 updates per outer step is standard in SAC/TD3 and empirically stable.
+# Multiple critic updates per actor step: critic must keep up with shifting
+# state distribution from BPTT. 4 is standard in SAC/TD3.
 N_CRITIC_UPDATES = 4
 
-# Critic warmup: train critic-only for this many updates before starting BPTT.
-# Gives the critic a head-start so V(s_H) is meaningful from the beginning —
-# prevents the actor from being misled by a near-zero critic at t=0.
+# Critic warmup: pre-train critic before first actor BPTT update so the
+# bootstrap V(s_H) is calibrated, not near-zero.
 CRITIC_WARMUP_UPDATES = 30
 
 # Ricampiona stati iniziali ogni N update
@@ -294,7 +286,7 @@ def _rollout_single(actor_params, critic_params, actor_apply, critic_apply,
     Il gradiente fluisce: theta->mean->action->step_env->(x,y,reward)->J(theta)
     Questo è il vero gradiente SHAC — esatto rispetto alla dinamica reale.
     """
-    # ── VRAM fix: remat on the ENTIRE scan body ───────────────────────────────
+    # ── VRAM fix: remat on entire scan body ───────────────────────────────────
     def _step(carry, t):
         obs, state, key, cum_disc, already_done = carry
         key, step_key = jax.random.split(key)
@@ -320,22 +312,24 @@ def _rollout_single(actor_params, critic_params, actor_apply, critic_apply,
         done_f = jax.lax.stop_gradient(done.astype(jnp.float32))
 
         # active = step is within curriculum horizon AND episode not yet ended.
-        # Post-terminal steps have zeroed reward and zero discount contribution,
-        # preventing dead-episode terminal rewards (-90/+200) from corrupting
-        # TD targets or the actor return.  [Bug B fix]
-        active = horizon_mask[t] & ~already_done
+        # Post-terminal steps are zeroed so -90/+200 terminal rewards from dead
+        # episodes don't corrupt TD targets or the actor return. [Bug B fix]
+        active     = horizon_mask[t] & ~already_done
+        act_f      = active.astype(jnp.float32)
         raw_r_safe = jnp.where(jnp.isfinite(diff_r), diff_r, jnp.zeros_like(diff_r))
-        masked_r   = raw_r_safe * active.astype(jnp.float32)
+        masked_r   = raw_r_safe * act_f
 
-        # Discount for actor: zero after episode ends or beyond horizon
-        next_disc      = cum_disc * GAMMA * (1.0 - done_f) * active.astype(jnp.float32)
+        # Discount zeroed after done/horizon so bootstrap is only γ^H when all
+        # H steps ran to completion.
+        next_disc        = cum_disc * GAMMA * (1.0 - done_f) * act_f
         new_already_done = already_done | done
 
-        # Bug A fix: store obs (s_t, start of step t) not new_obs (s_{t+1}).
-        # TD(λ) needs V(s_t) aligned with r_t.  new_obs goes into carry for
-        # the next step and is correctly used there.
+        # Bug A fix: output obs (= s_t, start of step t), NOT new_obs (= s_{t+1}).
+        # The critic TD scan needs V(s_t) aligned with r_t:
+        #   delta_t = r_t + γ·V(s_{t+1}) − V(s_t)  ← correct
+        # Previously new_obs was stored → delta used V(s_{t+2}) − V(s_{t+1}).
         return (new_obs, new_state, key, next_disc, new_already_done), \
-               (masked_r, obs, done_f, cum_disc, active.astype(jnp.float32))
+               (masked_r, obs, done_f, cum_disc, act_f)
 
     _step_remat = jax.checkpoint(_step)
 
@@ -347,13 +341,13 @@ def _rollout_single(actor_params, critic_params, actor_apply, critic_apply,
         length=H_MAX,
         unroll=1,
     )
-    # obs_seq[t]    = s_t  (start of step t).  Shape: (H_MAX, OBS_SIZE)
-    # raw_rewards[t]= r_t  zeroed post-done / beyond horizon
-    # active_mask[t]= 1.0 if step was executed, else 0.0
+    # obs_seq[t]     = s_t (start of step t).   Shape: (H_MAX, OBS_SIZE)
+    # raw_rewards[t] = r_t zeroed post-done / beyond horizon
+    # active_mask[t] = 1.0 if step executed, 0.0 otherwise
     # disc_weights[t]= γ^t (cum_disc entering step t)
-    # final_obs     = s_H  (for bootstrap)
+    # final_obs      = s_H (for bootstrap)
 
-    discounted_rewards = raw_rewards * disc_weights
+    discounted_rewards = raw_rewards * disc_weights   # γ^t · r_t
     bootstrap = jax.lax.stop_gradient(
         critic_apply({"params": critic_params}, final_obs[None])[0]
     )
@@ -383,62 +377,47 @@ def _actor_loss(actor_params, critic_params, actor_apply, critic_apply,
 def _critic_loss(critic_params, critic_apply,
                  obs_seq, rewards, dones, final_obs, active_mask, target_params):
     """
-    TD(λ) critic loss — corrected and stabilised.
+    TD(λ) critic loss — corrected obs alignment + Huber loss + active masking.
 
-    Key fixes vs previous version:
-      1. obs_seq[t] = s_t (NOT s_{t+1}): aligned with r_t for correct delta.
-      2. Huber loss instead of MSE: robust to large terminal rewards (±90/+200).
-         The reward scale spans 3000x (step: -0.03, terminal: -90/+200).
-         MSE amplifies these 10000x → critic diverges. Huber clips gradients
-         to O(1) for large errors while remaining quadratic near zero.
-      3. Active mask: MSE/Huber only over real steps (not padded / post-done).
-      4. Reward normalisation per-batch: divide by batch std before computing
-         targets. Critic predicts normalised values; bootstrap is un-normalised
-         in actor (stop_gradient) so actor gradient is unaffected.
+    Fixes vs previous:
+      1. obs_seq[t] = s_t (not s_{t+1}): correct Bellman alignment
+         delta_t = r_t + γ·V(s_{t+1})·(1-d) − V(s_t)
+      2. Huber loss (δ=10) instead of MSE: robust to terminal rewards ±90/+200.
+         MSE amplifies a -90 collision to 8100 gradient; Huber clamps it to ~90.
+         δ=10 is quadratic for |error|<10 (covers normal V range), linear beyond.
+      3. NO reward normalisation: normalising rewards creates a unit mismatch —
+         the critic predicts V in normalised units while the actor sums raw rewards,
+         causing the bootstrap γ^H·V to have the wrong scale and grow with H.
+         Huber alone is sufficient to handle the reward scale spread.
+      4. active_mask: MSE/Huber only over real executed steps, not padding.
 
-    TD(λ) backward scan (correct alignment):
-        obs_seq[:, t, :] = s_t
-        v_t    = V(s_t)   from target network
-        next_v = V(s_{t+1}) from previous iteration (starts at V(s_H))
-        delta_t = r_t + γ·next_v·(1−d_t) − v_t     ← correct Bellman error
-        gae_t   = delta_t + γ·λ·(1−d_t)·gae_{t+1}
-        target_t = gae_t + v_t
+    TD(λ) reverse scan (corrected):
+        obs_seq[:, t, :] = s_t  →  v_t = V(s_t)  from target network
+        next_v in carry        = V(s_{t+1})
+        delta_t = r_t + γ·next_v·(1-d_t) − v_t   ← correct Bellman error
+        gae_t   = delta_t + γ·λ·(1-d_t)·gae_{t+1}
+        target_t = gae_t + v_t                     ← TD(λ) target for V(s_t)
     """
     N, H = rewards.shape
 
-    # ── Reward normalisation ──────────────────────────────────────────────────
-    # Normalise rewards by the batch standard deviation (not mean-centred, to
-    # preserve the sign/direction of the reward signal). This maps the reward
-    # scale from [-90, +200] to roughly [-3, +6], making TD targets well-scaled
-    # for the critic MLP and preventing MSE spikes from terminal rewards.
-    # The actor loss uses raw rewards (stop_gradient from bootstrap), so the
-    # actor gradient through BPTT is NOT affected by this normalisation.
-    n_active   = jnp.maximum(jnp.sum(active_mask), 1.0)
-    r_mean     = jnp.sum(rewards * active_mask) / n_active
-    r_var      = jnp.sum(active_mask * (rewards - r_mean) ** 2) / n_active
-    r_std      = jnp.sqrt(r_var + 1e-8)
-    r_norm     = rewards / r_std   # (N, H), zero-divided rewards stay finite
-
-    # V(s_H) for bootstrap — target network, stop_gradient
     v_final = jax.lax.stop_gradient(
         critic_apply({"params": target_params}, final_obs)
-    )  # (N,)
+    )  # (N,) — V(s_H) for bootstrap at the end of the horizon
 
     def _td_scan(carry, t):
         gae, next_v = carry   # next_v = V(s_{t+1})
-        r   = r_norm[:, t]
+        r   = rewards[:, t]
         d   = dones[:, t]
         act = active_mask[:, t]
-        # obs_seq[:, t, :] = s_t  →  v_t = V(s_t)
+        # obs_seq[:, t, :] = s_t → v_t = V(s_t) from target network
         v_t = jax.lax.stop_gradient(
             critic_apply({"params": target_params}, obs_seq[:, t, :])
         )
-        delta = r + GAMMA * next_v * (1.0 - d) - v_t
+        delta = r + GAMMA * next_v * (1.0 - d) - v_t   # correct Bellman error
         gae   = delta + GAMMA * LAM * (1.0 - d) * gae
-        # Zero gae for inactive steps so they don't corrupt earlier targets
-        gae   = gae * act
+        gae   = gae * act   # zero gae for inactive steps
         target = jax.lax.stop_gradient(gae + v_t)
-        # Carry next_v = v_t = V(s_t), which becomes V(s_{t+1}) for step t-1
+        # next iteration: next_v = v_t = V(s_t), which is V(s_{t+1}) for step t-1
         return (gae, v_t), (target, act)
 
     (_, _), (targets, acts) = jax.lax.scan(
@@ -451,15 +430,15 @@ def _critic_loss(critic_params, critic_apply,
     v_preds  = critic_apply({"params": critic_params}, obs_flat).reshape(N, H)
     tgt_sg   = jax.lax.stop_gradient(targets)
 
-    # ── Huber loss (δ=1) over active steps only ───────────────────────────────
-    # Huber replaces MSE: quadratic for |error| < 1, linear beyond.
-    # This limits the gradient from any single collision/goal step to O(1)
-    # instead of O(90²) with MSE, preventing critic divergence.
-    err    = v_preds - tgt_sg
-    huber  = jnp.where(jnp.abs(err) < 1.0,
-                       0.5 * err ** 2,
-                       jnp.abs(err) - 0.5)
-    n_act  = jnp.maximum(jnp.sum(acts), 1.0)
+    # Huber loss (δ=10): quadratic for |v_pred - target| < 10, linear beyond.
+    # δ=10 covers the full range of V values for this reward scale (~[-50, +10]).
+    # Quadratic regime gives proper gradient for normal TD errors; the linear
+    # regime caps the gradient from rare large-magnitude terminal targets.
+    err   = v_preds - tgt_sg
+    huber = jnp.where(jnp.abs(err) < 10.0,
+                      0.5 * err ** 2,
+                      10.0 * jnp.abs(err) - 50.0)
+    n_act = jnp.maximum(jnp.sum(acts), 1.0)
     return VF_COEF * jnp.sum(acts * huber) / n_act
 
 
@@ -496,7 +475,6 @@ def make_update_step(actor_apply, critic_apply,
                 actor_params, critic_params, actor_apply, critic_apply,
                 obs_batch, state_batch, keys, horizon_mask, ghost_robot,
             )
-
         a_grads = jax.tree_util.tree_map(
             lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), a_grads
         )
@@ -506,33 +484,37 @@ def make_update_step(actor_apply, critic_apply,
         )
         new_actor_params = optax.apply_updates(actor_params, a_updates)
 
-        # ── 2. Critic update — N_CRITIC_UPDATES passes on the same rollout data ─
+        # ── 2. Critic — N_CRITIC_UPDATES steps on the same rollout data ───────
+        # Multiple steps let the critic converge before the next BPTT update.
+        # Target network is soft-updated after each critic step (TAU=0.02).
         def _one_critic_step(carry, _):
-            c_params, c_opt, c_tgt = carry
-            c_loss_i, c_grads_i = jax.value_and_grad(_critic_loss)(
-                c_params, critic_apply,
-                obs_seq, rewards, dones, final_obs, active_mask, c_tgt,
+            cp, co, ct = carry
+            cl, cg = jax.value_and_grad(_critic_loss)(
+                cp, critic_apply,
+                obs_seq, rewards, dones, final_obs, active_mask, ct,
             )
-            c_grads_i = jax.tree_util.tree_map(
-                lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), c_grads_i
+            cg = jax.tree_util.tree_map(
+                lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), cg
             )
-            c_gn_i = optax.global_norm(c_grads_i)
-            c_upd, new_c_opt_i = critic_optimizer.update(c_grads_i, c_opt, c_params)
-            new_c_params = optax.apply_updates(c_params, c_upd)
-            new_c_tgt = jax.tree_util.tree_map(
+            cgn = optax.global_norm(cg)
+            cu, new_co = critic_optimizer.update(cg, co, cp)
+            new_cp = optax.apply_updates(cp, cu)
+            new_ct = jax.tree_util.tree_map(
                 lambda tgt, online: (1.0 - TAU) * tgt + TAU * online,
-                c_tgt, new_c_params
+                ct, new_cp
             )
-            return (new_c_params, new_c_opt_i, new_c_tgt), (c_loss_i, c_gn_i)
+            return (new_cp, new_co, new_ct), (cl, cgn)
 
-        (new_critic_params, new_c_opt, new_target_params), (c_losses, c_gns) = jax.lax.scan(
-            _one_critic_step,
-            (critic_params, critic_opt_state, critic_target_params),
-            None, length=N_CRITIC_UPDATES
-        )
+        (new_critic_params, new_c_opt, new_target_params), (c_losses, c_gns) = \
+            jax.lax.scan(
+                _one_critic_step,
+                (critic_params, critic_opt_state, critic_target_params),
+                None, length=N_CRITIC_UPDATES
+            )
         c_loss      = jnp.mean(c_losses)
-        c_grad_norm = c_gns[-1]   # grad norm of the last critic update step
+        c_grad_norm = c_gns[-1]
 
+        # mean_raw_reward: true reward/step in raw units, H-invariant, for curriculum.
         n_active = jnp.maximum(jnp.sum(active_mask), 1.0)
         metrics = {
             "actor_loss":      a_loss,
@@ -540,9 +522,6 @@ def make_update_step(actor_apply, critic_apply,
             "mean_return":     jnp.mean(returns),
             "actor_gn":        a_grad_norm,
             "critic_gn":       c_grad_norm,
-            # mean_raw_reward: true reward/step for curriculum EMA.
-            # Divide by total active steps so the value is invariant to H and
-            # N_ENVS — matches the calibrated curriculum thresholds.
             "mean_raw_reward": jnp.sum(rewards * active_mask) / n_active,
         }
         return (new_actor_params, new_critic_params, new_target_params,
@@ -734,61 +713,57 @@ if __name__ == "__main__":
           f"({'OK' if _gn > 1e-8 else 'ATTENZIONE gradiente molto piccolo'})")
 
     # ── Critic warmup ─────────────────────────────────────────────────────────
-    # Train the critic only (no actor update) for CRITIC_WARMUP_UPDATES steps.
-    # This gives the critic a head-start so V(s_H) is meaningful before the
-    # first actor BPTT update. Without warmup the bootstrap starts at ~0 while
-    # the true value is ~-7, causing the actor to be misled by a wrong signal.
-    # We build a dedicated critic-only JIT step (no BPTT, just rollouts + critic).
+    # Pre-train the critic for CRITIC_WARMUP_UPDATES steps with the actor frozen.
+    # Without warmup V(s_H) ≈ 0, so the bootstrap in the actor return is wrong
+    # from step 0 and the actor gradient points in a misleading direction.
     print(f"Critic warmup ({CRITIC_WARMUP_UPDATES} steps, critic-only)...")
 
     @jax.jit
-    def _critic_warmup_step(actor_params_sg, critic_params, critic_target_params,
-                             critic_opt_state, obs_batch, state_batch, keys, horizon_mask):
-        """Run rollout with a fixed (stop-gradient) actor, train critic only."""
-        # _actor_loss returns (loss, (returns, aux)) where aux is the 5-tuple.
-        # We only need the rollout data (aux), not the loss or returns.
-        _, (_, aux) = _actor_loss(
-            actor_params_sg, critic_params, actor_net.apply, critic_net.apply,
-            obs_batch, state_batch, keys, horizon_mask, ghost_robot,
+    def _critic_warmup_step(ap_sg, cp, ct, co,
+                             obs_b, state_b, keys_b, hmask):
+        # _actor_loss returns (loss, (returns, (obs_seq, rewards, dones, final_obs, active_mask)))
+        _, (_, rollout) = _actor_loss(
+            ap_sg, cp, actor_net.apply, critic_net.apply,
+            obs_b, state_b, keys_b, hmask, ghost_robot,
         )
-        obs_seq, rewards, dones, final_obs, active_mask = aux
+        obs_seq, rewards, dones, final_obs, active_mask = rollout
 
-        def _one_step(carry, _):
-            cp, co, ct = carry
-            loss_i, grads_i = jax.value_and_grad(_critic_loss)(
-                cp, critic_net.apply,
-                obs_seq, rewards, dones, final_obs, active_mask, ct,
+        def _one(carry, _):
+            cp_i, co_i, ct_i = carry
+            cl, cg = jax.value_and_grad(_critic_loss)(
+                cp_i, critic_net.apply,
+                obs_seq, rewards, dones, final_obs, active_mask, ct_i,
             )
-            grads_i = jax.tree_util.tree_map(
-                lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), grads_i
+            cg = jax.tree_util.tree_map(
+                lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), cg
             )
-            upd, new_co = critic_optimizer.update(grads_i, co, cp)
-            new_cp = optax.apply_updates(cp, upd)
-            new_ct = jax.tree_util.tree_map(
-                lambda t, o: (1.0 - TAU) * t + TAU * o, ct, new_cp
+            cu, new_co_i = critic_optimizer.update(cg, co_i, cp_i)
+            new_cp_i = optax.apply_updates(cp_i, cu)
+            new_ct_i = jax.tree_util.tree_map(
+                lambda t, o: (1.0 - TAU) * t + TAU * o, ct_i, new_cp_i
             )
-            return (new_cp, new_co, new_ct), loss_i
+            return (new_cp_i, new_co_i, new_ct_i), cl
 
         (new_cp, new_co, new_ct), losses = jax.lax.scan(
-            _one_step, (critic_params, critic_opt_state, critic_target_params),
-            None, length=N_CRITIC_UPDATES
+            _one, (cp, co, ct), None, length=N_CRITIC_UPDATES
         )
         return new_cp, new_ct, new_co, jnp.mean(losses)
 
     _wu_mask = make_horizon_mask(H_INIT)
-    # stop_gradient the actor params so warmup never computes actor gradients
-    _actor_params_sg = jax.lax.stop_gradient(actor_params)
+    # stop_gradient so warmup never computes BPTT gradients through actor
+    _ap_sg = jax.lax.stop_gradient(actor_params)
     for _wu in range(CRITIC_WARMUP_UPDATES):
-        rng, _wu_rng, _wu_sample = jax.random.split(rng, 3)
+        rng, _wu_rng, _wu_smp = jax.random.split(rng, 3)
         if _wu % RESAMPLE_INTERVAL == 0:
-            obs_batch, state_batch = _sample_init_states(_wu_sample, cur_dist, ghost_robot)
+            obs_batch, state_batch = _sample_init_states(_wu_smp, cur_dist, ghost_robot)
         _wu_keys = jax.random.split(_wu_rng, N_ENVS)
         critic_params, critic_target_params, critic_opt_state, _wu_loss = \
-            _critic_warmup_step(_actor_params_sg, critic_params, critic_target_params,
+            _critic_warmup_step(_ap_sg, critic_params, critic_target_params,
                                 critic_opt_state, obs_batch, state_batch,
                                 _wu_keys, _wu_mask)
         if (_wu + 1) % 10 == 0:
-            print(f"  warmup {_wu+1:3d}/{CRITIC_WARMUP_UPDATES}  critic_loss={float(_wu_loss):.4f}")
+            print(f"  warmup {_wu+1:3d}/{CRITIC_WARMUP_UPDATES}  "
+                  f"critic_loss={float(_wu_loss):.4f}")
     print("Critic warmup done.")
 
     # ── CSV log ───────────────────────────────────────────────────────────────
@@ -804,12 +779,12 @@ if __name__ == "__main__":
     ])
     _log_file.flush()
 
-    best_ret = -999.0
-    t_start  = time.time()
+    best_r_step = -999.0
+    t_start     = time.time()
 
     hdr = (
-        f"{'Upd':>5} | {'Return':>8} {'Roll':>7} | "
-        f"{'Actor-L':>8} {'Critic-L':>8} {'AGN':>6} {'CGN':>6} | "
+        f"{'Upd':>5} | {'R/step':>7} {'Roll':>7} | "
+        f"{'Critic-L':>8} {'AGN':>6} {'CGN':>6} | "
         f"{'H':>3} {'Stage':>5} {'Dist':>5} | "
         f"{'FPS':>7} {'Time':>6}"
     )
@@ -881,8 +856,8 @@ if __name__ == "__main__":
         if update % 5 == 0:
             elapsed = (time.time() - t_start) / 60.0
             print(
-                f"{update:>5d} | {mean_ret:>8.2f} {rolling_ret:>7.2f} | "
-                f"{actor_loss:>8.4f} {critic_loss:>8.4f} {a_gn:>6.3f} {c_gn:>6.3f} | "
+                f"{update:>5d} | {mean_r_step:>7.3f} {rolling_ret:>7.3f} | "
+                f"{critic_loss:>8.4f} {a_gn:>6.3f} {c_gn:>6.3f} | "
                 f"{horizon:>3d} {cur_stage:>5d} {cur_dist:>4.1f}m | "
                 f"{fps:>7,.0f} {elapsed:>5.1f}min"
             )
@@ -892,13 +867,16 @@ if __name__ == "__main__":
                 round(actor_loss, 5), round(critic_loss, 5),
                 round(mean_ret, 3), round(a_gn, 4), round(c_gn, 4),
                 horizon, cur_stage, round(cur_dist, 1),
-                round(rolling_ret, 3), round(elapsed, 2),
+                round(rolling_ret, 3), round(mean_r_step, 4), round(elapsed, 2),
             ])
             _log_file.flush()
 
         # ── Checkpoint ────────────────────────────────────────────────────────
-        if mean_ret > best_ret:
-            best_ret = mean_ret
+        # Use mean_r_step (reward/step, H-invariant) as checkpoint criterion.
+        # mean_ret (discounted sum) grows negatively with H and is not comparable
+        # across curriculum stages — it's a misleading checkpoint signal.
+        if mean_r_step > best_r_step:
+            best_r_step = mean_r_step
             save_checkpoint(
                 actor_params, critic_params, critic_target_params,
                 actor_opt_state, critic_opt_state,
@@ -907,7 +885,7 @@ if __name__ == "__main__":
 
     # ── Fine ──────────────────────────────────────────────────────────────────
     elapsed = time.time() - t_start
-    print(f"\nDone! {elapsed/3600:.2f}h | Best return: {best_ret:.2f}")
+    print(f"\nDone! {elapsed/3600:.2f}h | Best r/step: {best_r_step:.4f}")
 
     save_checkpoint(
         actor_params, critic_params, critic_target_params,
