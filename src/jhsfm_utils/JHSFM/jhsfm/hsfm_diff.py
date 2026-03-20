@@ -110,9 +110,13 @@ def compute_edge_closest_point(reference_point: jnp.ndarray, edge: jnp.ndarray):
         dist = safe_norm(h - reference_point)
         return h, dist
 
+    # GRADIENT FIX: ramo NaN del cond restituisce (nan, nan) che si propaga
+    # nei gradienti dell'altro ramo via XLA's differentiation di lax.cond.
+    # Fix: usa un punto finito molto lontano (1e6, 1e6) come fallback.
+    # Il gradiente del ramo fallback è 0 (costante), non NaN.
     return lax.cond(
         jnp.any(jnp.isnan(edge)),
-        lambda _: (jnp.array([jnp.nan, jnp.nan]), jnp.float32(1_000_000.)),
+        lambda _: (jnp.array([1e6, 1e6]), jnp.float32(1_000_000.)),
         lambda _: _not_nan(reference_point, edge),
         None,
     )
@@ -132,9 +136,11 @@ def compute_obstacle_closest_point(reference_point: jnp.ndarray,
         )
         return closest_points[jnp.argmin(min_distances)]
 
+    # GRADIENT FIX: stessa fix del cond in compute_edge_closest_point.
+    # jnp.nan come output del ramo fallback contamina i gradienti.
     return lax.cond(
         jnp.all(jnp.isnan(obstacle)),
-        lambda _: jnp.full((2,), jnp.nan),
+        lambda _: jnp.full((2,), 1e6),
         lambda _: _not_nan(reference_point, obstacle),
         None,
     )
@@ -354,8 +360,13 @@ def single_update(
     bv_proj  = bv * self_parameters[2] / jnp.maximum(bv_norm, self_parameters[2])
     new_state = new_state.at[2:4].set(bv_proj)
 
-    # Safety net — should never trigger if fixes are correct
-    new_state = jnp.nan_to_num(new_state, nan=0.0, posinf=1e3, neginf=-1e3)
+    # GRADIENT FIX: sostituito nan_to_num con clip finito.
+    # nan_to_num(nan=0.0) mappa NaN → costante 0 → ∂(0)/∂input = 0 nel backward:
+    # ogni volta che la fisica produce NaN, il gradiente dell'intera traiettoria
+    # BPTT diventa zero (o NaN). jnp.clip è differenziabile ovunque:
+    # gradiente=0 solo in saturazione (non per NaN).
+    # Per sicurezza, le posizioni restano in range fisico ragionevole.
+    new_state = jnp.clip(new_state, -2000.0, 2000.0)
     return new_state
 
 
