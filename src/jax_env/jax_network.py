@@ -84,7 +84,7 @@ class EndToEndActorCritic(nn.Module):
         # than the actor (fused→128→64→1 vs actor's fused→256→128→head).
         # Shallower critic underfits as policy improves → value loss rises
         # monotonically (50→124 in logs) → noisy advantages → corrupted gradients.
-        critic = nn.relu(nn.Dense(128)(fused))
+        critic = nn.relu(nn.Dense(128)(shared))
         critic = nn.relu(nn.Dense(64)(critic))
         value  = nn.Dense(1)(critic)
 
