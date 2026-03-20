@@ -118,6 +118,16 @@ N_ENVS          = args.envs
 H_INIT          = args.h_init
 H_MAX           = args.h_max
 H_GROWTH        = 30       # update tra ogni +1 orizzonte
+
+# Memory budget per BPTT:
+#   BPTT stores activations for every step in the scan for backprop.
+#   Peak VRAM ≈ N_ENVS × H_MAX × OBS_SIZE × bytes_per_activation × ~8 (CNN)
+#   1024 × 32 × 342 × 4 × 8 ≈ 360 MB for obs alone, but CNN activations
+#   (32 feature maps × 54 spatial × 3 layers) add ~10× → ~3.6 GB just for
+#   the forward pass activations. With gradient buffers: ~2× = ~7 GB.
+#   Fix: use jax.checkpoint on the scan body to recompute activations during
+#   backward instead of storing them. This trades ~2× compute for ~10× less
+#   VRAM — acceptable for BPTT where compute >> memory bandwidth anyway.
 TOTAL_UPDATES   = args.updates
 
 LR_ACTOR        = 1e-4    # abbassato: con AGN esplosivo (>100) serve lr basso
@@ -263,19 +273,27 @@ def _rollout_single(actor_params, critic_params, actor_apply, critic_apply,
 
     Usiamo il reward di step_env direttamente. Per evitare NaN nel backward:
       - nan_to_num sui gradienti prima dell'optimizer (già presente)
-      - Il _actor_apply_remat riduce il picco VRAM del backward della CNN
+      - jax.checkpoint sul scan body riduce il picco VRAM del backward
 
     Il gradiente fluisce: theta->mean->action->step_env->(x,y,reward)->J(theta)
     Questo è il vero gradiente SHAC — esatto rispetto alla dinamica reale.
     """
-    # remat sul network: riduce VRAM del backward (attivazioni CNN ricompute)
-    _actor_apply_remat = jax.remat(actor_apply)
-
+    # ── VRAM fix: remat on the ENTIRE scan body, not just actor_apply. ──────
+    # With naive scan, XLA stores activations for ALL H_MAX steps simultaneously
+    # to compute gradients in the backward pass:
+    #   peak VRAM ≈ N_ENVS × H_MAX × (CNN activations + step_env activations)
+    #             ≈ 1024  × 32   × ~700 KB  ≈  22 GB  → OOM
+    #
+    # jax.checkpoint on the scan body tells XLA to discard activations after
+    # each forward step and recompute them on-the-fly during backward:
+    #   peak VRAM ≈ N_ENVS × 1 step × ~700 KB  ≈  700 MB  → fits in 10 GB
+    # Cost: ~2× compute (one extra forward pass per step during backward).
+    # This is the standard fix for BPTT OOM — correct and well-tested in JAX.
     def _step(carry, t):
         obs, state, key, cum_disc = carry
         key, step_key = jax.random.split(key)
 
-        mean, _, _ = _actor_apply_remat({"params": actor_params}, obs[None])
+        mean, _, _ = actor_apply({"params": actor_params}, obs[None])
         mean   = mean[0]
         action = scale_action_to_env(mean, state.env_state.max_v)
 
@@ -294,22 +312,19 @@ def _rollout_single(actor_params, critic_params, actor_apply, critic_apply,
         )
         new_obs   = jnp.concatenate([new_ps.flatten(), new_sv, new_ls.flatten()])
 
-        # Reward: usa il reward REALE di step_env per il critico (obs consistenti),
-        # ma per il gradiente dell'actor usa solo la parte smooth del reward
-        # (progress + jerk) che ha gradiente non-zero rispetto ad action.
-        # Il reward terminale di step_env usa jnp.where(bool, CONSTANT) che ha
-        # gradiente zero sui terminali — non importa perché stop_gradient(done)
-        # azzera il discount futuro quando done=True, eliminando l'episodio.
         done_f    = jax.lax.stop_gradient(done.astype(jnp.float32))
-        # NaN guard locale: cattura NaN prodotti da stati estremi (robot a parete)
         diff_r_safe = jnp.where(jnp.isfinite(diff_r), diff_r, jnp.zeros_like(diff_r))
         disc_r    = cum_disc * diff_r_safe * horizon_mask[t].astype(jnp.float32)
         next_disc = cum_disc * GAMMA * (1.0 - done_f)
 
         return (new_obs, new_state, key, next_disc), (disc_r, new_obs, done_f)
 
+    # Wrap the scan body with checkpoint: discard and recompute per-step
+    # activations during backward instead of storing all H_MAX of them.
+    _step_remat = jax.checkpoint(_step)
+
     (final_obs, _, _, final_disc), (rewards, obs_seq, dones) = jax.lax.scan(
-        _step,
+        _step_remat,
         (init_obs, init_state, rng_key, jnp.ones(())),
         jnp.arange(H_MAX),
         length=H_MAX,
@@ -610,20 +625,27 @@ if __name__ == "__main__":
     print(f"Pronti. obs shape={obs_batch.shape}")
 
     # ── Verifica gradient flow ────────────────────────────────────────────────
-    print("Verifica gradient flow...")
+    # IMPORTANT: run on a tiny slice (4 envs) — only tests that gradients are
+    # non-zero/finite. Using all N_ENVS here forces XLA to plan the full graph
+    # (N_ENVS × H_MAX activations) before JIT compilation, causing OOM on
+    # 10 GB cards. The first real update_step call will JIT-compile the full
+    # kernel and will use jax.checkpoint to stay within budget.
+    _N_TEST = 4
+    print(f"Verifica gradient flow (su {_N_TEST} env per evitare OOM)...")
     _mask_test = make_horizon_mask(H_INIT)
-    _keys_test = jax.random.split(jax.random.PRNGKey(0), N_ENVS)
+    _keys_test = jax.random.split(jax.random.PRNGKey(0), _N_TEST)
+    _obs_test   = obs_batch[:_N_TEST]
+    _state_test = jax.tree_util.tree_map(lambda x: x[:_N_TEST], state_batch)
     def _test_loss(p):
         returns, _ = _rollout_batched(
             p, critic_params, actor_net.apply, critic_net.apply,
-            obs_batch, state_batch, _keys_test, _mask_test, ghost_robot,
+            _obs_test, _state_test, _keys_test, _mask_test, ghost_robot,
         )
         return -jnp.mean(returns)
     _grads = jax.grad(_test_loss)(actor_params)
     _leaves  = jax.tree_util.tree_leaves(_grads)
     _has_nan = any(bool(jnp.any(jnp.isnan(g) | jnp.isinf(g))) for g in _leaves)
     if _has_nan:
-        # Nan guard: azzerare e procedere invece di crashare con messaggio oscuro
         _grads = jax.tree_util.tree_map(
             lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), _grads
         )
