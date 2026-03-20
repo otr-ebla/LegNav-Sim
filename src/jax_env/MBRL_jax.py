@@ -89,8 +89,17 @@ parser.add_argument("--load",       type=str, default="",
 args, _ = parser.parse_known_args()
 
 os.environ["CUDA_VISIBLE_DEVICES"]           = args.gpu
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.88"
+# OOM FIX: abbassato da 0.88 a 0.80.
+# Il compilatore XLA usa memoria HOST-side durante il tracing ma può anche
+# riversare buffer temporanei sulla GPU. Con 0.88 su 10 GB la GPU preallocava
+# 8.8 GB per JAX, lasciando solo 1.2 GB per i buffer di compilazione XLA
+# (che per un vmap(scan(H=24, N=512)) richiedono ~1.5-2 GB di scratch).
+# Con 0.80 → 8 GB JAX, 2 GB scratch XLA: sufficiente.
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.80"
 os.environ["TF_GPU_ALLOCATOR"]               = "cuda_malloc_async"
+# Disabilita l'unrolling aggressivo di XLA per i loop scan: riduce il picco
+# di memoria durante la compilazione senza impatto sul throughput a runtime.
+os.environ["XLA_FLAGS"] = "--xla_gpu_enable_while_loop_unrolling=false"
 
 import jax
 import jax.numpy as jnp
@@ -430,7 +439,7 @@ if __name__ == "__main__":
     print(f"  JAX MBRL — PPO + SHAC Hybrid  (GPU {args.gpu})")
     print(f"  SHAC: {'ENABLED' if USE_SHAC else 'DISABLED'}")
     if USE_SHAC:
-        print(f"  SHAC envs={N_SHAC_ENVS}, H_init={4}, H_max={SHAC_H_MAX}")
+        print(f"  SHAC envs={N_SHAC_ENVS} (ridotto da 1024 per VRAM), H_init={4}, H_max={SHAC_H_MAX}")
         alpha_str = "adaptive" if args.shac_alpha < 0 else f"{args.shac_alpha:.2f}"
         print(f"  Alpha: {alpha_str}")
     print(f"  PPO:  envs={NUM_ENVS}, steps={ROLLOUT_STEPS}, batch={BATCH_SIZE:,}")

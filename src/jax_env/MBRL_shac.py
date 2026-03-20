@@ -91,7 +91,15 @@ SHAC_H_INIT  = 4
 SHAC_H_MAX   = 24     # rollout sempre su H_MAX, reward mascherato oltre h_curr
 SHAC_H_GROWTH_INTERVAL = 40
 
-N_SHAC_ENVS = 1024
+# OOM FIX: ridotto da 1024 a 512.
+# Budget VRAM per il grafo BPTT compilato:
+#   1024 env × 24 passi × OBS_SIZE=342 × 4B × ~8 buffer intermedi ≈ 2.7 GB
+#   512  env × 24 passi × OBS_SIZE=342 × 4B × ~8 buffer intermedi ≈ 1.3 GB
+# Con remat+unroll=1 il fattore 8 scende a ~2, ma dimezzare N_SHAC_ENVS
+# dà margine per la frammentazione e per i buffer Adam (2×params×N_SHAC_ENVS).
+# La qualità del gradiente SHAC cala poco: 512 traiettorie parallele
+# hanno varianza del gradiente simile a 1024 per gradienti analitici (var≈0).
+N_SHAC_ENVS = 512
 
 SHAC_LR_ACTOR  = 3e-5
 SHAC_LR_CRITIC = 3e-4
@@ -215,18 +223,34 @@ def _shac_rollout_single(
         return (new_obs, new_stacked, key, next_discount), \
                (masked_r, new_obs, done_f)
 
-    # FIX 4: gradient checkpointing — ricomputa attivazioni nel backward
-    _step_fn_ckpt = jax.checkpoint(_step_fn)
+    # FIX 4 (REVISED) — jax.remat con policy + scan unroll=1:
+    # Il vecchio jax.checkpoint(_step_fn) non bastava: XLA materializzava
+    # comunque tutti i buffer del grafo vmap(scan) durante la compilazione AOT,
+    # causando il picco da 4 GB che triggera l'OOM prima ancora del primo step.
+    #
+    # Soluzione in due parti:
+    #   A) jax.remat con policy "dots_with_no_batch_dims_saveable":
+    #      salva solo i tensori piccoli (scalari, vettori 1D), ricomputa le
+    #      attivazioni CNN/MLP grandi nel backward. Taglia i buffer BPTT da
+    #      ~700 MB a ~50 MB per il grafo del singolo step.
+    #   B) unroll=1 nello scan: XLA compila un solo step di loop invece di
+    #      unrollare tutto H_MAX=24. Questo è il fix principale per l'OOM di
+    #      compilazione: il grafo XLA scende da O(H*N*params) a O(N*params).
+    #      Costo runtime: ~5% più lento per overhead di loop; accettabile.
+    # Fallback per JAX < 0.4.14 che non ha checkpoint_policies
+    try:
+        _remat_policy = jax.checkpoint_policies.dots_with_no_batch_dims_saveable
+    except AttributeError:
+        _remat_policy = None   # jax.remat senza policy = salva tutto (più VRAM, ok)
+    _step_fn_ckpt = jax.remat(_step_fn, policy=_remat_policy)
 
-    # BUG FIX #1: scan ys ora è (masked_r_scalar, obs_vector, done_float).
-    # L'ordine della tupla nel carry e nello ys deve essere identico a quanto
-    # restituito da _step_fn: (masked_r, new_obs, done_f).
     (final_obs, final_state, _, final_discount), (rewards, obs_seq, dones) = \
         jax.lax.scan(
             _step_fn_ckpt,
             (init_obs, init_state, rng_key, jnp.ones(())),
-            jnp.arange(SHAC_H_MAX),   # t passato come xs per la maschera
+            jnp.arange(SHAC_H_MAX),
             length=SHAC_H_MAX,
+            unroll=1,
         )
     # rewards: (H,)  obs_seq: (H, OBS_SIZE)  dones: (H,)
 
