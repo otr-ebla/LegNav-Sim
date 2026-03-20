@@ -312,18 +312,21 @@ def _rollout_single(actor_params, critic_params, actor_apply, critic_apply,
         )
         new_obs   = jnp.concatenate([new_ps.flatten(), new_sv, new_ls.flatten()])
 
-        done_f    = jax.lax.stop_gradient(done.astype(jnp.float32))
-        diff_r_safe = jnp.where(jnp.isfinite(diff_r), diff_r, jnp.zeros_like(diff_r))
-        disc_r    = cum_disc * diff_r_safe * horizon_mask[t].astype(jnp.float32)
-        next_disc = cum_disc * GAMMA * (1.0 - done_f)
+        done_f      = jax.lax.stop_gradient(done.astype(jnp.float32))
+        # Store RAW (undiscounted) reward — the critic needs raw rewards for
+        # correct TD(λ) targets. Storing disc_r = cum_disc * r was Bug #1:
+        # the critic received γ^t·r_t and then applied γ again → targets exploded.
+        raw_r_safe  = jnp.where(jnp.isfinite(diff_r), diff_r, jnp.zeros_like(diff_r))
+        masked_r    = raw_r_safe * horizon_mask[t].astype(jnp.float32)
+        next_disc   = cum_disc * GAMMA * (1.0 - done_f)
 
-        return (new_obs, new_state, key, next_disc), (disc_r, new_obs, done_f)
+        return (new_obs, new_state, key, next_disc), (masked_r, new_obs, done_f, cum_disc)
 
     # Wrap the scan body with checkpoint: discard and recompute per-step
     # activations during backward instead of storing all H_MAX of them.
     _step_remat = jax.checkpoint(_step)
 
-    (final_obs, _, _, final_disc), (rewards, obs_seq, dones) = jax.lax.scan(
+    (final_obs, _, _, final_disc), (raw_rewards, obs_seq, dones, disc_weights) = jax.lax.scan(
         _step_remat,
         (init_obs, init_state, rng_key, jnp.ones(())),
         jnp.arange(H_MAX),
@@ -331,13 +334,18 @@ def _rollout_single(actor_params, critic_params, actor_apply, critic_apply,
         unroll=1,
     )
 
+    # Actor return: Σ γ^t · r_t + γ^H · V(s_H)
+    # disc_weights[t] = γ^t (the cum_disc carried into step t).
+    # Discounting is applied here on raw rewards, not inside the scan.
+    # Bug #3 fix: do NOT divide by n_active (horizon length) — that made the
+    # loss scale change with H during curriculum, corrupting gradient magnitude.
+    # vmap + jnp.mean in _actor_loss normalises across N_ENVS correctly.
+    discounted_rewards = raw_rewards * disc_weights   # element-wise γ^t · r_t
     bootstrap = jax.lax.stop_gradient(
         critic_apply({"params": critic_params}, final_obs[None])[0]
     )
-    n_active = jnp.sum(horizon_mask).astype(jnp.float32)
-    n_active = jnp.maximum(n_active, 1.0)
-    total_return = (jnp.sum(rewards) + final_disc * bootstrap) / n_active
-    return total_return, (obs_seq, rewards, dones, final_obs)
+    total_return = jnp.sum(discounted_rewards) + final_disc * bootstrap
+    return total_return, (obs_seq, raw_rewards, dones, final_obs)
 
 
 # vmap su N_ENVS env in parallelo
@@ -464,7 +472,16 @@ def make_update_step(actor_apply, critic_apply,
             "mean_return":      jnp.mean(returns),
             "actor_gn":         a_grad_norm,
             "critic_gn":        c_grad_norm,
-            "mean_reward_step": jnp.mean(rewards),
+            # mean_reward_step: used for curriculum EMA.
+            # rewards shape is (N_ENVS, H_MAX) of RAW rewards with horizon mask
+            # applied (zeros beyond active horizon). To get per-step average we
+            # must divide by active steps, not by H_MAX (which inflates zeros).
+            # Bug #2 fix: previously used mean_return (discounted sum) which is
+            # not in reward/step units — curriculum thresholds were miscalibrated.
+            "mean_reward_step": jnp.mean(rewards),   # kept for logging
+            "mean_raw_reward":  jnp.sum(rewards) / jnp.maximum(
+                                    jnp.sum(horizon_mask).astype(jnp.float32) * rewards.shape[0], 1.0
+                                ),
         }
         return (new_actor_params, new_critic_params, new_target_params,
                 new_a_opt, new_c_opt, metrics)
@@ -714,14 +731,18 @@ if __name__ == "__main__":
         critic_loss = float(metrics["critic_loss"])
         a_gn        = float(metrics["actor_gn"])
         c_gn        = float(metrics["critic_gn"])
+        # Bug #2 fix: curriculum EMA must use reward/step, not the discounted
+        # return. mean_return = Σ γ^t·r_t grows with H → thresholds triggered
+        # too early as H increased in curriculum. mean_raw_reward = mean r_t
+        # over active steps, invariant to H, matching the calibrated thresholds.
+        mean_r_step = float(metrics["mean_raw_reward"])
 
         # FPS calcolato sul rollout: N_ENVS × H step per update
         env_steps_per_update = N_ENVS * horizon
         fps = env_steps_per_update / (time.time() - t0)
 
-        # EMA reward rolling (lag ~20 update con alpha=0.05)
-        # rolling_ret ora è reward/step (normalizzato per H)
-        rolling_ret = 0.95 * rolling_ret + 0.05 * mean_ret
+        # EMA on reward/step — invariant to horizon length H
+        rolling_ret = 0.95 * rolling_ret + 0.05 * mean_r_step
 
         # ── Curriculum ────────────────────────────────────────────────────────
         new_dist  = curriculum_dist(rolling_ret)
