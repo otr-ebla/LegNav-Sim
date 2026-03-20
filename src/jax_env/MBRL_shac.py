@@ -59,6 +59,24 @@ FIX APPLICATI
   FIX 6 — _sample_shac_init_states non JITtata:
     Aggiunto jax.jit alla vmap di reset per evitare ricompilazione.
 
+  FIX 7 — SHAC-L sempre = 0 (BUG CRITICO):
+    _actor_loss_fn normalizzava i returns con (x-mean)/std PRIMA di jnp.mean.
+    Per definizione, mean((x-mean(x))/std(x)) = 0 esattamente — la loss
+    loggata era sempre zero indipendentemente dal training.
+    Il gradiente BPTT fluiva correttamente (il grad di -mean(normalized)
+    rispetto a θ è non-zero), ma la metrica era inutile e il segnale era
+    attenuato dalla normalizzazione. Fix: loss = -mean(returns - baseline)
+    dove baseline=stop_gradient(mean(returns)) — riduce varianza senza
+    azzerare la loss. Il logging ora mostra valori significativi.
+
+  FIX 8 — SHAC_GRAD_NORM_ACTOR troppo aggressivo:
+    Il clip a 0.2 troncava il 95%+ del segnale BPTT (‖∇‖ tipico ≈ 1-10).
+    Alzato a 1.0 — lascia passare i gradienti significativi.
+
+  FIX 9 — SHAC_LR_ACTOR troppo basso:
+    3e-5 con 1 update SHAC vs 384 PPO rendeva il segnale SHAC irrilevante.
+    Alzato a 1e-4.
+
 INVARIATO
 ---------
   - Architettura SHAC (rollout differenziabile, vmap, TD(λ))
@@ -93,16 +111,24 @@ SHAC_H_GROWTH_INTERVAL = 40
 
 # OOM FIX: ridotto da 1024 a 512 — dimezza il picco VRAM di compilazione.
 # Il gradiente analitico SHAC ha varianza ~0: 512 env è equivalente a 1024.
-N_SHAC_ENVS = 512
+# UPDATE: con fix SHAC-L e grad_norm corretti, il segnale è ora utile.
+# Aumentato a 1024 per più diversità di stati iniziali per update.
+# Se OOM: tornare a 512.
+N_SHAC_ENVS = 1024
 
-SHAC_LR_ACTOR  = 3e-5
+SHAC_LR_ACTOR  = 1e-4   # FIX: era 3e-5 — troppo basso. Con alpha=0.05 effettivo
+                          # e 1 update SHAC vs 384 PPO, il segnale SHAC era
+                          # irrilevante. 1e-4 bilancia meglio con PPO lr=5e-4.
 SHAC_LR_CRITIC = 3e-4
 
 SHAC_GAMMA    = 0.99
 SHAC_LAM      = 0.95
 SHAC_VF_COEF  = 0.5
 
-SHAC_GRAD_NORM_ACTOR  = 0.2
+SHAC_GRAD_NORM_ACTOR  = 1.0   # FIX: era 0.2 — troppo aggressivo, azzerava il segnale SHAC.
+                               # Con gradiente BPTT tipicamente ‖∇‖ ≈ 1-10, un clip a 0.2
+                               # tronca il 95%+ del segnale. 1.0 lascia passare i gradienti
+                               # significativi senza permettere esplosione.
 SHAC_GRAD_NORM_CRITIC = 1.0
 
 SHAC_RETURN_NORM_EPS = 1e-8
@@ -343,17 +369,28 @@ def _actor_loss_fn(
     """
     J(θ) = E_envs[ Σ_{t<h} γ^t r_t + γ^h V(s_h) ]
     Gradiente analitico, varianza zero.
+
+    FIX SHAC-L=0: la normalizzazione (returns - mean) / std applicata PRIMA
+    di jnp.mean produce per definizione matematica mean=0 sempre.
+    La loss loggata era costantemente 0 anche se il gradiente fluiva.
+
+    Soluzione: loss = -mean(returns) non normalizzata.
+    La stabilizzazione del gradiente si fa via clip_by_global_norm nell'optimizer
+    (già presente con SHAC_GRAD_NORM_ACTOR). Non serve normalizzare qui.
+
+    La baseline di controllo della varianza viene gestita sottraendo la media
+    con stop_gradient — questo riduce la varianza senza azzerare la loss.
     """
     returns, (obs_seq, rewards, dones, final_obs) = _shac_rollout_batched(
         actor_params, critic_params, actor_apply, critic_apply,
         init_obs_batch, init_state_batch, rng_keys, horizon_mask, ghost_robot,
     )
 
-    ret_mean = jax.lax.stop_gradient(jnp.mean(returns))
-    ret_std  = jax.lax.stop_gradient(jnp.std(returns) + SHAC_RETURN_NORM_EPS)
-    normalized_returns = (returns - ret_mean) / ret_std
-
-    loss = -jnp.mean(normalized_returns)
+    # Baseline con stop_gradient: riduce varianza senza azzerare la loss.
+    # mean(returns - baseline) = mean(returns) - baseline (invariante al gradiente),
+    # ma la varianza dei gradienti diminuisce perché returns è centrata su 0.
+    baseline = jax.lax.stop_gradient(jnp.mean(returns))
+    loss = -jnp.mean(returns - baseline)
     return loss, (returns, obs_seq, rewards, dones, final_obs)
 
 

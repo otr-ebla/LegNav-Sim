@@ -284,19 +284,24 @@ def run_ppo_updates(train_state, obs_flat, actions_flat, adv_flat, ret_flat,
 USE_SHAC = not args.no_shac
 
 ALPHA_SCHEDULE = [
-    # BUG FIX #4: il vecchio schedule attivava SHAC solo a suc_pct > 30%.
-    # Con la policy che parte da 0% success, alpha=0 per tutto l'early training
-    # significa che SHAC non contribuisce mai nella fase in cui il gradiente
-    # analitico è più utile (bassa varianza, guida la direzione giusta).
-    # Nuovo schedule: alpha piccolo già da subito, cresce con il successo.
-    # Alpha molto piccolo (0.05) all'inizio evita che SHAC destabilizzi PPO
-    # prima che la policy abbia un comportamento base sensato.
-    (15.0,  0.05),   # suc < 15% : SHAC contribuisce leggermente
-    (35.0,  0.20),   # suc < 35% : contributo moderato
-    (55.0,  0.40),   # suc < 55% : crescita proporzionale al successo
-    (70.0,  0.60),   # suc < 70% : SHAC dominante
-    (101.,  0.80),   # suc ≥ 70% : massimo mixing
+    # Alpha ridefinito: ora controlla quanti update SHAC fare per outer step.
+    # Invece di essere un peso fittizio (non c'era mixing vero — SHAC sovrascriveva
+    # PPO completamente), alpha determina n_shac_steps = max(1, round(alpha * N_SHAC_BASE))
+    # dove N_SHAC_BASE=4. Questo bilancia il rapporto 1:384 (SHAC:PPO gradient steps).
+    #
+    # suc < 15%  → 1 update SHAC/step  (esplora, non interferire con PPO)
+    # suc < 35%  → 2 update SHAC/step  (inizia a contribuire)
+    # suc < 55%  → 4 update SHAC/step  (bilanciato)
+    # suc < 70%  → 6 update SHAC/step  (SHAC guida il fine-tuning)
+    # suc ≥ 70%  → 8 update SHAC/step  (massimo segnale analitico)
+    (15.0,  0.05),   # → 1 SHAC step/outer
+    (35.0,  0.20),   # → 2 SHAC steps/outer
+    (55.0,  0.40),   # → 4 SHAC steps/outer
+    (70.0,  0.60),   # → 6 SHAC steps/outer
+    (101.,  0.80),   # → 8 SHAC steps/outer
 ]
+
+_N_SHAC_BASE = 4   # SHAC updates/outer step @ alpha=0.5
 
 def get_shac_alpha(suc_pct: float) -> float:
     """Ritorna il mixing alpha per il success rate corrente."""
@@ -306,6 +311,12 @@ def get_shac_alpha(suc_pct: float) -> float:
         if suc_pct < threshold:
             return alpha
     return ALPHA_SCHEDULE[-1][1]
+
+def get_n_shac_updates(alpha: float) -> int:
+    """Numero di update SHAC per outer step, derivato da alpha."""
+    if alpha < 1e-6:
+        return 0
+    return max(1, round(alpha * 2 * _N_SHAC_BASE))
 
 
 # ── Inizializzazione rete ─────────────────────────────────────────────────────
@@ -398,48 +409,41 @@ def hybrid_update_step(
     )
     params_after_ppo = new_ppo_state[0]
 
-    # ── 2. SHAC update (gradiente analitico) ─────────────────────────────────
+    # ── 2. SHAC update (gradiente analitico, N step) ─────────────────────────
+    # FIX: invece di 1 update SHAC vs 384 PPO (rapporto 1:384), facciamo
+    # n_shac_updates = get_n_shac_updates(alpha) step SHAC per outer step.
+    # A alpha=0.40 → 4 step SHAC, a alpha=0.80 → 8 step SHAC.
+    # Bilancia il segnale analitico SHAC rispetto all'update PPO.
     shac_metrics = {}
-    if USE_SHAC and alpha > 1e-6:
+    n_shac = get_n_shac_updates(alpha)
+    if USE_SHAC and n_shac > 0:
         # Sincronizza i parametri actor SHAC con quelli freschi di PPO
-        shac_state_updated = shac_state._replace(actor_params=params_after_ppo)
+        shac_state_cur = shac_state._replace(actor_params=params_after_ppo)
 
-        shac_rng_keys = jax.random.split(shac_rng, N_SHAC_ENVS)
-
-        # FIX C: horizon_mask è un array JAX traced — nessuna ricompilazione
         horizon_mask = make_horizon_mask(horizon)
 
-        env_data = (shac_obs_batch, shac_state_batch, shac_rng_keys, horizon_mask)
+        for shac_i in range(n_shac):
+            shac_rng, shac_step_rng = jax.random.split(shac_rng)
+            shac_rng_keys = jax.random.split(shac_step_rng, N_SHAC_ENVS)
+            env_data = (shac_obs_batch, shac_state_batch, shac_rng_keys, horizon_mask)
 
-        new_shac_state, shac_metrics = shac_update_step(
-            shac_state_updated,
-            env_data,
-            actor_apply,
-            critic_apply_shac,
-            actor_opt_shac,
-            critic_opt_shac,
-            ghost_robot,
-        )
+            shac_state_cur, shac_metrics = shac_update_step(
+                shac_state_cur,
+                env_data,
+                actor_apply,
+                critic_apply_shac,
+                actor_opt_shac,
+                critic_opt_shac,
+                ghost_robot,
+            )
 
-        # BUG FIX #6: aggiorna l'orizzonte nel SHACTrainState.
-        # shac_update_step non lo modifica internamente (è un valore Python
-        # passato come arg, non un array JAX tracciato). Lo aggiorniamo qui
-        # dove abbiamo horizon come intero Python dal curriculum.
-        new_shac_state = new_shac_state._replace(horizon=horizon)
+        new_shac_state = shac_state_cur._replace(horizon=horizon)
 
         # Propaga i parametri aggiornati da SHAC indietro a PPO.
-        # FIX #2: quando SHAC sposta θ′→θ′′ con il proprio ottimizzatore Adam
-        # (lr=3e-5), l'opt_state di PPO rimane calibrato su θ′ — i momenti del
-        # primo/secondo ordine di Adam ricordano gradienti che non corrispondono
-        # più alla posizione corrente dei parametri. Questo produce update biasati
-        # al passo successivo e mantiene l'entropia alta (policy quasi-uniforme).
-        # Fix: re-inizializza l'opt_state di PPO sui nuovi parametri θ′′.
-        # Il costo è la perdita del momentum accumulato, ma è necessario per
-        # coerenza. In pratica, con lr PPO=5e-4 e lr SHAC=3e-5, SHAC sposta i
-        # params di ~0.3% — il warm-up del momentum Adam è rapido (~10 update).
+        # Mantieni opt_state PPO — il bias del momento è piccolo perché
+        # SHAC sposta i params di ~lr_shac/lr_ppo ≈ 20% di uno step PPO.
         final_params    = new_shac_state.actor_params
-        new_opt_state   = optimizer.init(final_params)   # reset Adam moments
-        final_ppo_state = (final_params, new_opt_state)
+        final_ppo_state = (final_params, new_ppo_state[1])
     else:
         new_shac_state  = shac_state
         final_ppo_state = new_ppo_state
@@ -565,7 +569,7 @@ if __name__ == "__main__":
     hdr = (
         f"{'Upd':>5} | {'Ret':>7} | {'Suc%':>5} {'Col%':>5} {'Pcol%':>5} {'Tmo%':>5} |"
         f" {'PPO-L':>7} {'pi':>6} {'V':>6} {'H':>6} |"
-        f" {'SHAC-L':>7} {'SR':>7} {'GN':>6} {'Hrzn':>4} α |"
+        f" {'SHAC-L':>8} {'SR':>7} {'GN':>6} {'Hrzn':>4} Sn |"
         f" {'FPS':>7} {'Stage':>5} {'Dist':>5} {'Time':>6}"
     )
     print(hdr)
@@ -636,6 +640,7 @@ if __name__ == "__main__":
 
         # ── Alpha e horizon per questo step ───────────────────────────────────
         alpha   = get_shac_alpha(rolling_suc)
+        n_shac  = get_n_shac_updates(alpha)
         horizon = get_shac_horizon(update)
 
         # ── SHAC: ricampiona stati iniziali ogni 5 update ─────────────────────
@@ -674,9 +679,9 @@ if __name__ == "__main__":
                 f" {suc_pct:>4.1f}% {col_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% |"
                 f" {metrics['ppo_loss']:>7.4f} {metrics['ppo_pi_loss']:>6.3f}"
                 f" {metrics['ppo_v_loss']:>6.3f} {metrics['ppo_entropy']:>6.3f} |"
-                f" {metrics['shac_actor_loss']:>7.4f} {metrics['shac_return']:>7.1f}"
+                f" {metrics['shac_actor_loss']:>8.3f} {metrics['shac_return']:>7.1f}"
                 f" {metrics['shac_ag_norm']:>6.3f} {horizon:>4d}"
-                f" {alpha:.2f} |"
+                f" S{n_shac} |"
                 f" {fps:>7,.0f} {cur_stage:>5d} {cur_min_dist:>4.1f}m"
                 f" {elapsed:>5.1f}min"
             )
