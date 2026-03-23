@@ -611,9 +611,22 @@ def make_horizon_mask(h: int) -> jnp.ndarray:
     """(H_MAX,) bool: True per t < h. JAX traced → zero ricompilazioni."""
     return jnp.arange(H_MAX) < h
 
-def get_horizon(update: int) -> int:
-    h = H_INIT + update // H_GROWTH
-    return min(h, H_MAX)
+# Horizon tied to curriculum stage, NOT to update count.
+# H grows only when the policy is good enough to justify longer BPTT,
+# preventing AGN explosion at large H from an under-trained policy.
+# Stage → H mapping is calibrated so that at each stage the expected
+# goal distance and max_v yield a natural episode length ≈ H:
+#   Stage 0 (1.5m, v≤2.0) → ~5 steps → H=8  (safe margin)
+#   Stage 1 (2.5m)         → ~9 steps → H=12
+#   Stage 2 (4.0m)         → ~15 steps → H=16
+#   Stage 3 (6.0m)         → ~22 steps → H=22
+#   Stage 4 (8.0m)         → ~29 steps → H=28
+#   Stage 5 (9.0m)         → ~32 steps → H=32
+_STAGE_HORIZONS = [8, 12, 16, 22, 28, 32]
+
+def get_horizon(rolling_ret: float) -> int:
+    stage = curriculum_stage(rolling_ret)
+    return _STAGE_HORIZONS[min(stage, len(_STAGE_HORIZONS) - 1)]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -624,7 +637,7 @@ if __name__ == "__main__":
 
     print(f"\n{'='*60}")
     print(f"  SHAC Pure Training  (GPU {args.gpu})")
-    print(f"  Envs={N_ENVS}  H: {H_INIT}→{H_MAX} (ogni {H_GROWTH} upd)")
+    print(f"  Envs={N_ENVS}  H: {H_INIT}→{H_MAX} (legato al curriculum stage)")
     print(f"  LR actor={LR_ACTOR}  LR critic={LR_CRITIC}")
     print(f"  Total updates={TOTAL_UPDATES}")
     print(f"  Ghost robot={'OFF' if args.no_ghost else 'ON'}")
@@ -823,8 +836,10 @@ if __name__ == "__main__":
 
         rng, step_rng, sample_rng2 = jax.random.split(rng, 3)
 
-        # Horizon curriculum
-        horizon      = get_horizon(update)
+        # Horizon curriculum: H grows with policy performance, not update count.
+        # This prevents BPTT explosion from using large H before the policy/critic
+        # are calibrated enough to produce stable gradients at that depth.
+        horizon      = get_horizon(rolling_ret)
         horizon_mask = make_horizon_mask(horizon)
 
         # Ricampiona stati iniziali ogni RESAMPLE_INTERVAL update
