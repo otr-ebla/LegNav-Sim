@@ -16,7 +16,6 @@ Tests:
 
 import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
-os.environ["CUDA_VISIBLE_DEVICES"] = ""   # CPU-only for test
 
 import jax
 import jax.numpy as jnp
