@@ -64,7 +64,7 @@ parser.add_argument("--h-init", type=int, default=8,
                     help="Orizzonte iniziale SHAC")
 parser.add_argument("--h-max",  type=int, default=32,
                     help="Orizzonte massimo SHAC")
-parser.add_argument("--updates",type=int, default=1000,
+parser.add_argument("--updates",type=int, default=2000,
                     help="Numero totale di outer update")
 parser.add_argument("--load",   type=str, default="",
                     help="Percorso checkpoint da caricare")
@@ -125,8 +125,8 @@ H_GROWTH        = 30       # update tra ogni +1 orizzonte
 #   VRAM — acceptable for BPTT where compute >> memory bandwidth anyway.
 TOTAL_UPDATES   = args.updates
 
-LR_ACTOR        = 1e-4    # abbassato: con AGN esplosivo (>100) serve lr basso
-LR_CRITIC       = 3e-4    # abbassato proporzionalmente
+LR_ACTOR        = 1e-4    # after wall-grad fix AGN should drop ~10×; keep conservative
+LR_CRITIC       = 1e-4    # lowered 3e-4→1e-4: critic loss diverged 9→92 in prev run
 GRAD_CLIP_ACTOR = 2.0     # Fix 6: with stop_gradient on state in carry,
                            # AGN is O(√H) not O(H²) — can afford larger clip
 GRAD_CLIP_CRITIC= 1.0
@@ -160,7 +160,7 @@ RESAMPLE_INTERVAL = 3
 #   reward/step ≈ +1   : navigazione sociale buona
 CURRICULUM = [
     # (rolling_reward_per_step_threshold, min_goal_dist)
-    (-1.5, 1.5),   # policy random → inizia qui
+    (-1.7, 1.5),   # lowered -1.5→-1.7: wall sigmoid baseline creates ~-1.62/step floor
     (-0.5, 2.5),   # evita collisioni, spesso raggiunge goal a 1.5m
     ( 0.0, 4.0),   # navigazione base a 2.5m
     ( 0.5, 5.5),
