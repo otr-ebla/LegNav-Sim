@@ -1,31 +1,32 @@
 """
-SHAC_jax.py — SHAC Pure Training (no PPO)
-============================================
+SHAC_jax.py — SHAC Pure Training (True Differentiable Simulator)
+=================================================================
 
-Addestra la policy usando SOLO il gradiente analitico SHAC (BPTT attraverso
+Traina la policy usando SOLO il gradiente analitico SHAC (BPTT attraverso
 il simulatore differenziabile). Nessun PPO, nessun rollout Monte Carlo.
 
-PERCHÉ SHAC PURO È SUFFICIENTE
+DIFF UPGRADE
+------------
+step_env in jax_env_multi.py è ora NATIVAMENTE differenziabile:
+
+  • soft_clip su azioni e posizione robot (no zero grad ai limiti)
+  • Indicatori di collisione sigmoid per il reward (no grad morto ai contatti)
+  • Reward = somma di termini smooth (no hard jnp.where sui terminali)
+  • LiDAR: sentinel finito invece di jnp.inf (no NaN nel backward)
+  • Osservazione: SENSOR_NOISE=False → gradiente deterministico
+
+Questo significa che SHAC differenzia attraverso la VERA dinamica del
+simulatore, non una ricostruzione cinematica approssimata.
+_diff_reward NON è più necessario: il reward di step_env è usato direttamente.
+
+PERÉ SHAC PURO È SUFFICIENTE
 --------------------------------
-
-SHAC calcola il gradiente esatto di J(θ) rispetto ai parametri della policy:
-
-    J(θ) = E[ Σ_{t=0}^{H-1} γ^t · r(s_t, π(s_t; θ)) + γ^H · V_φ(s_H) ]
-
-tramite backpropagation attraverso il simulatore (BPTT). Il gradiente ha
-varianza ZERO (deterministico dato lo stato iniziale) — PPO serve per ridurre
-la varianza del gradiente MC, qui non è necessario.
-
-Vantaggi rispetto a PPO+SHAC ibrido:
-  - Un solo ottimizzatore, nessun conflitto di momentum
-  - LR e grad clip calibrati su un solo algoritmo
-  - Nessuna sincronizzazione di parametri tra due loop
-  - Codice ~3× più semplice
-  - Convergenza tipicamente più rapida nelle prime fasi
+SHAC calcola il gradiente esatto di J(θ) rispetto ai parametri della policy.
+Il gradiente ha varianza ZERO (deterministico dato lo stato iniziale) — PPO
+serve per ridurre la varianza del gradiente MC, qui non è necessario.
 
 ARCHITETTURA
 ------------
-
 Per ogni outer update:
   1. Campiona N_ENVS stati iniziali
   2. Esegue rollout differenziabile di H step in parallelo via vmap
@@ -34,27 +35,14 @@ Per ogni outer update:
   5. Aggiorna critico con TD(λ) sugli stessi rollout
   6. Soft update del target network critico (τ=0.005)
 
-CURRICULUM
-----------
-Stesso schema curriculum di prima ma basato sul reward medio rolling invece
-della success rate (non disponibile senza rollout completi a episodio):
-  stage 0: dist=1.5m  (target reward > -30 rolling)
-  stage 1: dist=2.5m  (target reward > 0 rolling)
-  stage 2: dist=4.0m  (target reward > 30 rolling)
-  ...
-
-Il curriculum usa una EMA del reward medio normalizzato invece della success
-rate (non disponibile senza rollout completi a episodio). Un reward medio
-che supera la soglia indica che la policy ha imparato a navigare stabily.
-
 IPERPARAMETRI
 -------------
 N_ENVS       = 2048   — ambienti paralleli per update (VRAM ~400 MB)
 H_INIT       = 8      — orizzonte iniziale (passi)
 H_MAX        = 32     — orizzonte massimo
 H_GROWTH     = 30     — update tra ogni incremento di orizzonte
-LR_ACTOR     = 3e-4   — Adam per l'actor
-LR_CRITIC    = 1e-3   — Adam per il critico (più alto: critico imparata veloce)
+LR_ACTOR     = 3e-4   — Adam per l’actor
+LR_CRITIC    = 1e-3   — Adam per il critico
 GRAD_CLIP    = 1.0    — clip globale gradienti actor
 GAMMA        = 0.99
 LAMBDA       = 0.95   — GAE λ per TD(λ) critico
@@ -107,7 +95,14 @@ from jax_env_multi import (
     _PROGRESS_COEF, _STEP_PEN, _JERK_WEIGHT, _CF_CENTER,
 )
 from jax_wrappers import make_stacked_env, StackedEnvState
+import jax_env as _jax_env
 from jax_env import NUM_RAYS, STATE_VEC_SIZE
+
+# DIFFERENTIABILITY: disable sensor noise for deterministic BPTT gradients.
+# Stochastic noise in the observation breaks the gradient chain: the random
+# salt-and-pepper gate is not differentiable. Setting this before any JIT
+# compilation ensures the compiled graph never includes the noise branch.
+_jax_env.SENSOR_NOISE = False
 
 # ── Costanti ──────────────────────────────────────────────────────────────────
 OBS_SIZE   = 3 * 3 + 9 + 108 * 3   # 342

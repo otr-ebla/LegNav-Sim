@@ -46,10 +46,18 @@ from jax_physics import compute_lidar
 from jax_humans import update_all_humans
 from jax_legs import get_leg_circles, get_shoe_boxes, advance_feet, init_foot_state, LEG_RADIUS
 
-# ── Feature flag ──────────────────────────────────────────────────────────────
-# Flip this to False for cylinder-model baseline/ablation training.
+# ── Feature flags ─────────────────────────────────────────────────────────────
+# Flip USE_LEGS to False for cylinder-model baseline/ablation training.
 # Eval scripts can override: import jax_env; jax_env.USE_LEGS = False
 USE_LEGS = False
+
+# DIFFERENTIABILITY: Set SENSOR_NOISE = False in SHAC training to get a
+# deterministic gradient path through the observation.  Noise adds variance to
+# BPTT gradients (the random gates are not differentiable) and can cause
+# spurious zero/NaN grad contributions.
+# Eval scripts should keep SENSOR_NOISE = True for realistic sensor simulation.
+# Override: import jax_env; jax_env.SENSOR_NOISE = False
+SENSOR_NOISE = True
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 DT             = 0.15
@@ -161,20 +169,23 @@ def get_obs(state: EnvState, key: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray
         NUM_RAYS, float(FOV), MAX_LIDAR_DIST, ROOM_W, ROOM_H
     )
 
-    # ── NEW: Apply Vectorized Sensor Noise ────────────────────────────────────
-    k_gauss, k_sp = jax.random.split(key)
-    
-    # 1. Gaussian Noise (e.g., 0.05m standard deviation)
-    gaussian = jax.random.normal(k_gauss, raw_lidar.shape) * 0.05
-    
-    # 2. Salt & Pepper Noise (3% of rays)
-    sp_rand = jax.random.uniform(k_sp, raw_lidar.shape)
-    sp_mask = sp_rand < 0.03            # The 3% affected rays
-    is_max  = sp_rand < 0.015           # 1.5% drop to maximum
-    
-    # Apply Gaussian first, then overwrite with Salt/Pepper extremes
-    noisy_lidar = jnp.where(sp_mask, jnp.where(is_max, MAX_LIDAR_DIST, 0.0), raw_lidar + gaussian)
-    noisy_lidar = jnp.clip(noisy_lidar, 0.0, MAX_LIDAR_DIST)
+    # ── NEW: Apply Vectorized Sensor Noise (only when SENSOR_NOISE=True) ────────
+    # SHAC training sets SENSOR_NOISE=False for deterministic gradient flow.
+    # SENSOR_NOISE is a Python bool resolved at trace time — zero overhead.
+    if SENSOR_NOISE:
+        k_gauss, k_sp = jax.random.split(key)
+        # 1. Gaussian Noise (e.g., 0.05m standard deviation)
+        gaussian = jax.random.normal(k_gauss, raw_lidar.shape) * 0.05
+        # 2. Salt & Pepper Noise (3% of rays)
+        sp_rand = jax.random.uniform(k_sp, raw_lidar.shape)
+        sp_mask = sp_rand < 0.03            # The 3% affected rays
+        is_max  = sp_rand < 0.015           # 1.5% drop to maximum
+        # Apply Gaussian first, then overwrite with Salt/Pepper extremes
+        noisy_lidar = jnp.where(sp_mask, jnp.where(is_max, MAX_LIDAR_DIST, 0.0), raw_lidar + gaussian)
+        noisy_lidar = jnp.clip(noisy_lidar, 0.0, MAX_LIDAR_DIST)
+    else:
+        # No noise: clean differentiable LiDAR for SHAC BPTT
+        noisy_lidar = raw_lidar
     # ──────────────────────────────────────────────────────────────────────────
 
     # Rear sweep — 4 rays, FOV=0.75π

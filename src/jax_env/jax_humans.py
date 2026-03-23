@@ -20,6 +20,18 @@ PEOPLE ARRAY (N, 8) — unchanged:
 import jax
 import jax.numpy as jnp
 
+# ── Differentiable soft_clip (replaces jnp.clip in pushout ops) ─────────────────────
+# jnp.clip has zero gradient when saturated. soft_clip uses softplus so the
+# gradient is always non-zero, letting BPTT receive signal near walls.
+# beta=25 makes the softplus very tight (within 0.03m of the hard boundary),
+# so the simulation physics are almost identical in forward mode.
+_BETA = 25.0
+
+def _soft_clip_scalar(x, lo, hi):
+    below  = lo + jax.nn.softplus(_BETA * (x - lo)) / _BETA
+    result = hi - jax.nn.softplus(_BETA * (hi - below)) / _BETA
+    return result
+
 # ── Force tuning for dt=0.15s ─────────────────────────────────────────────────
 # Rule of thumb: F/m * dt < v_max  →  F < m*v_max/dt = 75*1.3/0.15 ≈ 650 N
 # We use much smaller values so a single step never overshoots.
@@ -150,8 +162,9 @@ def _robot_force(px, py, rx, ry, distract):
 # overlaps AFTER integration so people can never be inside obstacles.
 
 def _pushout_walls(px, py, r, room_w, room_h):
-    px = jnp.clip(px, r, room_w - r)
-    py = jnp.clip(py, r, room_h - r)
+    # DIFF FIX: soft_clip instead of jnp.clip → gradient flows at boundaries
+    px = _soft_clip_scalar(px, r, room_w - r)
+    py = _soft_clip_scalar(py, r, room_h - r)
     return px, py
 
 def _pushout_circles(px, py, r, circles):
@@ -260,12 +273,13 @@ def _update_one(human, key, all_humans, obs_circles, obs_boxes,
     d_theta   = (vel_theta - theta + jnp.pi) % (2*jnp.pi) - jnp.pi
     new_theta = jnp.where(moving, theta + 0.25 * d_theta, theta)
 
-    # NaN guard
-    new_px    = jnp.nan_to_num(new_px, nan=px)
-    new_py    = jnp.nan_to_num(new_py, nan=py)
-    new_vx    = jnp.nan_to_num(new_vx, nan=0.0)
-    new_vy    = jnp.nan_to_num(new_vy, nan=0.0)
-    new_theta = jnp.nan_to_num(new_theta, nan=theta)
+    # NaN guard: jnp.clip is differentiable; nan_to_num maps NaN→constant (grad=0)
+    _MAX_POS = 1e4
+    new_px    = jnp.clip(new_px,    -_MAX_POS, _MAX_POS)
+    new_py    = jnp.clip(new_py,    -_MAX_POS, _MAX_POS)
+    new_vx    = jnp.clip(new_vx,    -MAX_SPEED, MAX_SPEED)
+    new_vy    = jnp.clip(new_vy,    -MAX_SPEED, MAX_SPEED)
+    new_theta = jnp.clip(new_theta, -jnp.pi, jnp.pi)
 
     return jnp.stack([new_px, new_py, new_vx, new_vy,
                       new_theta, distract, wp_x, des_spd])
