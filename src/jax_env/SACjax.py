@@ -83,6 +83,11 @@ WARMUP_STEPS   = 10_000
 GAMMA          = 0.99
 TAU            = 0.005
 LR             = 3e-4
+
+TARGET_ENTROPY = -float(ACTION_DIM)   # -2.0
+TOTAL_UPDATES  = 200_000
+LOG_EVERY      = 500        # scan length inside train_chunk; also log interval
+SAVE_EVERY     = 5000
 TARGET_ENTROPY = -1.0   # softer target: better exploration than -|A| = -2.0
 TOTAL_UPDATES  = 200_000
 LOG_EVERY      = 500        # scan length inside train_chunk; also log + checkpoint interval
