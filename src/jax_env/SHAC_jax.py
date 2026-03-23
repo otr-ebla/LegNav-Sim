@@ -323,7 +323,27 @@ def _rollout_single(actor_params, critic_params, actor_apply, critic_apply,
         # The critic TD scan needs V(s_t) aligned with r_t:
         #   delta_t = r_t + γ·V(s_{t+1}) − V(s_t)  ← correct
         # Previously new_obs was stored → delta used V(s_{t+2}) − V(s_{t+1}).
-        return (new_obs, new_state, key, next_disc, new_already_done), \
+
+        # BUG FIX 5: Stop gradient through new_obs in the scan carry.
+        #
+        # The obs feedback loop: obs_t → CNN → a_t → kinematics → obs_{t+1} → CNN → ...
+        # The Jacobian through lidar → CNN → action → kinematics → lidar is
+        # ||J_lidar|| ≫ 1 at near-tangent rays (∂t_intersect/∂pos unbounded at
+        # grazing incidence). Over H steps this multiplies as ||J||^H, causing the
+        # observed AGN explosion that grows with H (91 @ H=17, 352 @ H=20).
+        #
+        # Gradient paths PRESERVED (still better than PPO):
+        #   θ → a_t → r_t             (direct action→reward, clean, O(1)/step)
+        #   θ → a_t → s_{t+1} → r_{t+1}  (1-step state lookahead via kinematics,
+        #                                   Jacobian eigenvalue ≈ 1, bounded)
+        # Gradient path STOPPED:
+        #   θ → a_t → obs_{t+1} → a_{t+1} → ...  (multi-step LiDAR amplification)
+        #
+        # The useful signal from obs (goal direction, speed, proximity) already
+        # flows through state.env_state.(x,y,theta,v,w) in the carry, which is
+        # NOT stop_gradient'd.  No information is lost for reward computation;
+        # only the unstable LiDAR CNN cross-step gradient is cut.
+        return (jax.lax.stop_gradient(new_obs), new_state, key, next_disc, new_already_done), \
                (masked_r, obs, done_f, cum_disc, act_f)
 
     _step_remat = jax.checkpoint(_step)
@@ -774,7 +794,7 @@ if __name__ == "__main__":
     ])
     _log_file.flush()
 
-    best_r_step = -999.0
+    best_r_step = 0.0 # start saving checkpoints immediately when reward/step > 0
     t_start     = time.time()
 
     hdr = (
@@ -848,7 +868,7 @@ if __name__ == "__main__":
                   f"(rolling_ret={rolling_ret:.1f})")
 
         # ── Logging ───────────────────────────────────────────────────────────
-        if update % 5 == 0:
+        if update % 25 == 0:
             elapsed = (time.time() - t_start) / 60.0
             print(
                 f"{update:>5d} | {mean_r_step:>7.3f} {rolling_ret:>7.3f} | "
