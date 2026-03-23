@@ -127,8 +127,9 @@ TOTAL_UPDATES   = args.updates
 
 LR_ACTOR        = 1e-4    # after wall-grad fix AGN should drop ~10×; keep conservative
 LR_CRITIC       = 1e-4    # lowered 3e-4→1e-4: critic loss diverged 9→92 in prev run
-GRAD_CLIP_ACTOR = 2.0     # Fix 6: with stop_gradient on state in carry,
-                           # AGN is O(√H) not O(H²) — can afford larger clip
+GRAD_CLIP_ACTOR = 0.5     # lowered 2.0→0.5: AGN was hitting 1278 at H=54;
+                           # clip must be tight enough that even at H_MAX the
+                           # effective update step = clip/AGN is bounded.
 GRAD_CLIP_CRITIC= 1.0
 
 GAMMA           = 0.99
@@ -314,9 +315,12 @@ def _rollout_single(actor_params, critic_params, actor_apply, critic_apply,
         raw_r_safe = jnp.where(jnp.isfinite(diff_r), diff_r, jnp.zeros_like(diff_r))
         masked_r   = raw_r_safe * act_f
 
-        # Discount zeroed after done/horizon so bootstrap is only γ^H when all
-        # H steps ran to completion.
-        next_disc        = cum_disc * GAMMA * (1.0 - done_f) * act_f
+        # FIX: stop_gradient on discount weight — removes the differentiable
+        # path through cum_disc itself, which would otherwise add an O(H)
+        # multiplicative factor to the total gradient norm.
+        next_disc        = jax.lax.stop_gradient(
+            cum_disc * GAMMA * (1.0 - done_f) * act_f
+        )
         new_already_done = already_done | done
 
         # Bug A fix: output obs (= s_t, start of step t), NOT new_obs (= s_{t+1}).

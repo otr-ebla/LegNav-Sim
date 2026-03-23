@@ -577,15 +577,12 @@ def step_env(key, state, action, ghost_robot: bool = True):
     # reward magnitude.  All terms are SUMMED so no gradient is killed by a
     # hard branch.  Far from the terminal boundary the sigmoid saturates and
     # each term contributes nearly zero, leaving dense_reward dominant.
-    # BUG FIX 3: Reduce terminal sigmoid sharpness from 20 → 8.
-    # With _k_term=20 the gradient of the goal bonus w.r.t. distance at the
-    # inflection point is _R_GOAL × _k_term × 0.25 = 200 × 20 × 0.25 = 1000.
-    # This compounds with the BPTT chain over H steps, contributing to the
-    # observed AGN explosion even after Fix 1 (HSFM stop_gradient).
-    # _k_term=8 → max gradient = 200 × 8 × 0.25 = 400 (2.5× reduction).
-    # The transition width is ~1/_k_term ≈ 0.125m, still sharper than
-    # GOAL_RADIUS=0.3m so the goal bonus fires precisely.
-    _k_term = 8.0
+    # FIX: Reduce terminal sigmoid sharpness from 8 → 4.
+    # Max gradient of goal_bonus w.r.t. dist at inflection point:
+    #   _k_term=8  → 200 × 8  × 0.25 = 400/step → AGN~1278 at H=54
+    #   _k_term=4  → 200 × 4  × 0.25 = 200/step → AGN~640  at H=54 (∼ 2× reduction)
+    # Transition width ~1/_k_term=0.25m, still inside GOAL_RADIUS=0.3m.
+    _k_term = 4.0
 
     # Goal bonus (positive): peaks sharply as robot enters GOAL_RADIUS
     goal_bonus = _R_GOAL * jax.nn.sigmoid(_k_term * (GOAL_RADIUS - new_dist))
