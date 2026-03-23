@@ -287,9 +287,19 @@ def _rollout_single(actor_params, critic_params, actor_apply, critic_apply,
         obs, state, key, cum_disc, already_done = carry
         key, step_key = jax.random.split(key)
 
-        mean, _, _ = actor_apply({"params": actor_params}, obs[None])
+        # FIX Bug 2: reparameterization in rollout.
+        # Using mean only (deterministic) makes BPTT optimize a deterministic policy
+        # with zero variance across same-obs envs. Reparameterization adds exploration
+        # noise (stop_grad'd so it doesn't contribute to AGN) while keeping the
+        # gradient path through `mean` intact: ∂action/∂θ = ∂(mean)/∂θ ≠ 0.
+        mean, logstd, _ = actor_apply({"params": actor_params}, obs[None])
         mean   = mean[0]
-        action = scale_action_to_env(mean, state.env_state.max_v)
+        logstd = logstd[0]
+        noise  = jax.lax.stop_gradient(
+            jax.random.normal(step_key, mean.shape)
+        )
+        raw_action = mean + jnp.exp(logstd) * noise
+        action = scale_action_to_env(raw_action, state.env_state.max_v)
 
         base_obs, new_base, diff_r, done, _info = step_env(
             step_key, state.env_state, action, ghost_robot=ghost_robot
@@ -328,29 +338,14 @@ def _rollout_single(actor_params, critic_params, actor_apply, critic_apply,
         #   delta_t = r_t + γ·V(s_{t+1}) − V(s_t)  ← correct
         # Previously new_obs was stored → delta used V(s_{t+2}) − V(s_{t+1}).
 
-        # BUG FIX 5+6: Stop gradient through BOTH new_obs AND new_state in the
-        # scan carry.
-        #
-        # Fix 5 (new_obs): cuts the LiDAR-CNN amplification loop
-        #   θ → a_t → kinematics → new_lidar → CNN → a_{t+1} → ...
-        #   ||J_lidar|| ≫ 1 at near-tangent rays; compounds as ||J||^H.
-        #
-        # Fix 6 (new_state): cuts the kinematic position-chain loop
-        #   θ → a_t → new_x_t → new_x_{t+1} → ... → reward_{t+k}
-        #   Each step adds ∂reward/∂x × dt ≈ goal_grad × 0.15 ≈ 60 to the chain.
-        #   Over H steps this accumulates as O(H²) → AGN=565 at H=32.
-        #   The goal_bonus gradient alone is _R_GOAL×_k_term×0.25 = 200×8×0.25=400
-        #   per unit distance, which dominates at any H>8.
-        #
-        # Gradient path PRESERVED at each step (exact 1-step Jacobian):
-        #   θ → a_t → step_env(stop_grad(state_t), a_t) → r_t
-        #   This is the exact ∂r_t/∂a_t × ∂a_t/∂θ — no surrogate log-prob.
-        #   Better than PPO because it uses the true action Jacobian, not a
-        #   variance-prone REINFORCE estimator.
-        #
-        # Expected result: AGN ≈ √H × mean_step_grad × ||∂actor/∂θ|| — O(√H),
-        # not O(H²).  At H=32 with mean_step_grad≈5: AGN ≈ 28 × ||J_net||.
-        return (jax.lax.stop_gradient(new_obs), jax.lax.stop_gradient(new_state),
+        # FIX Bug 1: keep stop_gradient ONLY on new_obs (cuts LiDAR→CNN→a_{t+1} loop).
+        # new_state is left differentiable so the kinematic chain
+        #   θ → a_t → (new_x, new_y) → reward_{t+1} → J(θ)
+        # remains intact across steps — this IS the SHAC gradient.
+        # The HSFM substeps (N_SUBSTEPS=15) inside step_env are already
+        # blocked by stop_gradient at jax_env_multi.py:305, so no HSFM
+        # explosion is reintroduced here.
+        return (jax.lax.stop_gradient(new_obs), new_state,
                 key, next_disc, new_already_done), \
                (masked_r, obs, done_f, cum_disc, act_f)
 
@@ -874,8 +869,9 @@ if __name__ == "__main__":
         env_steps_per_update = N_ENVS * horizon
         fps = env_steps_per_update / (time.time() - t0)
 
-        # EMA on reward/step — invariant to horizon length H
-        rolling_ret = 0.95 * rolling_ret + 0.05 * mean_r_step
+        # EMA on reward/step — α raised 0.05→0.15 so curriculum advances
+        # faster when performance genuinely improves past a threshold.
+        rolling_ret = 0.85 * rolling_ret + 0.15 * mean_r_step
 
         # ── Curriculum ────────────────────────────────────────────────────────
         new_dist  = curriculum_dist(rolling_ret)
