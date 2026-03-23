@@ -127,8 +127,8 @@ TOTAL_UPDATES   = args.updates
 
 LR_ACTOR        = 1e-4    # abbassato: con AGN esplosivo (>100) serve lr basso
 LR_CRITIC       = 3e-4    # abbassato proporzionalmente
-GRAD_CLIP_ACTOR = 0.5     # più conservativo: BPTT su cinematica unicycle
-                           # produce gradienti O(H) — clip basso è essenziale
+GRAD_CLIP_ACTOR = 2.0     # Fix 6: with stop_gradient on state in carry,
+                           # AGN is O(√H) not O(H²) — can afford larger clip
 GRAD_CLIP_CRITIC= 1.0
 
 GAMMA           = 0.99
@@ -324,26 +324,30 @@ def _rollout_single(actor_params, critic_params, actor_apply, critic_apply,
         #   delta_t = r_t + γ·V(s_{t+1}) − V(s_t)  ← correct
         # Previously new_obs was stored → delta used V(s_{t+2}) − V(s_{t+1}).
 
-        # BUG FIX 5: Stop gradient through new_obs in the scan carry.
+        # BUG FIX 5+6: Stop gradient through BOTH new_obs AND new_state in the
+        # scan carry.
         #
-        # The obs feedback loop: obs_t → CNN → a_t → kinematics → obs_{t+1} → CNN → ...
-        # The Jacobian through lidar → CNN → action → kinematics → lidar is
-        # ||J_lidar|| ≫ 1 at near-tangent rays (∂t_intersect/∂pos unbounded at
-        # grazing incidence). Over H steps this multiplies as ||J||^H, causing the
-        # observed AGN explosion that grows with H (91 @ H=17, 352 @ H=20).
+        # Fix 5 (new_obs): cuts the LiDAR-CNN amplification loop
+        #   θ → a_t → kinematics → new_lidar → CNN → a_{t+1} → ...
+        #   ||J_lidar|| ≫ 1 at near-tangent rays; compounds as ||J||^H.
         #
-        # Gradient paths PRESERVED (still better than PPO):
-        #   θ → a_t → r_t             (direct action→reward, clean, O(1)/step)
-        #   θ → a_t → s_{t+1} → r_{t+1}  (1-step state lookahead via kinematics,
-        #                                   Jacobian eigenvalue ≈ 1, bounded)
-        # Gradient path STOPPED:
-        #   θ → a_t → obs_{t+1} → a_{t+1} → ...  (multi-step LiDAR amplification)
+        # Fix 6 (new_state): cuts the kinematic position-chain loop
+        #   θ → a_t → new_x_t → new_x_{t+1} → ... → reward_{t+k}
+        #   Each step adds ∂reward/∂x × dt ≈ goal_grad × 0.15 ≈ 60 to the chain.
+        #   Over H steps this accumulates as O(H²) → AGN=565 at H=32.
+        #   The goal_bonus gradient alone is _R_GOAL×_k_term×0.25 = 200×8×0.25=400
+        #   per unit distance, which dominates at any H>8.
         #
-        # The useful signal from obs (goal direction, speed, proximity) already
-        # flows through state.env_state.(x,y,theta,v,w) in the carry, which is
-        # NOT stop_gradient'd.  No information is lost for reward computation;
-        # only the unstable LiDAR CNN cross-step gradient is cut.
-        return (jax.lax.stop_gradient(new_obs), new_state, key, next_disc, new_already_done), \
+        # Gradient path PRESERVED at each step (exact 1-step Jacobian):
+        #   θ → a_t → step_env(stop_grad(state_t), a_t) → r_t
+        #   This is the exact ∂r_t/∂a_t × ∂a_t/∂θ — no surrogate log-prob.
+        #   Better than PPO because it uses the true action Jacobian, not a
+        #   variance-prone REINFORCE estimator.
+        #
+        # Expected result: AGN ≈ √H × mean_step_grad × ||∂actor/∂θ|| — O(√H),
+        # not O(H²).  At H=32 with mean_step_grad≈5: AGN ≈ 28 × ||J_net||.
+        return (jax.lax.stop_gradient(new_obs), jax.lax.stop_gradient(new_state),
+                key, next_disc, new_already_done), \
                (masked_r, obs, done_f, cum_disc, act_f)
 
     _step_remat = jax.checkpoint(_step)
@@ -868,7 +872,7 @@ if __name__ == "__main__":
                   f"(rolling_ret={rolling_ret:.1f})")
 
         # ── Logging ───────────────────────────────────────────────────────────
-        if update % 25 == 0:
+        if update % 25 == 0: # print e log ogni 25 update
             elapsed = (time.time() - t_start) / 60.0
             print(
                 f"{update:>5d} | {mean_r_step:>7.3f} {rolling_ret:>7.3f} | "
