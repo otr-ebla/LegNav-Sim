@@ -622,7 +622,7 @@ def make_horizon_mask(h: int) -> jnp.ndarray:
 #   Stage 3 (6.0m)         → ~22 steps → H=22
 #   Stage 4 (8.0m)         → ~29 steps → H=28
 #   Stage 5 (9.0m)         → ~32 steps → H=32
-_STAGE_HORIZONS = [8, 12, 16, 22, 28, 32]
+_STAGE_HORIZONS = [8, 12, 12, 16, 22, 32]
 
 def get_horizon(rolling_ret: float) -> int:
     stage = curriculum_stage(rolling_ret)
