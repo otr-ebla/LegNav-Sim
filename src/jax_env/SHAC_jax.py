@@ -62,7 +62,7 @@ parser.add_argument("--envs",   type=int, default=2048,
                     help="Numero di env paralleli per update SHAC")
 parser.add_argument("--h-init", type=int, default=8,
                     help="Orizzonte iniziale SHAC")
-parser.add_argument("--h-max",  type=int, default=32,
+parser.add_argument("--h-max",  type=int, default=64,
                     help="Orizzonte massimo SHAC")
 parser.add_argument("--updates",type=int, default=4000,
                     help="Numero totale di outer update")
@@ -161,11 +161,11 @@ RESAMPLE_INTERVAL = 3
 CURRICULUM = [
     # (rolling_reward_per_step_threshold, min_goal_dist)
     (-0.5, 1.5),   # stage 0: avoids frequent wall hits ✅
-    ( 0.2, 2.5),   # stage 1: consistent goal approach (progress≈0.30/step → rolling ~0.28)
-    ( 2.0, 4.0),   # stage 2: reaches 2.5m goals sometimes (goal_bonus fires)
-    ( 5.0, 6.0),
-    ( 8.0, 8.0),
-    (12.0, 9.0),
+    ( 0.2, 2.5),   # stage 1: consistent goal approach ✅
+    ( 0.3, 4.0),   # stage 2: reach 2.5m goals (H=64 now enough to cover 4m at max speed)
+    ( 0.5, 6.0),   # stage 3: reach 4m goals
+    ( 1.0, 8.0),   # stage 4: reach 6m goals
+    ( 2.0, 9.0),   # stage 5: reach 8m goals → full room
 ]
 
 def curriculum_dist(rolling_ret_per_step: float) -> float:
