@@ -794,7 +794,7 @@ if __name__ == "__main__":
         "update", "total_env_steps",
         "actor_loss", "critic_loss", "mean_return",
         "actor_gn", "critic_gn",
-        "horizon", "stage", "dist", "rolling_ret", "elapsed_min"
+        "horizon", "stage", "dist", "rolling_ret", "mean_raw_reward", "elapsed_min"
     ])
     _log_file.flush()
 

@@ -198,7 +198,7 @@ def get_obs(state: EnvState, key: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray
     )
 
     inv_lidar = jnp.clip(
-        (MAX_LIDAR_DIST - raw_lidar) / (MAX_LIDAR_DIST - ROBOT_RADIUS), 0.0, 1.0
+        (MAX_LIDAR_DIST - noisy_lidar) / (MAX_LIDAR_DIST - ROBOT_RADIUS), 0.0, 1.0
     )
     rear_prox_vec = jnp.clip(
         (MAX_LIDAR_DIST - rear_raw) / (MAX_LIDAR_DIST - ROBOT_RADIUS), 0.0, 1.0

@@ -211,7 +211,7 @@ def _shac_diff_reward(
     dx_p = new_state.people[:, 0] - new_x
     dy_p = new_state.people[:, 1] - new_y
     dists_p = jnp.sqrt(dx_p**2 + dy_p**2 + 1e-8)
-    dists_p_active = jnp.where(active_mask, dists_p, jnp.inf)
+    dists_p_active = jnp.where(active_mask, dists_p, 1e4)  # finite sentinel avoids NaN in XLA backward (0×inf=NaN)
     closest_human = jnp.min(dists_p_active)
     edge_to_edge = jnp.maximum(0.0, closest_human - PEOPLE_RADIUS - ROBOT_RADIUS)
     clearance_factor = jax.nn.sigmoid((edge_to_edge - _CF_CENTER) / _CF_SLOPE_SHAC)
@@ -310,7 +310,9 @@ def _shac_rollout_single(
         # decomprimeva come (obs_seq, rewards, dones) → rewards prendeva new_obs
         # (shape OBS_SIZE) e obs_seq prendeva masked_r (scalar): BPTT su tensori
         # scambiati → gradiente rumore → SHAC-L=0, GN=0 per tutto il training.
-        return (new_obs, new_stacked, key, next_discount), \
+        # stop_gradient on carry: 1-step gradients only (prevents O(H²) AGN explosion)
+        return (jax.lax.stop_gradient(new_obs), jax.lax.stop_gradient(new_stacked),
+                key, next_discount), \
                (masked_r, new_obs, done_f)
 
     # OOM+GRADIENT FIX: remat(policy=None) + unroll=1.
