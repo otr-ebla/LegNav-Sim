@@ -288,6 +288,16 @@ def step_env(key, state, action, ghost_robot: bool = True):
     (new_h_state, _), _ = jax.lax.scan(
         _hsfm_substep, (h_state_init, r_state_init), None, length=N_SUBSTEPS
     )
+    # BUG FIX 1: Stop gradient through HSFM substeps.
+    # BPTT depth without this: H_outer × N_SUBSTEPS = 32 × 15 = 480 steps.
+    # The HSFM Jacobian has eigenvalues > 1 in crowded scenarios, so gradients
+    # explode multiplicatively over 480 steps (AGN up to 200+ observed).
+    # Human positions are not controlled by the actor — only robot kinematics
+    # are. The relevant BPTT path is: actor_params → action → robot kinematics
+    # → dist_to_humans/goal/obstacles → reward. Human positions contribute only
+    # noise amplified over 480 steps.  stop_gradient reduces BPTT depth to H
+    # outer steps only.
+    new_h_state = jax.lax.stop_gradient(new_h_state)
 
     # ── 3. Waypoint toggle & Respawn Logic ────────────────────────────────────
     idx_cur = state.people[:, 10]
@@ -402,7 +412,14 @@ def step_env(key, state, action, ghost_robot: bool = True):
 
     # Mask dummies from all distance/collision logic
     active_mask    = new_people[:, 10] >= 0.0
-    dists_p_active = jnp.where(active_mask, dists_p, jnp.inf)
+    # BUG FIX 2: Replace jnp.inf with large finite sentinel for dummy humans.
+    # jnp.min over an array containing jnp.inf can produce NaN gradients in
+    # XLA's backward pass when inf wins the reduction (gradient of the inf
+    # branch is NaN-contaminated).  Using a large finite value avoids this
+    # while keeping dummy humans effectively invisible to all distance logic.
+    # 1e4 >> ROOM_W/H (~12m) so it never affects the min for active humans.
+    _DUMMY_DIST = 1e4
+    dists_p_active = jnp.where(active_mask, dists_p, _DUMMY_DIST)
     closest_human  = jnp.min(dists_p_active)
 
     # ── 5. Collision Detection ───────────────────────────────────────────────────
@@ -555,7 +572,15 @@ def step_env(key, state, action, ghost_robot: bool = True):
     # reward magnitude.  All terms are SUMMED so no gradient is killed by a
     # hard branch.  Far from the terminal boundary the sigmoid saturates and
     # each term contributes nearly zero, leaving dense_reward dominant.
-    _k_term = 20.0  # sigmoid sharpness: ~0.05m / 0.05-step transition width
+    # BUG FIX 3: Reduce terminal sigmoid sharpness from 20 → 8.
+    # With _k_term=20 the gradient of the goal bonus w.r.t. distance at the
+    # inflection point is _R_GOAL × _k_term × 0.25 = 200 × 20 × 0.25 = 1000.
+    # This compounds with the BPTT chain over H steps, contributing to the
+    # observed AGN explosion even after Fix 1 (HSFM stop_gradient).
+    # _k_term=8 → max gradient = 200 × 8 × 0.25 = 400 (2.5× reduction).
+    # The transition width is ~1/_k_term ≈ 0.125m, still sharper than
+    # GOAL_RADIUS=0.3m so the goal bonus fires precisely.
+    _k_term = 8.0
 
     # Goal bonus (positive): peaks sharply as robot enters GOAL_RADIUS
     goal_bonus = _R_GOAL * jax.nn.sigmoid(_k_term * (GOAL_RADIUS - new_dist))
@@ -569,10 +594,16 @@ def step_env(key, state, action, ghost_robot: bool = True):
     # Human penalty: active (robot moving into human ahead) vs passive
     active_col_probs = human_col_probs * (in_fwd_fov & in_prox).astype(jnp.float32)
     active_col_soft  = jnp.where(target_v >= 0.1, jnp.max(active_col_probs), 0.0)
-    passive_col_soft = jnp.where(
-        ~obs_collision & ~wall_collision,
-        jnp.max(human_col_probs * (~(in_fwd_fov & in_prox)).astype(jnp.float32)),
-        0.0,
+    # BUG FIX 4: Replace boolean ~obs_collision & ~wall_collision guard with
+    # smooth soft indicators.  The original jnp.where(bool, ..., 0.0) kills the
+    # gradient through the passive collision term whenever a wall or static
+    # obstacle collision occurs (gradient of jnp.where w.r.t. a boolean condition
+    # is 0).  Using the already-computed soft indicators preserves gradients:
+    # when obs_col_soft / wall_col_soft → 1 the passive penalty is smoothly
+    # suppressed; when they → 0 (no hard collision) it fires normally.
+    _no_hard_col_soft = 1.0 - jnp.clip(obs_col_soft + wall_col_soft, 0.0, 1.0)
+    passive_col_soft = _no_hard_col_soft * jnp.max(
+        human_col_probs * (~(in_fwd_fov & in_prox)).astype(jnp.float32)
     )
     human_pen = _R_ACTIVE_COL * active_col_soft + _R_PASSIVE_COL * passive_col_soft
 
