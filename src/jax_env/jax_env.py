@@ -186,6 +186,7 @@ def get_obs(state: EnvState, key: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray
     else:
         # No noise: clean differentiable LiDAR for SHAC BPTT
         noisy_lidar = raw_lidar
+        sp_mask = jnp.zeros(raw_lidar.shape, dtype=bool)
     # ──────────────────────────────────────────────────────────────────────────
 
     # Rear sweep — 4 rays, FOV=0.75π
