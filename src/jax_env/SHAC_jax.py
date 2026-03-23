@@ -64,7 +64,7 @@ parser.add_argument("--h-init", type=int, default=8,
                     help="Orizzonte iniziale SHAC")
 parser.add_argument("--h-max",  type=int, default=32,
                     help="Orizzonte massimo SHAC")
-parser.add_argument("--updates",type=int, default=2000,
+parser.add_argument("--updates",type=int, default=4000,
                     help="Numero totale di outer update")
 parser.add_argument("--load",   type=str, default="",
                     help="Percorso checkpoint da caricare")
@@ -152,20 +152,20 @@ RESAMPLE_INTERVAL = 3
 # Questo normalizza rispetto all'orizzonte crescente:
 #   return_totale = H × reward_per_step  →  reward_per_step è invariante a H.
 #
-# Calibrazione:
+# Calibrazione (wall signed-dist, _PROGRESS_COEF=8):
 #   reward/step ≈ -5   : policy random (collide sempre)
-#   reward/step ≈ -2   : inizia a evitare le collisioni
-#   reward/step ≈ -0.5 : raggiunge il goal con qualche collisione
-#   reward/step ≈  0   : navigazione base competente
-#   reward/step ≈ +1   : navigazione sociale buona
+#   reward/step ≈ -1   : evita le collisioni con le pareti
+#   reward/step ≈ +0.3 : avanza verso il goal costantemente (progress≈0.30/step)
+#   reward/step ≈ +2   : raggiunge il goal a 2.5m con frequenza
+#   reward/step ≈ +6   : navigazione competente (goal raggiunti spesso a 4m)
 CURRICULUM = [
     # (rolling_reward_per_step_threshold, min_goal_dist)
-    (-1.7, 1.5),   # lowered -1.5→-1.7: wall sigmoid baseline creates ~-1.62/step floor
-    (-0.5, 2.5),   # evita collisioni, spesso raggiunge goal a 1.5m
-    ( 0.0, 4.0),   # navigazione base a 2.5m
-    ( 0.5, 5.5),
-    ( 1.0, 7.0),
-    ( 2.0, 9.0),
+    (-0.5, 1.5),   # stage 0: avoids frequent wall hits ✅
+    ( 0.2, 2.5),   # stage 1: consistent goal approach (progress≈0.30/step → rolling ~0.28)
+    ( 2.0, 4.0),   # stage 2: reaches 2.5m goals sometimes (goal_bonus fires)
+    ( 5.0, 6.0),
+    ( 8.0, 8.0),
+    (12.0, 9.0),
 ]
 
 def curriculum_dist(rolling_ret_per_step: float) -> float:

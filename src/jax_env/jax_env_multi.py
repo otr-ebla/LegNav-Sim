@@ -111,7 +111,7 @@ _R_TIMEOUT     =   -5.0
 
 # Progress scaling — how much a metre of progress toward goal is worth
 # when the robot is in completely open space (clearance_factor = 1).
-_PROGRESS_COEF =   3.0
+_PROGRESS_COEF =   8.0   # raised 3→8: clearance_factor≈0.47 avg (12 ppl/12×12m) halves progress signal; 8×0.08×0.47≈0.30/step target
 
 # Step penalty — small constant cost per timestep, encourages efficiency.
 _STEP_PEN      =  -0.02
@@ -232,12 +232,17 @@ def step_env(key, state, action, ghost_robot: bool = True):
     # Boolean wall_collision for episode logic (stop_grad'd later)
     wall_collision = (raw_x < ROBOT_RADIUS) | (raw_x > ROOM_W - ROBOT_RADIUS) | \
                      (raw_y < ROBOT_RADIUS) | (raw_y > ROOM_H - ROBOT_RADIUS)
-    # Smooth wall penetration depth for differentiable reward
-    _wall_pen_x = jax.nn.softplus(_SC_BETA * (ROBOT_RADIUS - raw_x)) / _SC_BETA + \
-                  jax.nn.softplus(_SC_BETA * (raw_x - (ROOM_W - ROBOT_RADIUS))) / _SC_BETA
-    _wall_pen_y = jax.nn.softplus(_SC_BETA * (ROBOT_RADIUS - raw_y)) / _SC_BETA + \
-                  jax.nn.softplus(_SC_BETA * (raw_y - (ROOM_H - ROBOT_RADIUS))) / _SC_BETA
-    wall_col_soft = jax.nn.sigmoid((_wall_pen_x + _wall_pen_y - 0.02) / 0.005)
+    # Signed wall margin: positive in free space, zero at boundary, negative inside wall.
+    # Using signed distance instead of softplus penetration depth eliminates the constant
+    # sigmoid baseline: softplus≈0 in free space → sigmoid(-0.02/0.005)=sigmoid(-4)=0.018
+    # → -1.62/step constant penalty everywhere. With signed margin, sigmoid→0 far from walls.
+    # Transition width ≈ 0.05m (slope parameter): gentle warning starts ~0.2m from wall.
+    _wall_margin_x = jnp.minimum(raw_x - ROBOT_RADIUS,
+                                  (ROOM_W - ROBOT_RADIUS) - raw_x)
+    _wall_margin_y = jnp.minimum(raw_y - ROBOT_RADIUS,
+                                  (ROOM_H - ROBOT_RADIUS) - raw_y)
+    _wall_margin   = jnp.minimum(_wall_margin_x, _wall_margin_y)
+    wall_col_soft  = jax.nn.sigmoid(-_wall_margin / 0.05)
 
     # DIFF: soft_clip keeps gradient alive near walls
     new_x = _soft_clip(raw_x, ROBOT_RADIUS, ROOM_W - ROBOT_RADIUS)
