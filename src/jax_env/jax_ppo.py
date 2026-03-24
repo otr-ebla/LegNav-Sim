@@ -372,7 +372,7 @@ if __name__ == "__main__":
 
         rng, rollout_rng, update_rng = jax.random.split(rng, 3)
         # FIX Bug #3: pass vmap_step explicitly as static arg.
-        rollout_history, env_state, env_obs = collect_rollouts(
+        rollout_history, env_state, env_obs, last_val = collect_rollouts(
             rollout_rng, train_state[0], network.apply, vmap_step, env_state, env_obs
         )
 
@@ -425,7 +425,6 @@ if __name__ == "__main__":
             print(f"  → Curriculum reinit: stage={cur_stage}, dist={cur_min_dist:.1f}m, "
                   f"ghost_prob={cur_ghost:.1f}")
 
-        _, _, last_val = network.apply({"params": train_state[0]}, env_obs)
         advantages, returns = compute_gae(rewards, values, dones, last_val)
 
         train_state, mean_loss, aux = run_ppo_updates(

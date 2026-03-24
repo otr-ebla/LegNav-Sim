@@ -178,4 +178,5 @@ def collect_rollouts(rng_key, params, apply_fn, vmap_step, env_state, env_obs):
     (new_state, new_obs, _), rollout_history = jax.lax.scan(
         _env_step, (env_state, env_obs, rng_key), None, length=ROLLOUT_STEPS
     )
-    return rollout_history, new_state, new_obs
+    _, _, last_val = apply_fn({"params": params}, new_obs)
+    return rollout_history, new_state, new_obs, last_val
