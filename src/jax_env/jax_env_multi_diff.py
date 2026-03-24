@@ -512,11 +512,10 @@ def step_env(key, state, action, ghost_robot: bool = True):
     active_col  = active_col_body  | active_col_shoe
     passive_col = (passive_col_body | passive_col_shoe) & ~obs_collision & ~wall_collision
 
-    collision       = human_collision | any_shoe_col | obs_collision | wall_collision
-    fatal_collision = active_col | obs_collision | wall_collision
-    timeout         = (state.time_step + 1) >= MAX_STEPS
-    goal_reached    = new_dist < GOAL_RADIUS
-    done            = goal_reached | fatal_collision | timeout
+    collision    = human_collision | any_shoe_col | obs_collision | wall_collision
+    timeout      = (state.time_step + 1) >= MAX_STEPS
+    goal_reached = new_dist < GOAL_RADIUS
+    done         = goal_reached | collision | timeout
 
     # ── 5e. Smooth collision indicators for differentiable reward ────────────────
     # These sigmoid soft-indicators give SHAC a non-zero gradient signal near

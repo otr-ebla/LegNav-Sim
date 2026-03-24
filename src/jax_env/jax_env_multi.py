@@ -487,11 +487,10 @@ def step_env(key, state, action, ghost_robot: bool = True):
     active_col  = active_col_body  | active_col_shoe
     passive_col = (passive_col_body | passive_col_shoe) & ~obs_collision & ~wall_collision
 
-    collision       = human_collision | any_shoe_col | obs_collision | wall_collision
-    fatal_collision = active_col | obs_collision | wall_collision
-    timeout         = (state.time_step + 1) >= MAX_STEPS
-    goal_reached    = new_dist < GOAL_RADIUS
-    done            = goal_reached | fatal_collision | timeout
+    collision    = human_collision | any_shoe_col | obs_collision | wall_collision
+    timeout      = (state.time_step + 1) >= MAX_STEPS
+    goal_reached = new_dist < GOAL_RADIUS
+    done         = goal_reached | collision | timeout
 
     # ── 6. Reward ───────────────────────────────────────────────────────────────
 
@@ -513,7 +512,7 @@ def step_env(key, state, action, ghost_robot: bool = True):
     reward = jnp.where(wall_collision & ~obs_collision & ~goal_reached, _R_WALL_COL, reward)
     reward = jnp.where(active_col & ~obs_collision & ~wall_collision & ~goal_reached, _R_ACTIVE_COL, reward)
     reward = jnp.where(passive_col & ~active_col & ~obs_collision & ~wall_collision & ~goal_reached, _R_PASSIVE_COL, reward)
-    reward = jnp.where(timeout & ~goal_reached & ~fatal_collision, _R_TIMEOUT, reward)
+    reward = jnp.where(timeout & ~goal_reached & ~collision, _R_TIMEOUT, reward)
 
     new_state = state.replace(
         x=new_x, y=new_y, theta=new_theta,
