@@ -509,6 +509,10 @@ def step_env(key, state, action, ghost_robot: bool = True):
     obs, sp_mask = get_obs(new_state, k_obs)
     new_state = new_state.replace(sp_mask=sp_mask)
 
+    # instant_col: episode dies on its very first step due to collision.
+    # This flags broken spawns where robot/human overlap from frame 0.
+    instant_col = collision & (state.time_step == 0)
+
     info = {
         "discount":      jnp.where(done, 0.0, 1.0),
         "goal_reached":  goal_reached,
@@ -518,5 +522,6 @@ def step_env(key, state, action, ghost_robot: bool = True):
         "closest_human": closest_human,
         "sp_mask":       sp_mask,
         "timeout":       timeout,
+        "instant_col":   instant_col,
     }
     return obs, new_state, reward, done, info

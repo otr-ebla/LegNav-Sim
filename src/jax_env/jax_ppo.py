@@ -251,13 +251,14 @@ def run_ppo_updates(train_state, obs_flat, actions_flat, adv_flat, ret_flat,
 
 
 @jax.jit
-def collect_episode_outcomes(rewards, dones, goal_reached, collision, passive_col):
+def collect_episode_outcomes(rewards, dones, goal_reached, collision, passive_col, instant_col):
     """
     Build mutually exclusive episode outcome categories that sum to 100%.
 
     From jax_env:
       collision   = human_col | obs_col | wall_col  (includes passive)
       passive_col = human_col & robot_stopped & human_in_fov  (subset of collision)
+      instant_col = collision & (time_step == 0)  (broken spawn — frame-0 death)
 
     So active_col = collision & ~passive_col  (wall/obs/active human — robot's fault)
        passive_col = passive_col              (human walked into stopped robot)
@@ -272,7 +273,7 @@ def collect_episode_outcomes(rewards, dones, goal_reached, collision, passive_co
 
     def _scan(carry, t):
         ep_ret = carry
-        r, d, g, c, p = t
+        r, d, g, c, p, ic = t
         ep_ret = ep_ret + r
 
         # Split collision into mutually exclusive sub-types first.
@@ -292,16 +293,17 @@ def collect_episode_outcomes(rewards, dones, goal_reached, collision, passive_co
         out_col  = jnp.where(d, is_acol.astype(jnp.float32), 0.0)
         out_pcol = jnp.where(d, is_pcol.astype(jnp.float32), 0.0)
         out_tmo  = jnp.where(d, is_tmo.astype(jnp.float32),  0.0)
+        out_ic   = jnp.where(d, ic.astype(jnp.float32),       0.0)
         out_msk  = d.astype(jnp.float32)
 
         ep_ret = jnp.where(d, 0.0, ep_ret)
-        return ep_ret, (out_ret, out_suc, out_col, out_pcol, out_tmo, out_msk)
+        return ep_ret, (out_ret, out_suc, out_col, out_pcol, out_tmo, out_ic, out_msk)
 
-    _, (ep_rets, ep_suc, ep_col, ep_pcol, ep_tmo, ep_msk) = jax.lax.scan(
+    _, (ep_rets, ep_suc, ep_col, ep_pcol, ep_tmo, ep_ic, ep_msk) = jax.lax.scan(
         _scan, jnp.zeros(N),
-        (rewards, dones, goal_reached, collision, passive_col)
+        (rewards, dones, goal_reached, collision, passive_col, instant_col)
     )
-    return ep_rets.ravel(), ep_suc.ravel(), ep_col.ravel(), ep_pcol.ravel(), ep_tmo.ravel(), ep_msk.ravel()
+    return ep_rets.ravel(), ep_suc.ravel(), ep_col.ravel(), ep_pcol.ravel(), ep_tmo.ravel(), ep_ic.ravel(), ep_msk.ravel()
 
 if __name__ == "__main__":
 
@@ -350,8 +352,8 @@ if __name__ == "__main__":
                      # written when the run peaked at 61.8%. Now saves from the first
                      # improvement, then only on new highs.
 
-    hdr = (f"{'Upd':>5} | {'EpRet':>7} | {'Suc%':>5} {'Col%':>5} {'Pcol%':>5} {'Tmo%':>5} |"
-           f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} | {'FPS':>7} {'#Ep':>6} {'LR':>6}| "
+    hdr = (f"{'Upd':>5} | {'EpRet':>7} | {'Suc%':>5} {'Col%':>5} {'Pcol%':>5} {'Tmo%':>5} {'IC%':>5} |"
+           f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} | {'FPS':>7} {'#Ep':>6} {'LR':>6}  | "
            f"{'Stage':>5} {'MinDist':>7} {'Ghost':>6} {'Time':>6}")
     print(hdr)
     print("─" * len(hdr))
@@ -362,7 +364,7 @@ if __name__ == "__main__":
     _log_file   = open(_LOG_PATH, "w", newline="")
     _log_writer = csv.writer(_log_file)
     _log_writer.writerow(["step", "mean_ep_reward", "suc_pct", "col_pct",
-                           "pcol_pct", "tmo_pct", "n_ep"])
+                           "pcol_pct", "tmo_pct", "ic_pct", "n_ep"])
     _log_file.flush()
 
     t_start = time.time()
@@ -385,9 +387,10 @@ if __name__ == "__main__":
         goal_reached = rollout_history["goal_reached"]
         collision    = rollout_history["collision"]
         passive_col  = rollout_history["passive_col"]  # <-- ADD THIS LINE
+        instant_col  = rollout_history["instant_col"]
 
-        ep_rets, ep_suc, ep_col, ep_pcol, ep_tmo, ep_msk = collect_episode_outcomes(
-            rewards, dones, goal_reached, collision, passive_col
+        ep_rets, ep_suc, ep_col, ep_pcol, ep_tmo, ep_ic, ep_msk = collect_episode_outcomes(
+            rewards, dones, goal_reached, collision, passive_col, instant_col
         )
 
         n_ep = int(ep_msk.sum())
@@ -397,8 +400,9 @@ if __name__ == "__main__":
             col_pct  = float((ep_col * ep_msk).sum() / n_ep) * 100.0
             pcol_pct = float((ep_pcol * ep_msk).sum() / n_ep) * 100.0  # <-- CALCULATE PASSIVE COLLISION PCT
             tmo_pct  = float((ep_tmo * ep_msk).sum() / n_ep) * 100.0
+            ic_pct   = float((ep_ic * ep_msk).sum() / n_ep) * 100.0
         else:
-            mean_ret, suc_pct, col_pct, pcol_pct, tmo_pct = 0.0, 0.0, 0.0, 0.0, 0.0
+            mean_ret, suc_pct, col_pct, pcol_pct, tmo_pct, ic_pct = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
         # ── Curriculum update ─────────────────────────────────────────────────
         # FIX Issue #10: alpha raised from 0.03 → 0.1 for faster stage transitions.
@@ -445,7 +449,7 @@ if __name__ == "__main__":
             elapsedtime = (time.time() - t_start)/60.0
             print(
                 f"{update:>5d} | {mean_ret:>7.1f} | "
-                f"{suc_pct:>4.1f}% {col_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% | "
+                f"{suc_pct:>4.1f}% {col_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% {ic_pct:>4.1f}% | "
                 f"{float(mean_loss):>7.1f} {float(p_loss):>6.1f} "
                 f"{float(v_loss):>6.1f} {float(entropy):>6.1f} | "
                 f"{fps:>7,.0f} {n_ep:>6d} {lr_now:.2e} | "
@@ -455,7 +459,8 @@ if __name__ == "__main__":
             total_env_steps = (update + 1) * NUM_ENVS * ROLLOUT_STEPS
             _log_writer.writerow([total_env_steps, round(mean_ret, 4),
                                    round(suc_pct, 4), round(col_pct, 4),
-                                   round(pcol_pct, 4), round(tmo_pct, 4), n_ep])
+                                   round(pcol_pct, 4), round(tmo_pct, 4),
+                                   round(ic_pct, 4), n_ep])
             _log_file.flush()
 
         if suc_pct > best_suc and n_ep > 0:
