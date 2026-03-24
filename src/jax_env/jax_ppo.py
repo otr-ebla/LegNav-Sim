@@ -447,8 +447,8 @@ if __name__ == "__main__":
             print(
                 f"{update:>5d} | {mean_ret:>7.1f} | "
                 f"{suc_pct:>4.1f}% {col_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% | "
-                f"{float(mean_loss):>7.4f} {float(p_loss):>6.3f} "
-                f"{float(v_loss):>6.3f} {float(entropy):>6.3f} | "
+                f"{float(mean_loss):>7.1f} {float(p_loss):>6.1f} "
+                f"{float(v_loss):>6.1f} {float(entropy):>6.1f} | "
                 f"{fps:>7,.0f} {n_ep:>6d} {lr_now:.2e} | "
                 f"{cur_stage:>5d} {cur_min_dist:>5.1f}m {cur_ghost:>5.1f}g {elapsedtime:>5.1f}min"
             )
