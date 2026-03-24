@@ -1,29 +1,5 @@
 """
 jax_debug_train.py — Single-Environment Visual Debug Training
-=============================================================
-FIXES & IMPROVEMENTS vs previous version:
-
-  FIX (carried) — BUG 6: logstd[0] strip of batch dim in infer().
-
-  FIX (carried) — BUG 8: deque(maxlen=BUF_SIZE) replacing O(N) list.pop(0).
-
-  FIX A — ENTROPY_COEF mismatch (NEW):
-    Was 0.05 here vs 0.002 in jax_ppo.py — 25× mismatch meant debug training
-    produced a completely different policy than the full trainer.
-    Fixed: now uses shared ENTROPY_COEF = 0.002 imported concept.
-    The constant is defined here explicitly to match jax_ppo.py.
-
-  FIX B — GAE bootstrap ignores non-terminal last step (NEW):
-    gae() initialised nv = 0.0 regardless of whether the buffer's last
-    transition was terminal. For a non-terminal last step the value should
-    be bootstrapped from the critic's estimate of the NEXT state.
-    Fixed: nv = values[-1] if not done, 0.0 if done (standard correct GAE).
-
-  IMPROVEMENT — OBS_SIZE updated to 342 (was 339):
-    Matches jax_env.py new layout: 9+9+324 = 342.
-
-  UNCHANGED — Render functions, ppo_update, infer, sample_action_raw
-  are all correct.
 """
 
 import os

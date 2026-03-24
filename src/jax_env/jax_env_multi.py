@@ -224,16 +224,7 @@ def step_env(key, state, action, ghost_robot: bool = True):
     (new_h_state, _), _ = jax.lax.scan(
         _hsfm_substep, (h_state_init, r_state_init), None, length=N_SUBSTEPS
     )
-    # BUG FIX 1: Stop gradient through HSFM substeps.
-    # BPTT depth without this: H_outer × N_SUBSTEPS = 32 × 15 = 480 steps.
-    # The HSFM Jacobian has eigenvalues > 1 in crowded scenarios, so gradients
-    # explode multiplicatively over 480 steps (AGN up to 200+ observed).
-    # Human positions are not controlled by the actor — only robot kinematics
-    # are. The relevant BPTT path is: actor_params → action → robot kinematics
-    # → dist_to_humans/goal/obstacles → reward. Human positions contribute only
-    # noise amplified over 480 steps.  stop_gradient reduces BPTT depth to H
-    # outer steps only.
-    new_h_state = jax.lax.stop_gradient(new_h_state)
+ 
 
     # ── 3. Waypoint toggle & Respawn Logic ────────────────────────────────────
     idx_cur = state.people[:, 10]

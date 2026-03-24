@@ -20,17 +20,10 @@ PEOPLE ARRAY (N, 8) — unchanged:
 import jax
 import jax.numpy as jnp
 
-# ── Differentiable soft_clip (replaces jnp.clip in pushout ops) ─────────────────────
-# jnp.clip has zero gradient when saturated. soft_clip uses softplus so the
-# gradient is always non-zero, letting BPTT receive signal near walls.
-# beta=25 makes the softplus very tight (within 0.03m of the hard boundary),
-# so the simulation physics are almost identical in forward mode.
+
 _BETA = 25.0
 
-def _soft_clip_scalar(x, lo, hi):
-    below  = lo + jax.nn.softplus(_BETA * (x - lo)) / _BETA
-    result = hi - jax.nn.softplus(_BETA * (hi - below)) / _BETA
-    return result
+
 
 # ── Force tuning for dt=0.15s ─────────────────────────────────────────────────
 # Rule of thumb: F/m * dt < v_max  →  F < m*v_max/dt = 75*1.3/0.15 ≈ 650 N

@@ -1,37 +1,6 @@
 """
 jax_env.py — Core 2D Navigation Environment
 ============================================
-PATCH — Leg-pair LiDAR simulation (on top of all previous fixes):
-
-  NEW: USE_LEGS flag (module-level bool).
-    Set USE_LEGS = True  → each human emits 2 small leg circles in LiDAR
-    Set USE_LEGS = False → legacy single-cylinder model (for ablation)
-
-  NEW: EnvState.leg_phases  (NUM_PEOPLE,) float32
-    Per-human gait phase that advances every step. Stored in state so that
-    jax.lax.scan / vmap across envs keeps each environment's gait independent.
-
-  CHANGED: get_obs
-    Uses jax_legs.get_leg_circles() instead of building people_circles
-    directly. The circles fed to compute_lidar are now 2*N leg circles
-    (radius=LEG_RADIUS=0.08 m) instead of N body circles (PEOPLE_RADIUS=0.2 m).
-    → No change to OBS_SIZE or network input layout.
-
-  CHANGED: reset_env
-    Initialises leg_phases with random uniform offsets in [0, 2π) so
-    humans don't all start mid-stride simultaneously.
-
-  CHANGED: step_env
-    Advances leg_phases via jax_legs.advance_phase() before building new_state.
-
-  COLLISION detection (rewards) is UNCHANGED — still uses body centres.
-  This is intentional: leg-phase jitter would corrupt the reward signal.
-
-  To toggle legs from CLI, set the env variable or pass --legs to eval scripts:
-    USE_LEGS is read from the module-level constant; eval/train scripts can
-    override it via:
-        import jax_env; jax_env.USE_LEGS = False
-
 Previous fixes: A (LiDAR anchor), B (passive_col), C (resample cap),
                 D (no nested JIT), E (person spawn clearance).
 Obs layout (single frame): pose(3) + state_vec(9) + lidar(NUM_RAYS) = 120

@@ -1,38 +1,6 @@
 """
 jax_physics.py — Vectorized 2D Physics & LiDAR Engine
 ======================================================
-IMPROVEMENTS vs previous version:
-
-  IMPROVEMENT A — Fused ray-direction computation (NEW):
-    get_ray_circles_intersections and get_ray_boxes_intersections each
-    independently called jnp.cos/sin on the angles array. In compute_lidar
-    this happened THREE times (walls, circles, boxes).
-    FIX: compute dx/dy once in compute_lidar and pass them in; inner
-    functions accept pre-computed directions to avoid redundant trig.
-    On 4096 parallel envs × 112 rays this saves significant GPU cycles.
-
-  IMPROVEMENT B — @jax.jit removed from sub-functions (NEW):
-    get_ray_wall_intersections, get_ray_circles_intersections,
-    get_ray_boxes_intersections were all @jax.jit decorated but are always
-    called from within compute_lidar which is itself @jax.jit. Nested JIT
-    is legal but adds tracing overhead and prevents kernel fusion.
-    FIX: removed @jax.jit from subfunctions; only compute_lidar is JIT-ted.
-    The full LiDAR sweep now compiles as a single fused kernel.
-
-  IMPROVEMENT C — Avoid recomputation of angles linspace (NEW):
-    The angles array was recomputed every call. Now the formula is kept
-    but inlined without intermediate naming to help XLA's CSE pass.
-
-  DIFFERENTIABILITY FIX D — Replace jnp.inf with finite sentinel:
-    All intersection functions previously used jnp.inf to mark "no hit".
-    jnp.minimum(jnp.inf, x) has gradient NaN when inf wins — the gradient
-    of jnp.minimum is 1 for the winning branch and 0 for the other, but
-    XLA propagates NaN from inf through the gradient of the losing branch.
-    FIX: _NO_HIT = max_dist + 100.0 is passed into every sub-function.
-    The final jnp.clip(_, 0, max_dist) clamps all _NO_HIT values to max_dist
-    cleanly, and gradients are finite everywhere.
-
-  UNCHANGED — All intersection math is correct and unchanged.
 """
 
 import functools
@@ -44,7 +12,7 @@ import jax.numpy as jnp
 # Wall Intersections — accepts pre-computed dx, dy
 # ---------------------------------------------------------------------------
 
-def _get_ray_wall_intersections(x0, y0, dx, dy, room_w, room_h, no_hit):
+def _get_ray_wall_intersections(x0, y0, dx, dy, room_w, room_h):
     """N rays vs 4 axis-aligned walls. dx,dy:(N,) → returns (N,)"""
     eps = 1e-7
     dx = jnp.where(jnp.abs(dx) < eps, jnp.sign(dx) * eps + eps, dx)
@@ -56,10 +24,10 @@ def _get_ray_wall_intersections(x0, y0, dx, dy, room_w, room_h, no_hit):
     t_top    = (room_h - y0) / dy
 
     # DIFF FIX D: replace jnp.inf with finite no_hit to avoid NaN gradients
-    t_left   = jnp.where(t_left   > 1e-5, t_left,   no_hit)
-    t_right  = jnp.where(t_right  > 1e-5, t_right,  no_hit)
-    t_bottom = jnp.where(t_bottom > 1e-5, t_bottom, no_hit)
-    t_top    = jnp.where(t_top    > 1e-5, t_top,    no_hit)
+    t_left   = jnp.where(t_left   > 1e-5, t_left,   jnp.inf)
+    t_right  = jnp.where(t_right  > 1e-5, t_right,  jnp.inf)
+    t_bottom = jnp.where(t_bottom > 1e-5, t_bottom, jnp.inf)
+    t_top    = jnp.where(t_top    > 1e-5, t_top,    jnp.inf)
 
     return jnp.minimum(
         jnp.minimum(t_left, t_right),
@@ -83,23 +51,31 @@ def _intersect_ray_circle_scalar(ray_x, ray_y, dx, dy, cx, cy, r, no_hit):
     t1 = (-b - sqrt_disc) * 0.5
     t2 = (-b + sqrt_disc) * 0.5
 
-    # DIFF FIX D: finite no_hit instead of jnp.inf
-    valid_t1 = jnp.where(t1 > 1e-5, t1, no_hit)
-    valid_t2 = jnp.where(t2 > 1e-5, t2, no_hit)
+    # Use jnp.inf directly
+    valid_t1 = jnp.where(t1 > 1e-5, t1, jnp.inf)
+    valid_t2 = jnp.where(t2 > 1e-5, t2, jnp.inf)
     min_t    = jnp.minimum(valid_t1, valid_t2)
-    return jnp.where(disc < 0.0, no_hit, min_t)
+    return jnp.where(disc < 0.0, jnp.inf, min_t)
 
 
-def _get_ray_circles_intersections(x0, y0, dx, dy, circles, no_hit):
-    """
-    N rays vs M circles.
-    dx,dy:(N,)  circles:(M,3) [cx,cy,r]  → returns (N,)
-    """
+def _intersect_ray_circle_scalar(ray_x, ray_y, dx, dy, cx, cy, r):
+    # ... keep the math exactly the same up to here ...
+    sqrt_disc = jnp.sqrt(jnp.maximum(1e-8, disc))
+    t1 = (-b - sqrt_disc) * 0.5
+    t2 = (-b + sqrt_disc) * 0.5
+
+    # Use jnp.inf directly
+    valid_t1 = jnp.where(t1 > 1e-5, t1, jnp.inf)
+    valid_t2 = jnp.where(t2 > 1e-5, t2, jnp.inf)
+    min_t    = jnp.minimum(valid_t1, valid_t2)
+    return jnp.where(disc < 0.0, jnp.inf, min_t)
+
+def _get_ray_circles_intersections(x0, y0, dx, dy, circles):
     cx, cy, r = circles[:, 0], circles[:, 1], circles[:, 2]
 
     def one_ray(dxi, dyi):
         return jax.vmap(
-            lambda cxi, cyi, ri: _intersect_ray_circle_scalar(x0, y0, dxi, dyi, cxi, cyi, ri, no_hit)
+            lambda cxi, cyi, ri: _intersect_ray_circle_scalar(x0, y0, dxi, dyi, cxi, cyi, ri)
         )(cx, cy, r)
 
     distances = jax.vmap(one_ray)(dx, dy)
@@ -129,17 +105,17 @@ def _intersect_ray_aabb_scalar(x0, y0, dx, dy, bx, by, bw, bh, no_hit):
 
     hit = tmax >= jnp.maximum(tmin, 1e-5)
     t   = jnp.where(tmin > 1e-5, tmin, tmax)
-    # DIFF FIX D: finite no_hit instead of jnp.inf
-    return jnp.where(hit & (t > 1e-5), t, no_hit)
+    
+    # Use jnp.inf directly
+    return jnp.where(hit & (t > 1e-5), t, jnp.inf)
 
 
-def _get_ray_boxes_intersections(x0, y0, dx, dy, boxes, no_hit):
-    """N rays vs K boxes. boxes:(K,4) [cx,cy,hw,hh] → (N,)"""
+def _get_ray_boxes_intersections(x0, y0, dx, dy, boxes):
     bx, by, bw, bh = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
 
     def one_ray(dxi, dyi):
         return jax.vmap(
-            lambda bxi, byi, bwi, bhi: _intersect_ray_aabb_scalar(x0, y0, dxi, dyi, bxi, byi, bwi, bhi, no_hit)
+            lambda bxi, byi, bwi, bhi: _intersect_ray_aabb_scalar(x0, y0, dxi, dyi, bxi, byi, bwi, bhi)
         )(bx, by, bw, bh)
 
     distances = jax.vmap(one_ray)(dx, dy)
@@ -153,30 +129,15 @@ def _get_ray_boxes_intersections(x0, y0, dx, dy, boxes, no_hit):
 
 @functools.partial(jax.jit, static_argnums=(5, 6, 7, 8, 9))
 def compute_lidar(x, y, theta, circles, boxes, num_rays, fov, max_dist, room_w, room_h):
-    """
-    Full LiDAR sweep.
-    circles:(M,3) [cx,cy,r]   boxes:(K,4) [cx,cy,hw,hh]
-    Returns (num_rays,) clipped distances.
-
-    IMPROVEMENT: cos/sin computed ONCE here and shared with all sub-routines.
-    No nested @jax.jit — entire sweep compiles as one fused XLA kernel.
-
-    DIFF FIX D: All sub-functions use finite no_hit = max_dist + 100.0 instead
-    of jnp.inf. This avoids NaN gradients from jnp.minimum(inf, x) chains.
-    The final jnp.clip(_, 0, max_dist) maps all no_hit values back to max_dist.
-    """
     angles = theta - fov * 0.5 + jnp.arange(num_rays) * (fov / (num_rays - 1))
 
-    # Compute directions once — shared by all three intersection routines
     dx = jnp.cos(angles)
     dy = jnp.sin(angles)
 
-    # Finite sentinel: larger than max_dist but finite → clean gradients
-    no_hit = max_dist + 100.0
-
-    wall_dists   = _get_ray_wall_intersections(x, y, dx, dy, room_w, room_h, no_hit)
-    circle_dists = _get_ray_circles_intersections(x, y, dx, dy, circles, no_hit)
-    box_dists    = _get_ray_boxes_intersections(x, y, dx, dy, boxes, no_hit)
+    # We no longer need the finite sentinel. Pass jnp.inf implicitly or update sub-functions.
+    wall_dists   = _get_ray_wall_intersections(x, y, dx, dy, room_w, room_h)
+    circle_dists = _get_ray_circles_intersections(x, y, dx, dy, circles)
+    box_dists    = _get_ray_boxes_intersections(x, y, dx, dy, boxes)
 
     final = jnp.minimum(jnp.minimum(wall_dists, circle_dists), box_dists)
     return jnp.clip(final, 0.0, max_dist)
