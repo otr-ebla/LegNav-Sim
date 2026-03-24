@@ -63,7 +63,16 @@ def _batch_sample_safe_pos(key, clearance, obs_circles, obs_boxes, min_val, max_
 
 def generate_scenario(key: jnp.ndarray, min_goal_dist: float, scenario_idx: int = -1):
     k_scen, k_branch = jax.random.split(key)
-    idx = jnp.where(scenario_idx < 0, jax.random.randint(k_scen, (), 0, 7), jnp.int32(scenario_idx))
+    
+    # Sample a random scenario normally
+    sampled_idx = jax.random.randint(k_scen, (), 0, 7)
+    
+    # If the user requested a specific scenario, use it
+    idx = jnp.where(scenario_idx < 0, sampled_idx, jnp.int32(scenario_idx))
+    
+    # OVERRIDE: If the curriculum requires a short goal distance (< 5.0m), 
+    # force Scenario 0 (Random Static) because it is the only one that supports it.
+    idx = jnp.where(min_goal_dist < 5.0, 0, idx)
 
     def pack_human(px, py, th, g1x, g1y, g2x, g2y):
         return jnp.stack([
