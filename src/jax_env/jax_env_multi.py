@@ -39,8 +39,8 @@ _R_OBS_COL     =  -90.0
 _R_WALL_COL    =  -90.0   
 _R_ACTIVE_COL  =  -90.0   
 
-_R_PASSIVE_COL =  -30.0   
-_R_TIMEOUT     =  -10.0   
+_R_PASSIVE_COL =  -60.0   
+_R_TIMEOUT     =  -90.0   
 
 
 _PROGRESS_COEF =  8.0   
