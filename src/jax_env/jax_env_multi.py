@@ -124,8 +124,8 @@ _JERK_WEIGHT   =   2.0
 #   d = 1.2 m  → clearance_factor = 0.50  → progress halved → slow down
 #   d = 0.7 m  → clearance_factor ≈ 0.10  → progress worth almost nothing → stop/detour
 #   d < 0.5 m  → clearance_factor ≈ 0.02  → collision imminent, no progress matters
-_CF_CENTER = 1.2   # m — personal space boundary (Hall 1966)
-_CF_SLOPE  = 0.4   # m — sigmoid steepness
+_CF_CENTER = 0.3   # m — personal space boundary (Hall 1966)
+_CF_SLOPE  = 0.3   # m — sigmoid steepness
 N_SUBSTEPS = int(DT / HSFM_DT)
 NUM_PEOPLE = 12
 
