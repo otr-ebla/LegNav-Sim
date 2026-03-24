@@ -72,7 +72,7 @@ def generate_scenario(key: jnp.ndarray, min_goal_dist: float, scenario_idx: int 
     
     # OVERRIDE: If the curriculum requires a short goal distance (< 5.0m), 
     # force Scenario 0 (Random Static) because it is the only one that supports it.
-    idx = jnp.where(min_goal_dist < 5.0, 0, idx)
+    idx = jnp.where(min_goal_dist < 2.0, 0, idx)
 
     def pack_human(px, py, th, g1x, g1y, g2x, g2y):
         return jnp.stack([
