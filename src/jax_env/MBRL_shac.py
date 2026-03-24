@@ -96,11 +96,11 @@ from typing import Tuple, NamedTuple
 
 # Importazioni dal codebase esistente
 from jax_network import EndToEndActorCritic, scale_action_to_env
-from jax_env_multi import step_env, reset_env, EnvState
+from jax_env_multi_diff import step_env, reset_env, EnvState
 from jax_wrappers import make_stacked_env, StackedEnvState
 
 # Costanti di osservazione (top-level, non dentro scan)
-from jax_env import NUM_RAYS, STATE_VEC_SIZE
+from jax_env_diff import NUM_RAYS, STATE_VEC_SIZE
 _POSE_SIZE = 3
 
 # ── Iperparametri SHAC ────────────────────────────────────────────────────────
@@ -183,7 +183,7 @@ class SHACCritic(flax.linen.Module):
 #   pose = [gdx_ego/MAX, gdy_ego/MAX, theta/pi] (goal-relative normalizzato)
 # Le posizioni assolute vengono lette da state.env_state.x/y
 
-from jax_env_multi import (ROBOT_RADIUS, PEOPLE_RADIUS, ROOM_W, ROOM_H,
+from jax_env_multi_diff import (ROBOT_RADIUS, PEOPLE_RADIUS, ROOM_W, ROOM_H,
                             GOAL_RADIUS, _R_GOAL, _R_OBS_COL, _R_WALL_COL,
                             _R_ACTIVE_COL, _PROGRESS_COEF, _STEP_PEN,
                             _JERK_WEIGHT, _CF_CENTER)

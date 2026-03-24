@@ -58,7 +58,18 @@ __all__ = ["reset_env", "step_env", "EnvState", "get_obs"]
 
 HSFM_DT    = 0.01
 
+# ── Differentiable soft_clip ────────────────────────────────────────────────────
+# Replaces jnp.clip in robot kinematics so SHAC gets non-zero gradients
+# even when the robot is at/beyond a boundary (wall, speed limit).
+# beta=25: softplus tracks hard clip to within ~0.03m. Forward physics are
+# effectively unchanged; only the backward gradient differs.
+_SC_BETA = 25.0
 
+def _soft_clip(x, lo, hi, beta=_SC_BETA):
+    """Differentiable drop-in for jnp.clip(x, lo, hi)."""
+    below  = lo + jax.nn.softplus(beta * (x - lo)) / beta
+    result = hi - jax.nn.softplus(beta * (hi - below)) / beta
+    return result
 
 # ── Reward constants ─────────────────────────────────────────────────────────
 #
@@ -207,9 +218,11 @@ def step_env(key, state, action, ghost_robot: bool = True):
     """
     k_step, k_obs = jax.random.split(key)
 
-    # ── 1. Robot Kinematics ───────────────────────────────────────────────────────
-    target_v = jnp.clip(action[0], 0.0, state.max_v)
-    target_w = jnp.clip(action[1], -1.0, 1.0)
+    # ── 1. Robot Kinematics (DIFF: soft_clip on action and position) ────────────
+    # soft_clip matches jnp.clip in forward mode to within ~0.03 m/s / 0.03 rad/s
+    # but has non-zero gradient at the boundary for BPTT.
+    target_v = _soft_clip(action[0], 0.0, state.max_v)
+    target_w = _soft_clip(action[1], -1.0, 1.0)
 
     mid_theta = state.theta + 0.5 * target_w * DT
     new_theta = (state.theta + target_w * DT + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
@@ -219,9 +232,21 @@ def step_env(key, state, action, ghost_robot: bool = True):
     # Boolean wall_collision for episode logic (stop_grad'd later)
     wall_collision = (raw_x < ROBOT_RADIUS) | (raw_x > ROOM_W - ROBOT_RADIUS) | \
                      (raw_y < ROBOT_RADIUS) | (raw_y > ROOM_H - ROBOT_RADIUS)
+    # Signed wall margin: positive in free space, zero at boundary, negative inside wall.
+    # Using signed distance instead of softplus penetration depth eliminates the constant
+    # sigmoid baseline: softplus≈0 in free space → sigmoid(-0.02/0.005)=sigmoid(-4)=0.018
+    # → -1.62/step constant penalty everywhere. With signed margin, sigmoid→0 far from walls.
+    # Transition width ≈ 0.05m (slope parameter): gentle warning starts ~0.2m from wall.
+    _wall_margin_x = jnp.minimum(raw_x - ROBOT_RADIUS,
+                                  (ROOM_W - ROBOT_RADIUS) - raw_x)
+    _wall_margin_y = jnp.minimum(raw_y - ROBOT_RADIUS,
+                                  (ROOM_H - ROBOT_RADIUS) - raw_y)
+    _wall_margin   = jnp.minimum(_wall_margin_x, _wall_margin_y)
+    wall_col_soft  = jax.nn.sigmoid(-_wall_margin / 0.05)
 
-    new_x = jnp.clip(raw_x, ROBOT_RADIUS, ROOM_W - ROBOT_RADIUS)
-    new_y = jnp.clip(raw_y, ROBOT_RADIUS, ROOM_H - ROBOT_RADIUS)
+    # DIFF: soft_clip keeps gradient alive near walls
+    new_x = _soft_clip(raw_x, ROBOT_RADIUS, ROOM_W - ROBOT_RADIUS)
+    new_y = _soft_clip(raw_y, ROBOT_RADIUS, ROOM_H - ROBOT_RADIUS)
 
     # ── 2. JHSFM substeps ─────────────────────────────────────────────────────
     hsfm_params      = get_standard_humans_parameters(NUM_PEOPLE + 1)
@@ -492,7 +517,48 @@ def step_env(key, state, action, ghost_robot: bool = True):
     goal_reached = new_dist < GOAL_RADIUS
     done         = goal_reached | collision | timeout
 
-    # ── 6. Reward ───────────────────────────────────────────────────────────────
+    # ── 5e. Smooth collision indicators for differentiable reward ────────────────
+    # These sigmoid soft-indicators give SHAC a non-zero gradient signal near
+    # collision events, unlike the boolean flags above which kill the grad.
+    # Sharpness k=20 (width ~0.05m): smooth but still near-binary in practice.
+    _k = 20.0  # sigmoid sharpness (1/m or 1/step)
+
+    # Goal: sigmoid centered on GOAL_RADIUS
+    goal_col_soft = jax.nn.sigmoid(_k * (GOAL_RADIUS - new_dist))
+
+    # Static obstacles: smooth indicator from closest distances
+    obs_col_soft = jax.nn.sigmoid(_k * (ROBOT_RADIUS - closest_cir)) + \
+                   jax.nn.sigmoid(_k * (ROBOT_RADIUS - closest_box))
+    obs_col_soft = jnp.clip(obs_col_soft, 0.0, 1.0)  # sum may exceed 1
+
+    # Human body collision soft indicator
+    if USE_LEGS:
+        body_thresh_soft = ROBOT_RADIUS + _LEG_R
+    else:
+        body_thresh_soft = ROBOT_RADIUS + PEOPLE_RADIUS
+    # Per-human collision probability, masked by active humans
+    human_col_probs = jax.nn.sigmoid(_k * (body_thresh_soft - dists_p)) * active_mask
+    human_col_soft  = jnp.max(human_col_probs)  # worst-case human
+
+    # ── 6. Reward (fully differentiable for SHAC) ────────────────────────────────
+    #
+    # Dense shaping terms (fully smooth, gradients flow everywhere):
+    #   social_progress = sigmoid-clearance-weighted Δdist
+    #   step_pen, jerk_pen = constant / quadratic
+    #
+    # Terminal-like terms (sigmoid soft-indicators, never zero-out gradients):
+    #   goal_bonus     = _R_GOAL * sigmoid((GOAL_RADIUS  - dist) * k)
+    #   obs_pen        = _R_OBS_COL  * soft_obs_col_indicator
+    #   wall_pen       = _R_WALL_COL * soft_wall_col_indicator
+    #   human_pen      = mix of active / passive soft indicators
+    #
+    # All terms are SUMMED (no hard jnp.where switch), so BPTT sees gradients
+    # through every term at every timestep, including near terminal events.
+    #
+    # Note: The magnitude of goal_bonus / collision terms is scaled so they
+    # dominate around the event but remain finite elsewhere. The sigmoid
+    # saturates away from the event, so far-from-terminal steps the dense
+    # shape terms (progress + jerk) dominate as before.
 
     # — 6a. Clearance factor (unchanged) ──────────────────────────────────
     edge_to_edge   = jnp.maximum(0.0, closest_human - PEOPLE_RADIUS - ROBOT_RADIUS)
@@ -505,14 +571,50 @@ def step_env(key, state, action, ghost_robot: bool = True):
     jerk_pen         = -_JERK_WEIGHT * (target_w - state.w) ** 2
     dense_reward     = social_progress + step_pen + jerk_pen
 
-    # — 6c. Terminal cascades ─────────────────────────────────────────────
-    reward = dense_reward
-    reward = jnp.where(goal_reached, _R_GOAL, reward)
-    reward = jnp.where(obs_collision & ~goal_reached, _R_OBS_COL, reward)
-    reward = jnp.where(wall_collision & ~obs_collision & ~goal_reached, _R_WALL_COL, reward)
-    reward = jnp.where(active_col & ~obs_collision & ~wall_collision & ~goal_reached, _R_ACTIVE_COL, reward)
-    reward = jnp.where(passive_col & ~active_col & ~obs_collision & ~wall_collision & ~goal_reached, _R_PASSIVE_COL, reward)
-    reward = jnp.where(timeout & ~goal_reached & ~collision, _R_TIMEOUT, reward)
+    # — 6c. Smooth terminal bonus / penalty terms (DIFF: sigmoid, not jnp.where)
+    #
+    # Each soft indicator ∈ [0,1] is multiplied by the corresponding terminal
+    # reward magnitude.  All terms are SUMMED so no gradient is killed by a
+    # hard branch.  Far from the terminal boundary the sigmoid saturates and
+    # each term contributes nearly zero, leaving dense_reward dominant.
+    # FIX: Reduce terminal sigmoid sharpness from 8 → 4.
+    # Max gradient of goal_bonus w.r.t. dist at inflection point:
+    #   _k_term=8  → 200 × 8  × 0.25 = 400/step → AGN~1278 at H=54
+    #   _k_term=4  → 200 × 4  × 0.25 = 200/step → AGN~640  at H=54 (∼ 2× reduction)
+    # Transition width ~1/_k_term=0.25m, still inside GOAL_RADIUS=0.3m.
+    _k_term = 4.0
+
+    # Goal bonus (positive): peaks sharply as robot enters GOAL_RADIUS
+    goal_bonus = _R_GOAL * jax.nn.sigmoid(_k_term * (GOAL_RADIUS - new_dist))
+
+    # Obstacle penalty (negative)
+    obs_pen = _R_OBS_COL * obs_col_soft
+
+    # Wall penalty (negative)
+    wall_pen = _R_WALL_COL * wall_col_soft
+
+    # Human penalty: active (robot moving into human ahead) vs passive
+    active_col_probs = human_col_probs * (in_fwd_fov & in_prox).astype(jnp.float32)
+    active_col_soft  = jnp.where(target_v >= 0.1, jnp.max(active_col_probs), 0.0)
+    # BUG FIX 4: Replace boolean ~obs_collision & ~wall_collision guard with
+    # smooth soft indicators.  The original jnp.where(bool, ..., 0.0) kills the
+    # gradient through the passive collision term whenever a wall or static
+    # obstacle collision occurs (gradient of jnp.where w.r.t. a boolean condition
+    # is 0).  Using the already-computed soft indicators preserves gradients:
+    # when obs_col_soft / wall_col_soft → 1 the passive penalty is smoothly
+    # suppressed; when they → 0 (no hard collision) it fires normally.
+    _no_hard_col_soft = 1.0 - jnp.clip(obs_col_soft + wall_col_soft, 0.0, 1.0)
+    passive_col_soft = _no_hard_col_soft * jnp.max(
+        human_col_probs * (~(in_fwd_fov & in_prox)).astype(jnp.float32)
+    )
+    human_pen = _R_ACTIVE_COL * active_col_soft + _R_PASSIVE_COL * passive_col_soft
+
+    # Timeout soft indicator: activates sharply as step count approaches MAX_STEPS
+    timeout_soft = jax.nn.sigmoid(_k_term * ((state.time_step + 1) / MAX_STEPS - 1.0))
+    timeout_pen  = _R_TIMEOUT * timeout_soft
+
+    # — 6d. Total reward — sum of dense + smooth terminal terms
+    reward = dense_reward + goal_bonus + obs_pen + wall_pen + human_pen + timeout_pen
 
     new_state = state.replace(
         x=new_x, y=new_y, theta=new_theta,

@@ -93,15 +93,15 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 jax.config.update("jax_default_device", jax.devices("cuda")[0])
 
 from jax_network import EndToEndActorCritic, scale_action_to_env
-from jax_env_multi import (
+from jax_env_multi_diff import (
     reset_env, step_env,
     ROBOT_RADIUS, PEOPLE_RADIUS, ROOM_W, ROOM_H, GOAL_RADIUS,
     _R_GOAL, _R_WALL_COL, _R_ACTIVE_COL,
     _PROGRESS_COEF, _STEP_PEN, _JERK_WEIGHT, _CF_CENTER,
 )
 from jax_wrappers import make_stacked_env, StackedEnvState
-import jax_env as _jax_env
-from jax_env import NUM_RAYS, STATE_VEC_SIZE
+import jax_env_diff as _jax_env
+from jax_env_diff import NUM_RAYS, STATE_VEC_SIZE
 
 # DIFFERENTIABILITY: disable sensor noise for deterministic BPTT gradients.
 # Stochastic noise in the observation breaks the gradient chain: the random

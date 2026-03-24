@@ -76,13 +76,56 @@ ACTION_DIM = 2
 # ── PPO / SHAC ─────────────────────────────────────────────────────────────────
 # Uses EndToEndActorCritic from jax_network.py (imported only when needed to
 # avoid triggering GPU pinning code in training scripts).
+# Also includes a fallback `_OldPPOActor` for older checkpoints where the critic
+# branched directly from the `fused` representation instead of `shared` trunk.
+
+class _OldPPOActor(nn.Module):
+    action_dim: int
+    stack_dim:  int = 3
+    num_rays:   int = 108
+
+    @nn.compact
+    def __call__(self, x):
+        pose_size  = 3 * self.stack_dim
+        state_size = 9
+
+        pose_stack = x[..., :pose_size]
+        state_vec  = x[..., pose_size : pose_size + state_size]
+        lidar_flat = x[..., pose_size + state_size:]
+
+        batch_shape = lidar_flat.shape[:-1]
+        lidar_cnn   = lidar_flat.reshape((*batch_shape, self.num_rays, self.stack_dim))
+        cnn = nn.relu(nn.Conv(features=32, kernel_size=(7,), strides=(2,), padding='SAME')(lidar_cnn))
+        cnn = nn.relu(nn.Conv(features=64, kernel_size=(5,), strides=(2,), padding='SAME')(cnn))
+        cnn = nn.relu(nn.Conv(features=64, kernel_size=(3,), strides=(2,), padding='SAME')(cnn))
+        cnn_feat = nn.LayerNorm()(cnn.reshape((*batch_shape, -1)))
+
+        global_in   = jnp.concatenate([pose_stack, state_vec], axis=-1)
+        global_feat = nn.relu(nn.Dense(128)(global_in))
+        global_feat = nn.relu(nn.Dense(64)(global_feat))
+
+        fused  = jnp.concatenate([cnn_feat, global_feat], axis=-1)
+        shared = nn.relu(nn.Dense(256)(fused))
+        shared = nn.relu(nn.Dense(128)(shared))
+
+        actor_mean = nn.Dense(self.action_dim)(shared)
+        actor_logstd = nn.Dense(self.action_dim, bias_init=nn.initializers.constant(-1.0))(shared)
+        actor_logstd = jnp.clip(actor_logstd, -4.0, 0.5)
+
+        critic = nn.relu(nn.Dense(128)(fused))
+        critic = nn.relu(nn.Dense(64)(critic))
+        value  = nn.Dense(1)(critic)
+
+        return actor_mean, actor_logstd, jnp.squeeze(value, axis=-1)
+
 
 def _build_ppo_shac():
     from jax_network import EndToEndActorCritic, scale_action_to_env
 
-    net = EndToEndActorCritic(action_dim=ACTION_DIM)
+    net_new = EndToEndActorCritic(action_dim=ACTION_DIM)
+    net_old = _OldPPOActor(action_dim=ACTION_DIM)
     rng = jax.random.PRNGKey(0)
-    init_params = net.init(rng, jnp.zeros((1, OBS_SIZE)))["params"]
+    init_params = net_new.init(rng, jnp.zeros((1, OBS_SIZE)))["params"]
 
     def load(path):
         with open(path, "rb") as f:
@@ -92,6 +135,8 @@ def _build_ppo_shac():
         return bundle.get("params", bundle)
 
     def infer(params, obs, max_v):
+        is_old_arch = ("Dense_6" in params and params["Dense_6"]["kernel"].shape[0] == 960)
+        net = net_old if is_old_arch else net_new
         mean, _, _ = net.apply({"params": params}, obs[None])
         return scale_action_to_env(jnp.squeeze(mean, 0), float(max_v))
 
