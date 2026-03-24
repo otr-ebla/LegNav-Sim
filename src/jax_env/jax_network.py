@@ -73,17 +73,21 @@ class EndToEndActorCritic(nn.Module):
         actor_mean = nn.Dense(self.action_dim)(shared)
 
         # Actor log_std — state-dependent Dense head, bias init -1.0
-        actor_logstd = nn.Dense(
-            self.action_dim,
-            bias_init=nn.initializers.constant(-1.0),
-        )(shared)
+        # actor_logstd = nn.Dense(
+        #     self.action_dim,
+        #     bias_init=nn.initializers.constant(-1.0),
+        # )(shared)
+        # actor_logstd = jnp.clip(actor_logstd, LOG_STD_MIN, LOG_STD_MAX)
+
+        logstd_param = self.param('log_std', nn.initializers.constant(-1.0), (self.action_dim,))
+        
+        # Broadcast the parameter to match the batch dimension of the mean
+        actor_logstd = jnp.broadcast_to(logstd_param, actor_mean.shape)
+        
+        # Clamp it to prevent mathematical explosion
         actor_logstd = jnp.clip(actor_logstd, LOG_STD_MIN, LOG_STD_MAX)
 
-        # Critic head — FIX: branches from `shared`, not `fused`.
-        # Old code branched from fused (pre-trunk), making the critic shallower
-        # than the actor (fused→128→64→1 vs actor's fused→256→128→head).
-        # Shallower critic underfits as policy improves → value loss rises
-        # monotonically (50→124 in logs) → noisy advantages → corrupted gradients.
+        
         critic = nn.relu(nn.Dense(128)(shared))
         critic = nn.relu(nn.Dense(64)(critic))
         value  = nn.Dense(1)(critic)
