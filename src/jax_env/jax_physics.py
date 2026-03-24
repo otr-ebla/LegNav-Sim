@@ -59,18 +59,25 @@ def _intersect_ray_circle_scalar(ray_x, ray_y, dx, dy, cx, cy, r, no_hit):
 
 
 def _intersect_ray_circle_scalar(ray_x, ray_y, dx, dy, cx, cy, r):
-    # ... keep the math exactly the same up to here ...
+    """Single ray vs single circle. Returns smallest positive t or jnp.inf."""
+    fx = ray_x - cx
+    fy = ray_y - cy
+    b  = 2.0 * (fx * dx + fy * dy)
+    c  = fx * fx + fy * fy - r * r
+    disc = b * b - 4.0 * c
+
     sqrt_disc = jnp.sqrt(jnp.maximum(1e-8, disc))
     t1 = (-b - sqrt_disc) * 0.5
     t2 = (-b + sqrt_disc) * 0.5
 
-    # Use jnp.inf directly
     valid_t1 = jnp.where(t1 > 1e-5, t1, jnp.inf)
     valid_t2 = jnp.where(t2 > 1e-5, t2, jnp.inf)
     min_t    = jnp.minimum(valid_t1, valid_t2)
     return jnp.where(disc < 0.0, jnp.inf, min_t)
 
+
 def _get_ray_circles_intersections(x0, y0, dx, dy, circles):
+    """N rays vs M circles."""
     cx, cy, r = circles[:, 0], circles[:, 1], circles[:, 2]
 
     def one_ray(dxi, dyi):
@@ -86,10 +93,9 @@ def _get_ray_circles_intersections(x0, y0, dx, dy, circles):
 # Box (AABB) Intersections — accepts pre-computed dx, dy
 # ---------------------------------------------------------------------------
 
-def _intersect_ray_aabb_scalar(x0, y0, dx, dy, bx, by, bw, bh, no_hit):
+def _intersect_ray_aabb_scalar(x0, y0, dx, dy, bx, by, bw, bh):
     """Slab method: single ray vs single axis-aligned box."""
     eps = 1e-7
-    # Prevent jnp.sign(0) from returning 0 and causing 1.0/0.0
     safe_dx = jnp.where(jnp.abs(dx) < eps, eps * jnp.sign(dx + 1e-8), dx)
     safe_dy = jnp.where(jnp.abs(dy) < eps, eps * jnp.sign(dy + 1e-8), dy)
     idx = 1.0 / safe_dx
@@ -105,12 +111,11 @@ def _intersect_ray_aabb_scalar(x0, y0, dx, dy, bx, by, bw, bh, no_hit):
 
     hit = tmax >= jnp.maximum(tmin, 1e-5)
     t   = jnp.where(tmin > 1e-5, tmin, tmax)
-    
-    # Use jnp.inf directly
     return jnp.where(hit & (t > 1e-5), t, jnp.inf)
 
 
 def _get_ray_boxes_intersections(x0, y0, dx, dy, boxes):
+    """N rays vs K boxes."""
     bx, by, bw, bh = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
 
     def one_ray(dxi, dyi):
