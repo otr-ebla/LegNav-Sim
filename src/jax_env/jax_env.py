@@ -18,7 +18,7 @@ from jax_legs import get_leg_circles, get_shoe_boxes, advance_feet, init_foot_st
 # ── Feature flags ─────────────────────────────────────────────────────────────
 # Flip USE_LEGS to False for cylinder-model baseline/ablation training.
 # Eval scripts can override: import jax_env; jax_env.USE_LEGS = False
-USE_LEGS = False
+USE_LEGS = True
 
 # DIFFERENTIABILITY: Set SENSOR_NOISE = False in SHAC training to get a
 # deterministic gradient path through the observation.  Noise adds variance to
