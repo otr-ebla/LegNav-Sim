@@ -68,6 +68,11 @@ parser.add_argument("--updates",type=int, default=4000,
                     help="Numero totale di outer update")
 parser.add_argument("--load",   type=str, default="",
                     help="Percorso checkpoint da caricare")
+parser.add_argument("--rolling-init", type=float, default=-5.0,
+                    help="Valore iniziale del rolling_ret (monitoraggio, non usato per avanzamento)")
+parser.add_argument("--stage", type=int, default=0,
+                    help="Curriculum stage di partenza (0-5). Usare con --load per riprendere "
+                         "da uno stage già raggiunto senza sprecare update sugli stage facili.")
 parser.add_argument("--no-ghost", action="store_true",
                     help="Disabilita ghost robot (robot visibile agli umani)")
 args, _ = parser.parse_known_args()
@@ -125,12 +130,17 @@ H_GROWTH        = 30       # update tra ogni +1 orizzonte
 #   VRAM — acceptable for BPTT where compute >> memory bandwidth anyway.
 TOTAL_UPDATES   = args.updates
 
-LR_ACTOR        = 1e-4    # after wall-grad fix AGN should drop ~10×; keep conservative
+LR_ACTOR        = 1e-4    # restored 3e-5→1e-4: with clip=0.2 and AGN≈100 the
+                           # effective step = clip*LR = 0.2*1e-4 = 2e-5. At 3e-5
+                           # that was 6e-6 — too small; network barely moved from
+                           # the loaded checkpoint over 4000 updates.
 LR_CRITIC       = 1e-4    # lowered 3e-4→1e-4: critic loss diverged 9→92 in prev run
-GRAD_CLIP_ACTOR = 0.5     # lowered 2.0→0.5: AGN was hitting 1278 at H=54;
-                           # clip must be tight enough that even at H_MAX the
-                           # effective update step = clip/AGN is bounded.
-GRAD_CLIP_CRITIC= 1.0
+GRAD_CLIP_ACTOR = 0.2     # 0.1→0.2: 0.1 was too tight — with AGN 100–678 the clipped
+                           # gradient pointed in a near-random direction AND was tiny.
+                           # 0.2 gives a more reliable direction while still bounding
+                           # the step to clip*LR = 2e-5 per update.
+GRAD_CLIP_CRITIC= 0.5     # tightened 1.0→0.5: critic loss oscillated 1.5–4.7;
+                           # tighter clip prevents critic from chasing outlier targets.
 
 GAMMA           = 0.99
 LAM             = 0.95
@@ -138,15 +148,27 @@ TAU             = 0.02    # was 0.005: too slow, target ≈ online after ~200 up
 VF_COEF         = 0.5
 
 # Multiple critic updates per actor step: critic must keep up with shifting
-# state distribution from BPTT. 4 is standard in SAC/TD3.
-N_CRITIC_UPDATES = 4
+# state distribution from BPTT. Raised 4→8: with a stuck policy and oscillating
+# critic loss (1.5–4.7), the critic needs more steps per actor update to converge
+# on stable TD targets before the next BPTT gradient is computed.
+N_CRITIC_UPDATES = 8
 
 # Critic warmup: pre-train critic before first actor BPTT update so the
 # bootstrap V(s_H) is calibrated, not near-zero.
-CRITIC_WARMUP_UPDATES = 30
+# Raised 30→150: when starting from a loaded checkpoint at a high curriculum stage
+# (e.g. stage 3, H=22), the checkpoint critic was calibrated for a different
+# horizon. 30 warmup steps at H=8 (H_INIT) then jumping to H=22 at training start
+# creates a 2.6× value mismatch (V_H8≈0.9 vs V_H22≈2.4) that takes hundreds of
+# training updates to recover from, explaining critic_loss≈9 at update 0.
+# 150 warmup steps AT THE TRAINING HORIZON ensure the critic is properly calibrated
+# before the first actor BPTT gradient is computed.
+CRITIC_WARMUP_UPDATES = 150
 
-# Ricampiona stati iniziali ogni N update
-RESAMPLE_INTERVAL = 3
+# Ricampiona stati iniziali ogni N update.
+# Raised 3→10: resampling every 3 steps means the critic never sees the same
+# states twice and can't converge — moving target problem. 10 steps gives the
+# critic enough updates on a stable batch to build a reliable value estimate.
+RESAMPLE_INTERVAL = 10
 
 # ── Curriculum ────────────────────────────────────────────────────────────────
 # Il curriculum usa il return PER STEP (return/H), non il return totale.
@@ -159,27 +181,58 @@ RESAMPLE_INTERVAL = 3
 #   reward/step ≈ +0.3 : avanza verso il goal costantemente (progress≈0.30/step)
 #   reward/step ≈ +2   : raggiunge il goal a 2.5m con frequenza
 #   reward/step ≈ +6   : navigazione competente (goal raggiunti spesso a 4m)
+## SHAC-AWARE CURRICULUM — goal distances calibrated to BPTT reachability
+# max_v ~ U[0.2, 2.0] m/s (avg=1.1), DT=0.15s, GOAL_RADIUS=0.3m
+# For BPTT to see non-zero goal-sigmoid gradient, the MEDIAN robot (max_v=1.1)
+# must be able to reach the goal within H steps:
+#   goal ≤ max_v_median × H × DT   →   goal ≤ 1.1 × H × 0.15
+#
+# Old curriculum used distances designed for PPO/MC (sparse terminal +200 propagated
+# via returns). SHAC needs the goal sigmoid gradient to be non-zero at typical
+# robot-goal distances (goal_sigmoid has effectively ~0 gradient beyond 0.5m).
+#
+# With H=22 and 6.0m goals: avg robot covers 3.6m → still 2.4m from goal →
+# goal_sigmoid gradient ≈ 0.000000 for 90% of envs. Policy has NO gradient signal
+# from goal completion → permanent progress-reward plateau at ~0.11/step.
+#
+# Fix: use goals the MEDIAN robot can reach (≥60% of 2048 envs get goal signal):
+#   Stage 0 (H=8):  0.91×median_max_dist=1.1×8×0.15×0.91=1.2m → 1.5m ✓ (40% reach)
+#   Stage 1 (H=12): 0.91×1.1×12×0.15=1.8m → 1.8m ✓ (60%+ reach)
+#   Stage 2 (H=16): 0.91×1.1×16×0.15=2.4m → 2.4m ✓ (60%+ reach)
+#   Stage 3 (H=22): 0.91×1.1×22×0.15=3.3m → 3.3m ✓ (65% reach)
+#   Stage 4 (H=28): 0.91×1.1×28×0.15=4.2m → 4.2m ✓ (65% reach)
+#   Stage 5 (H=32): 0.91×1.1×32×0.15=4.8m → 4.8m ✓ (65% reach)
+#
+# The 0.91 factor reserves ~9% of steps for obstacle avoidance/turning.
+# P(reach) at each stage ≈ 60–65% (up from 10% at stage 3 with old 6.0m goals).
 CURRICULUM = [
-    # (rolling_reward_per_step_threshold, min_goal_dist)
-    (-0.5, 1.5),   # stage 0: avoids frequent wall hits ✅
-    ( 0.2, 2.5),   # stage 1: consistent goal approach ✅
-    ( 0.3, 4.0),   # stage 2: reach 2.5m goals (H=64 now enough to cover 4m at max speed)
-    ( 0.5, 6.0),   # stage 3: reach 4m goals
-    ( 1.0, 8.0),   # stage 4: reach 6m goals
-    ( 2.0, 9.0),   # stage 5: reach 8m goals → full room
+    # (goal_dist,)  — one entry per stage, indexed by cur_stage
+    # DESIGN NOTE (2026-03-24): goal distances are calibrated so the MEDIAN
+    # robot (max_v=1.1 m/s) can reach the goal within H steps:
+    #   reachable ≈ 0.91 × H × DT × 1.1 m/s
+    # Advancement is step-count based (see STAGE_DURATIONS), NOT reward-based.
+    # Reward-based thresholds failed because per-step reward DECREASES as goals
+    # get harder (lower success rate) → increasing thresholds are unreachable.
+    1.5,   # stage 0 (H=8):  reachable ≈ 1.11m → 1.5m (early easy goals)
+    1.8,   # stage 1 (H=12): reachable ≈ 1.98m → 1.8m ✓
+    2.4,   # stage 2 (H=16): reachable ≈ 2.64m → 2.4m ✓
+    3.3,   # stage 3 (H=22): reachable ≈ 3.63m → 3.3m ✓
+    4.2,   # stage 4 (H=28): reachable ≈ 4.62m → 4.2m ✓
+    4.8,   # stage 5 (H=32): reachable ≈ 5.28m → 4.8m ✓
 ]
 
-def curriculum_dist(rolling_ret_per_step: float) -> float:
-    for thresh, dist in CURRICULUM:
-        if rolling_ret_per_step < thresh:
-            return dist
-    return CURRICULUM[-1][1]
+## STEP-COUNT ADVANCEMENT — how many outer updates to spend at each stage.
+## 0 = stay forever (used for the final stage).
+## Calibration (2026-03-24): stages 3-5 each need ~1500-4000 updates to show
+## meaningful improvement (BPTT gradient at H=22-32 is noisy; slow learning).
+##   stage 4 (4.2m, H=28): 1500 updates minimum to adapt from stage-3 policy
+##   stage 5 (4.8m, H=32): remaining budget (~2000 in a 4000-update run)
+## Fresh run from scratch: 25+75+150+300+1500 = 2050 updates to reach stage 5.
+STAGE_DURATIONS = [25, 75, 150, 300, 1500, 0]
 
-def curriculum_stage(rolling_ret_per_step: float) -> int:
-    for i, (thresh, _) in enumerate(CURRICULUM):
-        if rolling_ret_per_step < thresh:
-            return i
-    return len(CURRICULUM) - 1
+def curriculum_dist(stage: int) -> float:
+    """Return goal distance for the given stage index."""
+    return CURRICULUM[min(stage, len(CURRICULUM) - 1)]
 
 # ── Reward differenziabile per BPTT ──────────────────────────────────────────
 # step_env usa jnp.where(bool, CONSTANT) → ∂reward/∂action = 0 sui terminali.
@@ -388,7 +441,20 @@ def _actor_loss(actor_params, critic_params, actor_apply, critic_apply,
         actor_params, critic_params, actor_apply, critic_apply,
         obs_batch, state_batch, keys, horizon_mask, ghost_robot,
     )
-    loss = -jnp.mean(returns)
+    # Per-env return clipping: a few outlier environments (near-collision sigmoid
+    # boundaries) produce huge BPTT gradients that dominate the mean and send the
+    # actor in a noisy direction. Clipping to the [5th, 95th] percentile removes
+    # these outliers before computing the loss, reducing AGN variance without
+    # biasing the gradient direction for the 90% of well-behaved environments.
+    #
+    # CRITICAL: lo/hi must be stop_gradient'd. jnp.percentile is differentiable
+    # via sorted order — without stop_grad, the gradient of lo/hi w.r.t. actor_params
+    # flows through ALL returns (including the clipped outliers), recreating exactly
+    # the noisy cross-environment gradient coupling we are trying to suppress.
+    lo = jax.lax.stop_gradient(jnp.percentile(returns, 5))
+    hi = jax.lax.stop_gradient(jnp.percentile(returns, 95))
+    returns_clipped = jnp.clip(returns, lo, hi)
+    loss = -jnp.mean(returns_clipped)
     return loss, (returns, aux)
 
 
@@ -448,14 +514,17 @@ def _critic_loss(critic_params, critic_apply,
     v_preds  = critic_apply({"params": critic_params}, obs_flat).reshape(N, H)
     tgt_sg   = jax.lax.stop_gradient(targets)
 
-    # Huber loss (δ=10): quadratic for |v_pred - target| < 10, linear beyond.
-    # δ=10 covers the full range of V values for this reward scale (~[-50, +10]).
-    # Quadratic regime gives proper gradient for normal TD errors; the linear
-    # regime caps the gradient from rare large-magnitude terminal targets.
+    # Huber loss δ=2: tightened from δ=10.
+    # At H=22 with r/step≈0.12, V(s)≈2.4. The old δ=10 meant every TD error
+    # was in the quadratic regime (critic_loss≈7.5 → RMS_err≈5.5 > 2*V scale),
+    # causing large gradients that destabilised the critic.
+    # δ=2 caps the gradient at 2 for large errors (|err|≥2), which is already
+    # larger than V(s)≈2.4 — so we still get quadratic loss for small errors
+    # and bounded linear gradient for the rare large terminal-reward errors.
     err   = v_preds - tgt_sg
-    huber = jnp.where(jnp.abs(err) < 10.0,
+    huber = jnp.where(jnp.abs(err) < 2.0,
                       0.5 * err ** 2,
-                      10.0 * jnp.abs(err) - 50.0)
+                      2.0 * jnp.abs(err) - 2.0)
     n_act = jnp.maximum(jnp.sum(acts), 1.0)
     return VF_COEF * jnp.sum(acts * huber) / n_act
 
@@ -617,11 +686,31 @@ def make_horizon_mask(h: int) -> jnp.ndarray:
 #   Stage 3 (6.0m)         → ~22 steps → H=22
 #   Stage 4 (8.0m)         → ~29 steps → H=28
 #   Stage 5 (9.0m)         → ~32 steps → H=32
-_STAGE_HORIZONS = [8, 12, 12, 16, 22, 32]
+_STAGE_HORIZONS = [8, 12, 16, 22, 28, 32]   # BUG FIX: was [8,12,12,16,22,32]
+# ROOT CAUSE of plateau at rolling_ret≈0.30:
+#   Old array gave stages 2-4 the *previous* stage's horizon (off-by-one).
+#   At stage 3 (6.0m goals) H=16 → max_dist=16×0.15×2.0=4.8m < 6.0m → UNREACHABLE.
+#   The +200 goal reward was NEVER triggered; policy could only optimize the
+#   progress reward, which plateaus at ~0.30/step forever.
+#   Correct mapping (DT=0.15, max_v up to 2.0):
+#     Stage 2 (4.0m) → H=16: max_dist=4.8m > 4.0m ✓
+#     Stage 3 (6.0m) → H=22: max_dist=6.6m > 6.0m ✓
+#     Stage 4 (8.0m) → H=28: max_dist=8.4m > 8.0m ✓
 
-def get_horizon(rolling_ret: float) -> int:
-    stage = curriculum_stage(rolling_ret)
-    return _STAGE_HORIZONS[min(stage, len(_STAGE_HORIZONS) - 1)]
+def get_horizon(cur_stage: int) -> int:
+    """Return H for the current curriculum stage.
+
+    H is tied directly to cur_stage (the one-way curriculum ratchet), NOT to the
+    rolling_ret EMA. This avoids the circular trap where:
+      - H must be ≥22 for 6.0m goals to be reachable
+      - But rolling_ret stays low if goals are unreachable at H=16
+      - And a separate H-hysteresis gated H increases on rolling_ret
+
+    Since the curriculum only ever advances (cur_dist never shrinks), cur_stage is
+    monotonically non-decreasing → H is also monotonically non-decreasing → no
+    flip-flop is possible. The old hysteresis logic was redundant AND harmful.
+    """
+    return _STAGE_HORIZONS[min(cur_stage, len(_STAGE_HORIZONS) - 1)]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -701,9 +790,13 @@ if __name__ == "__main__":
             print(f"Caricamento fallito ({e}), partenza da zero.")
 
     # ── Curriculum iniziale ───────────────────────────────────────────────────
-    rolling_ret  = -5.0    # stima iniziale in unità reward/step
-    cur_dist     = curriculum_dist(rolling_ret)
-    cur_stage    = curriculum_stage(rolling_ret)
+    # --stage sets the starting curriculum stage directly. This replaces the old
+    # --rolling-init hack (which required reward-level thresholds that break when
+    # per-step reward decreases with goal difficulty).
+    rolling_ret   = args.rolling_init          # kept for monitoring only
+    cur_stage     = min(args.stage, len(CURRICULUM) - 1)
+    cur_dist      = curriculum_dist(cur_stage)
+    stage_updates = 0                           # updates spent at cur_stage so far
 
     print(f"Curriculum: stage={cur_stage}, min_goal_dist={cur_dist:.1f}m")
 
@@ -780,7 +873,12 @@ if __name__ == "__main__":
         )
         return new_cp, new_ct, new_co, jnp.mean(losses)
 
-    _wu_mask = make_horizon_mask(H_INIT)
+    # BUG FIX: warmup must use the TRAINING horizon (cur_stage → H=22 at stage 3),
+    # NOT H_INIT (=8). Using H_INIT calibrated the critic for V≈0.9 but training
+    # immediately used H=22 → V≈2.4 (2.6× mismatch, critic_loss=9.5 at update 0).
+    _wu_horizon = get_horizon(cur_stage)
+    _wu_mask = make_horizon_mask(_wu_horizon)
+    print(f"Critic warmup horizon = H={_wu_horizon} (stage {cur_stage})")
     # stop_gradient so warmup never computes BPTT gradients through actor
     _ap_sg = jax.lax.stop_gradient(actor_params)
     for _wu in range(CRITIC_WARMUP_UPDATES):
@@ -806,7 +904,8 @@ if __name__ == "__main__":
         "update", "total_env_steps",
         "actor_loss", "critic_loss", "mean_return",
         "actor_gn", "critic_gn",
-        "horizon", "stage", "dist", "rolling_ret", "mean_raw_reward", "elapsed_min"
+        "horizon", "stage", "dist", "rolling_ret", "mean_raw_reward", "elapsed_min",
+        "stage_updates"
     ])
     _log_file.flush()
 
@@ -816,7 +915,7 @@ if __name__ == "__main__":
     hdr = (
         f"{'Upd':>5} | {'R/step':>7} {'Roll':>7} | "
         f"{'Critic-L':>8} {'AGN':>6} {'CGN':>6} | "
-        f"{'H':>3} {'Stage':>5} {'Dist':>5} | "
+        f"{'H':>3} {'Stage':>5} {'Dist':>5} {'StgUpd':>8} | "
         f"{'FPS':>7} {'Time':>6}"
     )
     print(hdr)
@@ -831,10 +930,10 @@ if __name__ == "__main__":
 
         rng, step_rng, sample_rng2 = jax.random.split(rng, 3)
 
-        # Horizon curriculum: H grows with policy performance, not update count.
-        # This prevents BPTT explosion from using large H before the policy/critic
-        # are calibrated enough to produce stable gradients at that depth.
-        horizon      = get_horizon(rolling_ret)
+        # H follows cur_stage directly. cur_stage is a one-way ratchet (never
+        # retreats) so H also never decreases → no flip-flop possible without
+        # any separate hysteresis logic.
+        horizon      = get_horizon(cur_stage)
         horizon_mask = make_horizon_mask(horizon)
 
         # Ricampiona stati iniziali ogni RESAMPLE_INTERVAL update
@@ -869,30 +968,59 @@ if __name__ == "__main__":
         env_steps_per_update = N_ENVS * horizon
         fps = env_steps_per_update / (time.time() - t0)
 
-        # EMA on reward/step — α raised 0.05→0.15 so curriculum advances
-        # faster when performance genuinely improves past a threshold.
-        rolling_ret = 0.85 * rolling_ret + 0.15 * mean_r_step
+        # EMA on reward/step — monitoring only, NOT used for curriculum advancement.
+        # (Reward-based advancement failed: per-step reward decreases with goal
+        # difficulty, so increasing thresholds are unreachable at harder stages.)
+        rolling_ret = 0.90 * rolling_ret + 0.10 * mean_r_step
 
-        # ── Curriculum ────────────────────────────────────────────────────────
-        new_dist  = curriculum_dist(rolling_ret)
-        new_stage = curriculum_stage(rolling_ret)
-        if new_dist > cur_dist:
-            cur_dist  = new_dist
-            cur_stage = new_stage
+        # ── Curriculum (step-count based) ─────────────────────────────────────
+        # Advance after STAGE_DURATIONS[cur_stage] updates, regardless of reward.
+        stage_updates += 1
+        dur = STAGE_DURATIONS[cur_stage]
+        if dur > 0 and stage_updates >= dur and cur_stage < len(CURRICULUM) - 1:
+            prev_stage  = cur_stage
+            cur_stage  += 1
+            cur_dist    = curriculum_dist(cur_stage)
+            stage_updates = 0
             rng, reinit_rng = jax.random.split(rng)
             obs_batch, state_batch = _sample_init_states(
                 reinit_rng, cur_dist, ghost_robot
             )
             print(f"  → Curriculum stage={cur_stage}, dist={cur_dist:.1f}m "
-                  f"(rolling_ret={rolling_ret:.1f})")
+                  f"(after {dur} updates at stage {prev_stage}; "
+                  f"rolling_ret={rolling_ret:.3f})")
+
+            # Re-warmup critic whenever H increases (new stage → new horizon).
+            # Without re-warmup, the critic is miscalibrated for the new H:
+            # V(s) at H_new ≠ V(s) at H_old → critic_loss spikes after stage advance.
+            new_h = get_horizon(cur_stage)
+            old_h = get_horizon(prev_stage)
+            if new_h > old_h:
+                print(f"  Re-warmup critic at H={new_h} (was H={old_h})...")
+                _rewu_mask = make_horizon_mask(new_h)
+                _ap_sg2 = jax.lax.stop_gradient(actor_params)
+                for _rwu in range(50):  # 50 steps sufficient for re-calibration
+                    rng, _rwu_rng, _rwu_smp = jax.random.split(rng, 3)
+                    if _rwu % RESAMPLE_INTERVAL == 0:
+                        obs_batch, state_batch = _sample_init_states(
+                            _rwu_smp, cur_dist, ghost_robot)
+                    _rwu_keys = jax.random.split(_rwu_rng, N_ENVS)
+                    critic_params, critic_target_params, critic_opt_state, _rwu_loss = \
+                        _critic_warmup_step(
+                            _ap_sg2, critic_params, critic_target_params,
+                            critic_opt_state, obs_batch, state_batch,
+                            _rwu_keys, _rewu_mask)
+                print(f"  Re-warmup done (critic_loss={float(_rwu_loss):.4f})")
 
         # ── Logging ───────────────────────────────────────────────────────────
         if update % 25 == 0: # print e log ogni 25 update
             elapsed = (time.time() - t_start) / 60.0
+            dur_str = (f"{stage_updates}/{STAGE_DURATIONS[cur_stage]}"
+                       if STAGE_DURATIONS[cur_stage] > 0 else f"{stage_updates}/∞")
             print(
                 f"{update:>5d} | {mean_r_step:>7.3f} {rolling_ret:>7.3f} | "
                 f"{critic_loss:>8.4f} {a_gn:>6.3f} {c_gn:>6.3f} | "
-                f"{horizon:>3d} {cur_stage:>5d} {cur_dist:>4.1f}m | "
+                f"{horizon:>3d} {cur_stage:>5d} {cur_dist:>4.1f}m {dur_str:>8s} | "
                 f"{fps:>7,.0f} {elapsed:>5.1f}min"
             )
             total_env_steps = (update + 1) * env_steps_per_update
@@ -902,6 +1030,7 @@ if __name__ == "__main__":
                 round(mean_ret, 3), round(a_gn, 4), round(c_gn, 4),
                 horizon, cur_stage, round(cur_dist, 1),
                 round(rolling_ret, 3), round(mean_r_step, 4), round(elapsed, 2),
+                stage_updates,
             ])
             _log_file.flush()
 
