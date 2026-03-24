@@ -1,32 +1,5 @@
 """
-jax_env_multi.py — Core 2D Navigation Environment with JHSFM
-
-FIXES vs previous version:
-
-  FIX #5 — passive_col penalty ridotta da -60 a -20:
-    La passive_col si verifica quando il robot è fermo e un umano ci cammina
-    sopra. Il robot non può evitarla. Una penalità di -60 era sproporzionata
-    e incoraggiava la policy a muoversi freneticamente vicino agli umani per
-    "scappare" invece di navigare efficientemente. Con -20 rimane un segnale
-    negativo (non stare in mezzo al traffico) senza dominare il reward.
-
-  DIFFERENTIABILITY OVERHAUL (SHAC):
-    step_env is now natively fully differentiable so SHAC can backpropagate
-    exact gradients through the real simulator — no surrogate reward needed.
-
-    Changes:
-      • soft_clip() replaces jnp.clip() for action/position clamping.
-        jnp.clip has zero gradient when saturated; soft_clip (softplus-based)
-        returns a non-zero gradient at the boundary, allowing BPTT to learn
-        that pushing into a wall is bad.
-      • Boolean collision flags replaced by sigmoid soft-indicators for reward.
-        Hard bool flags have zero gradient; sigmoids give a smooth collision
-        signal that propagates into the actor gradient.
-      • Terminal jnp.where cascade replaced by a smooth reward sum.
-        jnp.where(done, CONST, reward) kills the gradient wherever done=True;
-        sigmoid indicators smoothly blend terminal and dense rewards.
-      • Boolean `done` is preserved for episode-reset logic but is wrapped in
-        stop_gradient so it never contaminates the BPTT graph.
+jax_env_multi.py — Core 2D Navigation Environment with JHSFM and multiple human-robot navigation scenarios
 """
 
 import jax
@@ -60,48 +33,16 @@ HSFM_DT    = 0.01
 
 
 
-# ── Reward constants ─────────────────────────────────────────────────────────
-#
-# Design philosophy: minimal hand-engineering, maximal emergence.
-#
-# The core reward is:
-#
-#   social_progress = Δdist_to_goal × clearance_factor(closest_human)
-#
-# where clearance_factor ∈ [0,1] is a smooth sigmoid that:
-#   → equals ~1 when the robot is comfortably far from all humans
-#   → drops toward 0 as it enters the personal-space zone
-#   → reaches 0 at the intimate zone boundary
-#
-# This single multiplicative term encodes the social priority rule:
-# "yield to humans" emerges because progress near humans is worth almost
-# nothing, so the policy learns that detouring around them (even at a
-# distance cost) is better than passing through.  Stopping to let a
-# crossing human pass also becomes rational: zero progress × anything = 0,
-# whereas waiting a few steps and then resuming full progress is better.
-#
-# No separate yield/escape/proxemic/overspeed/aim terms are needed.
-# The jerk penalty keeps trajectories smooth (humans walk smoothly).
-# Terminal rewards remain for hard constraints.
-
 # Terminal rewards
-_R_GOAL        =  100.0   # FIX: era 200 — scala ridotta per bilanciare con ENTROPY_COEF
-_R_OBS_COL     =  -50.0   # FIX: era -90
-_R_WALL_COL    =  -50.0   # FIX: era -90
-_R_ACTIVE_COL  =  -50.0   # FIX: era -90
-# FIX #5: ridotto da -60 a -20. La passive_col avviene quando il robot è
-# FERMO e un umano gli cammina sopra — il robot non può fare molto per
-# evitarla. Una penalità di -60 (quasi pari alla active_col) era sproporzionata
-# e insegnava alla policy a muoversi freneticamente per "scappare" dagli umani
-# invece di navigare efficientemente. Con -20 rimane un segnale negativo
-# (incentiva a non stare in mezzo al traffico) senza dominare il reward.
-_R_PASSIVE_COL =  -10.0   # FIX: era -20
-_R_TIMEOUT     =  -10.0   # FIX: era -5 — penalty più alta per timeout, incentiva velocità
+_R_GOAL        =  200.0   
+_R_OBS_COL     =  -90.0   
+_R_ACTIVE_COL  =  -50.0   
 
-# Progress scaling — how much a metre of progress toward goal is worth
-# when the robot is in completely open space (clearance_factor = 1).
-_PROGRESS_COEF =  12.0   # FIX: alzato 8→12. Con CF_CENTER=0.4 e densità media, clearance_factor≈0.5
-                         # → 12 × 0.08m/step × 0.5 ≈ 0.48/step; goal reward 100 ≈ 200 steps di progress
+_R_PASSIVE_COL =  -30.0   
+_R_TIMEOUT     =  -10.0   
+
+
+_PROGRESS_COEF =  8.0   
 
 # Step penalty — small constant cost per timestep, encourages efficiency.
 _STEP_PEN      =  -0.02
@@ -125,8 +66,21 @@ _JERK_WEIGHT   =   2.0
 #   d = 1.2 m  → clearance_factor = 0.50  → progress halved → slow down
 #   d = 0.7 m  → clearance_factor ≈ 0.10  → progress worth almost nothing → stop/detour
 #   d < 0.5 m  → clearance_factor ≈ 0.02  → collision imminent, no progress matters
-_CF_CENTER = 0.3   # m — personal space boundary (Hall 1966)
-_CF_SLOPE  = 0.3   # m — sigmoid steepness
+
+_CF_CENTER = 0.8   # m — clearance from closest shoe surface at which CF=0.5
+                   # BUG FIX (USE_LEGS=True): was 0.3 m.
+                   #
+                   # With USE_LEGS=True the physical contact surface is the shoe AABB,
+                   # not a body circle. closest_shoe_surface (computed below) replaces
+                   # closest_human in the clearance factor. The sigmoid center must be
+                   # expressed in shoe-surface-to-robot-surface terms:
+                   #   0.8 m gap means the robot is ~1 m from the body centre
+                   #   (shoe_centre ≈ 0.15 m offset + half shoe ≈ 0.10 m projection +
+                   #    ROBOT_RADIUS 0.20 m)
+                   # At 0.3 m (old value) the sigmoid was saturated at ≈1.0 for every
+                   # non-collision step — the social shaping was completely inert.
+
+_CF_SLOPE  = 0.35  # m — sigmoid steepness (slightly wider than before)
 N_SUBSTEPS = int(DT / HSFM_DT)
 NUM_PEOPLE = 12
 
@@ -394,14 +348,30 @@ def step_env(key, state, action, ghost_robot: bool = True):
     # Mask dummies from all distance/collision logic
     active_mask    = new_people[:, 10] >= 0.0
     # BUG FIX 2: Replace jnp.inf with large finite sentinel for dummy humans.
-    # jnp.min over an array containing jnp.inf can produce NaN gradients in
-    # XLA's backward pass when inf wins the reduction (gradient of the inf
-    # branch is NaN-contaminated).  Using a large finite value avoids this
-    # while keeping dummy humans effectively invisible to all distance logic.
-    # 1e4 >> ROOM_W/H (~12m) so it never affects the min for active humans.
     _DUMMY_DIST = 1e4
     dists_p_active = jnp.where(active_mask, dists_p, _DUMMY_DIST)
-    closest_human  = jnp.min(dists_p_active)
+    closest_human  = jnp.min(dists_p_active)   # body-centre dist — used for collision FOV logic
+
+
+    if USE_LEGS:
+        shoe_boxes_cf = get_shoe_boxes(new_people, new_foot_state)   # (2N, 4)
+        N_cf = NUM_PEOPLE
+        owner_idx_cf   = jnp.concatenate([jnp.arange(N_cf), jnp.arange(N_cf)])  # (2N,)
+        owner_active_cf = active_mask[owner_idx_cf]                              # (2N,)
+
+        def _shoe_dist_cf(box):
+            cx, cy, hw, hh = box
+            ddx = jnp.maximum(jnp.abs(new_x - cx) - hw, 0.0)
+            ddy = jnp.maximum(jnp.abs(new_y - cy) - hh, 0.0)
+            return jnp.sqrt(ddx**2 + ddy**2 + 1e-8)
+
+        shoe_dists_cf = jax.vmap(_shoe_dist_cf)(shoe_boxes_cf)          # (2N,)
+        shoe_dists_cf = jnp.where(owner_active_cf, shoe_dists_cf, _DUMMY_DIST)
+        # Subtract ROBOT_RADIUS so we get surface-to-surface gap
+        closest_shoe_surface = jnp.maximum(0.0, jnp.min(shoe_dists_cf) - ROBOT_RADIUS)
+    else:
+        # Fallback: body circle edge-to-edge (original formula)
+        closest_shoe_surface = jnp.maximum(0.0, closest_human - PEOPLE_RADIUS - ROBOT_RADIUS)
 
     # ── 5. Collision Detection ───────────────────────────────────────────────────
 
@@ -495,9 +465,13 @@ def step_env(key, state, action, ghost_robot: bool = True):
 
     # ── 6. Reward ───────────────────────────────────────────────────────────────
 
-    # — 6a. Clearance factor (unchanged) ──────────────────────────────────
-    edge_to_edge   = jnp.maximum(0.0, closest_human - PEOPLE_RADIUS - ROBOT_RADIUS)
-    clearance_factor = jax.nn.sigmoid((edge_to_edge - _CF_CENTER) / _CF_SLOPE)
+    # — 6a. Clearance factor ───────────────────────────────────────────────
+    # USE_LEGS=True: clearance_factor is based on closest_shoe_surface, which
+    # is the true robot-surface to shoe-AABB-surface gap computed above.
+    # USE_LEGS=False fallback: closest_shoe_surface already equals
+    #   max(0, closest_human - PEOPLE_RADIUS - ROBOT_RADIUS) (see above).
+    # In both cases closest_shoe_surface is the correct edge-to-edge gap.
+    clearance_factor = jax.nn.sigmoid((closest_shoe_surface - _CF_CENTER) / _CF_SLOPE)
 
     # — 6b. Dense shaping (smooth, unchanged) ────────────────────────────
     progress         = prev_dist - new_dist

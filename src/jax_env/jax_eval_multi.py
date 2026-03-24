@@ -51,6 +51,8 @@ def _parse_args():
                    help="Overlay JHSFM body ring on top of legs.")
     p.add_argument("--sensor-noise", action="store_true", default=False,
                    help="Enable Salt&Pepper sensor noise (off by default for clean eval).")
+    p.add_argument("--watch", action="store_true", default=False,
+                   help="Watch the checkpoint file and hot-reload weights when modified.")
     return p.parse_args()
 
 args = _parse_args()
@@ -531,6 +533,8 @@ def main():
         params = init_params
         print(f"⚠️  Checkpoint not found — running with random weights.")
 
+    last_mtime = os.path.getmtime(ckpt) if os.path.exists(ckpt) else 0
+
     def build_fast_reset(scen_idx):
         bound_reset = functools.partial(reset_env, scenario_idx=scen_idx)
         rs, ss = make_stacked_env(bound_reset, step_env, stack_dim=3, ghost_robot=False)
@@ -560,6 +564,7 @@ def main():
                 "tmo":w[:,3].mean()*100,"pcol":w[:,4].mean()*100}
 
     print("🎮 Keys: 0-6 lock scenario | 7 random | R reset | L lidar | H arrows | B body | Q quit")
+    if args.watch: print(f"👀 WATCH MODE ENABLED: Polling {ckpt} for updates.")
 
     while True:
         for event in pygame.event.get():
@@ -591,6 +596,16 @@ def main():
                     ep_reward=0.0; ep_steps=0; banner_t=0
 
         if paused: clock.tick(10); continue
+
+        if args.watch and ep_steps % 30 == 0:
+            try:
+                mtime = os.path.getmtime(ckpt)
+                if mtime > last_mtime:
+                    params = load_fn(ckpt)
+                    last_mtime = mtime
+                    print(f"🔄 Reloaded weights from {ckpt}!")
+            except Exception:
+                pass
 
         # ── Inference ────────────────────────────────────────────────────────
         env_action = infer_fn(params, obs, stacked_state.env_state.max_v)
