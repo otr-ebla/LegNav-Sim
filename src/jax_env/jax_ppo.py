@@ -1,43 +1,6 @@
 """
-jax_ppo.py — Single-GPU PPO Training  (GPU 0)
-===============================================
-FIXES vs previous version:
+jax_ppo.py — Single-GPU PPO Training  (GPU 0), must train always with GPU, no CPU, never CPU
 
-  FIX — _vmap_step stale-closure (Bug #3, coordinated with jax_train.py):
-    init_env_state() now returns (env_obs, env_state, vmap_step).
-    collect_rollouts receives vmap_step as an explicit static arg.
-    On curriculum stage change, the new vmap_step object triggers a retrace
-    so the new min_goal_dist actually propagates into the rollout loop.
-    cur_stage is now properly tracked and printed.
-
-  FIX — rolling_suc EMA alpha 0.03 → 0.1 (Issue #10):
-    With α=0.03 the time constant was ~33 updates, causing the agent to
-    spend 60-80 updates at the wrong curriculum stage. α=0.1 (~10-update
-    lag) is appropriate for a 400-update run with 3 stage transitions.
-
-  FIX — Scheduler step-count mismatch (Critical):
-    The optax step counter is incremented once per optimizer.update() call.
-    Because ppo_update_epoch runs N_MINIBATCHES=200 updates inside a
-    jax.lax.scan, and run_ppo_updates scans over PPO_EPOCHS=6 epochs, the
-    optimizer advances by 200×6=1200 steps per outer training update.
-    The old WARMUP_UPDATES=10 and TOTAL_UPDATES=400 were in outer-update
-    units, so the scheduler saw 1200 steps per outer update and exhausted
-    warmup (10 steps) halfway through the very first outer update, then
-    hit LR_END by outer update 1-2, silently killing all learning.
-    FIX: _WARMUP_OPT_STEPS and _TOTAL_OPT_STEPS scale by
-    _OPT_STEPS_PER_UPDATE = PPO_EPOCHS × N_MINIBATCHES = 1200, so the
-    scheduler now spans the correct real optimizer-step range.
-    lr_now display is also fixed to query scheduler at the true step.
-
-  FIX — Curriculum thresholds alzate (Bug #3):
-    Le vecchie soglie (10%, 20%, 35%...) facevano scattare il curriculum
-    troppo presto. Con rolling_suc EMA α=0.1 un singolo rollout fortunato
-    a ~11% poteva portare rolling_suc oltre la soglia del 10%, saltando
-    al distanza 2.5m prima che il comportamento base fosse consolidato.
-    Fix: soglie alzate a (25%, 38%, 50%...) — ogni stage richiede ~2×
-    il successo del precedente. GHOST_PROB_STAGES allineate di conseguenza.
-
-  All previous hyperparameters and PPO logic are carried.
 """
 
 import os

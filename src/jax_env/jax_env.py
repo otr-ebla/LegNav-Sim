@@ -516,10 +516,12 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
     passive_col = (passive_col_body | passive_col_shoe) & ~obs_collision & ~wall_collision
 
     # ── End of Episode Flags ──────────────────────────────────────────────────
-    collision    = active_col | passive_col | obs_collision | wall_collision
-    timeout      = (state.time_step + 1) >= MAX_STEPS
-    goal_reached = new_dist < GOAL_RADIUS
-    done         = goal_reached | collision | timeout
+    human_collision = active_col | passive_col
+    collision       = human_collision | obs_collision | wall_collision
+    fatal_collision = active_col | obs_collision | wall_collision
+    timeout         = (state.time_step + 1) >= MAX_STEPS
+    goal_reached    = new_dist < GOAL_RADIUS
+    done            = goal_reached | fatal_collision | timeout
 
     # ── Dense Rewards ─────────────────────────────────────────────────────────
 
@@ -590,7 +592,7 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
     reward = jnp.where(active_col  & ~obs_collision & ~wall_collision & ~goal_reached, -72.0, reward)
 
     reward = jnp.where(passive_col & ~active_col & ~obs_collision & ~wall_collision & ~goal_reached, -22.0, reward)
-    reward = jnp.where(timeout & ~goal_reached & ~collision, -0.5, reward)
+    reward = jnp.where(timeout & ~goal_reached & ~fatal_collision, -0.5, reward)
 
     new_state = state.replace(
         x=new_x, y=new_y, theta=new_theta,

@@ -590,7 +590,7 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
     reward = jnp.where(active_col  & ~obs_collision & ~wall_collision & ~goal_reached, -72.0, reward)
 
     reward = jnp.where(passive_col & ~active_col & ~obs_collision & ~wall_collision & ~goal_reached, -22.0, reward)
-    reward = jnp.where(timeout & ~goal_reached & ~collision, -0.5, reward)
+    reward = jnp.where(timeout & ~goal_reached & ~fatal_collision, -0.5, reward)
 
     new_state = state.replace(
         x=new_x, y=new_y, theta=new_theta,
