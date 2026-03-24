@@ -353,7 +353,7 @@ if __name__ == "__main__":
                      # improvement, then only on new highs.
 
     hdr = (f"{'Upd':>5} | {'EpRet':>7} | {'Suc%':>5} {'Col%':>5} {'Pcol%':>5} {'Tmo%':>5} {'IC%':>5} |"
-           f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} | {'FPS':>7} {'#Ep':>6} {'LR':>6}  | "
+           f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} | {'FPS':>7} {'#Ep':>6} {'LR':>6}| "
            f"{'Stage':>5} {'MinDist':>7} {'Ghost':>6} {'Time':>6}")
     print(hdr)
     print("─" * len(hdr))

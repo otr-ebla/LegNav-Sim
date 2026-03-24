@@ -49,39 +49,35 @@ _PROGRESS_COEF =  8.0
 _STEP_PEN      =  -0.02
 
 # Jerk penalty — discourages angular velocity changes (smooth paths).
-# Larger than before because smoothness is the only trajectory shaping left.
 _JERK_WEIGHT   =   2.0
 
-# ── Clearance factor parameters ───────────────────────────────────────────────
-# clearance_factor(d) = sigmoid((d - _CF_CENTER) / _CF_SLOPE)
+# ── Comfort penalty parameters (replaces old clearance-factor multiplier) ─────
+# OLD DESIGN (broken): clearance_factor multiplied progress reward.
+#   With 12 humans in 12×12m, closest_shoe_surface < 0.8m ~49% of the time,
+#   so CF < 0.5 half the time → progress reward suppressed → robot freezes.
 #
-#   _CF_CENTER : distance at which clearance_factor = 0.5 [m]
-#                Set to personal space boundary (~1.2 m).
-#                At this distance the progress reward is halved.
-#   _CF_SLOPE  : controls steepness of the sigmoid [m]
-#                Smaller → sharper boundary; larger → softer gradient.
-#                0.4 m gives a transition from ~0.1 to ~0.9 over ~1.8 m.
+# NEW DESIGN: progress reward is ALWAYS at full strength (never multiplied).
+#   Instead, an additive comfort penalty discourages lingering near humans.
+#   The robot is free to pass through crowded zones (progress pulls it forward)
+#   but learns to prefer wider paths when available.
+#
+# comfort_penalty = -_COMFORT_COEF * max(0, 1 - d / _COMFORT_DIST) * (1 + v/max_v)
+#
+#   _COMFORT_DIST : radius of the "personal space" zone [m]
+#                   Humans closer than this generate a per-step penalty.
+#   _COMFORT_COEF : base penalty magnitude at d=0 (body contact distance).
+#                   Scaled by (1 + v/max_v) so fast approaches cost more.
 #
 # Intuition for the policy:
-#   d > 2.0 m  → clearance_factor ≈ 0.95  → almost full progress reward
-#   d = 1.2 m  → clearance_factor = 0.50  → progress halved → slow down
-#   d = 0.7 m  → clearance_factor ≈ 0.10  → progress worth almost nothing → stop/detour
-#   d < 0.5 m  → clearance_factor ≈ 0.02  → collision imminent, no progress matters
+#   d > 1.2 m → no comfort penalty, full progress
+#   d = 0.6 m → penalty ≈ -0.075 * (1 + v/max_v)  → prefers wider path
+#   d = 0.0 m → penalty ≈ -0.15  * (1 + v/max_v)  → strong deterrent
+#   But even at d=0 the net reward of moving toward goal is still positive
+#   (progress ≈ 1.2/step vs penalty ≈ 0.3) → robot never freezes.
 
-_CF_CENTER = 0.8   # m — clearance from closest shoe surface at which CF=0.5
-                   # BUG FIX (USE_LEGS=True): was 0.3 m.
-                   #
-                   # With USE_LEGS=True the physical contact surface is the shoe AABB,
-                   # not a body circle. closest_shoe_surface (computed below) replaces
-                   # closest_human in the clearance factor. The sigmoid center must be
-                   # expressed in shoe-surface-to-robot-surface terms:
-                   #   0.8 m gap means the robot is ~1 m from the body centre
-                   #   (shoe_centre ≈ 0.15 m offset + half shoe ≈ 0.10 m projection +
-                   #    ROBOT_RADIUS 0.20 m)
-                   # At 0.3 m (old value) the sigmoid was saturated at ≈1.0 for every
-                   # non-collision step — the social shaping was completely inert.
+_COMFORT_DIST  = 1.2   # m — personal space boundary
+_COMFORT_COEF  = 0.15  # base penalty at d=0 (before speed scaling)
 
-_CF_SLOPE  = 0.35  # m — sigmoid steepness (slightly wider than before)
 N_SUBSTEPS = int(DT / HSFM_DT)
 NUM_PEOPLE = 12
 
@@ -471,20 +467,21 @@ def step_env(key, state, action, ghost_robot: bool = True):
 
     # ── 6. Reward ───────────────────────────────────────────────────────────────
 
-    # — 6a. Clearance factor ───────────────────────────────────────────────
-    # USE_LEGS=True: clearance_factor is based on closest_shoe_surface, which
-    # is the true robot-surface to shoe-AABB-surface gap computed above.
-    # USE_LEGS=False fallback: closest_shoe_surface already equals
-    #   max(0, closest_human - PEOPLE_RADIUS - ROBOT_RADIUS) (see above).
-    # In both cases closest_shoe_surface is the correct edge-to-edge gap.
-    clearance_factor = jax.nn.sigmoid((closest_shoe_surface - _CF_CENTER) / _CF_SLOPE)
+    # — 6a. Comfort penalty (additive, replaces old clearance_factor multiplier)
+    # Penalises proximity to humans. Summed over ALL humans within _COMFORT_DIST
+    # so the robot feels pressure from crowds, not just the single closest human.
+    # Speed-scaled: fast approach costs more than slow creep.
+    comfort_violations = jnp.maximum(0.0, 1.0 - dists_p_active / _COMFORT_DIST)  # (N,) in [0,1]
+    speed_scale = 1.0 + target_v / jnp.maximum(state.max_v, 1e-3)
+    comfort_pen = -_COMFORT_COEF * jnp.sum(comfort_violations) * speed_scale
 
-    # — 6b. Dense shaping (smooth, unchanged) ────────────────────────────
+    # — 6b. Dense shaping ─────────────────────────────────────────────────
+    # Progress reward at FULL strength — never suppressed by proximity.
     progress         = prev_dist - new_dist
-    social_progress  = _PROGRESS_COEF * progress * clearance_factor
+    social_progress  = _PROGRESS_COEF * progress
     step_pen         = _STEP_PEN
     jerk_pen         = -_JERK_WEIGHT * (target_w - state.w) ** 2
-    dense_reward     = social_progress + step_pen + jerk_pen
+    dense_reward     = social_progress + step_pen + jerk_pen + comfort_pen
 
     # — 6c. Terminal cascades ─────────────────────────────────────────────
     reward = dense_reward
