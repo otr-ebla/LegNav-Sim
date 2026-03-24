@@ -85,22 +85,23 @@ HSFM_DT    = 0.01
 # Terminal rewards remain for hard constraints.
 
 # Terminal rewards
-_R_GOAL        =  200.0
-_R_OBS_COL     =  -90.0
-_R_WALL_COL    =  -90.0
-_R_ACTIVE_COL  =  -90.0
+_R_GOAL        =  100.0   # FIX: era 200 — scala ridotta per bilanciare con ENTROPY_COEF
+_R_OBS_COL     =  -50.0   # FIX: era -90
+_R_WALL_COL    =  -50.0   # FIX: era -90
+_R_ACTIVE_COL  =  -50.0   # FIX: era -90
 # FIX #5: ridotto da -60 a -20. La passive_col avviene quando il robot è
 # FERMO e un umano gli cammina sopra — il robot non può fare molto per
 # evitarla. Una penalità di -60 (quasi pari alla active_col) era sproporzionata
 # e insegnava alla policy a muoversi freneticamente per "scappare" dagli umani
 # invece di navigare efficientemente. Con -20 rimane un segnale negativo
 # (incentiva a non stare in mezzo al traffico) senza dominare il reward.
-_R_PASSIVE_COL =  -20.0
-_R_TIMEOUT     =   -5.0
+_R_PASSIVE_COL =  -10.0   # FIX: era -20
+_R_TIMEOUT     =  -10.0   # FIX: era -5 — penalty più alta per timeout, incentiva velocità
 
 # Progress scaling — how much a metre of progress toward goal is worth
 # when the robot is in completely open space (clearance_factor = 1).
-_PROGRESS_COEF =   8.0   # raised 3→8: clearance_factor≈0.47 avg (12 ppl/12×12m) halves progress signal; 8×0.08×0.47≈0.30/step target
+_PROGRESS_COEF =  12.0   # FIX: alzato 8→12. Con CF_CENTER=0.4 e densità media, clearance_factor≈0.5
+                         # → 12 × 0.08m/step × 0.5 ≈ 0.48/step; goal reward 100 ≈ 200 steps di progress
 
 # Step penalty — small constant cost per timestep, encourages efficiency.
 _STEP_PEN      =  -0.02

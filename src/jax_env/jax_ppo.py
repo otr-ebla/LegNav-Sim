@@ -50,9 +50,13 @@ GAMMA          = 0.99
 GAE_LAMBDA     = 0.95
 CLIP_EPS       = 0.2
 VF_COEF        = 0.25
-# ENTROPY_COEF raised 0.003→0.01: entropy collapsed from H=0.38 to H=-0.30
-# by upd 55 with the old value — policy was prematurily converging.
-ENTROPY_COEF   = 0.01
+# FIX: ENTROPY_COEF abbassato 0.01→0.003.
+# Con reward scale -50/-10 e valore assoluto episodio ~50, il value loss domina.
+# ENTROPY_COEF=0.01 era troppo alto: il gradient dell'entropia spingeva sempre
+# verso logstd_max, bloccando l'entropia a 2.838 (il massimo con LOG_STD_MAX=0.0).
+# Con 0.003 l'entropia può scendere naturalmente quando la policy trova azioni
+# che massimizzano il reward, senza essere soffocata dall'entropy bonus.
+ENTROPY_COEF   = 0.003
 MAX_GRAD_NORM  = 0.5
 PPO_EPOCHS     = 6
 LR_START       = 5e-4
@@ -304,7 +308,7 @@ if __name__ == "__main__":
     print(f"PPO Training — GPU {args.gpu}  [30-min mode]") # <-- Updated to use args.gpu    print(f"  Envs       : {NUM_ENVS}  x  steps {ROLLOUT_STEPS}  =  {BATCH_SIZE:,} batch")
     print(f"  Minibatches: {N_MINIBATCHES} x {MINI_BATCH_SIZE} | epochs {PPO_EPOCHS}")
     print(f"  VF_COEF={VF_COEF}  ENTROPY_COEF={ENTROPY_COEF}  LR warmup {LR_MIN}->{LR_START} then decay ->{LR_END}")
-    print(f"  OBS_SIZE={OBS_SIZE}  log_std: state-dependent, bias=-1.0, clamp [{-4.0},{0.5}]")
+    print(f"  OBS_SIZE={OBS_SIZE}  log_std: state-dependent, bias=-1.0, clamp [{-4.0},{0.0}]")
     print(f"  Curriculum stages: {CURRICULUM_STAGES}\n")
 
     rng = jax.random.PRNGKey(42)

@@ -15,14 +15,17 @@ import jax.numpy as jnp
 ROOM_W = 12.0
 ROOM_H = 12.0
 ROBOT_RADIUS = 0.2
-PEOPLE_RADIUS = 0.2
+PEOPLE_RADIUS = 0.4   # FIX: era 0.2 — deve matchare jax_env.py (PEOPLE_RADIUS=0.4)
+                      # Con 0.2, PERSON_ROBOT_CLEAR=0.7m ma body_thresh=0.6m → margine <0.1m
+                      # → collisioni immediate al primo step garantite
 GOAL_RADIUS = 0.3
 NUM_PEOPLE = 12
 NUM_OBS_CIR = 6
 NUM_OBS_BOX = 6
 
-# Number of parallel guesses for spatial generation
-N_GUESSES = 32
+# FIX: aumentato 32→64 — con 12 umani + 6 cerchi + 6 box in 12×12m, 32 guess
+# falliscono silenziosamente (argmax ritorna indice 0 anche se non è safe).
+N_GUESSES = 64
 
 def _min_dist_to_circles(x, y, circles):
     dx = circles[:, 0] - x
@@ -113,9 +116,13 @@ def generate_scenario(key: jnp.ndarray, min_goal_dist: float, scenario_idx: int 
         gx, gy = g_guesses_x[g_best_idx], g_guesses_y[g_best_idx]
 
         # Vectorized People Spawn
-        PERSON_CLEARANCE = PEOPLE_RADIUS + 0.15
-        PERSON_ROBOT_CLEAR = ROBOT_RADIUS + PEOPLE_RADIUS + 0.3
-        PERSON_GOAL_CLEAR = GOAL_RADIUS + PEOPLE_RADIUS + 0.1
+        PERSON_CLEARANCE   = PEOPLE_RADIUS + 0.15
+        # FIX: era +0.3 → clearance centro-centro = 0.2+0.2+0.3 = 0.7m
+        # ma body_thresh in jax_env = 0.2+0.4 = 0.6m → margine reale < 0.1m
+        # dopo un solo step degli umani → collisione immediata garantita.
+        # Con PEOPLE_RADIUS ora corretto a 0.4: 0.2+0.4+0.6 = 1.2m → margine sicuro.
+        PERSON_ROBOT_CLEAR = ROBOT_RADIUS + PEOPLE_RADIUS + 0.6
+        PERSON_GOAL_CLEAR  = GOAL_RADIUS + PEOPLE_RADIUS + 0.3   # era +0.1
 
         def init_person(pkey):
             pk_pos, pk_g1x, pk_g1y = jax.random.split(pkey, 3)
