@@ -266,7 +266,8 @@ def main():
             )
             last_reward = float(reward)
             last_done = bool(done)
-            last_info = jax.tree_util.tree_map(lambda x: float(x) if x.ndim == 0 else x, info)
+            last_info = {k: (float(v) if hasattr(v, 'ndim') and v.ndim == 0 else v)
+                        for k, v in info.items()}
             episode_return += last_reward
             episode_steps += 1
 
