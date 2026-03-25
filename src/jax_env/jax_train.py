@@ -170,6 +170,7 @@ def collect_rollouts(rng_key, params, apply_fn, vmap_step, env_state, env_obs):
             "goal_reached": infos["goal_reached"],
             "collision":    infos["collision"],
             "passive_col":  infos["passive_col"],
+            "active_col":   infos["active_col"],   # <-- ADD THIS TO FETCH ACTIVE COLLISIONS
         }
         return (next_state, next_obs, current_rng), transition
 
