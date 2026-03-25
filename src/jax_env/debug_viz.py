@@ -26,7 +26,7 @@ import math
 parser = argparse.ArgumentParser()
 parser.add_argument("--checkpoint", type=str, default=None)
 parser.add_argument("--scenario", type=int, default=-1)
-parser.add_argument("--min-goal-dist", type=float, default=1.5)
+parser.add_argument("--max-goal-dist", type=float, default=1.5)
 parser.add_argument("--speed", type=float, default=1.0)
 parser.add_argument("--pause", action="store_true")
 parser.add_argument("--no-ghost", action="store_true", help="Disable ghost (eval mode)")
