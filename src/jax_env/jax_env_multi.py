@@ -43,7 +43,7 @@ _R_PASSIVE_COL =  -60.0
 _R_TIMEOUT     =  -90.0   
 
 
-_PROGRESS_COEF =  15.0   
+_PROGRESS_COEF =  25.0   
 
 # Step penalty — small constant cost per timestep, encourages efficiency.
 _STEP_PEN      =  -0.08
