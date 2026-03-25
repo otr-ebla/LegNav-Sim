@@ -521,5 +521,10 @@ def step_env(key, state, action, ghost_robot: bool = True):
         "sp_mask":       sp_mask,
         "timeout":       timeout,
         "instant_col":   instant_col,
+        # ── NEW: Export reward components for debugging ──
+        "rew_prog":      social_progress,
+        "rew_step":      jnp.array(step_pen),
+        "rew_jerk":      jerk_pen,
+        "rew_comf":      comfort_pen,
     }
     return obs, new_state, reward, done, info

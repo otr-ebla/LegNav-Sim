@@ -371,39 +371,47 @@ def main():
         if paused and not step_once:
             clock.tick(10); continue
 
-        if not last_done:
+        # ── Step ─────────────────────────────────────────────────────────────
+        if (not paused or step_once) and not last_done:
             rng, ak, sk = jax.random.split(rng, 3)
             if policy:
                 net, par = policy
                 m, ls, val = net.apply({"params": par}, obs[None])
-                from jax_network import scale_action_to_env
-                raw = m[0] # Deterministic evaluation
+                from jax_network import sample_action, scale_action_to_env
+                raw, _ = sample_action(ak, m[0], ls[0])
                 act = scale_action_to_env(raw, ss.env_state.max_v)
             else:
                 mv = float(ss.env_state.max_v)
                 v = jax.random.uniform(ak, minval=0.0, maxval=mv)
-                w = jax.random.uniform(jax.random.fold_in(ak, 1), minval=-1.0, maxval=1.0)
+                w = jax.random.uniform(jax.random.fold_in(ak, 1),
+                                        minval=-1.0, maxval=1.0)
                 act = jnp.array([v, w])
 
+            last_v, last_w = float(act[0]), float(act[1])
             obs, ss, rew, done, info = step_s(sk, ss, act)
+            last_r = float(rew)
             last_done = bool(done)
-            ep_ret += float(rew)
+            last_info = {k: (float(v) if hasattr(v, 'ndim') and v.ndim == 0 else v)
+                         for k, v in info.items()}
+            ep_ret += last_r
             ep_steps += 1
 
-            if last_done and not cur_updated_this_ep:
-                gr = bool(info.get("goal_reached", 0))
-                pc = bool(info.get("passive_col", 0))
-                co = bool(info.get("collision", 0))
-                
-                rolling_suc = 0.9 * rolling_suc + 0.1 * float(gr * 100.0)
-                cur_max_dist = curriculum_max_goal_dist(rolling_suc)
-                cur_scenario = 0 if rolling_suc < 25.0 else -1
-                cur_updated_this_ep = True
+            # ── Print the reward columns ──────────────────────────────────────
+            if ep_steps == 1:
+                print(f"\n{'Step':>5} | {'Prog':>8} | {'StepPen':>8} | {'Jerk':>8} | {'Comfort':>8} || {'Total':>8}")
+                print("─" * 63)
+            
+            r_prog = last_info.get("rew_prog", 0.0)
+            r_step = last_info.get("rew_step", 0.0)
+            r_jerk = last_info.get("rew_jerk", 0.0)
+            r_comf = last_info.get("rew_comf", 0.0)
+            print(f"{ep_steps:5d} | {r_prog:+8.3f} | {r_step:+8.3f} | {r_jerk:+8.3f} | {r_comf:+8.3f} || {last_r:+8.3f}")
+            # ──────────────────────────────────────────────────────────────────
 
-                act_col = co and not pc
-                banner = "success" if gr else ("collision" if act_col else ("passive_col" if pc else "timeout"))
-                banner_t = fps_target * 2
-                print(f"Ep {ep_count}: {banner.upper()}  steps={ep_steps}  ret={ep_ret:+.1f} | Rolling Suc: {rolling_suc:.1f}%")
+            if last_done:
+                gr = last_info.get("goal_reached", 0)
+                pc = last_info.get("passive_col", 0)
+                co = last_info.get("collision", 0)
 
         cpu_state = jax.device_get(ss.env_state)
         raw_lidar = MAX_LIDAR_DIST - jax.device_get(ss.lidar_stack)[-1] * (MAX_LIDAR_DIST - ROBOT_RADIUS)
