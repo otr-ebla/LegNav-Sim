@@ -34,16 +34,16 @@ HSFM_DT    = 0.01
 
 
 # Terminal rewards
-_R_GOAL        =  300.0   
+_R_GOAL        =  100.0   
 _R_OBS_COL     =  -90.0   
 _R_WALL_COL    =  -90.0   
 _R_ACTIVE_COL  =  -90.0   
 
-_R_PASSIVE_COL =  -60.0   
+_R_PASSIVE_COL =  -35.0   
 _R_TIMEOUT     =  -90.0   
 
 
-_PROGRESS_COEF =  25.0   
+_PROGRESS_COEF =  15.0   
 
 # Step penalty — small constant cost per timestep, encourages efficiency.
 _STEP_PEN      =  -0.08
