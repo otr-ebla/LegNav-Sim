@@ -45,29 +45,14 @@ class StackedEnvState:
 def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3,
                      num_rays: int = NUM_RAYS, ghost_robot: bool = True,
                      ghost_prob: float = 1.0):
-    """
-    Temporal stacking wrapper.
-
-    ghost_robot : Python bool — kept for backward compatibility.
-        If ghost_prob is not 1.0, ghost_robot is IGNORED and overridden by
-        a Bernoulli sample of ghost_prob resolved here at construction time.
-
-    ghost_prob  : float in [0, 1] — probability that ghost_robot=True for
-        this particular stacked env instance.
-        ghost_prob=1.0 → always ghost (default, original training behaviour).
-        ghost_prob=0.0 → never ghost (eval mode).
-        ghost_prob=p   → sampled once here; baked as a Python bool into the
-                         closure so JAX never sees a traced conditional.
-
-        CURRICULUM USAGE: call make_stacked_env again with the new ghost_prob
-        at each curriculum stage change (same pattern as max_goal_dist).
-    """
+    
     # Resolve ghost_robot once at construction time — never a traced value.
     if ghost_prob < 1.0:
         ghost_robot = (_random.random() < ghost_prob)
 
-    def reset_stacked(key, max_goal_dist: float = 3.0):
-        base_obs, base_state = base_reset_fn(key, max_goal_dist)
+    def reset_stacked(key, max_goal_dist: float = 3.0, **kwargs):
+        # Passes any extra dynamic args (like scenario_idx) gracefully down to the environment
+        base_obs, base_state = base_reset_fn(key, max_goal_dist, **kwargs)
         pose      = base_obs[0:POSE_SIZE]
         state_vec = base_obs[POSE_SIZE : POSE_SIZE + STATE_VEC_SIZE]
         lidar     = base_obs[POSE_SIZE + STATE_VEC_SIZE:]
@@ -86,8 +71,7 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3,
         return flat_obs, stacked_state
 
     def step_stacked(key, state: StackedEnvState, action):
-        # ghost_robot is captured from the enclosing scope as a Python bool —
-        # never a JAX-traced value, so the `if` inside step_env is safe.
+        # ghost_robot is captured from the enclosing scope as a Python bool
         base_obs, new_base_state, reward, done, info = base_step_fn(
             key, state.env_state, action, ghost_robot=ghost_robot
         )
@@ -112,23 +96,13 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3,
     return reset_stacked, step_stacked
 
 
-def make_autoreset_env(reset_fn, step_fn, max_goal_dist: float = 3.0):
-    """
-    Auto-reset wrapper.
-
-    ghost_robot behaviour is already baked into step_fn (= step_stacked) via
-    make_stacked_env's ghost_robot parameter — do NOT pass it again here.
-    This function is ghost_robot-agnostic: it works for both training and eval
-    because the correct behaviour is locked into the step_fn closure.
-    """
+def make_autoreset_env(reset_fn, step_fn, max_goal_dist: float = 3.0, scenario_idx: int = -1):
     def step_autoreset(key, state, action):
-        # ghost_robot is NOT forwarded here: step_fn (= step_stacked) already
-        # closes over it from its own make_stacked_env call. step_stacked's
-        # signature is (key, state, action) — passing ghost_robot again would
-        # raise "unexpected keyword argument".
         step_key, reset_key = jax.random.split(key)
         obs, next_state, reward, done, info = step_fn(step_key, state, action)
-        reset_obs, reset_state = reset_fn(reset_key, max_goal_dist)
+        
+        # Passes the active scenario strictly into the auto-reset
+        reset_obs, reset_state = reset_fn(reset_key, max_goal_dist, scenario_idx=scenario_idx)
 
         def _select(reset_leaf, next_leaf):
             d = jnp.asarray(done)

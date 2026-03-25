@@ -330,15 +330,16 @@ if __name__ == "__main__":
     # ── Curriculum state ──────────────────────────────────────────────────────
     cur_max_dist = curriculum_max_goal_dist(0.0)
     cur_stage    = _curriculum_stage(0.0)
-    cur_ghost    = curriculum_ghost_prob(0.0)   # ghost_prob for current stage
-    rolling_suc  = 0.0   # FIX Issue #10: EMA alpha raised to 0.1 below
+    cur_ghost    = curriculum_ghost_prob(0.0)
+    
+    # Force scenario 0 when goal distance is short, else unlock random scenarios
+    cur_scenario = 0 if cur_max_dist < 5.0 else -1
 
-    print(f"Curriculum: starting stage {cur_stage}, max_goal_dist={cur_max_dist:.1f} m, ghost_prob={cur_ghost:.1f}")
+    print(f"Curriculum: starting stage {cur_stage}, max_goal_dist={cur_max_dist:.1f} m, ghost_prob={cur_ghost:.1f}, scenario={cur_scenario}")
 
     print("Initialising environments...")
-    # FIX Bug #3: init_env_state returns vmap_step; thread it into collect_rollouts.
     env_obs, env_state, vmap_step = init_env_state(env_rng, max_goal_dist=cur_max_dist,
-                                                    ghost_prob=cur_ghost)
+                                                    ghost_prob=cur_ghost, scenario_idx=cur_scenario)
     print(f"Ready. obs={env_obs.shape}\n")
 
     best_suc = 76.0   # FIX: was 65.0 — hardcoded floor meant no checkpoint was ever
@@ -405,22 +406,21 @@ if __name__ == "__main__":
         new_max_dist = curriculum_max_goal_dist(rolling_suc)
         new_stage    = _curriculum_stage(rolling_suc)
         new_ghost    = curriculum_ghost_prob(rolling_suc)
+        new_scenario = 0 if new_max_dist < 5.0 else -1
 
-        # Reinitialise envs if either goal distance OR ghost_prob changed.
-        # ghost_prob change means make_stacked_env needs to be rebuilt with a new
-        # closure — the vmap_step object changes, triggering JAX retrace.
-        if new_max_dist > cur_max_dist or new_ghost < cur_ghost:
+        # Reinitialise envs if goal distance, ghost_prob, or the forced scenario changes.
+        if new_max_dist > cur_max_dist or new_ghost < cur_ghost or new_scenario != cur_scenario:
             cur_max_dist = new_max_dist
             cur_stage    = new_stage
             cur_ghost    = new_ghost
+            cur_scenario = new_scenario
 
             rng, reinit_rng = jax.random.split(rng)
-            # FIX Bug #3: capture new vmap_step; also passes updated ghost_prob.
-            env_obs, env_state, vmap_step = init_env_state(reinit_rng,
-                                                            max_goal_dist=cur_max_dist,
-                                                            ghost_prob=cur_ghost)
-            print(f"  → Curriculum reinit: stage={cur_stage}, dist={cur_max_dist:.1f}m, "
-                  f"ghost_prob={cur_ghost:.1f}")
+            env_obs, env_state, vmap_step = init_env_state(
+                reinit_rng, max_goal_dist=cur_max_dist, ghost_prob=cur_ghost, scenario_idx=cur_scenario
+            )
+            print(f"  -> Curriculum reinit: stage={cur_stage}, dist={cur_max_dist:.1f}m, "
+                  f"ghost_prob={cur_ghost:.1f}, scenario={cur_scenario}")
 
         advantages, returns = compute_gae(rewards, values, dones, last_val)
 

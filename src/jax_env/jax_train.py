@@ -83,39 +83,37 @@ OBS_SIZE = 3 * 3 + 9 + 108 * 3    # 342
 _VMAP_STEP_CACHE: dict = {}   # {ghost_robot_bool: vmap_step_fn}
 
 
-def init_env_state(rng_key, max_goal_dist: float = 3.0, ghost_prob: float = 1.0):
+def init_env_state(rng_key, max_goal_dist: float = 3.0, ghost_prob: float = 1.0, scenario_idx: int = -1):
     """
     Initialise all NUM_ENVS environments and return the vmap_step closure.
-
-    ghost_prob : float in [0,1] — resolved to bool (ghost_prob >= 0.5).
-        Uses cached vmap_step when available — no XLA retrace on curriculum
-        transitions that keep the same ghost_robot value.
-        A ghost_robot value change causes a one-time retrace and caches result.
-
-    Returns: (env_obs, env_state, vmap_step)
     """
     ghost_robot = (ghost_prob >= 0.5)
 
     # Build reset/step closures (pure Python, no JAX tracing here)
     reset_stacked, step_stacked = make_stacked_env(
-        reset_env, step_env, stack_dim=3, ghost_robot=ghost_robot
+        reset_env, step_env, stack_dim=3, ghost_prob=ghost_prob
     )
 
-    # vmap_step: reuse cached compiled kernel if ghost_robot hasn't changed.
-    # Building a new jax.jit object when ghost_robot IS the same would still
-    # cause a retrace because it's a new Python object (different id()).
-    if ghost_robot not in _VMAP_STEP_CACHE:
-        # Clear any stale entries first: each compiled vmap kernel holds
-        # significant VRAM for XLA scratch buffers. Keeping old kernels alive
-        # while new ones are compiled causes a peak-VRAM spike that triggers
-        # CUDA_ILLEGAL_ADDRESS on 10 GB cards.
+    # The cache key must include ALL variables baked into the autoreset closure
+    cache_key = (ghost_robot, max_goal_dist, scenario_idx)
+    
+    if cache_key not in _VMAP_STEP_CACHE:
         _VMAP_STEP_CACHE.clear()
         step_auto = make_autoreset_env(reset_stacked, step_stacked,
-                                       max_goal_dist=max_goal_dist)
-        _VMAP_STEP_CACHE[ghost_robot] = jax.jit(
+                                       max_goal_dist=max_goal_dist,
+                                       scenario_idx=scenario_idx)
+        _VMAP_STEP_CACHE[cache_key] = jax.jit(
             jax.vmap(step_auto, in_axes=(0, 0, 0))
         )
-    vmap_step = _VMAP_STEP_CACHE[ghost_robot]
+    vmap_step = _VMAP_STEP_CACHE[cache_key]
+
+    def _reset_with_dist(key):
+        return reset_stacked(key, max_goal_dist=max_goal_dist, scenario_idx=scenario_idx)
+    vmap_reset = jax.jit(jax.vmap(_reset_with_dist))
+
+    reset_keys = jax.random.split(rng_key, NUM_ENVS)
+    env_obs, env_state = vmap_reset(reset_keys)
+    return env_obs, env_state, vmap_step
 
     # vmap_reset is always rebuilt (cheap — just Python closure over max_goal_dist)
     def _reset_with_dist(key):
