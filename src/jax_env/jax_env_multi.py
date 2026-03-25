@@ -472,8 +472,9 @@ def step_env(key, state, action, ghost_robot: bool = True):
     # so the robot feels pressure from crowds, not just the single closest human.
     # Speed-scaled: fast approach costs more than slow creep.
     comfort_violations = jnp.maximum(0.0, 1.0 - dists_p_active / _COMFORT_DIST)  # (N,) in [0,1]
-    speed_scale = 1.0 + target_v / jnp.maximum(state.max_v, 1e-3)
-    comfort_pen = -_COMFORT_COEF * jnp.sum(comfort_violations) * speed_scale
+    #speed_scale = 1.0 + target_v / jnp.maximum(state.max_v, 1e-3)
+
+    comfort_pen = -_COMFORT_COEF * jnp.sum(comfort_violations)
 
     # — 6b. Dense shaping ─────────────────────────────────────────────────
     # Progress reward at FULL strength — never suppressed by proximity.
