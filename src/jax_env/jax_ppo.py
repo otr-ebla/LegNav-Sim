@@ -331,10 +331,10 @@ if __name__ == "__main__":
     cur_max_dist = curriculum_max_goal_dist(0.0)
     cur_stage    = _curriculum_stage(0.0)
     cur_ghost    = curriculum_ghost_prob(0.0)
+    rolling_suc  = 0.0   
     
-    # Force scenario 0 when goal distance is short, else unlock random scenarios
-    cur_scenario = 0 if cur_max_dist < 5.0 else -1
-
+    cur_scenario = 0 if rolling_suc < 25.0 else -1 # UNLOCK AT 25%: Force scenario 0 only while success is under 25%
+    
     print(f"Curriculum: starting stage {cur_stage}, max_goal_dist={cur_max_dist:.1f} m, ghost_prob={cur_ghost:.1f}, scenario={cur_scenario}")
 
     print("Initialising environments...")
@@ -406,7 +406,9 @@ if __name__ == "__main__":
         new_max_dist = curriculum_max_goal_dist(rolling_suc)
         new_stage    = _curriculum_stage(rolling_suc)
         new_ghost    = curriculum_ghost_prob(rolling_suc)
-        new_scenario = 0 if new_max_dist < 5.0 else -1
+        
+        # UNLOCK AT 25%: Update the active scenario based on rolling success
+        new_scenario = 0 if rolling_suc < 25.0 else -1
 
         # Reinitialise envs if goal distance, ghost_prob, or the forced scenario changes.
         if new_max_dist > cur_max_dist or new_ghost < cur_ghost or new_scenario != cur_scenario:
