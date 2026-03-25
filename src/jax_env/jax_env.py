@@ -582,6 +582,7 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray, **kwargs):
         "goal_reached":  goal_reached,
         "collision":     collision,
         "passive_col":   passive_col,
+        "active_col":    active_col,    # <-- Added this line
         "closest_human": closest_human,
         "sp_mask":       sp_mask,
     }
