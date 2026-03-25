@@ -49,7 +49,7 @@ _PROGRESS_COEF =  1.0
 _STEP_PEN      =  -0.2
 
 # Jerk penalty — discourages angular velocity changes (smooth paths).
-_JERK_WEIGHT   =   2.0
+_JERK_WEIGHT   =   0.7
 
 # ── Comfort penalty parameters (replaces old clearance-factor multiplier) ─────
 # OLD DESIGN (broken): clearance_factor multiplied progress reward.
