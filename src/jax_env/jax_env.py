@@ -205,7 +205,7 @@ def get_obs(state: EnvState, key: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray
 
 # ── Reset ─────────────────────────────────────────────────────────────────────
 
-def reset_env(key: jnp.ndarray, min_goal_dist: float = DEFAULT_MIN_GOAL_DIST):
+def reset_env(key: jnp.ndarray, max_goal_dist: float = 3.0, **kwargs):
     k1, k2, k3, k4, k5, k6, k7, k8, k9, k_legs, k_obs = jax.random.split(key, 11)
 
     max_v  = jax.random.uniform(k1, minval=0.2, maxval=2.0)
@@ -261,8 +261,10 @@ def reset_env(key: jnp.ndarray, min_goal_dist: float = DEFAULT_MIN_GOAL_DIST):
 
     def _goal_cond(carry):
         gx, gy, k, i = carry
-        too_close = jnp.sqrt((gx - rx)**2 + (gy - ry)**2) < min_goal_dist
-        return (too_close | ~_is_safe(gx, gy, GOAL_CLEARANCE, obs_circles, obs_boxes)) & \
+        dist = jnp.sqrt((gx - rx)**2 + (gy - ry)**2)
+        # Keeps goal outside the robot (0.8m) but within the curriculum max_goal_dist
+        bad_dist = (dist < 0.8) | (dist > max_goal_dist) 
+        return (bad_dist | ~_is_safe(gx, gy, GOAL_CLEARANCE, obs_circles, obs_boxes)) & \
                (i < MAX_RESAMPLE_ITERS)
 
     def _goal_body(carry):
@@ -339,7 +341,7 @@ def reset_env(key: jnp.ndarray, min_goal_dist: float = DEFAULT_MIN_GOAL_DIST):
 
 # ── Step ──────────────────────────────────────────────────────────────────────
 
-def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
+def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray, **kwargs):
     dt = DT
 
     target_v = jnp.clip(action[0], 0.0,  state.max_v)
