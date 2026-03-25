@@ -43,13 +43,13 @@ _R_PASSIVE_COL =  -60.0
 _R_TIMEOUT     =  -90.0   
 
 
-_PROGRESS_COEF =  1.0   
+_PROGRESS_COEF =  15.0   
 
 # Step penalty — small constant cost per timestep, encourages efficiency.
-_STEP_PEN      =  -0.2
+_STEP_PEN      =  -0.08
 
 # Jerk penalty — discourages angular velocity changes (smooth paths).
-_JERK_WEIGHT   =   0.7
+_JERK_WEIGHT   =   0.08
 
 # ── Comfort penalty parameters (replaces old clearance-factor multiplier) ─────
 # OLD DESIGN (broken): clearance_factor multiplied progress reward.
