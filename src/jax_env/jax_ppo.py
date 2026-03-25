@@ -322,7 +322,7 @@ if __name__ == "__main__":
     rolling_suc  = 0.0   
     highest_rolling_suc = 0.0  # <-- ADD THIS
 
-    cur_scenario = 0 if rolling_suc < 25.0 else -1
+    cur_scenario = 0 if rolling_suc < 35.0 else -1
     
     print(f"Curriculum: starting stage {cur_stage}, max_goal_dist={cur_max_dist:.1f} m, ghost_prob={cur_ghost:.1f}, scenario={cur_scenario}")
 
@@ -400,7 +400,7 @@ if __name__ == "__main__":
         new_ghost    = curriculum_ghost_prob(highest_rolling_suc)
         
         # UNLOCK AT 25%: Update the active scenario based on historical peak
-        new_scenario = 0 if highest_rolling_suc < 25.0 else -1
+        new_scenario = 0 if highest_rolling_suc < 35.0 else -1
 
         # Reinitialise envs if goal distance, ghost_prob, or the forced scenario changes.
         if new_max_dist > cur_max_dist or new_ghost < cur_ghost or new_scenario != cur_scenario:
