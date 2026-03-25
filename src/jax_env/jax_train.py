@@ -31,8 +31,8 @@ import os
 import functools
 import jax
 import jax.numpy as jnp
-#from jax_env import reset_env, step_env
-from jax_env_multi import reset_env, step_env
+from jax_env import reset_env, step_env
+#from jax_env_multi import reset_env, step_env
 from jax_wrappers import make_stacked_env, make_autoreset_env
 from jax_network import scale_actions_batched
 
