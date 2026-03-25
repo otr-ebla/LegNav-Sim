@@ -381,7 +381,7 @@ if __name__ == "__main__":
         goal_reached = rollout_history["goal_reached"]
         collision    = rollout_history["collision"]
         passive_col  = rollout_history["passive_col"]  # <-- ADD THIS LINE
-        instant_col  = rollout_history["instant_col"]
+        instant_col  = jnp.zeros_like(collision, dtype=bool)  # not tracked in rollout
 
         ep_rets, ep_suc, ep_col, ep_pcol, ep_tmo, ep_ic, ep_msk = collect_episode_outcomes(
             rewards, dones, goal_reached, collision, passive_col, instant_col
