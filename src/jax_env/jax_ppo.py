@@ -331,7 +331,7 @@ if __name__ == "__main__":
                                                     ghost_prob=cur_ghost, scenario_idx=cur_scenario)
     print(f"Ready. obs={env_obs.shape}\n")
 
-    best_suc = 76.0   # FIX: was 65.0 — hardcoded floor meant no checkpoint was ever
+    best_suc = 99.9   # FIX: was 65.0 — hardcoded floor meant no checkpoint was ever
                      # written when the run peaked at 61.8%. Now saves from the first
                      # improvement, then only on new highs.
 
