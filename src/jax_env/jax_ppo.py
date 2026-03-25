@@ -58,7 +58,7 @@ VF_COEF        = 0.25
 # verso logstd_max, bloccando l'entropia a 2.838 (il massimo con LOG_STD_MAX=0.0).
 # Con 0.003 l'entropia può scendere naturalmente quando la policy trova azioni
 # che massimizzano il reward, senza essere soffocata dall'entropy bonus.
-ENTROPY_COEF   = 0.005
+ENTROPY_COEF   = 0.01
 MAX_GRAD_NORM  = 0.5
 PPO_EPOCHS     = 6
 LR_START       = 5e-4
