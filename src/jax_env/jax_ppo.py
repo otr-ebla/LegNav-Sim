@@ -380,8 +380,7 @@ if __name__ == "__main__":
     print(f"Curriculum: starting stage {cur_stage}, max_goal_dist={cur_max_dist:.1f} m, ghost_prob={cur_ghost:.1f}, scenario={cur_scenario}")
 
     print("Initialising environments...")
-    env_obs, env_state, vmap_step = init_env_state(env_rng, max_goal_dist=cur_max_dist,
-                                                    ghost_prob=cur_ghost, scenario_idx=cur_scenario)
+    env_obs, env_state, vmap_step = init_env_state(env_rng, ghost_prob=cur_ghost)
 
     rms_state = RunningMeanStd.create()
     running_ret = jnp.zeros(NUM_ENVS)                                
@@ -415,7 +414,8 @@ if __name__ == "__main__":
         rng, rollout_rng, update_rng = jax.random.split(rng, 3)
         # FIX Bug #3: pass vmap_step explicitly as static arg.
         rollout_history, env_state, env_obs, last_val = collect_rollouts(
-            rollout_rng, train_state[0], network.apply, vmap_step, env_state, env_obs
+            rollout_rng, train_state[0], network.apply, vmap_step, env_state, env_obs, 
+            cur_max_dist, cur_scenario
         )
 
         # Extract batch arrays
@@ -466,19 +466,20 @@ if __name__ == "__main__":
         # UNLOCK AT 25%: Update the active scenario based on historical peak
         new_scenario = 0 if highest_rolling_suc < 35.0 else -1
 
-        # Reinitialise envs if goal distance, ghost_prob, or the forced scenario changes.
+        # Only reinitialize the entire environment if ghost_prob changes (since it breaks JAX control flow).
+        # max_goal_dist and scenario_idx update dynamically at zero computational cost.
         if new_max_dist > cur_max_dist or new_ghost < cur_ghost or new_scenario != cur_scenario:
             cur_max_dist = new_max_dist
             cur_stage    = new_stage
-            cur_ghost    = new_ghost
             cur_scenario = new_scenario
 
-            rng, reinit_rng = jax.random.split(rng)
-            env_obs, env_state, vmap_step = init_env_state(
-                reinit_rng, max_goal_dist=cur_max_dist, ghost_prob=cur_ghost, scenario_idx=cur_scenario
-            )
-            print(f"  -> Curriculum reinit: stage={cur_stage}, dist={cur_max_dist:.1f}m, "
-                  f"ghost_prob={cur_ghost:.1f}, scenario={cur_scenario}")
+            if new_ghost < cur_ghost:
+                cur_ghost = new_ghost
+                rng, reinit_rng = jax.random.split(rng)
+                env_obs, env_state, vmap_step = init_env_state(reinit_rng, ghost_prob=cur_ghost)
+                print(f"  -> Ghost reinit: ghost_prob={cur_ghost:.1f}")
+            else:
+                print(f"  -> Curriculum advanced: stage={cur_stage}, dist={cur_max_dist:.1f}m, scenario={cur_scenario}")
 
         advantages, returns = compute_gae(rewards, values, dones, last_val)
 
@@ -501,8 +502,8 @@ if __name__ == "__main__":
             print(
                 f"{update:>5d} | {mean_ret:>7.1f} | "
                 f"{suc_pct:>4.1f}% {obs_pct:>4.1f}% {acol_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% | "
-                f"{float(mean_loss):>7.1f} {float(p_loss):>6.1f} "
-                f"{float(v_loss):>6.1f} {float(entropy):>6.1f} | "
+                f"{float(mean_loss):>7.2f} {float(p_loss):>6.2f} "
+                f"{float(v_loss):>6.2f} {float(entropy):>6.2f} | "
                 f"{fps:>7,.0f} {n_ep:>6d} {lr_now:.2e} | "
                 f"{cur_stage:>5d} {cur_max_dist:>5.1f}m {cur_ghost:>5.1f}g {elapsedtime:>5.1f}min"
             )

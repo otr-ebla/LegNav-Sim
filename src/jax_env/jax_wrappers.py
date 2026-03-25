@@ -96,13 +96,13 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3,
     return reset_stacked, step_stacked
 
 
-def make_autoreset_env(reset_fn, step_fn, max_goal_dist: float = 3.0, scenario_idx: int = -1):
-    def step_autoreset(key, state, action):
+def make_autoreset_env(reset_fn, step_fn):
+    def step_autoreset(key, state, action, max_goal_dist, scenario_idx):
         step_key, reset_key = jax.random.split(key)
         obs, next_state, reward, done, info = step_fn(step_key, state, action)
         
-        # Passes the active scenario strictly into the auto-reset
-        reset_obs, reset_state = reset_fn(reset_key, max_goal_dist, scenario_idx=scenario_idx)
+        # Passes the active scenario strictly into the auto-reset dynamically
+        reset_obs, reset_state = reset_fn(reset_key, max_goal_dist=max_goal_dist, scenario_idx=scenario_idx)
 
         def _select(reset_leaf, next_leaf):
             d = jnp.asarray(done)
