@@ -7,7 +7,6 @@ Simple clean rendering of a single environment.
 Usage:
   python debug_viz.py                    # random policy
   python debug_viz.py --checkpoint path  # trained policy
-  python debug_viz.py --scenario 0       # force scenario
   python debug_viz.py --speed 0.5        # slower playback
   python debug_viz.py --pause            # start paused
 
@@ -25,8 +24,6 @@ import math
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--checkpoint", type=str, default=None)
-parser.add_argument("--scenario", type=int, default=-1)
-parser.add_argument("--max-goal-dist", type=float, default=1.5)
 parser.add_argument("--speed", type=float, default=1.0)
 parser.add_argument("--pause", action="store_true")
 parser.add_argument("--no-ghost", action="store_true", help="Disable ghost (eval mode)")
@@ -56,18 +53,32 @@ from jax_legs import get_shoe_boxes, LEG_RADIUS
 
 import pygame
 
+# ── Curriculum Logic ─────────────────────────────────────────────────────────
+CURRICULUM_STAGES = [
+    (25.0, 1.5),
+    (38.0, 2.5),
+    (50.0, 4.0),
+    (60.0, 5.0),
+    (70.0, 6.5),
+    (80.0, 8.0),
+    (101., 9.0),
+]
+
+def curriculum_max_goal_dist(suc_pct: float) -> float:
+    for threshold, dist in CURRICULUM_STAGES:
+        if suc_pct < threshold:
+            return dist
+    return CURRICULUM_STAGES[-1][1]
+
 # ── Display ──────────────────────────────────────────────────────────────────
 WIN_W, WIN_H = 800, 850
 HUD_H = 50
 
-
 def w2s(x, y, sc, ox, oy):
     return int(ox + x * sc), int(oy + (ROOM_H - y) * sc)
 
-
 def r2px(r, sc):
     return max(1, int(r * sc))
-
 
 def load_policy(path):
     if path is None:
@@ -87,11 +98,10 @@ def load_policy(path):
     print(f"Loaded: {path}")
     return net, p
 
-
 def main():
     pygame.init()
     screen = pygame.display.set_mode((WIN_W, WIN_H))
-    pygame.display.set_caption("RL Nav Debug")
+    pygame.display.set_caption("RL Nav Debug (Curriculum Viz)")
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("monospace", 13)
 
@@ -102,11 +112,21 @@ def main():
                                         ghost_robot=ghost)
     rng = jax.random.PRNGKey(args.seed)
 
-    def do_reset(k):
-        return reset_s(k, max_goal_dist=args.max_goal_dist)
+    # ── Dynamic JIT Reset ────────────────────────────────────────────────────
+    # We must wrap the reset function to accept the scenario index dynamically
+    def dynamic_reset(k, max_dist, scen_idx):
+        return reset_s(k, max_goal_dist=max_dist, scenario_idx=scen_idx)
+    
+    jreset = jax.jit(dynamic_reset, static_argnums=(2,))
+
+    # ── Curriculum State ─────────────────────────────────────────────────────
+    rolling_suc = 0.0
+    cur_max_dist = curriculum_max_goal_dist(rolling_suc)
+    cur_scenario = 0 if rolling_suc < 25.0 else -1
+    cur_updated_this_ep = False
 
     rng, rk = jax.random.split(rng)
-    obs, ss = do_reset(rk)
+    obs, ss = jreset(rk, cur_max_dist, cur_scenario)
 
     paused = args.pause
     ep_ret = 0.0
@@ -133,10 +153,12 @@ def main():
                     step_once = True
                 elif ev.key == pygame.K_r:
                     rng, rk = jax.random.split(rng)
-                    obs, ss = do_reset(rk)
+                    # Trigger the dynamic reset with current curriculum values
+                    obs, ss = jreset(rk, cur_max_dist, cur_scenario)
                     ep_ret, ep_steps = 0.0, 0
                     ep_count += 1
                     last_done = False
+                    cur_updated_this_ep = False
                     last_info = {}
 
         # ── Step ─────────────────────────────────────────────────────────────
@@ -164,14 +186,21 @@ def main():
             ep_ret += last_r
             ep_steps += 1
 
-            if last_done:
+            if last_done and not cur_updated_this_ep:
                 gr = last_info.get("goal_reached", 0)
                 pc = last_info.get("passive_col", 0)
                 co = last_info.get("collision", 0)
+                
+                # Update Curriculum based on the episode outcome
+                rolling_suc = 0.9 * rolling_suc + 0.1 * float(gr * 100.0)
+                cur_max_dist = curriculum_max_goal_dist(rolling_suc)
+                cur_scenario = 0 if rolling_suc < 25.0 else -1
+                cur_updated_this_ep = True
+
                 tag = ("SUCCESS" if gr else
                        "PASSIVE" if pc else
                        "COLLISION" if co else "TIMEOUT")
-                print(f"Ep {ep_count}: {tag}  steps={ep_steps}  ret={ep_ret:+.1f}")
+                print(f"Ep {ep_count}: {tag}  steps={ep_steps}  ret={ep_ret:+.1f} | Rolling Suc: {rolling_suc:.1f}%")
 
         # ── Extract state ────────────────────────────────────────────────────
         st = ss.env_state
@@ -186,32 +215,24 @@ def main():
         ox = (WIN_W - ROOM_W * sc) / 2
         oy = (room_px - ROOM_H * sc) / 2
 
-        def _w(x, y):
-            return w2s(x, y, sc, ox, oy)
-
-        def _r(r):
-            return r2px(r, sc)
+        def _w(x, y): return w2s(x, y, sc, ox, oy)
+        def _r(r): return r2px(r, sc)
 
         # ── Draw ─────────────────────────────────────────────────────────────
         screen.fill((25, 25, 30))
 
-        # Grid
         for i in range(int(ROOM_W) + 1):
             pygame.draw.line(screen, (40, 40, 45), _w(i, 0), _w(i, ROOM_H), 1)
         for j in range(int(ROOM_H) + 1):
             pygame.draw.line(screen, (40, 40, 45), _w(0, j), _w(ROOM_W, j), 1)
 
-        # Walls
         pygame.draw.polygon(screen, (160, 160, 160),
             [_w(0, 0), _w(ROOM_W, 0), _w(ROOM_W, ROOM_H), _w(0, ROOM_H)], 2)
 
-        # Obstacle circles (filled)
         for i in range(cirs.shape[0]):
             cx, cy, r = cirs[i]
-            if r > 0:
-                pygame.draw.circle(screen, (90, 90, 100), _w(cx, cy), _r(r))
+            if r > 0: pygame.draw.circle(screen, (90, 90, 100), _w(cx, cy), _r(r))
 
-        # Obstacle boxes (filled)
         for i in range(bxs.shape[0]):
             cx, cy, hw, hh = bxs[i]
             if hw > 0:
@@ -220,51 +241,41 @@ def main():
                 pygame.draw.rect(screen, (90, 90, 100),
                     pygame.Rect(tl[0], tl[1], br[0] - tl[0], br[1] - tl[1]))
 
-        # Goal
         gsx, gsy = _w(gx, gy)
         pygame.draw.circle(screen, (50, 220, 80), (gsx, gsy), _r(GOAL_RADIUS), 2)
         pygame.draw.circle(screen, (50, 220, 80), (gsx, gsy), 3)
 
-        # Humans (body circles + heading)
         for i in range(ppl.shape[0]):
             px, py = ppl[i, 0], ppl[i, 1]
-            if px < -100:
-                continue
+            if px < -100: continue
             gi = ppl[i, 10] if ppl.shape[1] > 10 else 0
-            if gi < 0:
-                continue
+            if gi < 0: continue
 
             hsx, hsy = _w(px, py)
-            pygame.draw.circle(screen, (220, 80, 60), (hsx, hsy),
-                               _r(PEOPLE_RADIUS), 2)
+            pygame.draw.circle(screen, (220, 80, 60), (hsx, hsy), _r(PEOPLE_RADIUS), 2)
 
             th = ppl[i, 4]
             spd = math.sqrt(ppl[i, 2]**2 + ppl[i, 3]**2)
             if spd > 0.05:
                 al = _r(0.4)
                 pygame.draw.line(screen, (220, 80, 60), (hsx, hsy),
-                    (int(hsx + al * math.cos(th)),
-                     int(hsy - al * math.sin(th))), 2)
+                    (int(hsx + al * math.cos(th)), int(hsy - al * math.sin(th))), 2)
 
-        # Shoe boxes (USE_LEGS only)
         if USE_LEGS:
             sbs = np.array(get_shoe_boxes(st.people, st.foot_state))
             for i in range(sbs.shape[0]):
                 cx, cy, hw, hh = sbs[i]
-                if cx < -100:
-                    continue
+                if cx < -100: continue
                 tl = _w(cx - hw, cy + hh)
                 br = _w(cx + hw, cy - hh)
                 pygame.draw.rect(screen, (255, 160, 40),
                     pygame.Rect(tl[0], tl[1], br[0]-tl[0], br[1]-tl[1]), 1)
 
-        # Robot
         rsx, rsy = _w(rx, ry)
         pygame.draw.circle(screen, (60, 140, 255), (rsx, rsy), _r(ROBOT_RADIUS))
         al = _r(ROBOT_RADIUS) + _r(0.15)
         pygame.draw.line(screen, (255, 255, 255), (rsx, rsy),
-            (int(rsx + al * math.cos(rt)),
-             int(rsy - al * math.sin(rt))), 2)
+            (int(rsx + al * math.cos(rt)), int(rsy - al * math.sin(rt))), 2)
 
         # ── DONE overlay ─────────────────────────────────────────────────────
         if last_done:
@@ -275,39 +286,30 @@ def main():
             gr = last_info.get("goal_reached", 0)
             pc = last_info.get("passive_col", 0)
             co = last_info.get("collision", 0)
-            if gr:
-                txt, col = "GOAL REACHED", (50, 220, 80)
-            elif pc:
-                txt, col = "PASSIVE COLLISION", (255, 160, 40)
-            elif co:
-                txt, col = "ACTIVE COLLISION", (255, 50, 50)
-            else:
-                txt, col = "TIMEOUT", (180, 180, 60)
+            if gr: txt, col = "GOAL REACHED", (50, 220, 80)
+            elif pc: txt, col = "PASSIVE COLLISION", (255, 160, 40)
+            elif co: txt, col = "ACTIVE COLLISION", (255, 50, 50)
+            else: txt, col = "TIMEOUT", (180, 180, 60)
 
             big = pygame.font.SysFont("monospace", 28, bold=True)
             ts = big.render(txt, True, col)
-            screen.blit(ts, ((WIN_W - ts.get_width()) // 2,
-                             (WIN_H - HUD_H) // 2 - 20))
-            sub = font.render(f"ret={ep_ret:+.1f}  steps={ep_steps}  [R]=reset",
-                              True, (160, 160, 160))
-            screen.blit(sub, ((WIN_W - sub.get_width()) // 2,
-                              (WIN_H - HUD_H) // 2 + 15))
+            screen.blit(ts, ((WIN_W - ts.get_width()) // 2, (WIN_H - HUD_H) // 2 - 20))
+            sub = font.render(f"ret={ep_ret:+.1f}  steps={ep_steps}  [R]=reset", True, (160, 160, 160))
+            screen.blit(sub, ((WIN_W - sub.get_width()) // 2, (WIN_H - HUD_H) // 2 + 15))
 
         # ── HUD ──────────────────────────────────────────────────────────────
         hud_y = WIN_H - HUD_H
         pygame.draw.rect(screen, (20, 20, 25), (0, hud_y, WIN_W, HUD_H))
 
-        gd = math.sqrt((rx - gx)**2 + (ry - gy)**2)
         status = "PAUSED" if paused else ("DONE" if last_done else "RUNNING")
-        mode = "TRAINED" if policy else "RANDOM"
-        gh = "ghost" if ghost else "visible"
-
-        l1 = (f"{mode} {gh} | s={ep_steps} r={last_r:+.2f} ret={ep_ret:+.1f}"
-              f" | goal={gd:.1f}m v={last_v:.2f} w={last_w:.2f} | {status}")
+        
+        # Display the live curriculum state in the HUD
+        scen_str = "RAND" if cur_scenario == -1 else f"FIX({cur_scenario})"
+        l1 = (f"Suc: {rolling_suc:04.1f}% | Dist: {cur_max_dist:.1f}m | Scen: {scen_str} | "
+              f"r={last_r:+.2f} ret={ep_ret:+.1f} | {status}")
         screen.blit(font.render(l1, True, (200, 200, 200)), (8, hud_y + 5))
 
-        l2 = (f"ep={ep_count} max_v={float(st.max_v):.1f}"
-              f" | [SPACE]=pause [R]=reset [→]=step [Q]=quit")
+        l2 = (f"ep={ep_count} max_v={float(st.max_v):.1f} | [SPACE]=pause [R]=reset [→]=step [Q]=quit")
         screen.blit(font.render(l2, True, (120, 120, 120)), (8, hud_y + 22))
 
         pygame.display.flip()
@@ -317,7 +319,6 @@ def main():
         clock.tick(fps)
 
     pygame.quit()
-
 
 if __name__ == "__main__":
     main()
