@@ -45,6 +45,8 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 from jax_network import EndToEndActorCritic
 from jax_train import collect_rollouts, init_env_state, NUM_ENVS, ROLLOUT_STEPS, OBS_SIZE
 
+
+
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 GAMMA          = 0.99
 GAE_LAMBDA     = 0.95
@@ -108,6 +110,57 @@ GHOST_PROB_STAGES = [
     (78.0, 0.6),
     (101., 0.4),
 ]
+
+from flax import struct
+
+@struct.dataclass
+class RunningMeanStd:
+    mean: jnp.ndarray
+    var: jnp.ndarray
+    count: jnp.ndarray
+
+    @classmethod
+    def create(cls):
+        return cls(mean=jnp.array(0.0), var=jnp.array(1.0), count=jnp.array(1e-4))
+
+    def update(self, x: jnp.ndarray):
+        batch_mean = jnp.mean(x)
+        batch_var = jnp.var(x)
+        batch_count = x.size
+
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+
+        new_mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + jnp.square(delta) * self.count * batch_count / tot_count
+        new_var = M2 / tot_count
+
+        return self.replace(mean=new_mean, var=new_var, count=tot_count)
+
+@jax.jit
+def normalize_batch_rewards(rewards, dones, running_ret, rms_state, gamma):
+    """
+    Calculates discounted returns, updates the running statistics,
+    and scales the rewards by the running standard deviation.
+    """
+    def _step(ret, t):
+        r, d = t
+        ret = r + gamma * ret * (1.0 - d)
+        return ret, ret
+
+    # Scan over the ROLLOUT_STEPS axis
+    running_ret, returns = jax.lax.scan(_step, running_ret, (rewards, dones))
+
+    # Update running stats with the flattened returns
+    new_rms_state = rms_state.update(returns.flatten())
+
+    # Normalize rewards and clip to [-10, 10] to prevent extreme gradient spikes
+    normalized_rewards = rewards / jnp.sqrt(new_rms_state.var + 1e-8)
+    normalized_rewards = jnp.clip(normalized_rewards, -10.0, 10.0)
+
+    return normalized_rewards, running_ret, new_rms_state
 
 def curriculum_ghost_prob(suc_pct: float) -> float:
     for threshold, prob in GHOST_PROB_STAGES:
@@ -329,6 +382,10 @@ if __name__ == "__main__":
     print("Initialising environments...")
     env_obs, env_state, vmap_step = init_env_state(env_rng, max_goal_dist=cur_max_dist,
                                                     ghost_prob=cur_ghost, scenario_idx=cur_scenario)
+
+    rms_state = RunningMeanStd.create()
+    running_ret = jnp.zeros(NUM_ENVS)                                
+                            
     print(f"Ready. obs={env_obs.shape}\n")
 
     best_suc = 99.9   # FIX: was 65.0 — hardcoded floor meant no checkpoint was ever
@@ -362,9 +419,16 @@ if __name__ == "__main__":
         )
 
         # Extract batch arrays
-        rewards      = rollout_history["rewards"]
+        raw_rewards  = rollout_history["rewards"]
         values       = rollout_history["values"]
         dones        = rollout_history["dones"]
+
+        # Apply dynamic normalization
+        rewards, running_ret, rms_state = normalize_batch_rewards(
+            raw_rewards, dones, running_ret, rms_state, GAMMA
+        )
+
+
         obs_all      = rollout_history["obs"]
         acts_all     = rollout_history["actions"]
         lp_all       = rollout_history["log_probs"]
