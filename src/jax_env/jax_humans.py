@@ -154,6 +154,16 @@ def _robot_force(px, py, rx, ry, distract):
 # Forces alone can't prevent penetration at dt=0.15. We explicitly resolve
 # overlaps AFTER integration so people can never be inside obstacles.
 
+def _soft_clip_scalar(x, min_val, max_val, k=100.0):
+    """
+    Differentiable soft clipping using softplus.
+    k controls the sharpness of the clip (higher = closer to hard clip).
+    """
+    # Apply lower bound smoothly
+    lb = min_val + jax.nn.softplus(k * (x - min_val)) / k
+    # Apply upper bound smoothly
+    return max_val - jax.nn.softplus(k * (max_val - lb)) / k
+
 def _pushout_walls(px, py, r, room_w, room_h):
     # DIFF FIX: soft_clip instead of jnp.clip → gradient flows at boundaries
     px = _soft_clip_scalar(px, r, room_w - r)
