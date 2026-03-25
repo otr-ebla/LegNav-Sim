@@ -88,28 +88,21 @@ _TOTAL_OPT_STEPS      = TOTAL_UPDATES  * _OPT_STEPS_PER_UPDATE   # 49_152
 network = EndToEndActorCritic(action_dim=2)
 
 # ── Curriculum ────────────────────────────────────────────────────────────────
-# Each entry: (suc_pct_threshold, min_goal_dist)
-# FIX #3: soglie alzate per evitare curriculum prematuro.
-# Con le vecchie soglie (10%, 20%, 35%...) la policy saltava allo stage
-# successivo con success rate ancora troppo bassa (~11% → stage 1).
-# Il robot non aveva consolidato il comportamento base prima di dover
-# navigare distanze più lunghe, causando regressione immediata post-jump.
-# Nuove soglie: ogni stage richiede ~2x il successo precedente;
-# il primo stage (1.5m→2.5m) ora richiede 25% invece di 10%.
+# Each entry: (suc_pct_threshold, max_goal_dist)
+# The curriculum controls the MAXIMUM distance the goal can be from the robot.
+# Stage 0: goal within 1.5m — robot learns basic goal-seeking.
+# As success rate rises, max_goal_dist increases — robot must navigate farther.
 CURRICULUM_STAGES = [
     (25.0, 1.5),
     (38.0, 2.5),
     (50.0, 4.0),
-    (60.0, 5.0),   # intermediate stage — old 4.0m→6.5m jump caused stall
+    (60.0, 5.0),
     (70.0, 6.5),
     (80.0, 8.0),
     (101., 9.0),
 ]
 
 GHOST_PROB_STAGES = [
-    # FIX #3: allineate alle nuove soglie curriculum.
-    # Il ghost inizia a degradare solo dopo che la policy è stabile (≥50%),
-    # non a 35% come prima quando era ancora in fase di consolidamento.
     (50.0, 1.0),
     (65.0, 0.8),
     (78.0, 0.6),
@@ -122,7 +115,7 @@ def curriculum_ghost_prob(suc_pct: float) -> float:
             return prob
     return GHOST_PROB_STAGES[-1][1]
 
-def curriculum_min_goal_dist(suc_pct: float) -> float:
+def curriculum_max_goal_dist(suc_pct: float) -> float:
     for threshold, dist in CURRICULUM_STAGES:
         if suc_pct < threshold:
             return dist
@@ -335,16 +328,16 @@ if __name__ == "__main__":
         print("Starting fresh.")
 
     # ── Curriculum state ──────────────────────────────────────────────────────
-    cur_min_dist = curriculum_min_goal_dist(0.0)
+    cur_max_dist = curriculum_max_goal_dist(0.0)
     cur_stage    = _curriculum_stage(0.0)
     cur_ghost    = curriculum_ghost_prob(0.0)   # ghost_prob for current stage
     rolling_suc  = 0.0   # FIX Issue #10: EMA alpha raised to 0.1 below
 
-    print(f"Curriculum: starting stage {cur_stage}, min_goal_dist={cur_min_dist:.1f} m, ghost_prob={cur_ghost:.1f}")
+    print(f"Curriculum: starting stage {cur_stage}, max_goal_dist={cur_max_dist:.1f} m, ghost_prob={cur_ghost:.1f}")
 
     print("Initialising environments...")
     # FIX Bug #3: init_env_state returns vmap_step; thread it into collect_rollouts.
-    env_obs, env_state, vmap_step = init_env_state(env_rng, min_goal_dist=cur_min_dist,
+    env_obs, env_state, vmap_step = init_env_state(env_rng, max_goal_dist=cur_max_dist,
                                                     ghost_prob=cur_ghost)
     print(f"Ready. obs={env_obs.shape}\n")
 
@@ -354,7 +347,7 @@ if __name__ == "__main__":
 
     hdr = (f"{'Upd':>5} | {'EpRet':>7} | {'Suc%':>5} {'Col%':>5} {'Pcol%':>5} {'Tmo%':>5} {'IC%':>5} |"
            f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} | {'FPS':>7} {'#Ep':>6} {'LR':>6}| "
-           f"{'Stage':>5} {'MinDist':>7} {'Ghost':>6} {'Time':>6}")
+           f"{'Stage':>5} {'MaxDist':>7} {'Ghost':>6} {'Time':>6}")
     print(hdr)
     print("─" * len(hdr))
 
@@ -409,24 +402,24 @@ if __name__ == "__main__":
         if n_ep > 0:
             rolling_suc = 0.9 * rolling_suc + 0.1 * suc_pct
 
-        new_min_dist = curriculum_min_goal_dist(rolling_suc)
+        new_max_dist = curriculum_max_goal_dist(rolling_suc)
         new_stage    = _curriculum_stage(rolling_suc)
         new_ghost    = curriculum_ghost_prob(rolling_suc)
 
         # Reinitialise envs if either goal distance OR ghost_prob changed.
         # ghost_prob change means make_stacked_env needs to be rebuilt with a new
         # closure — the vmap_step object changes, triggering JAX retrace.
-        if new_min_dist > cur_min_dist or new_ghost < cur_ghost:
-            cur_min_dist = new_min_dist
+        if new_max_dist > cur_max_dist or new_ghost < cur_ghost:
+            cur_max_dist = new_max_dist
             cur_stage    = new_stage
             cur_ghost    = new_ghost
 
             rng, reinit_rng = jax.random.split(rng)
             # FIX Bug #3: capture new vmap_step; also passes updated ghost_prob.
             env_obs, env_state, vmap_step = init_env_state(reinit_rng,
-                                                            min_goal_dist=cur_min_dist,
+                                                            max_goal_dist=cur_max_dist,
                                                             ghost_prob=cur_ghost)
-            print(f"  → Curriculum reinit: stage={cur_stage}, dist={cur_min_dist:.1f}m, "
+            print(f"  → Curriculum reinit: stage={cur_stage}, dist={cur_max_dist:.1f}m, "
                   f"ghost_prob={cur_ghost:.1f}")
 
         advantages, returns = compute_gae(rewards, values, dones, last_val)
@@ -453,7 +446,7 @@ if __name__ == "__main__":
                 f"{float(mean_loss):>7.1f} {float(p_loss):>6.1f} "
                 f"{float(v_loss):>6.1f} {float(entropy):>6.1f} | "
                 f"{fps:>7,.0f} {n_ep:>6d} {lr_now:.2e} | "
-                f"{cur_stage:>5d} {cur_min_dist:>5.1f}m {cur_ghost:>5.1f}g {elapsedtime:>5.1f}min"
+                f"{cur_stage:>5d} {cur_max_dist:>5.1f}m {cur_ghost:>5.1f}g {elapsedtime:>5.1f}min"
             )
             # ── CSV log row — total_env_steps for aligned x-axis ───────────────
             total_env_steps = (update + 1) * NUM_ENVS * ROLLOUT_STEPS

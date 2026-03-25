@@ -19,7 +19,7 @@ FIXES vs previous version:
     The sampled bool is baked into the closure — JAX never sees a traced bool.
 
     For curriculum decay: rebuild make_stacked_env at each stage change in
-    jax_ppo.py with the new ghost_prob, same as rebuilding for min_goal_dist.
+    jax_ppo.py with the new ghost_prob, same as rebuilding for max_goal_dist.
     make_autoreset_env is ghost_agnostic (behaviour is locked in step_fn).
 
 Obs layout: [pose_stack(3*stack_dim=9) | state_vec(9) | lidar_stack(num_rays*stack_dim=324)]
@@ -60,14 +60,14 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3,
                          closure so JAX never sees a traced conditional.
 
         CURRICULUM USAGE: call make_stacked_env again with the new ghost_prob
-        at each curriculum stage change (same pattern as min_goal_dist).
+        at each curriculum stage change (same pattern as max_goal_dist).
     """
     # Resolve ghost_robot once at construction time — never a traced value.
     if ghost_prob < 1.0:
         ghost_robot = (_random.random() < ghost_prob)
 
-    def reset_stacked(key, min_goal_dist: float = 3.0):
-        base_obs, base_state = base_reset_fn(key, min_goal_dist)
+    def reset_stacked(key, max_goal_dist: float = 3.0):
+        base_obs, base_state = base_reset_fn(key, max_goal_dist)
         pose      = base_obs[0:POSE_SIZE]
         state_vec = base_obs[POSE_SIZE : POSE_SIZE + STATE_VEC_SIZE]
         lidar     = base_obs[POSE_SIZE + STATE_VEC_SIZE:]
@@ -112,7 +112,7 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3,
     return reset_stacked, step_stacked
 
 
-def make_autoreset_env(reset_fn, step_fn, min_goal_dist: float = 3.0):
+def make_autoreset_env(reset_fn, step_fn, max_goal_dist: float = 3.0):
     """
     Auto-reset wrapper.
 
@@ -128,7 +128,7 @@ def make_autoreset_env(reset_fn, step_fn, min_goal_dist: float = 3.0):
         # raise "unexpected keyword argument".
         step_key, reset_key = jax.random.split(key)
         obs, next_state, reward, done, info = step_fn(step_key, state, action)
-        reset_obs, reset_state = reset_fn(reset_key, min_goal_dist)
+        reset_obs, reset_state = reset_fn(reset_key, max_goal_dist)
 
         def _select(reset_leaf, next_leaf):
             d = jnp.asarray(done)

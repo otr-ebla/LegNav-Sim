@@ -61,7 +61,18 @@ def _batch_sample_safe_pos(key, clearance, obs_circles, obs_boxes, min_val, max_
     return guesses_x[best_idx], guesses_y[best_idx]
 
 
-def generate_scenario(key: jnp.ndarray, min_goal_dist: float, scenario_idx: int = -1):
+def generate_scenario(key: jnp.ndarray, max_goal_dist: float, scenario_idx: int = -1):
+    """
+    Generate a scenario.
+
+    max_goal_dist : float — maximum robot-to-goal distance.
+        The goal is placed between MIN_GOAL_FLOOR and max_goal_dist from the
+        robot. This enables a proper curriculum: start with short goals (1.5m)
+        and gradually increase.
+    """
+    # Minimum goal distance floor — goal never spawns inside the robot
+    _MIN_GOAL_FLOOR = 0.8
+
     k_scen, k_branch = jax.random.split(key)
     
     # Sample a random scenario normally
@@ -72,7 +83,7 @@ def generate_scenario(key: jnp.ndarray, min_goal_dist: float, scenario_idx: int 
     
     # OVERRIDE: If the curriculum requires a short goal distance (< 5.0m), 
     # force Scenario 0 (Random Static) because it is the only one that supports it.
-    idx = jnp.where(min_goal_dist < 2.0, 0, idx)
+    idx = jnp.where(max_goal_dist < 5.0, 0, idx)
 
     def pack_human(px, py, th, g1x, g1y, g2x, g2y):
         return jnp.stack([
@@ -117,7 +128,8 @@ def generate_scenario(key: jnp.ndarray, min_goal_dist: float, scenario_idx: int 
         
         def check_goal_safe(x, y):
             safe_env = _is_safe(x, y, GOAL_CLEARANCE, obs_circles, obs_boxes)
-            dist_ok = jnp.sqrt((x - rx)**2 + (y - ry)**2) >= min_goal_dist
+            dist = jnp.sqrt((x - rx)**2 + (y - ry)**2)
+            dist_ok = (dist >= _MIN_GOAL_FLOOR) & (dist <= max_goal_dist)
             return safe_env & dist_ok
             
         g_safe_mask = jax.vmap(check_goal_safe)(g_guesses_x, g_guesses_y)

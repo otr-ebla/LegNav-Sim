@@ -83,7 +83,7 @@ OBS_SIZE = 3 * 3 + 9 + 108 * 3    # 342
 _VMAP_STEP_CACHE: dict = {}   # {ghost_robot_bool: vmap_step_fn}
 
 
-def init_env_state(rng_key, min_goal_dist: float = 3.0, ghost_prob: float = 1.0):
+def init_env_state(rng_key, max_goal_dist: float = 3.0, ghost_prob: float = 1.0):
     """
     Initialise all NUM_ENVS environments and return the vmap_step closure.
 
@@ -111,15 +111,15 @@ def init_env_state(rng_key, min_goal_dist: float = 3.0, ghost_prob: float = 1.0)
         # CUDA_ILLEGAL_ADDRESS on 10 GB cards.
         _VMAP_STEP_CACHE.clear()
         step_auto = make_autoreset_env(reset_stacked, step_stacked,
-                                       min_goal_dist=min_goal_dist)
+                                       max_goal_dist=max_goal_dist)
         _VMAP_STEP_CACHE[ghost_robot] = jax.jit(
             jax.vmap(step_auto, in_axes=(0, 0, 0))
         )
     vmap_step = _VMAP_STEP_CACHE[ghost_robot]
 
-    # vmap_reset is always rebuilt (cheap — just Python closure over min_goal_dist)
+    # vmap_reset is always rebuilt (cheap — just Python closure over max_goal_dist)
     def _reset_with_dist(key):
-        return reset_stacked(key, min_goal_dist=min_goal_dist)
+        return reset_stacked(key, max_goal_dist=max_goal_dist)
     vmap_reset = jax.jit(jax.vmap(_reset_with_dist))
 
     reset_keys = jax.random.split(rng_key, NUM_ENVS)
@@ -172,7 +172,6 @@ def collect_rollouts(rng_key, params, apply_fn, vmap_step, env_state, env_obs):
             "goal_reached": infos["goal_reached"],
             "collision":    infos["collision"],
             "passive_col":  infos["passive_col"],
-            "instant_col":  infos["instant_col"],
         }
         return (next_state, next_obs, current_rng), transition
 
