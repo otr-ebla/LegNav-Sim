@@ -332,8 +332,9 @@ if __name__ == "__main__":
     cur_stage    = _curriculum_stage(0.0)
     cur_ghost    = curriculum_ghost_prob(0.0)
     rolling_suc  = 0.0   
-    
-    cur_scenario = 0 if rolling_suc < 25.0 else -1 # UNLOCK AT 25%: Force scenario 0 only while success is under 25%
+    highest_rolling_suc = 0.0  # <-- ADD THIS
+
+    cur_scenario = 0 if rolling_suc < 25.0 else -1
     
     print(f"Curriculum: starting stage {cur_stage}, max_goal_dist={cur_max_dist:.1f} m, ghost_prob={cur_ghost:.1f}, scenario={cur_scenario}")
 
@@ -347,7 +348,7 @@ if __name__ == "__main__":
                      # improvement, then only on new highs.
 
     hdr = (f"{'Upd':>5} | {'EpRet':>7} | {'Suc%':>5} {'Col%':>5} {'Pcol%':>5} {'Tmo%':>5} {'IC%':>5} |"
-           f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} | {'FPS':>7} {'#Ep':>6} {'LR':>6}| "
+           f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} | {'FPS':>7} {'#Ep':>6} {'LR':>6}  | "
            f"{'Stage':>5} {'MaxDist':>7} {'Ghost':>6} {'Time':>6}")
     print(hdr)
     print("─" * len(hdr))
@@ -399,16 +400,18 @@ if __name__ == "__main__":
             mean_ret, suc_pct, col_pct, pcol_pct, tmo_pct, ic_pct = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
         # ── Curriculum update ─────────────────────────────────────────────────
-        # FIX Issue #10: alpha raised from 0.03 → 0.1 for faster stage transitions.
         if n_ep > 0:
             rolling_suc = 0.9 * rolling_suc + 0.1 * suc_pct
+            # FORCE MONOTONIC PROGRESSION: Track the highest historical success
+            highest_rolling_suc = max(highest_rolling_suc, rolling_suc)
 
-        new_max_dist = curriculum_max_goal_dist(rolling_suc)
-        new_stage    = _curriculum_stage(rolling_suc)
-        new_ghost    = curriculum_ghost_prob(rolling_suc)
+        # Calculate new curriculum based ONLY on the highest historical success
+        new_max_dist = curriculum_max_goal_dist(highest_rolling_suc)
+        new_stage    = _curriculum_stage(highest_rolling_suc)
+        new_ghost    = curriculum_ghost_prob(highest_rolling_suc)
         
-        # UNLOCK AT 25%: Update the active scenario based on rolling success
-        new_scenario = 0 if rolling_suc < 25.0 else -1
+        # UNLOCK AT 25%: Update the active scenario based on historical peak
+        new_scenario = 0 if highest_rolling_suc < 25.0 else -1
 
         # Reinitialise envs if goal distance, ghost_prob, or the forced scenario changes.
         if new_max_dist > cur_max_dist or new_ghost < cur_ghost or new_scenario != cur_scenario:
