@@ -62,11 +62,11 @@ ENTROPY_COEF   = 0.01
 MAX_GRAD_NORM  = 0.5
 PPO_EPOCHS     = 6
 LR_START       = 5e-4
-LR_END         = 1e-4
+LR_END         = 1e-5
 LR_MIN         = 1e-5
 WARMUP_UPDATES = 5
 # TOTAL_UPDATES: 128 × 16384 × 96 = 201,326,592 ≈ 200M env steps
-TOTAL_UPDATES  = 400
+TOTAL_UPDATES  = 800
 
 BATCH_SIZE      = NUM_ENVS * ROLLOUT_STEPS          # 8192 × 64 = 524,288
 # N_MINIBATCHES=64: MBS = 524288/64 = 8192 — matches GPU L2 cache working set
