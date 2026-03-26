@@ -32,6 +32,7 @@ import time
 import warnings
 import jax
 import jax.numpy as jnp
+import functools
 
 # ALWAYS index 0, regardless of which physical GPU you chose
 jax.config.update("jax_default_device", jax.devices("cuda")[0])
