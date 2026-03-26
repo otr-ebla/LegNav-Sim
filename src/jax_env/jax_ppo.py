@@ -507,7 +507,7 @@ if __name__ == "__main__":
     print(f"Ready. obs={env_obs.shape}\n")
     print("JIT compiling train_chunk (this may take ~1 min)...")
 
-    best_suc = 0.0
+    best_suc = 99.0
 
     hdr = (f"{'Upd':>5} | {'EpRet':>7} | {'Suc%':>5} {'Obs%':>5} {'Acol%':>5} {'Pcol%':>5} {'Tmo%':>5} |"
            f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} | {'FPS':>7} {'#Ep':>6} {'LR':>6}  | "
