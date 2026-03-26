@@ -477,7 +477,7 @@ def step_env(key, state, action, ghost_robot: bool = True):
     rel_angles   = (human_angles - new_theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
 
     YIELD_DIST = 1.5
-    YIELD_FOV  = 1.5708  # 90 gradi totali frontali
+    YIELD_FOV  = 2*jnp.pi
 
     in_yield_zone = (dists_p_active < YIELD_DIST) & (jnp.abs(rel_angles) < YIELD_FOV) & active_mask
     is_yield_situation = jnp.any(in_yield_zone)
@@ -488,7 +488,7 @@ def step_env(key, state, action, ghost_robot: bool = True):
     # Penalità massiccia se il robot tiene il gas premuto verso un umano.
     # Il -2.0 compensa abbondantemente il reward di progresso (+0.15/step),
     # rendendo la frenata (target_v = 0) l'unica azione matematicamente vantaggiosa.
-    yield_penalty = -2.0 * urgency * target_v
+    yield_penalty = -4.0 * urgency * target_v
 
     # — 6c. Dense shaping ─────────────────────────────────────────────────
     progress         = prev_dist - new_dist
