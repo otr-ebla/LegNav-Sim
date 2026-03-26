@@ -127,13 +127,22 @@ jax.config.update("jax_default_device", target_gpu)
 # ── Environment ───────────────────────────────────────────────────────────────
 reset_stacked, step_stacked = make_stacked_env(reset_env, step_env, stack_dim=3)
 
-def init_env_state(rng_key, min_goal_dist: float = 3.0):
+def init_env_state(rng_key, max_goal_dist: float = 3.0, scenario_idx: int = -1):
     """Build vmapped step/reset, initialise all envs. Returns (obs, state, vmap_step)."""
-    step_auto  = make_autoreset_env(reset_stacked, step_stacked, min_goal_dist=min_goal_dist)
-    vmap_step  = jax.jit(jax.vmap(step_auto, in_axes=(0, 0, 0)))
-    def _reset(key): return reset_stacked(key, min_goal_dist=min_goal_dist)
+    
+    # 1. Initialize the autoreset wrapper without static closure arguments
+    step_auto  = make_autoreset_env(reset_stacked, step_stacked)
+    
+    # 2. Tell vmap that max_goal_dist and scenario_idx are shared dynamic tensors (None)
+    vmap_step  = jax.jit(jax.vmap(step_auto, in_axes=(0, 0, 0, None, None)))
+    
+    # 3. Initialize the first batch of environments
+    def _reset(key): 
+        return reset_stacked(key, max_goal_dist=max_goal_dist, scenario_idx=scenario_idx)
     vmap_reset = jax.jit(jax.vmap(_reset))
+    
     env_obs, env_state = vmap_reset(jax.random.split(rng_key, N_ENVS))
+    
     return env_obs, env_state, vmap_step
 
 
@@ -427,17 +436,20 @@ def sac_update(aep, ahp, aeos, ahos, cep, chp, ceos, chos, tep, thp, la, alo,
             new_tep, new_thp, new_la, new_alo, metrics)
 
 
-# ── Single collection step ────────────────────────────────────────────────────
-# FUSE 2: one step per scan iteration — no large output tensor materialised.
+# Change the signature to accept the dynamic curriculum variables
 @functools.partial(jax.jit, static_argnums=(5,))
-def collect_step(aep, ahp, env_state, env_obs, rng_key, vmap_step):
+def collect_step(aep, ahp, env_state, env_obs, rng_key, vmap_step, max_goal_dist, scenario_idx):
     """aep = actor encoder params, ahp = actor head params."""
     mean, log_std = _actor_forward(aep, ahp, env_obs)
     env_action, _ = sample_action_sac_batched(
         rng_key, mean, log_std, extract_max_v(env_obs)
     )
     step_keys = jax.random.split(jax.random.fold_in(rng_key, 1), N_ENVS)
-    new_obs, new_state, reward, done, info = vmap_step(step_keys, env_state, env_action)
+    
+    # Pass the curriculum variables into vmap_step
+    new_obs, new_state, reward, done, info = vmap_step(
+        step_keys, env_state, env_action, max_goal_dist, scenario_idx
+    )
     return new_obs, new_state, env_obs, env_action, reward, done, info
 
 
@@ -447,13 +459,9 @@ def collect_step(aep, ahp, env_state, env_obs, rng_key, vmap_step):
 # Change this line (around line 430) to ONLY include 13:
 @functools.partial(jax.jit, static_argnums=(13,))
 def train_chunk(aep, ahp, aeos, ahos, cep, chp, ceos, chos,
-                tep, thp, la, alo, buf, vmap_step, es, eo, key):
-    """
-    Execute LOG_EVERY steps of:
-      collect 1 env step -> add to buffer -> sample batch -> SAC gradient update.
-    Everything runs on-GPU inside a single jax.lax.scan — one Python dispatch,
-    no host syncs until the scan completes.
-    """
+                tep, thp, la, alo, buf, vmap_step, es, eo, key, 
+                max_goal_dist, scenario_idx): # <-- Added arguments
+
     def _loop_body(carry, _):
         (aep, ahp, aeos, ahos, cep, chp, ceos, chos,
          tep, thp, la, alo, buf, es, eo, key) = carry
@@ -461,7 +469,7 @@ def train_chunk(aep, ahp, aeos, ahos, cep, chp, ceos, chos,
 
         # Collect one env step (actor encoder + head)
         new_eo, new_es, obs_b, env_a, rew, done, info = collect_step(
-            aep, ahp, es, eo, k_col, vmap_step
+            aep, ahp, es, eo, k_col, vmap_step, max_goal_dist, scenario_idx
         )
 
         # True terminal (ignore timeouts for Bellman backup)
@@ -604,7 +612,9 @@ if __name__ == "__main__":
         rand_w     = jax.random.uniform(k_act, (N_ENVS,), minval=-1.0, maxval=1.0)
         env_action = jnp.stack([rand_v, rand_w], axis=-1)
         step_keys  = jax.random.split(k_step, N_ENVS)
-        new_obs, env_state, reward, done, info = vmap_step(step_keys, env_state, env_action)
+        new_obs, env_state, reward, done, info = vmap_step(
+            step_keys, env_state, env_action, 3.0, -1
+        )
         terminal   = done & ~info["timeout"]
         replay_buf = buf_add(replay_buf, obs_before, env_action, reward,
                              new_obs, terminal.astype(jnp.float32))
@@ -636,7 +646,8 @@ if __name__ == "__main__":
         # ── Single fused GPU dispatch: LOG_EVERY steps of everything ──────────
         new_carry, all_step_data, all_metrics = train_chunk(
             aep, ahp, aeos, ahos, cep, chp, ceos, chos,
-            tep, thp, la, alo, replay_buf, vmap_step, env_state, env_obs, train_rng
+            tep, thp, la, alo, replay_buf, vmap_step, env_state, env_obs, train_rng,
+            3.0, -1  # <-- Added dynamic arguments
         )
         (aep, ahp, aeos, ahos, cep, chp, ceos, chos,
          tep, thp, la, alo, replay_buf, env_state, env_obs, train_rng) = new_carry
