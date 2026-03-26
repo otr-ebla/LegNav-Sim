@@ -50,7 +50,7 @@ from jax_train import collect_rollouts, init_env_state, NUM_ENVS, ROLLOUT_STEPS,
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 GAMMA          = 0.99
 GAE_LAMBDA     = 0.95
-CLIP_EPS       = 0.2
+CLIP_EPS       = 0.3
 VF_COEF        = 0.25
 # FIX: ENTROPY_COEF abbassato 0.01→0.003.
 # Con reward scale -50/-10 e valore assoluto episodio ~50, il value loss domina.
