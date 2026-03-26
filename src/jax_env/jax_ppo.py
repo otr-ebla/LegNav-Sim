@@ -43,8 +43,8 @@ import numpy as np
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-#from jax_network import EndToEndActorCritic
-from jax_network import DecoupledActorCritic
+from jax_network import EndToEndActorCritic
+#from jax_network import DecoupledActorCritic
 from jax_train import collect_rollouts, init_env_state, NUM_ENVS, ROLLOUT_STEPS, OBS_SIZE
 
 
@@ -89,8 +89,8 @@ _OPT_STEPS_PER_UPDATE = PPO_EPOCHS * N_MINIBATCHES   # 6 × 64 = 384
 _WARMUP_OPT_STEPS     = WARMUP_UPDATES * _OPT_STEPS_PER_UPDATE   # 1_920
 _TOTAL_OPT_STEPS      = TOTAL_UPDATES  * _OPT_STEPS_PER_UPDATE   # 49_152
 
-#network = EndToEndActorCritic(action_dim=2)
-network = DecoupledActorCritic(action_dim=2)
+network = EndToEndActorCritic(action_dim=2)
+#network = DecoupledActorCritic(action_dim=2)
 
 # ── Curriculum ────────────────────────────────────────────────────────────────
 # Each entry: (suc_pct_threshold, max_goal_dist)
@@ -457,29 +457,12 @@ def collect_episode_outcomes(rewards, dones, goal_reached, collision, passive_co
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 if __name__ == "__main__":
-    # We define LOG_EVERY globally so the JIT compiler can use it
-    global LOG_EVERY
-    LOG_EVERY = 10 
-    
-    print(f"PPO Training — GPU {args.gpu}  [Fused Chunk Mode]")
+    print(f"PPO Training — GPU {args.gpu}  [Classic Mode]")
     print(f"  Envs       : {NUM_ENVS}  x  steps {ROLLOUT_STEPS}  =  {BATCH_SIZE:,} batch")
     print(f"  Minibatches: {N_MINIBATCHES} x {MINI_BATCH_SIZE} | epochs {PPO_EPOCHS}")
-    print(f"  VF_COEF={VF_COEF}  ENTROPY_COEF={ENTROPY_COEF}  LR warmup {LR_MIN}->{LR_START} then decay ->{LR_END}")
-    print(f"  OBS_SIZE={OBS_SIZE}  log_std: global param, bias=-1.0, clamp [{-4.0},{0.0}]\n")
+    print(f"  VF_COEF={VF_COEF}  ENTROPY_COEF={ENTROPY_COEF}")
+    print(f"  Curriculum stages: {CURRICULUM_STAGES}\n")
 
     rng = jax.random.PRNGKey(42)
     rng, init_rng, env_rng = jax.random.split(rng, 3)
@@ -490,14 +473,21 @@ if __name__ == "__main__":
     opt_state   = optimizer.init(params)
     train_state = (params, opt_state)
 
-    ckpt_path = "checkpoints/ppo_model_best.msgpack"
-    
-    # ── Fixed Difficulty Curriculum (Like SAC) ──
-    cur_max_dist = 4.0   
-    cur_scenario = -1    
-    cur_ghost    = 1.0
+    # Usa nomi separati così non tocchi i modelli vecchi
+    ckpt_path       = "checkpoints/ppo_classic_best.msgpack"
+    final_ckpt_path = "checkpoints/ppo_classic_final.msgpack"
 
-    print(f"Starting Fixed Curriculum: max_goal_dist={cur_max_dist:.1f}m, ghost_prob={cur_ghost:.1f}, scenario={cur_scenario}")
+    # ── Curriculum state ──────────────────────────────────────────────────────
+    cur_max_dist = curriculum_max_goal_dist(0.0)
+    cur_stage    = _curriculum_stage(0.0)
+    cur_ghost    = curriculum_ghost_prob(0.0)
+    rolling_suc  = 0.0   
+    highest_rolling_suc = 0.0  
+
+    cur_scenario = 0 if rolling_suc < 35.0 else -1
+    
+    print(f"Curriculum: starting stage {cur_stage}, max_goal_dist={cur_max_dist:.1f} m, ghost_prob={cur_ghost:.1f}, scenario={cur_scenario}")
+
     print("Initialising environments...")
     env_obs, env_state, vmap_step = init_env_state(env_rng, ghost_prob=cur_ghost)
 
@@ -505,43 +495,46 @@ if __name__ == "__main__":
     running_ret = jnp.zeros(NUM_ENVS)                                
                             
     print(f"Ready. obs={env_obs.shape}\n")
-    print("JIT compiling train_chunk (this may take ~1 min)...")
 
-    best_suc = 99.0
+    best_suc = 99.0 # NEVER TOUCH THIS LINE, it has to stay to 99, NEVERRRRR!!!!!!!!
 
     hdr = (f"{'Upd':>5} | {'EpRet':>7} | {'Suc%':>5} {'Obs%':>5} {'Acol%':>5} {'Pcol%':>5} {'Tmo%':>5} |"
            f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} | {'FPS':>7} {'#Ep':>6} {'LR':>6}  | "
-           f"{'Time':>6}")
+           f"{'Stage':>5} {'MaxDist':>7} {'Ghost':>6} {'Time':>6}")
     print(hdr)
     print("─" * len(hdr))
 
-    _LOG_PATH = "checkpoints/ppo_training_log.csv"
-    os.makedirs("checkpoints", exist_ok=True)
-    _log_file   = open(_LOG_PATH, "w", newline="")
-    _log_writer = csv.writer(_log_file)
-    _log_writer.writerow(["step", "mean_ep_reward", "suc_pct", "obs_pct",
-                           "acol_pct", "pcol_pct", "tmo_pct", "n_ep"])
-    _log_file.flush()
-
     t_start = time.time()
-    n_updates = 0
 
-    while n_updates < TOTAL_UPDATES: 
+    for update in range(TOTAL_UPDATES):
         t0 = time.time()
 
-        # Execute 10 PPO updates fused on the GPU
-        new_carry, all_step_data, all_losses, all_aux = ppo_train_chunk(
-            train_state, env_state, env_obs, rms_state, vmap_step, running_ret, rng, cur_max_dist, cur_scenario
+        rng, rollout_rng, update_rng = jax.random.split(rng, 3)
+        rollout_history, env_state, env_obs, last_val = collect_rollouts(
+            rollout_rng, train_state[0], network.apply, vmap_step, env_state, env_obs, 
+            cur_max_dist, cur_scenario
         )
-        
-        train_state, env_state, env_obs, rms_state, running_ret, rng = new_carry
-        
-        n_updates += LOG_EVERY
 
-        # Reduce chunk metrics on GPU
-        ep_rets, ep_suc, ep_obs, ep_acol, ep_pcol, ep_tmo, ep_msk = collect_episode_outcomes_chunked(*all_step_data)
+        raw_rewards  = rollout_history["rewards"]
+        values       = rollout_history["values"]
+        dones        = rollout_history["dones"]
 
-        # Transfer only scalars to CPU
+        rewards, running_ret, rms_state = normalize_batch_rewards(
+            raw_rewards, dones, running_ret, rms_state, GAMMA
+        )
+
+        obs_all      = rollout_history["obs"]
+        acts_all     = rollout_history["actions"]
+        lp_all       = rollout_history["log_probs"]
+        goal_reached = rollout_history["goal_reached"]
+        collision    = rollout_history["collision"]
+        passive_col  = rollout_history["passive_col"]  
+        active_col   = rollout_history["active_col"]   
+
+        ep_rets, ep_suc, ep_obs, ep_acol, ep_pcol, ep_tmo, ep_msk = collect_episode_outcomes(
+            raw_rewards, dones, goal_reached, collision, passive_col, active_col
+        )
+
         n_ep = int(ep_msk.sum())
         if n_ep > 0:
             mean_ret = float((ep_rets * ep_msk).sum() / n_ep)
@@ -553,28 +546,64 @@ if __name__ == "__main__":
         else:
             mean_ret, suc_pct, obs_pct, acol_pct, pcol_pct, tmo_pct = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
-        p_loss, v_loss, entropy = jax.tree_util.tree_map(lambda x: x[-1], all_aux)
-        mean_loss = all_losses[-1]
-        
-        fps = (BATCH_SIZE * LOG_EVERY) / (time.time() - t0)
-        lr_now = float(scheduler(n_updates * _OPT_STEPS_PER_UPDATE))
-        elapsedtime = (time.time() - t_start)/60.0
+        # ── Curriculum update ─────────────────────────────────────────────────
+        if n_ep > 0:
+            rolling_suc = 0.9 * rolling_suc + 0.1 * suc_pct
+            highest_rolling_suc = max(highest_rolling_suc, rolling_suc)
 
-        print(
-            f"{n_updates:>5d} | {mean_ret:>7.1f} | "
-            f"{suc_pct:>4.1f}% {obs_pct:>4.1f}% {acol_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% | "
-            f"{float(mean_loss):>7.2f} {float(p_loss):>6.2f} "
-            f"{float(v_loss):>6.2f} {float(entropy):>6.2f} | "
-            f"{fps:>7,.0f} {n_ep:>6d} {lr_now:.2e} | "
-            f"{elapsedtime:>5.1f}min"
+        new_max_dist = curriculum_max_goal_dist(highest_rolling_suc)
+        new_stage    = _curriculum_stage(highest_rolling_suc)
+        new_ghost    = curriculum_ghost_prob(highest_rolling_suc)
+        
+        # Sblocco degli scenari
+        if highest_rolling_suc < 35.0:
+            new_scenario = 0
+        elif highest_rolling_suc < 50.0:
+            new_scenario = 1
+        elif highest_rolling_suc < 60.0:
+            new_scenario = 2
+        else:
+            new_scenario = -1
+
+        if new_max_dist > cur_max_dist or new_ghost < cur_ghost or new_scenario != cur_scenario:
+            cur_max_dist = new_max_dist
+            cur_stage    = new_stage
+            cur_scenario = new_scenario
+
+            if new_ghost < cur_ghost:
+                cur_ghost = new_ghost
+                rng, reinit_rng = jax.random.split(rng)
+                env_obs, env_state, vmap_step = init_env_state(reinit_rng, ghost_prob=cur_ghost)
+                print(f"  -> Ghost reinit: ghost_prob={cur_ghost:.1f}")
+            else:
+                print(f"  -> Curriculum advanced: stage={cur_stage}, dist={cur_max_dist:.1f}m, scenario={cur_scenario}")
+
+        advantages, returns = compute_gae(rewards, values, dones, last_val)
+
+        train_state, mean_loss, aux = run_ppo_updates(
+            train_state,
+            obs_all.reshape(-1, OBS_SIZE),
+            acts_all.reshape(-1, 2),
+            advantages.reshape(-1),
+            returns.reshape(-1),
+            lp_all.reshape(-1),
+            update_rng
         )
 
-        total_env_steps = n_updates * NUM_ENVS * ROLLOUT_STEPS
-        _log_writer.writerow([total_env_steps, round(mean_ret, 4),
-                               round(suc_pct, 4), round(obs_pct, 4),
-                               round(acol_pct, 4), round(pcol_pct, 4),
-                               round(tmo_pct, 4), n_ep])
-        _log_file.flush()
+        fps = BATCH_SIZE / (time.time() - t0)
+
+        if update % 5 == 0:
+            p_loss, v_loss, entropy = aux
+            lr_now = float(scheduler(update * _OPT_STEPS_PER_UPDATE))
+            elapsedtime = (time.time() - t_start)/60.0
+            print(
+                f"{update:>5d} | {mean_ret:>7.1f} | "
+                f"{suc_pct:>4.1f}% {obs_pct:>4.1f}% {acol_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% | "
+                f"{float(mean_loss):>7.2f} {float(p_loss):>6.2f} "
+                f"{float(v_loss):>6.2f} {float(entropy):>6.2f} | "
+                f"{fps:>7,.0f} {n_ep:>6d} {lr_now:.2e} | "
+                f"{cur_stage:>5d} {cur_max_dist:>5.1f}m {cur_ghost:>5.1f}g {elapsedtime:>5.1f}min"
+            )
 
         if suc_pct > best_suc and n_ep > 0:
             best_suc = suc_pct
@@ -582,6 +611,13 @@ if __name__ == "__main__":
 
     elapsed = time.time() - t_start
     print(f"\nDone! {elapsed/3600:.2f}h | Best success: {best_suc:.1f}%")
+    save_checkpoint(train_state[0], train_state[1], final_ckpt_path)
 
-    _log_file.close()
-    save_checkpoint(train_state[0], train_state[1], "checkpoints/ppo_model_final.msgpack")
+
+
+
+
+
+
+
+
