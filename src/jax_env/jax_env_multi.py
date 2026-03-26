@@ -467,24 +467,39 @@ def step_env(key, state, action, ghost_robot: bool = True):
 
     # ── 6. Reward ───────────────────────────────────────────────────────────────
 
-    # — 6a. Comfort penalty (additive, replaces old clearance_factor multiplier)
-    # Penalises proximity to humans. Summed over ALL humans within _COMFORT_DIST
-    # so the robot feels pressure from crowds, not just the single closest human.
-    # Speed-scaled: fast approach costs more than slow creep.
-    comfort_violations = jnp.maximum(0.0, 1.0 - dists_p_active / _COMFORT_DIST)  # (N,) in [0,1]
-    #speed_scale = 1.0 + target_v / jnp.maximum(state.max_v, 1e-3)
-
+    # — 6a. Comfort penalty (spazio personale spaziale)
+    comfort_violations = jnp.maximum(0.0, 1.0 - dists_p_active / _COMFORT_DIST)
     comfort_pen = -_COMFORT_COEF * jnp.sum(comfort_violations)
 
-    # — 6b. Dense shaping ─────────────────────────────────────────────────
-    # Progress reward at FULL strength — never suppressed by proximity.
+    # — 6b. NEW: Yield Penalty (Gradiente di Frenata Dinamica)
+    # Recuperato e riadattato da jax_env.py per forzare l'agente a rallentare
+    human_angles = jnp.arctan2(dy_p, dx_p)
+    rel_angles   = (human_angles - new_theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
+
+    YIELD_DIST = 1.5
+    YIELD_FOV  = 1.5708  # 90 gradi totali frontali
+
+    in_yield_zone = (dists_p_active < YIELD_DIST) & (jnp.abs(rel_angles) < YIELD_FOV) & active_mask
+    is_yield_situation = jnp.any(in_yield_zone)
+
+    closest_yield_dist = jnp.min(jnp.where(in_yield_zone, dists_p_active, 100.0))
+    urgency = jnp.where(is_yield_situation, (YIELD_DIST - closest_yield_dist) / YIELD_DIST, 0.0)
+
+    # Penalità massiccia se il robot tiene il gas premuto verso un umano.
+    # Il -2.0 compensa abbondantemente il reward di progresso (+0.15/step),
+    # rendendo la frenata (target_v = 0) l'unica azione matematicamente vantaggiosa.
+    yield_penalty = -2.0 * urgency * target_v
+
+    # — 6c. Dense shaping ─────────────────────────────────────────────────
     progress         = prev_dist - new_dist
     social_progress  = _PROGRESS_COEF * progress
     step_pen         = _STEP_PEN
     jerk_pen         = -_JERK_WEIGHT * (target_w - state.w) ** 2
-    dense_reward     = social_progress + step_pen + jerk_pen + comfort_pen
+    
+    # Aggiungiamo la yield_penalty al totale
+    dense_reward     = social_progress + step_pen + jerk_pen + comfort_pen + yield_penalty
 
-    # — 6c. Terminal cascades ─────────────────────────────────────────────
+    # — 6d. Terminal cascades ─────────────────────────────────────────────
     reward = dense_reward
     reward = jnp.where(goal_reached, _R_GOAL, reward)
     reward = jnp.where(obs_collision & ~goal_reached, _R_OBS_COL, reward)
@@ -507,8 +522,7 @@ def step_env(key, state, action, ghost_robot: bool = True):
     obs, sp_mask = get_obs(new_state, k_obs)
     new_state = new_state.replace(sp_mask=sp_mask)
 
-    # instant_col: episode dies on its very first step due to collision.
-    # This flags broken spawns where robot/human overlap from frame 0.
+ 
     instant_col = collision & (state.time_step == 0)
 
     info = {
@@ -521,6 +535,7 @@ def step_env(key, state, action, ghost_robot: bool = True):
         "sp_mask":       sp_mask,
         "timeout":       timeout,
         "instant_col":   instant_col,
+        "rew_yield":     yield_penalty,
         # ── NEW: Export reward components for debugging ──
         "rew_prog":      social_progress,
         "rew_step":      jnp.array(step_pen),
