@@ -42,7 +42,8 @@ import numpy as np
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-from jax_network import EndToEndActorCritic
+#from jax_network import EndToEndActorCritic
+from jax_network import DecoupledActorCritic
 from jax_train import collect_rollouts, init_env_state, NUM_ENVS, ROLLOUT_STEPS, OBS_SIZE
 
 
@@ -87,7 +88,8 @@ _OPT_STEPS_PER_UPDATE = PPO_EPOCHS * N_MINIBATCHES   # 6 × 64 = 384
 _WARMUP_OPT_STEPS     = WARMUP_UPDATES * _OPT_STEPS_PER_UPDATE   # 1_920
 _TOTAL_OPT_STEPS      = TOTAL_UPDATES  * _OPT_STEPS_PER_UPDATE   # 49_152
 
-network = EndToEndActorCritic(action_dim=2)
+#network = EndToEndActorCritic(action_dim=2)
+network = DecoupledActorCritic(action_dim=2)
 
 # ── Curriculum ────────────────────────────────────────────────────────────────
 # Each entry: (suc_pct_threshold, max_goal_dist)
