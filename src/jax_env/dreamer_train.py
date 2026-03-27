@@ -24,7 +24,7 @@ import optax
 import time
 from functools import partial
 
-from dreamer_buffer   import init_buffer, add_batch, sample_sequences, buffer_ready
+from dreamer_buffer   import init_buffer, add_batch, sample_sequences
 from dreamer_rssm     import RSSM, DreamerEncoder, LATENT_SIZE, DETERMINISTIC_SIZE
 from dreamer_decoders import ObservationDecoder, RewardDecoder, ContinueDecoder, world_model_loss
 from dreamer_behavior import DreamerActor, DreamerCritic, compute_lambda_returns, unroll_imagination, sample_action
