@@ -55,7 +55,7 @@ NUM_ENVS        = 64
 SEQ_LEN         = 64
 BATCH_SIZE      = 16
 HORIZON         = 15
-BUFFER_CAPACITY = 100_000
+BUFFER_CAPACITY = 20_000
 PREFILL_STEPS   = 1_000
 
 LR_WM        = 1e-4
@@ -317,7 +317,8 @@ if __name__ == "__main__":
     # 4. Prefill
     print("Compiling and executing fast pre-fill on GPU...")
     
-    @jax.jit
+
+    @jax.jit(donate_argnums=(1,))
     def run_prefill(rng_key, b_state, e_state, e_obs):
         def _step(carry, _):
             curr_b, curr_e_state, curr_e_obs, curr_rng = carry
