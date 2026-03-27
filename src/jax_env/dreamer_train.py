@@ -300,7 +300,7 @@ if __name__ == "__main__":
 
     # 4. Prefill
     print("Pre-filling buffer with random actions...")
-    for _ in range(PREFILL_STEPS):
+    for i in range(PREFILL_STEPS):
         rng, act_rng, step_rng = jax.random.split(rng, 3)
         raw_actions = jax.random.uniform(act_rng, (NUM_ENVS, ACTION_DIM), minval=-1.0, maxval=1.0)
         env_actions = scale_actions_batched(raw_actions, env_state.env_state.max_v)
@@ -311,9 +311,13 @@ if __name__ == "__main__":
         env_obs   = next_obs
         env_state = next_state
 
-    current_h      = jnp.zeros((NUM_ENVS, H_DIM))
-    current_z      = jnp.zeros((NUM_ENVS, Z_DIM))
-    current_action = jnp.zeros((NUM_ENVS, ACTION_DIM))
+        # Update the progress percentage every 10 steps
+        if (i + 1) % 10 == 0:
+            pct = (i + 1) / PREFILL_STEPS * 100
+            print(f"\rPre-filling buffer: {pct:.0f}% ({i + 1}/{PREFILL_STEPS})", end="", flush=True)
+            
+    # Print a newline once the loop is complete so the next prints start fresh
+    print()
 
     # 5. Main loop
     print("Starting Main Training Loop...")
