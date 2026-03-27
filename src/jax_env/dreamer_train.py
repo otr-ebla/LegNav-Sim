@@ -266,39 +266,56 @@ def act_step(rng_key, wm_params, actor_params, obs,
 @partial(jax.jit, static_argnames=('chunk_size',))
 def train_loop_chunk(rng_key, buffer_state, params, opt_states, 
                      env_obs, env_state, current_h, current_z, current_action,
+                     cur_return, ema_return, ema_success,
                      chunk_size=50):
     
     def single_step(carry, _):
-        (b_state, p, opt, h, z, a, obs, e_state, key) = carry
+        # 1. Unpack con le nuove variabili
+        (b_state, p, opt, h, z, a, obs, e_state, key, c_ret, e_ret, e_succ) = carry
         key, act_k, step_k, train_k = jax.random.split(key, 4)
 
-        # 1. Inferenza (act_step)
         raw_acts, next_h, next_z = act_step(
             act_k, p['wm'], p['actor'], obs, h, z, a, explore=True)
         
-        # 2. Ambiente (vmap_step)
         env_acts = scale_actions_batched(raw_acts, e_state.env_state.max_v)
         s_keys = jax.random.split(step_k, NUM_ENVS)
-        n_obs, n_e_state, rews, dones, _ = vmap_step(s_keys, e_state, env_acts, 3.0, -1)
+        
+        # 2. Recuperiamo 'info' invece di ignorarlo con '_'
+        n_obs, n_e_state, rews, dones, info = vmap_step(s_keys, e_state, env_acts, 3.0, -1)
 
-        # 3. Aggiornamento Buffer
         new_b_state = add_batch(b_state, obs, raw_acts, rews, dones)
-
-        # 4. Training Step (Monolithic update)
         new_p, new_opt, metrics = train_step(train_k, new_b_state, p, opt)
 
-        # Reset stati RSSM per env terminati (Fix Bug 6)
         alive = (~dones).astype(jnp.float32)[:, None]
         next_h *= alive
         next_z *= alive
+
+        # --- 3. LOGICA DI TRACKING (EMA) ---
+        c_ret = c_ret + rews
+        num_dones = jnp.sum(dones)
         
-        next_carry = (new_b_state, new_p, new_opt, next_h, next_z, raw_acts, n_obs, n_e_state, key)
+        # Calcola media dei return e successi solo per gli ambienti appena terminati
+        mean_ret  = jnp.sum(c_ret * dones) / jnp.maximum(1.0, num_dones)
+        mean_succ = jnp.sum(info['goal_reached'] * dones) / jnp.maximum(1.0, num_dones)
+        
+        # Aggiorna l'EMA solo se c'è almeno un episodio terminato in questo step
+        e_ret  = jnp.where(num_dones > 0, 0.95 * e_ret + 0.05 * mean_ret, e_ret)
+        e_succ = jnp.where(num_dones > 0, 0.95 * e_succ + 0.05 * mean_succ, e_succ)
+        
+        # Azzera l'accumulatore per gli ambienti riavviati
+        c_ret = c_ret * (~dones)
+
+        metrics['ema_return']  = e_ret
+        metrics['ema_success'] = e_succ
+
+        # 4. Repack del carry aggiornato
+        next_carry = (new_b_state, new_p, new_opt, next_h, next_z, raw_acts, n_obs, n_e_state, key, c_ret, e_ret, e_succ)
         return next_carry, metrics
 
-    init_carry = (buffer_state, params, opt_states, current_h, current_z, current_action, env_obs, env_state, rng_key)
+    # 5. Init e scan
+    init_carry = (buffer_state, params, opt_states, current_h, current_z, current_action, env_obs, env_state, rng_key, cur_return, ema_return, ema_success)
     final_carry, metrics_history = jax.lax.scan(single_step, init_carry, None, length=chunk_size)
     return final_carry, metrics_history
-
 
 
 
@@ -379,10 +396,14 @@ if __name__ == "__main__":
         'critic': opt_critic.init(params['critic']),
     }
 
-    # Tracking degli stati RSSM e azioni tra i chunk
     current_h      = jnp.zeros((NUM_ENVS, H_DIM))
     current_z      = jnp.zeros((NUM_ENVS, Z_DIM))
     current_action = jnp.zeros((NUM_ENVS, ACTION_DIM))
+    
+    # --- NUOVI TRACKER ---
+    cur_return  = jnp.zeros(NUM_ENVS)  # Accumulatore reward per l'episodio in corso
+    ema_return  = jnp.array(0.0)       # Media mobile esponenziale del return
+    ema_success = jnp.array(0.0)       # Media mobile esponenziale del success rate
 
     # 4. Prefill (GPU-side)
     print("Compiling and executing fast pre-fill on GPU...")
@@ -412,37 +433,41 @@ if __name__ == "__main__":
     # 5. Main Training Loop (Mega-JIT)
     print("Starting Optimized Main Training Loop...")
     CHUNK_SIZE = 50  # Numero di step eseguiti interamente su GPU per ogni iterazione Python
-    TOTAL_STEPS = 50_000
+    TOTAL_STEPS = 100_000
     
     for step in range(0, TOTAL_STEPS, CHUNK_SIZE):
         t0 = time.time()
         
-        # Chiamata al Mega-JIT Loop
-        # Assicurati che train_loop_chunk sia definita nel tuo file
+        # Passiamo i nuovi tracker alla funzione
         final_carry, metrics_history = train_loop_chunk(
             rng, buffer_state, params, opt_states,
             env_obs, env_state, current_h, current_z, current_action,
+            cur_return, ema_return, ema_success,
             chunk_size=CHUNK_SIZE
         )
         
-        # Unpack dei risultati per il prossimo chunk
+        # Unpack includendo i tracker
         (buffer_state, params, opt_states, 
          current_h, current_z, current_action, 
-         env_obs, env_state, rng) = final_carry
+         env_obs, env_state, rng,
+         cur_return, ema_return, ema_success) = final_carry
 
-        # Logging (usiamo la media dei valori nel chunk per precisione)
         if step % 100 == 0:
             avg_wm     = jnp.mean(metrics_history['wm_loss'])
             avg_actor  = jnp.mean(metrics_history['actor_loss'])
-            avg_critic = jnp.mean(metrics_history['critic_loss'])
             fps        = (NUM_ENVS * CHUNK_SIZE) / (time.time() - t0)
+            
+            # Estraiamo l'ultimo valore dell'EMA dal chunk e convertiamo in percentuale
+            ret_val  = metrics_history['ema_return'][-1]
+            succ_val = metrics_history['ema_success'][-1] * 100.0
             
             print(
                 f"Step {step:05d} | "
+                f"FPS: {fps:.0f} | "
                 f"WM: {avg_wm:.3f} | "
-                f"Actor: {avg_actor:.3f} | "
-                f"Critic: {avg_critic:.3f} | "
-                f"FPS: {fps:.0f}"
+                f"Act: {avg_actor:.3f} | "
+                f"Ret: {ret_val:.1f} | "
+                f"Succ: {succ_val:.1f}%"
             )
 
     print("Training Complete.")
