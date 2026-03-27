@@ -5,6 +5,7 @@ dreamer_decoders.py — World Model Decoders and Objective for DreamerV3
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
+from typing import Tuple  # <-- ADD THIS LINE
 from dreamer_rssm import DETERMINISTIC_SIZE, symlog
 
 class ObservationDecoder(nn.Module):
