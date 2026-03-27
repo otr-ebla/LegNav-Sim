@@ -390,3 +390,23 @@ if __name__ == "__main__":
             )
 
     print("Training Complete.")
+
+    print("Training Complete.")
+    
+    # --- SALVATAGGIO CHECKPOINT ---
+    import os
+    import flax.serialization
+    
+    os.makedirs("checkpoints", exist_ok=True)
+    ckpt_path = "checkpoints/dreamer_best.msgpack"
+    
+    # Salviamo solo i parametri necessari per l'inferenza
+    eval_params = {
+        'encoder': jax.device_get(params['wm']['encoder']),
+        'rssm': jax.device_get(params['wm']['rssm']),
+        'actor': jax.device_get(params['actor'])
+    }
+    
+    with open(ckpt_path, "wb") as f:
+        f.write(flax.serialization.to_bytes(eval_params))
+    print(f"Checkpoint salvato con successo in {ckpt_path}!")
