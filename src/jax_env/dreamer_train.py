@@ -299,25 +299,35 @@ if __name__ == "__main__":
     current_action = jnp.zeros((NUM_ENVS, ACTION_DIM))
 
     # 4. Prefill
-    print("Pre-filling buffer with random actions...")
-    for i in range(PREFILL_STEPS):
-        rng, act_rng, step_rng = jax.random.split(rng, 3)
-        raw_actions = jax.random.uniform(act_rng, (NUM_ENVS, ACTION_DIM), minval=-1.0, maxval=1.0)
-        env_actions = scale_actions_batched(raw_actions, env_state.env_state.max_v)
-        step_keys   = jax.random.split(step_rng, NUM_ENVS)
-        next_obs, next_state, rewards, dones, _ = vmap_step(
-            step_keys, env_state, env_actions, 3.0, -1)
-        buffer_state = add_batch(buffer_state, env_obs, raw_actions, rewards, dones)
-        env_obs   = next_obs
-        env_state = next_state
-
-        # Update the progress percentage every 10 steps
-        if (i + 1) % 10 == 0:
-            pct = (i + 1) / PREFILL_STEPS * 100
-            print(f"\rPre-filling buffer: {pct:.0f}% ({i + 1}/{PREFILL_STEPS})", end="", flush=True)
+    print("Compiling and executing fast pre-fill on GPU...")
+    
+    @jax.jit
+    def run_prefill(rng_key, b_state, e_state, e_obs):
+        def _step(carry, _):
+            curr_b, curr_e_state, curr_e_obs, curr_rng = carry
+            curr_rng, act_rng, step_rng = jax.random.split(curr_rng, 3)
             
-    # Print a newline once the loop is complete so the next prints start fresh
-    print()
+            raw_acts = jax.random.uniform(act_rng, (NUM_ENVS, ACTION_DIM), minval=-1.0, maxval=1.0)
+            env_acts = scale_actions_batched(raw_acts, curr_e_state.env_state.max_v)
+            
+            s_keys = jax.random.split(step_rng, NUM_ENVS)
+            next_obs, next_state, rews, dones, _ = vmap_step(s_keys, curr_e_state, env_acts, 3.0, -1)
+            
+            next_b = add_batch(curr_b, curr_e_obs, raw_acts, rews, dones)
+            return (next_b, next_state, next_obs, curr_rng), None
+
+        # Esegue 1000 step internamente alla GPU
+        (final_b, final_e_state, final_e_obs, _), _ = jax.lax.scan(
+            _step, (b_state, e_state, e_obs, rng_key), None, length=PREFILL_STEPS
+        )
+        return final_b, final_e_state, final_e_obs
+
+    t_prefill = time.time()
+    buffer_state, env_state, env_obs = run_prefill(rng, buffer_state, env_state, env_obs)
+    
+    # Costringe Python ad aspettare che la GPU finisca prima di stampare
+    buffer_state.insert_idx.block_until_ready() 
+    print(f"Pre-fill complete in {time.time() - t_prefill:.2f} seconds!\n")
 
     # 5. Main loop
     print("Starting Main Training Loop...")
