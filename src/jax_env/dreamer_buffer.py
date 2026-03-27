@@ -41,16 +41,6 @@ def init_buffer(capacity: int, num_envs: int,
     )
 
 
-def buffer_ready(buffer_state: ReplayBufferState, seq_len: int) -> bool:
-    """
-    Python-level guard: returns True once the buffer contains at least
-    seq_len + 1 timesteps so that sample_sequences has at least one valid
-    non-degenerate window to draw from. Call this before train_step.
-    """
-    filled = (int(buffer_state.is_full) * int(buffer_state.obs.shape[0])
-              + (1 - int(buffer_state.is_full)) * int(buffer_state.insert_idx))
-    return filled > seq_len
-
 
 @jax.jit
 def add_batch(buffer_state: ReplayBufferState,
