@@ -59,9 +59,9 @@ class RSSM(nn.Module):
     @nn.compact
     def __call__(self):
         # We will not use the standard __call__ directly.
-        # We define explicit methods for Prior, Posterior, and Step.
         pass
 
+    @nn.compact  # <-- ADD THIS
     def step_gru(self, h_prev: jnp.ndarray, z_prev: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
         """
         Advances the deterministic hidden state.
@@ -69,11 +69,11 @@ class RSSM(nn.Module):
         """
         x = jnp.concatenate([z_prev, action], axis=-1)
         x = nn.relu(nn.Dense(DETERMINISTIC_SIZE)(x))
-        # Flax GRUCell expects (carry, inputs) and returns (new_carry, output)
         gru = nn.GRUCell(features=DETERMINISTIC_SIZE)
         new_h, _ = gru(h_prev, x)
         return new_h
 
+    @nn.compact  # <-- ADD THIS
     def prior(self, h_t: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """
         Predicts the next stochastic state WITHOUT seeing the observation.
@@ -82,11 +82,11 @@ class RSSM(nn.Module):
         logits = nn.Dense(NUM_CATEGORIES * CATEGORY_SIZE)(x)
         logits = logits.reshape(logits.shape[:-1] + (NUM_CATEGORIES, CATEGORY_SIZE))
         
-        # Instantiate the straight-through sampler
         sampler = CategoricalStraightThrough()
         z_t = sampler(logits, sample=True)
         return z_t, logits
 
+    @nn.compact  # <-- ADD THIS
     def posterior(self, h_t: jnp.ndarray, obs_embed: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """
         Calculates the stochastic state USING the actual observation.
@@ -99,7 +99,7 @@ class RSSM(nn.Module):
         sampler = CategoricalStraightThrough()
         z_t = sampler(logits, sample=True)
         return z_t, logits
-
+        
 class DreamerEncoder(nn.Module):
     """
     Re-uses your optimized 1D CNN architecture to encode LiDAR and state vectors.
