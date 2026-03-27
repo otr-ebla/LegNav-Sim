@@ -343,19 +343,19 @@ if __name__ == "__main__":
         env_state = next_state
 
         # BUG 7 FIX: only call train_step once the buffer has enough data
-        if buffer_ready(buffer_state, SEQ_LEN):
-            params, opt_states, metrics = train_step(
-                train_rng, buffer_state, params, opt_states)
+        # Execute the monolithic JIT update directly
+        params, opt_states, metrics = train_step(
+            train_rng, buffer_state, params, opt_states)
 
-            if step % 100 == 0:
-                fps = NUM_ENVS / (time.time() - t0)
-                print(
-                    f"Step {step:05d} | "
-                    f"WM: {metrics['wm_loss']:.3f} | "
-                    f"Actor: {metrics['actor_loss']:.3f} | "
-                    f"Critic: {metrics['critic_loss']:.3f} | "
-                    f"KL: {metrics['kl_loss']:.3f} | "
-                    f"FPS: {fps:.0f}"
-                )
+        if step % 100 == 0:
+            fps = NUM_ENVS / (time.time() - t0)
+            print(
+                f"Step {step:05d} | "
+                f"WM: {metrics['wm_loss']:.3f} | "
+                f"Actor: {metrics['actor_loss']:.3f} | "
+                f"Critic: {metrics['critic_loss']:.3f} | "
+                f"KL: {metrics['kl_loss']:.3f} | "
+                f"FPS: {fps:.0f}"
+            )
 
     print("Training Complete.")
