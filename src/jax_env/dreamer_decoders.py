@@ -76,9 +76,9 @@ def compute_kl_loss(prior_logits: jnp.ndarray, posterior_logits: jnp.ndarray, fr
         axis=-1
     )
 
-    # Apply free nats (free bits) clipping to prevent over-regularization early in training
-    kl_prior_loss = jnp.maximum(jnp.mean(kl_prior), free_nats)
-    kl_posterior_loss = jnp.maximum(jnp.mean(kl_posterior), free_nats)
+    # Apply free nats (free bits) clipping PER-ELEMENT to prevent dimension collapse
+    kl_prior_loss = jnp.mean(jnp.maximum(kl_prior, free_nats))
+    kl_posterior_loss = jnp.mean(jnp.maximum(kl_posterior, free_nats))
 
     # DreamerV3 balancing formulation
     loss = 0.8 * kl_prior_loss + 0.2 * kl_posterior_loss

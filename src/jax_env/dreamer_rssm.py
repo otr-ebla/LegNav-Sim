@@ -56,48 +56,46 @@ class RSSM(nn.Module):
     """
     action_dim: int
     
-    @nn.compact
+    def setup(self):
+        # Define all sub-modules here so Flax tracks their weights globally
+        self.cell = nn.GRUCell(features=DETERMINISTIC_SIZE)
+        self.step_dense = nn.Dense(DETERMINISTIC_SIZE)
+        
+        self.prior_dense1 = nn.Dense(DETERMINISTIC_SIZE)
+        self.prior_dense2 = nn.Dense(NUM_CATEGORIES * CATEGORY_SIZE)
+        
+        self.post_dense1 = nn.Dense(DETERMINISTIC_SIZE)
+        self.post_dense2 = nn.Dense(NUM_CATEGORIES * CATEGORY_SIZE)
+        
+        self.sampler = CategoricalStraightThrough()
+
     def __call__(self):
-        # We will not use the standard __call__ directly.
         pass
 
-    @nn.compact  # <-- ADD THIS
     def step_gru(self, h_prev: jnp.ndarray, z_prev: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
-        """
-        Advances the deterministic hidden state.
-        h_t = GRU(h_{t-1}, [z_{t-1}, a_{t-1}])
-        """
+        """Advances the deterministic hidden state."""
         x = jnp.concatenate([z_prev, action], axis=-1)
-        x = nn.relu(nn.Dense(DETERMINISTIC_SIZE)(x))
-        gru = nn.GRUCell(features=DETERMINISTIC_SIZE)
-        new_h, _ = gru(h_prev, x)
+        x = nn.relu(self.step_dense(x))
+        new_h, _ = self.cell(h_prev, x)
         return new_h
 
-    @nn.compact  # <-- ADD THIS
     def prior(self, h_t: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        """
-        Predicts the next stochastic state WITHOUT seeing the observation.
-        """
-        x = nn.relu(nn.Dense(DETERMINISTIC_SIZE)(h_t))
-        logits = nn.Dense(NUM_CATEGORIES * CATEGORY_SIZE)(x)
+        """Predicts the stochastic state WITHOUT the observation."""
+        x = nn.relu(self.prior_dense1(h_t))
+        logits = self.prior_dense2(x)
         logits = logits.reshape(logits.shape[:-1] + (NUM_CATEGORIES, CATEGORY_SIZE))
         
-        sampler = CategoricalStraightThrough()
-        z_t = sampler(logits, sample=True)
+        z_t = self.sampler(logits, sample=True)
         return z_t, logits
 
-    @nn.compact  # <-- ADD THIS
     def posterior(self, h_t: jnp.ndarray, obs_embed: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        """
-        Calculates the stochastic state USING the actual observation.
-        """
+        """Calculates the stochastic state USING the observation."""
         x = jnp.concatenate([h_t, obs_embed], axis=-1)
-        x = nn.relu(nn.Dense(DETERMINISTIC_SIZE)(x))
-        logits = nn.Dense(NUM_CATEGORIES * CATEGORY_SIZE)(x)
+        x = nn.relu(self.post_dense1(x))
+        logits = self.post_dense2(x)
         logits = logits.reshape(logits.shape[:-1] + (NUM_CATEGORIES, CATEGORY_SIZE))
         
-        sampler = CategoricalStraightThrough()
-        z_t = sampler(logits, sample=True)
+        z_t = self.sampler(logits, sample=True)
         return z_t, logits
         
 class DreamerEncoder(nn.Module):

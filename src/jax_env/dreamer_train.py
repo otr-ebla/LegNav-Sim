@@ -43,52 +43,37 @@ cont_decoder = ContinueDecoder()
 actor = DreamerActor(action_dim=2)
 critic = DreamerCritic()
 
-def scan_rssm(wm_params: dict, obs_seq: jnp.ndarray, act_seq: jnp.ndarray) -> tuple:
-    """
-    Unrolls the RSSM over the L=64 temporal sequence.
-    """
+def scan_rssm(wm_params: dict, obs_seq: jnp.ndarray, act_seq: jnp.ndarray, rng_key: jnp.ndarray) -> tuple:
     def step(carry, inputs):
-        h_prev, z_prev = carry
+        h_prev, z_prev, current_rng = carry
         obs_t, act_prev = inputs
         
-        # 1. Deterministic step
-        h_t = rssm.apply({'params': wm_params['rssm']}, h_prev, z_prev, act_prev, method=rssm.step_gru)
+        # Split RNG for the Gumbel samplers
+        current_rng, post_key, prior_key = jax.random.split(current_rng, 3)
         
-        # 2. Encode observation
+        h_t = rssm.apply({'params': wm_params['rssm']}, h_prev, z_prev, act_prev, method=rssm.step_gru)
         obs_embed = encoder.apply({'params': wm_params['encoder']}, obs_t)
         
-        # 3. Compute Posterior (uses observation)
-        z_t, post_logits = rssm.apply({'params': wm_params['rssm']}, h_t, obs_embed, method=rssm.posterior)
+        # Pass the gumbel rngs stream to allow sampling
+        z_t, post_logits = rssm.apply({'params': wm_params['rssm']}, h_t, obs_embed, method=rssm.posterior, rngs={'gumbel': post_key})
+        _, prior_logits = rssm.apply({'params': wm_params['rssm']}, h_t, method=rssm.prior, rngs={'gumbel': prior_key})
         
-        # 4. Compute Prior (guesses without observation)
-        _, prior_logits = rssm.apply({'params': wm_params['rssm']}, h_t, method=rssm.prior)
-        
-        return (h_t, z_t), (h_t, z_t, prior_logits, post_logits)
+        return (h_t, z_t, current_rng), (h_t, z_t, prior_logits, post_logits)
 
-    # Initialize h_0 and z_0 with zeros
     batch_sz = obs_seq.shape[0]
     h_0 = jnp.zeros((batch_sz, 512))
     z_0 = jnp.zeros((batch_sz, 32 * 32))
-    
-    # We shift actions by 1 to represent act_{t-1}. Pad the first step with zero action.
     act_prev = jnp.concatenate([jnp.zeros((batch_sz, 1, 2)), act_seq[:, :-1, :]], axis=1)
     
-    # Scan over the sequence length dimension (axis 1)
-    # Swap axes so time is the leading dimension for jax.lax.scan
     obs_seq_t = jnp.swapaxes(obs_seq, 0, 1)
     act_prev_t = jnp.swapaxes(act_prev, 0, 1)
     
     _, (h_states, z_states, prior_logits, post_logits) = jax.lax.scan(
-        step, (h_0, z_0), (obs_seq_t, act_prev_t)
+        step, (h_0, z_0, rng_key), (obs_seq_t, act_prev_t)
     )
     
-    # Swap axes back to [Batch, Seq, Feature]
-    return (
-        jnp.swapaxes(h_states, 0, 1),
-        jnp.swapaxes(z_states, 0, 1),
-        jnp.swapaxes(prior_logits, 0, 1),
-        jnp.swapaxes(post_logits, 0, 1)
-    )
+    return (jnp.swapaxes(h_states, 0, 1), jnp.swapaxes(z_states, 0, 1),
+            jnp.swapaxes(prior_logits, 0, 1), jnp.swapaxes(post_logits, 0, 1))
 
 @partial(jax.jit, static_argnums=(4,))
 def train_step(rng_key, buffer_state, params, opt_states, max_goal_dist):
@@ -102,7 +87,7 @@ def train_step(rng_key, buffer_state, params, opt_states, max_goal_dist):
     
     # --- A. WORLD MODEL UPDATE ---
     def wm_loss_fn(wm_params):
-        h_states, z_states, prior_logits, post_logits = scan_rssm(wm_params, obs_seq, act_seq)
+        h_states, z_states, prior_logits, post_logits = scan_rssm(wm_params, obs_seq, act_seq, k_wm)
         
         obs_pred = obs_decoder.apply({'params': wm_params['obs']}, h_states, z_states)
         rew_pred = rew_decoder.apply({'params': wm_params['rew']}, h_states, z_states)
@@ -134,7 +119,7 @@ def train_step(rng_key, buffer_state, params, opt_states, max_goal_dist):
         traj, _, _ = unroll_imagination(
             k_actor, 
             lambda p, h, z, a: rssm.apply({'params': p}, h, z, a, method=rssm.step_gru),
-            lambda p, h, k: rssm.apply({'params': p}, h, method=rssm.prior),
+            lambda p, h, k: rssm.apply({'params': p}, h, method=rssm.prior, rngs={'gumbel': k}),
             lambda p, h, z: actor.apply({'params': p}, h, z),
             {'rssm': jax.lax.stop_gradient(new_wm_params['rssm']), 'actor': actor_params},
             start_h, start_z, HORIZON
@@ -197,27 +182,20 @@ def train_step(rng_key, buffer_state, params, opt_states, max_goal_dist):
     
     return new_params, new_opt_states, metrics
 
-@partial(jax.jit, static_argnums=(4,))
+@partial(jax.jit, static_argnums=(7,))
 def act_step(rng_key, wm_params, actor_params, obs, prev_h, prev_z, prev_action, explore: bool = True):
-    """
-    Tracks the latent state and samples an action from the trained Actor.
-    Runs entirely on the GPU to keep inference blazingly fast.
-    """
-    # 1. Encode the current observation
-    obs_embed = encoder.apply({'params': wm_params['encoder']}, obs)
+    rng_key, post_key, act_key = jax.random.split(rng_key, 3)
     
-    # 2. Advance the deterministic state (GRU)
+    obs_embed = encoder.apply({'params': wm_params['encoder']}, obs)
     h_t = rssm.apply({'params': wm_params['rssm']}, prev_h, prev_z, prev_action, method=rssm.step_gru)
     
-    # 3. Compute the posterior stochastic state
-    z_t, _ = rssm.apply({'params': wm_params['rssm']}, h_t, obs_embed, method=rssm.posterior)
+    # Provide the gumbel stream
+    z_t, _ = rssm.apply({'params': wm_params['rssm']}, h_t, obs_embed, method=rssm.posterior, rngs={'gumbel': post_key})
     
-    # 4. Get the action distribution from the Actor
     mean, std = actor.apply({'params': actor_params}, h_t, z_t)
     
-    # 5. Sample the action (with exploration noise) or take the mean (for evaluation)
     if explore:
-        action, _ = sample_action(rng_key, mean, std)
+        action, _ = sample_action(act_key, mean, std)
     else:
         action = jnp.tanh(mean)
         
