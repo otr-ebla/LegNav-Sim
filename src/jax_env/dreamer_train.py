@@ -18,7 +18,23 @@ Fixes vs submitted version:
     always discarded). Call sites updated accordingly.
 """
 
+import os
+import argparse
+
+# 1. Forza le variabili d'ambiente PRIMA di importare JAX
+parser = argparse.ArgumentParser(description="DreamerV3 Training")
+parser.add_argument("--gpu", type=str, default="0", help="Target GPU ID")
+args, _ = parser.parse_known_args()
+
+os.environ["CUDA_VISIBLE_DEVICES"]           = args.gpu
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.88"
+os.environ["TF_GPU_ALLOCATOR"]               = "cuda_malloc_async"
+
 import jax
+# 2. Impedisce il fallback silenzioso: se non c'è CUDA, deve crashare
+jax.config.update("jax_platform_name", "cuda")
+jax.config.update("jax_default_device", jax.devices("cuda")[0])
+
 import jax.numpy as jnp
 import optax
 import time
