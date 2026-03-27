@@ -53,6 +53,7 @@ class CategoricalStraightThrough(nn.Module):
 
     @nn.compact
     def __call__(self, logits: jnp.ndarray) -> jnp.ndarray:
+        logits = jnp.clip(logits, -20.0, 20.0) 
         probs = jax.nn.softmax(logits, axis=-1)
 
         if self.sample:

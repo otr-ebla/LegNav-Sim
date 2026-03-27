@@ -260,6 +260,75 @@ def act_step(rng_key, wm_params, actor_params, obs,
 
     return action, h_t, z_t
 
+
+
+
+@partial(jax.jit, static_argnums=(4,))
+def train_loop_chunk(rng_key, buffer_state, params, opt_states, 
+                     env_obs, env_state, current_h, current_z, current_action,
+                     chunk_size=50):
+    
+    def single_step(carry, _):
+        (b_state, p, opt, h, z, a, obs, e_state, key) = carry
+        key, act_k, step_k, train_k = jax.random.split(key, 4)
+
+        # 1. Inferenza (act_step)
+        raw_acts, next_h, next_z = act_step(
+            act_k, p['wm'], p['actor'], obs, h, z, a, explore=True)
+        
+        # 2. Ambiente (vmap_step)
+        env_acts = scale_actions_batched(raw_acts, e_state.env_state.max_v)
+        s_keys = jax.random.split(step_k, NUM_ENVS)
+        n_obs, n_e_state, rews, dones, _ = vmap_step(s_keys, e_state, env_acts, 3.0, -1)
+
+        # 3. Aggiornamento Buffer
+        new_b_state = add_batch(b_state, obs, raw_acts, rews, dones)
+
+        # 4. Training Step (Monolithic update)
+        new_p, new_opt, metrics = train_step(train_k, new_b_state, p, opt)
+
+        # Reset stati RSSM per env terminati (Fix Bug 6)
+        alive = (~dones).astype(jnp.float32)[:, None]
+        next_h *= alive
+        next_z *= alive
+        
+        next_carry = (new_b_state, new_p, new_opt, next_h, next_z, raw_acts, n_obs, n_e_state, key)
+        return next_carry, metrics
+
+    init_carry = (buffer_state, params, opt_states, current_h, current_z, current_action, env_obs, env_state, rng_key)
+    final_carry, metrics_history = jax.lax.scan(single_step, init_carry, None, length=chunk_size)
+    return final_carry, metrics_history
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -277,16 +346,16 @@ if __name__ == "__main__":
     # 2. Replay buffer
     buffer_state = init_buffer(BUFFER_CAPACITY, NUM_ENVS, OBS_DIM, ACTION_DIM)
 
-    # 3. Parameters — BUG 1 FIX: init via __call__ to register ALL sub-layers
+    # 3. Parameters Initialization
     dummy_obs   = jnp.zeros((1, OBS_DIM))
     dummy_h     = jnp.zeros((1, H_DIM))
     dummy_z     = jnp.zeros((1, Z_DIM))
     dummy_act   = jnp.zeros((1, ACTION_DIM))
     dummy_embed = jnp.zeros((1, H_DIM))
 
-    rng, r1, r2, r3 = jax.random.split(rng, 4)
+    rng, r1, r2 = jax.random.split(rng, 3)
 
-    # Use __call__ for rssm init so every sub-layer is touched
+    # Bug 1 Fix: init via __call__
     rssm_params = rssm.init(
         {'params': r1, 'gumbel': r2},
         dummy_h, dummy_z, dummy_act, dummy_embed,
@@ -310,30 +379,26 @@ if __name__ == "__main__":
         'critic': opt_critic.init(params['critic']),
     }
 
+    # Tracking degli stati RSSM e azioni tra i chunk
     current_h      = jnp.zeros((NUM_ENVS, H_DIM))
     current_z      = jnp.zeros((NUM_ENVS, Z_DIM))
     current_action = jnp.zeros((NUM_ENVS, ACTION_DIM))
 
-    # 4. Prefill
+    # 4. Prefill (GPU-side)
     print("Compiling and executing fast pre-fill on GPU...")
     
-
-    @jax.jit(donate_argnums=(1,))
+    @jax.jit
     def run_prefill(rng_key, b_state, e_state, e_obs):
         def _step(carry, _):
             curr_b, curr_e_state, curr_e_obs, curr_rng = carry
             curr_rng, act_rng, step_rng = jax.random.split(curr_rng, 3)
-            
             raw_acts = jax.random.uniform(act_rng, (NUM_ENVS, ACTION_DIM), minval=-1.0, maxval=1.0)
             env_acts = scale_actions_batched(raw_acts, curr_e_state.env_state.max_v)
-            
             s_keys = jax.random.split(step_rng, NUM_ENVS)
-            next_obs, next_state, rews, dones, _ = vmap_step(s_keys, curr_e_state, env_acts, 3.0, -1)
-            
+            n_obs, n_state, rews, dones, _ = vmap_step(s_keys, curr_e_state, env_acts, 3.0, -1)
             next_b = add_batch(curr_b, curr_e_obs, raw_acts, rews, dones)
-            return (next_b, next_state, next_obs, curr_rng), None
+            return (next_b, n_state, n_obs, curr_rng), None
 
-        # Esegue 1000 step internamente alla GPU
         (final_b, final_e_state, final_e_obs, _), _ = jax.lax.scan(
             _step, (b_state, e_state, e_obs, rng_key), None, length=PREFILL_STEPS
         )
@@ -341,66 +406,53 @@ if __name__ == "__main__":
 
     t_prefill = time.time()
     buffer_state, env_state, env_obs = run_prefill(rng, buffer_state, env_state, env_obs)
-    
-    # Costringe Python ad aspettare che la GPU finisca prima di stampare
     buffer_state.insert_idx.block_until_ready() 
-    print(f"Pre-fill complete in {time.time() - t_prefill:.2f} seconds!\n")
+    print(f"Pre-fill complete in {time.time() - t_prefill:.2f}s!\n")
 
-    # 5. Main loop
-    print("Starting Main Training Loop...")
-    for step in range(50_000):
+    # 5. Main Training Loop (Mega-JIT)
+    print("Starting Optimized Main Training Loop...")
+    CHUNK_SIZE = 50  # Numero di step eseguiti interamente su GPU per ogni iterazione Python
+    TOTAL_STEPS = 50_000
+    
+    for step in range(0, TOTAL_STEPS, CHUNK_SIZE):
         t0 = time.time()
-        rng, act_rng, step_rng, train_rng = jax.random.split(rng, 4)
+        
+        # Chiamata al Mega-JIT Loop
+        # Assicurati che train_loop_chunk sia definita nel tuo file
+        final_carry, metrics_history = train_loop_chunk(
+            rng, buffer_state, params, opt_states,
+            env_obs, env_state, current_h, current_z, current_action,
+            chunk_size=CHUNK_SIZE
+        )
+        
+        # Unpack dei risultati per il prossimo chunk
+        (buffer_state, params, opt_states, 
+         current_h, current_z, current_action, 
+         env_obs, env_state, rng) = final_carry
 
-        raw_actions, current_h, current_z = act_step(
-            act_rng, params['wm'], params['actor'],
-            env_obs, current_h, current_z, current_action, explore=True)
-        current_action = raw_actions
-
-        env_actions = scale_actions_batched(raw_actions, env_state.env_state.max_v)
-        step_keys   = jax.random.split(step_rng, NUM_ENVS)
-        next_obs, next_state, rewards, dones, _ = vmap_step(
-            step_keys, env_state, env_actions, 3.0, -1)
-
-        buffer_state = add_batch(buffer_state, env_obs, raw_actions, rewards, dones)
-
-        # BUG 6 FIX: explicit bool→float cast, not `1.0 - dones`
-        alive          = (~dones).astype(jnp.float32)[:, None]
-        current_h      = current_h      * alive
-        current_z      = current_z      * alive
-        current_action = current_action * alive
-
-        env_obs   = next_obs
-        env_state = next_state
-
-        # BUG 7 FIX: only call train_step once the buffer has enough data
-        # Execute the monolithic JIT update directly
-        params, opt_states, metrics = train_step(
-            train_rng, buffer_state, params, opt_states)
-
+        # Logging (usiamo la media dei valori nel chunk per precisione)
         if step % 100 == 0:
-            fps = NUM_ENVS / (time.time() - t0)
+            avg_wm     = jnp.mean(metrics_history['wm_loss'])
+            avg_actor  = jnp.mean(metrics_history['actor_loss'])
+            avg_critic = jnp.mean(metrics_history['critic_loss'])
+            fps        = (NUM_ENVS * CHUNK_SIZE) / (time.time() - t0)
+            
             print(
                 f"Step {step:05d} | "
-                f"WM: {metrics['wm_loss']:.3f} | "
-                f"Actor: {metrics['actor_loss']:.3f} | "
-                f"Critic: {metrics['critic_loss']:.3f} | "
-                f"KL: {metrics['kl_loss']:.3f} | "
+                f"WM: {avg_wm:.3f} | "
+                f"Actor: {avg_actor:.3f} | "
+                f"Critic: {avg_critic:.3f} | "
                 f"FPS: {fps:.0f}"
             )
 
     print("Training Complete.")
-
-    print("Training Complete.")
     
-    # --- SALVATAGGIO CHECKPOINT ---
+    # 6. Checkpoint Saving
     import os
     import flax.serialization
-    
     os.makedirs("checkpoints", exist_ok=True)
     ckpt_path = "checkpoints/dreamer_best.msgpack"
     
-    # Salviamo solo i parametri necessari per l'inferenza
     eval_params = {
         'encoder': jax.device_get(params['wm']['encoder']),
         'rssm': jax.device_get(params['wm']['rssm']),
@@ -409,4 +461,4 @@ if __name__ == "__main__":
     
     with open(ckpt_path, "wb") as f:
         f.write(flax.serialization.to_bytes(eval_params))
-    print(f"Checkpoint salvato con successo in {ckpt_path}!")
+    print(f"Checkpoint salvato in {ckpt_path}!")
