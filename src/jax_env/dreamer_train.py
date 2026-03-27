@@ -263,7 +263,7 @@ def act_step(rng_key, wm_params, actor_params, obs,
 
 
 
-@partial(jax.jit, static_argnums=(4,))
+@partial(jax.jit, static_argnames=('chunk_size',))
 def train_loop_chunk(rng_key, buffer_state, params, opt_states, 
                      env_obs, env_state, current_h, current_z, current_action,
                      chunk_size=50):
