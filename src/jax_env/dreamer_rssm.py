@@ -1,23 +1,6 @@
 """
 dreamer_rssm.py — Recurrent State Space Model for DreamerV3
 
-Fixes vs submitted version:
-  - BUG 1 FIXED: RSSM.init() now called through __call__ so all sub-layer
-    weights are registered in one shot.
-  - BUG 2 FIXED: CategoricalStraightThrough `sample` is a static Module field,
-    not a runtime argument, eliminating Python branches inside JIT-traced code.
-
-Architectural upgrades:
-  - BLOCK GRU: nn.GRUCell(512) replaced with BlockDiagonalGRU(num_blocks=8,
-    block_size=64). The monolithic GRU scales O(N^2) in recurrent parameters
-    and FLOPs. The block-diagonal variant partitions hidden state into 8
-    independent blocks of size 64 — same total capacity (512), but each block
-    only attends to its own slice. Recurrent parameter count drops from
-    512x512 = 262144 to 8x(64x64) = 32768 per gate — an 8x reduction.
-    XLA fuses the vmapped block matmuls into a single batched kernel.
-  - LAYER NORM: nn.LayerNorm injected after every Dense and before every swish
-    activation in the GRU input projection and prior/posterior heads. Prevents
-    internal covariate shift under symlog-distorted gradient magnitudes.
 """
 
 import jax

@@ -1,17 +1,6 @@
 """
 dreamer_buffer.py — Vectorized Sequence Replay Buffer for DreamerV3
 
-Fixes vs submitted version:
-  - BUG 3 FIXED: episode boundary crossing. A causal alive-mask is now applied
-    inside extract_seq so that rewards and dones are zeroed from the first
-    terminal step onward within each sampled window. The RSSM no longer sees
-    contradictory cross-episode transitions.
-  - BUG 4 FIXED: max_valid_idx can be ~1 when insert_idx < seq_len, making
-    every sample start at t=0. A Python-level buffer_ready() helper is provided
-    for the training loop to gate train_step calls. Inside sample_sequences the
-    floor is now seq_len (not 1) to ensure at least one valid window exists.
-  - BUG D FIXED: buffer_ready() helper was promised by the docstring but the
-    function body was entirely absent from the file. Added below init_buffer().
 """
 
 import functools

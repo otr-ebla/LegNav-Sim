@@ -1,33 +1,6 @@
 """
 dreamer_train.py — Main Training Loop for DreamerV3
 
-Bug fixes:
-  - BUG 1/2: rssm.init() via __call__ registers all sub-layer weights.
-  - BUG 3/4: episode boundary masking + buffer_ready guard.
-  - BUG 5: removed unused static float arg from train_step jit signature.
-  - BUG 6: done mask coercion fixed to (~dones).astype(jnp.float32).
-  - BUG 7/C: buffer_ready() guard added and actually called in the loop.
-  - BUG 8: global step-fn cache .clear() replaced by fresh closure.
-  - BUG 9: unroll_imagination returns only traj.
-  - BUG A: scan_rssm uses prior_greedy() — no wasted gumbel RNG split.
-  - BUG B: entropy loss double-negation fixed to single negation.
-
-Architectural upgrades:
-  - BLOCK GRU: nn.GRUCell(512) replaced with BlockDiagonalGRU(8 x 64) in
-    dreamer_rssm.py. 8x fewer recurrent parameters, same latent capacity.
-  - LAYER NORM: injected after every Dense before every swish in all MLPs
-    (actor, critic, all decoders, RSSM heads) via dreamer_behavior.py,
-    dreamer_decoders.py, and dreamer_rssm.py.
-  - GRAD CLIPPING: all three Adam optimizers chained with
-    optax.clip_by_global_norm(100.0). Prevents non-stationary RL loss spikes
-    from destroying world-model weights on edge-case environment transitions.
-  - WM WARMUP: actor/critic gradients zeroed for first WM_WARMUP_STEPS steps.
-  - ADVANTAGE NORMALISATION: zero-mean / unit-std per batch before PG weight.
-  - CRITIC TWO-HOT: DreamerCritic outputs 255-bin logits; critic loss uses
-    two_hot_loss. Actor decodes logits to scalars via symexp over bin centres.
-  - REWARD NORMALISATION REMOVED: raw rewards buffered directly; symlog inside
-    two_hot_loss provides scale invariance (anti-V3 EMA division removed).
-  - ALL nn.relu REPLACED WITH nn.swish across every network module.
 """
 
 import os

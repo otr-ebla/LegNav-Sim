@@ -1,11 +1,5 @@
 """
 dreamer_behavior.py — Actor-Critic and Latent Imagination Engine
-
-Architectural upgrades:
-  - LAYER NORM: nn.LayerNorm injected after every Dense and before every swish
-    activation in DreamerActor and DreamerCritic. Prevents internal covariate
-    shift under symlog-distorted reward gradients.
-  - unroll_imagination returns only `traj` (final h/z discarded by all callers).
 """
 
 import jax

@@ -1,15 +1,6 @@
 """
 dreamer_env.py — Environment Initialization for DreamerV3
 
-Fixes vs submitted version:
-  - BUG 8 FIXED: module-level _VMAP_STEP_CACHE was a global dict that called
-    .clear() on every cache miss, silently invalidating any previously compiled
-    step function that external code still held a reference to. Replaced with
-    a plain closure: init_dreamer_envs now compiles and returns vmap_step
-    fresh every call, which is the correct pattern since Flax/JAX JIT caches
-    compilation results internally keyed on the function object anyway.
-    If you truly need caching across calls (e.g. hot-reload in a notebook),
-    pass the result out and reuse it — don't rely on a module-level dict.
 """
 
 import jax

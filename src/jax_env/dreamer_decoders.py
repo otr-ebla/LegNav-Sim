@@ -1,12 +1,6 @@
 """
 dreamer_decoders.py — World Model Decoders and Objective for DreamerV3
 
-Architectural upgrade:
-  - LAYER NORM: nn.LayerNorm injected after every Dense and before every swish
-    activation in ObservationDecoder, RewardDecoder, and ContinueDecoder.
-    Prevents internal covariate shift under symlog-distorted gradient magnitudes.
-Per-element free_nats clipping correctly applied before averaging — matches
-the DreamerV3 paper spec.
 """
 
 import jax
