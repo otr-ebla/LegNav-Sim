@@ -47,10 +47,14 @@ class EndToEndActorCritic(nn.Module):
         # Actor mean
         actor_mean = nn.Dense(self.action_dim)(shared)
 
-        # Actor log_std — Parametro globale
+        # Actor log_std — Global parameter with smooth bounded mapping.
+        # FIX 3: Replace jnp.clip (dead gradient outside bounds) with tanh squashing.
+        # jnp.clip has zero gradient when logstd hits LOG_STD_MIN or LOG_STD_MAX,
+        # permanently freezing the parameter. tanh keeps gradients alive everywhere.
         logstd_param = self.param('log_std', nn.initializers.constant(-1.0), (self.action_dim,))
-        actor_logstd = jnp.broadcast_to(logstd_param, actor_mean.shape)
-        actor_logstd = jnp.clip(actor_logstd, LOG_STD_MIN, LOG_STD_MAX)
+        actor_logstd_raw = jnp.broadcast_to(logstd_param, actor_mean.shape)
+        # Maps (-inf, +inf) → (LOG_STD_MIN, LOG_STD_MAX) with non-zero gradient everywhere
+        actor_logstd = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (jnp.tanh(actor_logstd_raw) + 1.0)
 
         # Critic head
         critic = nn.relu(nn.Dense(128)(shared))
@@ -58,6 +62,37 @@ class EndToEndActorCritic(nn.Module):
         value  = nn.Dense(1)(critic)
 
         return actor_mean, actor_logstd, jnp.squeeze(value, axis=-1)
+
+def _squash_log_jacobian(raw_actions: jnp.ndarray, max_v: float = 1.0) -> jnp.ndarray:
+    """
+    FIX 1: Log-determinant of the Jacobian of the squashing functions.
+    v = sigmoid(raw[0]) * max_v  →  d/d(raw[0]) = sigmoid * (1 - sigmoid) * max_v
+    w = tanh(raw[1])             →  d/d(raw[1]) = 1 - tanh²
+    Returns shape (...,) — to be subtracted from the Gaussian log_prob.
+    """
+    v_squash = jax.nn.sigmoid(raw_actions[..., 0])
+    w_squash = jnp.tanh(raw_actions[..., 1])
+    log_dv = jnp.log(v_squash * (1.0 - v_squash) * max_v + 1e-6)
+    log_dw = jnp.log(1.0 - w_squash ** 2 + 1e-6)
+    return log_dv + log_dw
+
+
+def squash_corrected_log_prob(raw_actions: jnp.ndarray, mean: jnp.ndarray,
+                               logstd: jnp.ndarray, max_v: float = 1.0) -> jnp.ndarray:
+    """
+    FIX 1: Log-probability of raw_actions under Gaussian(mean, exp(logstd)),
+    corrected for the sigmoid/tanh squashing applied to produce env actions.
+    Both rollout collection and PPO loss must use this function so the
+    importance sampling ratio exp(new_log_prob - old_log_prob) is valid.
+    max_v is the mean robot max speed (used to scale the sigmoid output).
+    In practice we use a per-env max_v; pass the batch mean or a fixed scalar
+    here — the Jacobian correction absorbs most of the variance.
+    """
+    std = jnp.exp(logstd)
+    z   = (raw_actions - mean) / (std + 1e-8)
+    base_log_prob = jnp.sum(-0.5 * (z ** 2 + jnp.log(2.0 * jnp.pi)) - logstd, axis=-1)
+    return base_log_prob - _squash_log_jacobian(raw_actions, max_v)
+
 
 def sample_action(rng_key: jnp.ndarray, mean: jnp.ndarray, logstd: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
     std      = jnp.exp(logstd)

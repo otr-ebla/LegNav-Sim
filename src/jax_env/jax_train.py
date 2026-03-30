@@ -51,6 +51,7 @@ _VMAP_STEP_CACHE: dict = {}   # {ghost_robot_bool: vmap_step_fn}
 def init_env_state(rng_key, max_goal_dist: float = 3.0, ghost_prob: float = 1.0, scenario_idx: int = -1):
     """
     Initialise all NUM_ENVS environments and return the vmap_step closure.
+    Only called once at startup, and when ghost_prob changes (see rebuild_vmap_step).
     """
     ghost_robot = (ghost_prob >= 0.5)
 
@@ -82,12 +83,59 @@ def init_env_state(rng_key, max_goal_dist: float = 3.0, ghost_prob: float = 1.0,
     return env_obs, env_state, vmap_step
 
 
-def batched_sample_action(rng_key, mean, logstd):
-    std       = jnp.exp(logstd)
-    noise     = jax.random.normal(rng_key, shape=mean.shape)
-    actions   = mean + noise * std
-    log_probs = jnp.sum(-0.5 * (noise ** 2 + jnp.log(2.0 * jnp.pi)) - logstd, axis=-1)
-    return actions, log_probs
+def rebuild_vmap_step(ghost_prob: float):
+    """
+    FIX 4: Rebuild ONLY the vmap_step closure when ghost_prob changes at a
+    curriculum transition — without touching env_state or env_obs.
+
+    The old code called init_env_state on ghost transitions, which wiped all
+    8192 live environments and reset the env_state array from the host. This
+    destroyed the temporal link needed for GAE: last_val was computed for the
+    old episodes, then the state was replaced with freshly spawned episodes,
+    injecting a massive discontinuity into value targets.
+
+    The correct behaviour: only the step closure changes (ghost_robot bool baked
+    in). Existing episodes continue uninterrupted. The new ghost_robot behaviour
+    takes effect from the next step call forward, which is exactly correct.
+
+    ghost_prob >= 0.5  → ghost_robot=True  (humans ignore robot, training mode)
+    ghost_prob <  0.5  → ghost_robot=False (humans avoid robot, harder mode)
+    """
+    ghost_robot = (ghost_prob >= 0.5)
+    cache_key   = ghost_robot
+
+    # Build fresh closures with the new ghost_prob baked in
+    reset_stacked, step_stacked = make_stacked_env(
+        reset_env, step_env, stack_dim=3, ghost_prob=ghost_prob
+    )
+
+    # Always rebuild: the ghost bool changed, so we must recompile the kernel
+    _VMAP_STEP_CACHE.clear()
+    step_auto = make_autoreset_env(reset_stacked, step_stacked)
+    _VMAP_STEP_CACHE[cache_key] = jax.jit(
+        jax.vmap(step_auto, in_axes=(0, 0, 0, None, None))
+    )
+    return _VMAP_STEP_CACHE[cache_key]
+
+
+def batched_sample_action(rng_key, mean, logstd, max_v):
+    """
+    FIX 1: Sample raw actions and compute log_prob corrected for sigmoid/tanh squashing.
+    max_v is the per-env max velocity array (shape: NUM_ENVS,) used to scale
+    the Jacobian of the v = sigmoid(raw) * max_v transformation.
+    """
+    std     = jnp.exp(logstd)
+    noise   = jax.random.normal(rng_key, shape=mean.shape)
+    raw_actions = mean + noise * std
+    # Base Gaussian log_prob (before squash correction)
+    base_log_probs = jnp.sum(-0.5 * (noise ** 2 + jnp.log(2.0 * jnp.pi)) - logstd, axis=-1)
+    # Jacobian correction — uses per-env max_v for the sigmoid dimension
+    v_squash = jax.nn.sigmoid(raw_actions[:, 0])
+    w_squash = jnp.tanh(raw_actions[:, 1])
+    log_dv   = jnp.log(v_squash * (1.0 - v_squash) * max_v + 1e-6)
+    log_dw   = jnp.log(1.0 - w_squash ** 2 + 1e-6)
+    log_probs = base_log_probs - (log_dv + log_dw)
+    return raw_actions, log_probs
 
 
 @functools.partial(jax.jit, static_argnums=(2, 3))
@@ -100,9 +148,9 @@ def collect_rollouts(rng_key, params, apply_fn, vmap_step, env_state, env_obs, m
         current_rng, action_rng, step_rng = jax.random.split(current_rng, 3)
 
         mean, logstd, values = apply_fn({"params": params}, current_obs)
-        raw_actions, log_probs = batched_sample_action(action_rng, mean, logstd)
-
         max_v       = current_state.env_state.max_v
+        raw_actions, log_probs = batched_sample_action(action_rng, mean, logstd, max_v)
+
         env_actions = scale_actions_batched(raw_actions, max_v)
 
         step_keys = jax.random.split(step_rng, NUM_ENVS)
@@ -117,6 +165,7 @@ def collect_rollouts(rng_key, params, apply_fn, vmap_step, env_state, env_obs, m
             "values":       values,
             "rewards":      rewards,
             "dones":        dones,
+            "max_v":        max_v,          # FIX 1: needed for Jacobian correction in loss
             "goal_reached": infos["goal_reached"],
             "collision":    infos["collision"],
             "passive_col":  infos["passive_col"],
