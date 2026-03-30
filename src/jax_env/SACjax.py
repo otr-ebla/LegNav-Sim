@@ -4,9 +4,17 @@ SACjax.py — Soft Actor-Critic (shared-encoder, fused-JIT)
 Architecture:
   - ONE shared encoder (ep) updated only through critic loss.
   - Actor head receives stop_gradient(feat_obs) — no separate encoder params.
-  - Target network: EMA of critic head only (thp); encoder is shared, no tep.
+  - Target encoder (tep) tracks online encoder via EMA — used for target Q only.
+  - Target critic head (thp) tracks online critic head via EMA.
   - extract_max_v called ONCE per collection step; stored in buffer.
   - vmap_step is NOT jit-wrapped here — outer train_chunk JIT fuses naturally.
+  - No reward scaling — alpha auto-tunes from a conservative init.
+
+Fixes applied:
+  1. BUFFER_CAP 5M, LOG_EVERY 50 — buffer no longer fully overwritten per chunk.
+  2. tep restored — target Q uses a slow-moving encoder, not the volatile online one.
+  3. REWARD_SCALE removed — raw rewards, alpha starts at 0.01, target entropy -1.0.
+  4. Single enc(next_obs) pass in critic loss — no redundant CNN forward.
 """
 
 import os
@@ -34,17 +42,16 @@ from jax_wrappers import make_stacked_env, make_autoreset_env
 OBS_SIZE       = 342        # 9 (pose) + 9 (state_vec) + 324 (lidar)
 ACTION_DIM     = 2
 N_ENVS         = 2048
-BUFFER_CAP     = 1_000_000
+BUFFER_CAP     = 5_000_000  # FIX 1: 5M — never overwritten in a single chunk
 BATCH_SIZE     = 2048
 WARMUP_STEPS   = 10_000
 GAMMA          = 0.99
 TAU            = 0.005
 LR             = 3e-4
-TARGET_ENTROPY = -float(ACTION_DIM)   # -2.0
+TARGET_ENTROPY = -1.0       # FIX 3: softer than -|A|=-2.0; balances exploration
 TOTAL_UPDATES  = 200_000
-LOG_EVERY      = 500
+LOG_EVERY      = 50         # FIX 1: 2048*50=102k << 5M buffer — proper off-policy
 SAVE_EVERY     = 5000
-REWARD_SCALE   = 20.0
 MAX_GRAD_NORM  = 10.0
 
 # pose_stack indices 0-8; state_vec[2] = max_v/2 at flat index 9+2 = 11
@@ -77,11 +84,10 @@ reset_stacked, step_stacked = make_stacked_env(reset_env, step_env, stack_dim=3)
 
 def init_env_state(rng_key, max_goal_dist: float = 3.0, scenario_idx: int = -1):
     """Build vmapped step/reset, initialise all envs. Returns (obs, state, vmap_step).
-    vmap_step is NOT jit-wrapped here — the outer train_chunk JIT fuses it.
+    vmap_step is NOT jit-wrapped — the outer train_chunk JIT fuses it.
     """
-    step_auto  = make_autoreset_env(reset_stacked, step_stacked)
-    # No jax.jit here: let train_chunk's top-level JIT own the full graph.
-    vmap_step  = jax.vmap(step_auto, in_axes=(0, 0, 0, None, None))
+    step_auto = make_autoreset_env(reset_stacked, step_stacked)
+    vmap_step = jax.vmap(step_auto, in_axes=(0, 0, 0, None, None))
 
     def _reset(key):
         return reset_stacked(key, max_goal_dist=max_goal_dist, scenario_idx=scenario_idx)
@@ -121,11 +127,7 @@ class ObsEncoder(nn.Module):
         return nn.relu(nn.Dense(128)(shared))
 
 
-# ── Split-head networks ───────────────────────────────────────────────────────
-# ONE shared encoder (ep) — updated only through critic loss.
-# Actor head receives stop_gradient(feat) so encoder gradients come
-# exclusively from the Bellman backup signal — the more stable of the two.
-# Target network = EMA of critic HEAD only (thp); encoder is already shared.
+# ── Head networks ─────────────────────────────────────────────────────────────
 
 class ActorHead(nn.Module):
     action_dim:  int   = ACTION_DIM
@@ -164,11 +166,11 @@ critic_head = CriticHead()
 
 # ── Optimisers ────────────────────────────────────────────────────────────────
 # Three param groups: shared encoder (ep), actor head (ahp), critic head (chp).
-# encoder is updated via critic loss only — one optimiser for ep.
-enc_opt    = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
+# Encoder updated via critic loss only.
+enc_opt         = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
 head_actor_opt  = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
 head_critic_opt = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
-alpha_opt  = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
+alpha_opt       = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
 
 
 # ── Action squashing + exact log-prob ─────────────────────────────────────────
@@ -203,7 +205,6 @@ def extract_max_v(obs):
 
 
 # ── Replay buffer (on-GPU circular) ───────────────────────────────────────────
-# max_v stored per transition so the hot loop never re-slices obs.
 def make_buffer(capacity):
     return {
         "obs":      jnp.zeros((capacity, OBS_SIZE),   jnp.float32),
@@ -243,70 +244,72 @@ def buf_sample(buf, rng_key, batch_size: int):
 
 # ── SAC update step ───────────────────────────────────────────────────────────
 # Param layout:
-#   ep            — shared encoder params (updated via critic loss only)
-#   eos           — encoder opt state
+#   ep  / eos     — shared online encoder params + opt state
+#   tep           — target encoder (EMA of ep)
 #   ahp / ahos    — actor head params + opt state
-#   chp / chos    — critic head params + opt state
+#   chp / chos    — online critic head params + opt state
 #   thp           — target critic head (EMA of chp)
 #   la  / alo     — log alpha + opt state
 #
-# Encoder passes per call:
-#   Critic loss : enc(obs) [trainable] + enc(next_obs) [stop_grad, for actor next]
-#   Actor loss  : stop_gradient(feat_obs) reused — ZERO extra enc passes
-#   Total       : 2 enc passes over 2 obs tensors (down from 4 in split-encoder design)
+# CNN passes per update:
+#   enc(obs)       — online, trainable via critic loss      [1]
+#   enc_tgt(next)  — target, stop_grad, for target Q       [1]
+#   enc(obs)       — for actor, stop_grad reuse of above   [0]
+#   Total: 2 encoder passes (online obs + target next_obs)
 @jax.jit
-def sac_update(ep, eos, ahp, ahos, chp, chos, thp, la, alo,
+def sac_update(ep, eos, tep, ahp, ahos, chp, chos, thp, la, alo,
                obs, action, reward, next_obs, done, max_v_obs, max_v_next, rng_key):
 
     rng_c, rng_a = jax.random.split(rng_key)
-
-    # Extract features ONCE for obs — used by both critic and actor losses.
-    # Gradients through feat_obs flow only into the critic loss (see below).
-    feat_obs = encoder_net.apply({"params": ep}, obs)
 
     # ── 1. Critic loss — Bellman backup ──────────────────────────────────────
     def _critic_loss(ep_, chp_):
         alpha = jax.lax.stop_gradient(jnp.exp(la))
 
-        # Actor next: encoder frozen — gradients must not update ep via actor path
-        feat_next_sg  = jax.lax.stop_gradient(encoder_net.apply({"params": ep_}, next_obs))
-        mean_n, lgs_n = actor_head.apply({"params": ahp}, feat_next_sg)
+        # FIX 2+4: Single target encoder pass on next_obs — used for BOTH
+        # the actor's next-action sampling AND the target Q computation.
+        # tep is EMA of ep, so features are stable.
+        feat_next = jax.lax.stop_gradient(
+            encoder_net.apply({"params": tep}, next_obs)
+        )
+        mean_n, lgs_n = actor_head.apply({"params": ahp}, feat_next)
         next_act, next_lp = sample_action_sac_batched(rng_c, mean_n, lgs_n, max_v_next)
 
-        # Target Q: head-only EMA, encoder also stop_grad
-        feat_next_t = jax.lax.stop_gradient(encoder_net.apply({"params": ep_}, next_obs))
-        q1_t, q2_t  = critic_head.apply({"params": thp}, feat_next_t, next_act)
+        # Target Q: target head on target features
+        q1_t, q2_t = critic_head.apply({"params": thp}, feat_next, next_act)
 
+        # FIX 3: No reward scaling — raw rewards flow directly into backup.
+        # Alpha auto-tunes to match the reward magnitude.
         v_next = jnp.minimum(q1_t, q2_t) - alpha * next_lp
         backup = jax.lax.stop_gradient(
-            reward / REWARD_SCALE + GAMMA * (1.0 - done) * v_next
+            reward + GAMMA * (1.0 - done) * v_next
         )
 
-        # Online Q: feat comes from ep_ so gradients update the encoder
-        feat_o = encoder_net.apply({"params": ep_}, obs)
-        q1, q2 = critic_head.apply({"params": chp_}, feat_o, action)
-        loss   = jnp.mean((q1 - backup) ** 2) + jnp.mean((q2 - backup) ** 2)
-        return loss, jnp.mean(backup) * REWARD_SCALE
+        # Online Q: online encoder on obs — gradients flow into ep_
+        feat_obs = encoder_net.apply({"params": ep_}, obs)
+        q1, q2   = critic_head.apply({"params": chp_}, feat_obs, action)
+        loss = jnp.mean((q1 - backup) ** 2) + jnp.mean((q2 - backup) ** 2)
+        return loss, (jnp.mean(backup), feat_obs)
 
-    (c_loss, q_mean), (c_grads_enc, c_grads_head) = jax.value_and_grad(
+    (c_loss, (q_mean, feat_obs_online)), (c_grads_enc, c_grads_head) = jax.value_and_grad(
         _critic_loss, argnums=(0, 1), has_aux=True
     )(ep, chp)
 
-    e_upd,  new_eos  = enc_opt.update(c_grads_enc,  eos, ep)
+    e_upd,  new_eos  = enc_opt.update(c_grads_enc, eos, ep)
     ch_upd, new_chos = head_critic_opt.update(c_grads_head, chos, chp)
-    new_ep  = optax.apply_updates(ep,  e_upd)
+    new_ep  = optax.apply_updates(ep, e_upd)
     new_chp = optax.apply_updates(chp, ch_upd)
 
     # ── 2. Actor loss — maximise Q - alpha * log_pi ───────────────────────────
-    # Encoder is FROZEN for the actor: stop_gradient(feat_obs).
-    # This ensures enc gradients come only from the critic Bellman signal.
+    # Encoder frozen for actor: gradients come only from Bellman via critic.
     def _actor_loss(ahp_):
         alpha = jax.lax.stop_gradient(jnp.exp(la))
-        feat  = jax.lax.stop_gradient(feat_obs)   # reuse, zero extra enc pass
+        # Reuse online features from critic pass — zero extra encoder forward
+        feat = jax.lax.stop_gradient(feat_obs_online)
         mean, log_std = actor_head.apply({"params": ahp_}, feat)
         action_new, log_pi = sample_action_sac_batched(rng_a, mean, log_std, max_v_obs)
 
-        # Critic Q with updated params, encoder also frozen
+        # Use updated critic params with frozen encoder
         feat_c = jax.lax.stop_gradient(encoder_net.apply({"params": new_ep}, obs))
         q1, q2 = critic_head.apply({"params": new_chp}, feat_c, action_new)
         return jnp.mean(alpha * log_pi - jnp.minimum(q1, q2)), jnp.mean(log_pi)
@@ -324,7 +327,9 @@ def sac_update(ep, eos, ahp, ahos, chp, chos, thp, la, alo,
     al_upd, new_alo = alpha_opt.update(al_grad, alo)
     new_la = optax.apply_updates(la, al_upd)
 
-    # ── 4. Soft target update (critic head only — encoder is shared) ──────────
+    # ── 4. Soft target update — BOTH encoder and critic head ──────────────────
+    # FIX 2: tep tracks ep via EMA so target features are stable.
+    new_tep = jax.tree_util.tree_map(lambda t, o: TAU * o + (1.0 - TAU) * t, tep, new_ep)
     new_thp = jax.tree_util.tree_map(lambda t, o: TAU * o + (1.0 - TAU) * t, thp, new_chp)
 
     metrics = {
@@ -334,17 +339,17 @@ def sac_update(ep, eos, ahp, ahos, chp, chos, thp, la, alo,
         "log_pi":      log_pi_mean,
         "q_mean":      q_mean,
     }
-    return (new_ep, new_eos, new_ahp, new_ahos,
+    return (new_ep, new_eos, new_tep, new_ahp, new_ahos,
             new_chp, new_chos, new_thp, new_la, new_alo, metrics)
 
 
-# ── Collection step (runs inside train_chunk lax.scan) ───────────────────────
+# ── Collection step ───────────────────────────────────────────────────────────
 @functools.partial(jax.jit, static_argnums=(5,))
 def collect_step(ep, ahp, env_state, env_obs, rng_key, vmap_step, max_goal_dist, scenario_idx):
-    """Compute max_v ONCE, sample action, step env. rng_key is threaded by lax.scan carry."""
-    max_v    = extract_max_v(env_obs)
+    """Compute max_v ONCE, sample action, step env."""
+    max_v = extract_max_v(env_obs)
     k_act, k_step = jax.random.split(rng_key)
-    feat  = encoder_net.apply({"params": ep}, env_obs)
+    feat = encoder_net.apply({"params": ep}, env_obs)
     mean, log_std = actor_head.apply({"params": ahp}, feat)
     env_action, _ = sample_action_sac_batched(k_act, mean, log_std, max_v)
     step_keys = jax.random.split(k_step, N_ENVS)
@@ -355,18 +360,18 @@ def collect_step(ep, ahp, env_state, env_obs, rng_key, vmap_step, max_goal_dist,
 
 
 # ── Fused GPU train chunk ─────────────────────────────────────────────────────
-@functools.partial(jax.jit, static_argnums=(9,))
-def train_chunk(ep, eos, ahp, ahos, chp, chos,
+@functools.partial(jax.jit, static_argnums=(10,))
+def train_chunk(ep, eos, tep, ahp, ahos, chp, chos,
                 thp, la, alo, vmap_step,
                 buf, es, eo, key,
                 max_goal_dist, scenario_idx):
 
     def _loop_body(carry, _):
-        (ep, eos, ahp, ahos, chp, chos,
+        (ep, eos, tep, ahp, ahos, chp, chos,
          thp, la, alo, buf, es, eo, key) = carry
         key, k_col, k_samp, k_upd = jax.random.split(key, 4)
 
-        # Collect — max_v decoded ONCE inside collect_step from the pre-step obs
+        # Collect — max_v decoded ONCE inside collect_step
         new_eo, new_es, obs_b, env_a, rew, done, info, max_v_cur = collect_step(
             ep, ahp, es, eo, k_col, vmap_step, max_goal_dist, scenario_idx
         )
@@ -376,21 +381,21 @@ def train_chunk(ep, eos, ahp, ahos, chp, chos,
                           terminal.astype(jnp.float32), max_v_cur)
 
         b_obs, b_act, b_rew, b_next, b_done, b_max_v = buf_sample(new_buf, k_samp, BATCH_SIZE)
-        b_max_v_next = extract_max_v(b_next)   # decoded once from sampled next_obs
+        b_max_v_next = extract_max_v(b_next)
 
-        (new_ep, new_eos, new_ahp, new_ahos,
+        (new_ep, new_eos, new_tep, new_ahp, new_ahos,
          new_chp, new_chos, new_thp, new_la, new_alo, metrics) = sac_update(
-            ep, eos, ahp, ahos, chp, chos, thp, la, alo,
+            ep, eos, tep, ahp, ahos, chp, chos, thp, la, alo,
             b_obs, b_act, b_rew, b_next, b_done, b_max_v, b_max_v_next, k_upd
         )
 
         step_data = (rew, done, info["goal_reached"], info["collision"], info["passive_col"])
-        new_carry = (new_ep, new_eos, new_ahp, new_ahos,
+        new_carry = (new_ep, new_eos, new_tep, new_ahp, new_ahos,
                      new_chp, new_chos, new_thp, new_la, new_alo,
                      new_buf, new_es, new_eo, key)
         return new_carry, (step_data, metrics)
 
-    carry = (ep, eos, ahp, ahos, chp, chos,
+    carry = (ep, eos, tep, ahp, ahos, chp, chos,
              thp, la, alo, buf, es, eo, key)
     new_carry, (all_step_data, all_metrics) = jax.lax.scan(
         _loop_body, carry, None, length=LOG_EVERY
@@ -428,19 +433,20 @@ def collect_episode_outcomes(rewards, dones, goal_reached, collision, passive_co
 
 
 # ── Checkpoint ────────────────────────────────────────────────────────────────
-def save_checkpoint(ep, ahp, chp, thp, eos, ahos, chos, la, alo, step):
+def save_checkpoint(ep, tep, ahp, chp, thp, eos, ahos, chos, la, alo, step):
     os.makedirs(CKPT_DIR, exist_ok=True)
     bundle = {
-        "encoder_params":      jax.device_get(ep),
-        "actor_head_params":   jax.device_get(ahp),
-        "critic_head_params":  jax.device_get(chp),
-        "target_head_params":  jax.device_get(thp),
-        "encoder_opt":         jax.device_get(eos),
-        "actor_head_opt":      jax.device_get(ahos),
-        "critic_head_opt":     jax.device_get(chos),
-        "log_alpha":           jax.device_get(la),
-        "alpha_opt_state":     jax.device_get(alo),
-        "step":                int(step),
+        "encoder_params":       jax.device_get(ep),
+        "target_enc_params":    jax.device_get(tep),
+        "actor_head_params":    jax.device_get(ahp),
+        "critic_head_params":   jax.device_get(chp),
+        "target_head_params":   jax.device_get(thp),
+        "encoder_opt":          jax.device_get(eos),
+        "actor_head_opt":       jax.device_get(ahos),
+        "critic_head_opt":      jax.device_get(chos),
+        "log_alpha":            jax.device_get(la),
+        "alpha_opt_state":      jax.device_get(alo),
+        "step":                 int(step),
     }
     with open(CKPT_PATH, "wb") as f:
         f.write(flax.serialization.to_bytes(bundle))
@@ -450,9 +456,10 @@ def save_checkpoint(ep, ahp, chp, thp, eos, ahos, chos, la, alo, step):
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
 
-    print("SAC Training  (shared-encoder architecture)")
+    print("SAC Training  (shared-encoder + target-encoder architecture)")
     print(f"  N_ENVS={N_ENVS}  BUFFER={BUFFER_CAP:,}  BATCH={BATCH_SIZE}")
-    print(f"  gamma={GAMMA}  tau={TAU}  lr={LR}  H*={TARGET_ENTROPY}\n")
+    print(f"  gamma={GAMMA}  tau={TAU}  lr={LR}  H*={TARGET_ENTROPY}")
+    print(f"  LOG_EVERY={LOG_EVERY}  transitions/chunk={N_ENVS*LOG_EVERY:,}\n")
 
     master_key = jax.random.PRNGKey(7)
     master_key, k_init, k_env, k_warmup = jax.random.split(master_key, 4)
@@ -464,7 +471,8 @@ if __name__ == "__main__":
 
     k_e, k_ah, k_ch = jax.random.split(k_init, 3)
 
-    ep  = encoder_net.init(k_e,  dummy_obs)["params"]               # shared encoder
+    ep  = encoder_net.init(k_e,  dummy_obs)["params"]               # shared online encoder
+    tep = jax.tree_util.tree_map(jnp.array, ep)                     # FIX 2: target encoder (EMA copy)
     ahp = actor_head.init(k_ah, dummy_feat)["params"]               # actor head
     chp = critic_head.init(k_ch, dummy_feat, dummy_act)["params"]   # critic head
     thp = jax.tree_util.tree_map(jnp.array, chp)                    # target head (copy)
@@ -472,7 +480,8 @@ if __name__ == "__main__":
     eos  = enc_opt.init(ep)
     ahos = head_actor_opt.init(ahp)
     chos = head_critic_opt.init(chp)
-    la   = jnp.array(jnp.log(0.1), dtype=jnp.float32)
+    # FIX 3: alpha=0.01 — conservative init so entropy doesn't drown raw rewards.
+    la   = jnp.array(jnp.log(0.01), dtype=jnp.float32)
     alo  = alpha_opt.init(la)
 
     print("Initialising environments...")
@@ -490,7 +499,7 @@ if __name__ == "__main__":
     for _ in range((WARMUP_STEPS // N_ENVS) + 1):
         k_warmup, k_act, k_step = jax.random.split(k_warmup, 3)
         obs_before = env_obs
-        max_v      = extract_max_v(env_obs)          # once per warmup step
+        max_v      = extract_max_v(env_obs)
         rand_v     = jax.random.uniform(k_act, (N_ENVS,)) * max_v
         rand_w     = jax.random.uniform(k_act, (N_ENVS,), minval=-1.0, maxval=1.0)
         env_action = jnp.stack([rand_v, rand_w], axis=-1)
@@ -522,16 +531,19 @@ if __name__ == "__main__":
                            "pcol_pct", "tmo_pct", "n_ep"])
     _log_file.flush()
 
+    # Print every 10th chunk = every 500 updates (10 * LOG_EVERY=50)
+    PRINT_EVERY_CHUNKS = 10
+
     while n_updates < TOTAL_UPDATES:
         t0 = time.time()
 
         new_carry, all_step_data, all_metrics = train_chunk(
-            ep, eos, ahp, ahos, chp, chos,
+            ep, eos, tep, ahp, ahos, chp, chos,
             thp, la, alo, vmap_step,
             replay_buf, env_state, env_obs, train_rng,
             3.0, -1
         )
-        (ep, eos, ahp, ahos, chp, chos,
+        (ep, eos, tep, ahp, ahos, chp, chos,
          thp, la, alo, replay_buf, env_state, env_obs, train_rng) = new_carry
 
         n_updates   += LOG_EVERY
@@ -557,7 +569,8 @@ if __name__ == "__main__":
         s = int(elapsed % 60)
         elapsed_str = f"{h:d}h{m:02d}m{s:02d}s" if h > 0 else f"{m:d}m{s:02d}s"
 
-        if n_updates == 500 or n_updates % 5000 == 0:
+        chunk_idx = n_updates // LOG_EVERY
+        if chunk_idx == 1 or chunk_idx % PRINT_EVERY_CHUNKS == 0:
             print(
                 f"{n_updates:>7d} | {total_steps:>10,} | {mean_ret:>7.1f} | "
                 f"{suc_pct:>4.1f}% {col_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% | "
@@ -579,7 +592,7 @@ if __name__ == "__main__":
         if is_better and n_ep > 0:
             best_suc = suc_pct
             best_ret = mean_ret
-            save_checkpoint(ep, ahp, chp, thp, eos, ahos, chos, la, alo, n_updates)
+            save_checkpoint(ep, tep, ahp, chp, thp, eos, ahos, chos, la, alo, n_updates)
 
     elapsed = time.time() - t_start
     print(f"\nSAC done! {elapsed/3600:.2f}h | Best success: {best_suc:.1f}%  Best reward: {best_ret:.1f}")
