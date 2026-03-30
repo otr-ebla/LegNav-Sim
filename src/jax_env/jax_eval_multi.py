@@ -283,7 +283,7 @@ PANEL_W    = 300
 WINDOW_W   = SIM_SIZE + PANEL_W
 WINDOW_H   = SIM_SIZE
 SCALE      = SIM_SIZE / max(ROOM_W, ROOM_H)
-FPS_TARGET = 30
+FPS_TARGET = 10
 
 C_BG        = (28,  28,  34); C_FLOOR    = (44,  44,  52); C_GRID     = (56,  56,  66)
 C_WALL      = (190, 190, 205); C_ROBOT    = (60,  140, 255); C_ROBOT_H  = (170, 210, 255)

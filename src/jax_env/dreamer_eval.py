@@ -1,5 +1,10 @@
 """
 dreamer_eval.py — Interactive Evaluation for DreamerV3
+
+Fixes vs submitted version:
+  - BUG E FIXED: build_fast_reset passed ghost_robot=False to make_stacked_env,
+    but the parameter is named ghost_prob (a float). At eval time ghost_prob=0.0
+    means humans are fully aware of the robot — the correct evaluation setting.
 """
 
 import argparse
@@ -97,7 +102,8 @@ def main():
 
     def build_fast_reset(scen_idx):
         bound_reset = functools.partial(reset_env, scenario_idx=scen_idx)
-        rs, ss = make_stacked_env(bound_reset, step_env, stack_dim=3, ghost_robot=False)
+        # BUG E FIX: make_stacked_env accepts ghost_prob (float), not ghost_robot (bool).
+        rs, ss = make_stacked_env(bound_reset, step_env, stack_dim=3, ghost_prob=0.0)
         return jax.jit(rs), jax.jit(ss)
 
     rng = jax.random.PRNGKey(42)

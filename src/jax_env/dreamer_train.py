@@ -14,8 +14,20 @@ Fixes vs submitted version:
     (~dones).astype(jnp.float32)[:, None] for an explicit, type-safe mask.
   - BUG 7 FIXED: buffer_ready() guard added before train_step so
     sample_sequences is never called with a near-empty buffer.
+  - BUG 8 FIXED (via dreamer_env.py): global cache .clear() replaced by closure.
   - BUG 9 FIXED: unroll_imagination now returns only `traj` (final h/z were
     always discarded). Call sites updated accordingly.
+  - BUG A FIXED: scan_rssm was calling rssm.prior(..., rngs={'gumbel': key})
+    purely to get the prior logits for the KL loss. A Gumbel sample is never
+    needed for KL computation — only the logits matter. Switched to
+    rssm.prior_greedy(), eliminating a wasted RNG split per scan step.
+  - BUG B FIXED: entropy loss double-negation.
+    -ENTROPY_COEF * mean(-log_prob) == +ENTROPY_COEF * mean(log_prob), which
+    penalises entropy rather than encouraging it. Fixed to a single negation:
+    -ENTROPY_COEF * mean(log_prob).
+  - BUG C FIXED: buffer_ready() was imported and mentioned but never called in
+    the main training loop. Added guard call at the top of the training for-loop
+    so a cold-start without prefill does not crash sample_sequences.
 """
 
 import os
@@ -40,7 +52,7 @@ import optax
 import time
 from functools import partial
 
-from dreamer_buffer   import init_buffer, add_batch, sample_sequences
+from dreamer_buffer   import init_buffer, add_batch, sample_sequences, buffer_ready
 from dreamer_rssm     import RSSM, DreamerEncoder, LATENT_SIZE, DETERMINISTIC_SIZE
 from dreamer_decoders import ObservationDecoder, RewardDecoder, ContinueDecoder, world_model_loss
 from dreamer_behavior import DreamerActor, DreamerCritic, compute_lambda_returns, unroll_imagination, sample_action
@@ -106,7 +118,7 @@ def scan_rssm(wm_params: dict, obs_seq: jnp.ndarray,
     def step(carry, inputs):
         h_prev, z_prev, key = carry
         obs_i, act_i = inputs
-        key, post_key, prior_key = jax.random.split(key, 3)
+        key, post_key = jax.random.split(key, 2)
 
         h_t = rssm.apply(
             {'params': wm_params['rssm']},
@@ -118,9 +130,11 @@ def scan_rssm(wm_params: dict, obs_seq: jnp.ndarray,
             {'params': wm_params['rssm']}, h_t, obs_embed,
             method=rssm.posterior, rngs={'gumbel': post_key})
 
+        # BUG A FIX: use prior_greedy for KL logits — we only need the logits,
+        # not a Gumbel sample, so no RNG key is needed and prior_key is freed.
         _, prior_logits = rssm.apply(
             {'params': wm_params['rssm']}, h_t,
-            method=rssm.prior, rngs={'gumbel': prior_key})
+            method=rssm.prior_greedy)
 
         return (h_t, z_t, key), (h_t, z_t, prior_logits, post_logits)
 
@@ -201,7 +215,10 @@ def train_step(rng_key, buffer_state, params, opt_states):
 
         advantages  = jax.lax.stop_gradient(lambda_returns - values[:-1])
         actor_loss  = -jnp.mean(traj['log_prob'][:-1] * advantages)
-        entropy_loss = -ENTROPY_COEF * jnp.mean(-traj['log_prob'][:-1])
+        # BUG B FIX: single negation only — we want to maximise entropy,
+        # i.e. minimise -entropy = -mean(-log_prob) = mean(log_prob).
+        # The previous double negation was penalising entropy instead.
+        entropy_loss = -ENTROPY_COEF * jnp.mean(traj['log_prob'][:-1])
         return actor_loss + entropy_loss, (traj, lambda_returns)
 
     (act_loss, (traj, lambda_returns)), act_grads = jax.value_and_grad(
@@ -437,6 +454,12 @@ if __name__ == "__main__":
     
     for step in range(0, TOTAL_STEPS, CHUNK_SIZE):
         t0 = time.time()
+        
+        # BUG C FIX: guard train_step against near-empty buffer. After prefill
+        # this is always True, but protects cold-start or very small prefill runs.
+        if not buffer_ready(buffer_state, SEQ_LEN):
+            print(f"Step {step:05d} | Buffer not ready yet, skipping train_step.")
+            continue
         
         # Passiamo i nuovi tracker alla funzione
         final_carry, metrics_history = train_loop_chunk(

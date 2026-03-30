@@ -10,6 +10,8 @@ Fixes vs submitted version:
     every sample start at t=0. A Python-level buffer_ready() helper is provided
     for the training loop to gate train_step calls. Inside sample_sequences the
     floor is now seq_len (not 1) to ensure at least one valid window exists.
+  - BUG D FIXED: buffer_ready() helper was promised by the docstring but the
+    function body was entirely absent from the file. Added below init_buffer().
 """
 
 import functools
@@ -39,6 +41,17 @@ def init_buffer(capacity: int, num_envs: int,
         insert_idx = jnp.int32(0),
         is_full    = jnp.bool_(False),
     )
+
+
+def buffer_ready(buffer_state: ReplayBufferState, seq_len: int) -> bool:
+    """
+    BUG D FIX: Python-level guard promised by the docstring but absent from the
+    original file.  Returns True iff the buffer contains at least one complete
+    sequence window of length seq_len, making sample_sequences safe to call.
+    """
+    insert_idx = int(buffer_state.insert_idx)
+    is_full    = bool(buffer_state.is_full)
+    return is_full or (insert_idx >= seq_len)
 
 
 
