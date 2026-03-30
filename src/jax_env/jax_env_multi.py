@@ -33,23 +33,25 @@ HSFM_DT    = 0.01
 
 
 
-# Terminal rewards
-_R_GOAL        =  100.0   
-_R_OBS_COL     =  -90.0   
-_R_WALL_COL    =  -90.0   
-_R_ACTIVE_COL  =  -90.0   
+# Terminal rewards (all /10 from original to keep Q-values O(100) not O(1000)).
+# This ensures alpha*log_pi remains a meaningful fraction of the critic signal
+# so the entropy term actually shapes the policy during early training.
+_R_GOAL        =  10.0
+_R_OBS_COL     =  -9.0
+_R_WALL_COL    =  -9.0
+_R_ACTIVE_COL  =  -9.0
 
-_R_PASSIVE_COL =  -35.0   
-_R_TIMEOUT     =  -90.0   
+_R_PASSIVE_COL =  -3.5
+_R_TIMEOUT     =  -9.0
 
 
-_PROGRESS_COEF =  15.0   
+_PROGRESS_COEF =  1.5
 
 # Step penalty — small constant cost per timestep, encourages efficiency.
-_STEP_PEN      =  -0.08
+_STEP_PEN      =  -0.008
 
 # Jerk penalty — discourages angular velocity changes (smooth paths).
-_JERK_WEIGHT   =   0.08
+_JERK_WEIGHT   =   0.008
 
 # ── Comfort penalty parameters (replaces old clearance-factor multiplier) ─────
 # OLD DESIGN (broken): clearance_factor multiplied progress reward.
@@ -76,7 +78,7 @@ _JERK_WEIGHT   =   0.08
 #   (progress ≈ 1.2/step vs penalty ≈ 0.3) → robot never freezes.
 
 _COMFORT_DIST  = 1.2   # m — personal space boundary
-_COMFORT_COEF  = 0.15  # base penalty at d=0 (before speed scaling)
+_COMFORT_COEF  = 0.015 # base penalty at d=0 (before speed scaling) — /10 from 0.15
 
 N_SUBSTEPS = int(DT / HSFM_DT)
 NUM_PEOPLE = 12
@@ -488,7 +490,7 @@ def step_env(key, state, action, ghost_robot: bool = True):
     # Penalità massiccia se il robot tiene il gas premuto verso un umano.
     # Il -2.0 compensa abbondantemente il reward di progresso (+0.15/step),
     # rendendo la frenata (target_v = 0) l'unica azione matematicamente vantaggiosa.
-    yield_penalty = -4.0 * urgency * target_v
+    yield_penalty = -0.4 * urgency * target_v  # /10 from -4.0
 
     # — 6c. Dense shaping ─────────────────────────────────────────────────
     progress         = prev_dist - new_dist

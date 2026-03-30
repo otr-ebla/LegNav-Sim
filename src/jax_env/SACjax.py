@@ -3,18 +3,19 @@ SACjax.py — Soft Actor-Critic (shared-encoder, fused-JIT)
 
 Architecture:
   - ONE shared encoder (ep) updated only through critic loss.
-  - Actor head receives stop_gradient(feat_obs) — no separate encoder params.
-  - Target encoder (tep) tracks online encoder via EMA — used for target Q only.
-  - Target critic head (thp) tracks online critic head via EMA.
+  - Actor head receives stop_gradient(feat_obs) — no encoder gradients from actor.
+  - Target encoder (tep) & target critic head (thp) — EMA of online (ep, chp).
+  - Buffer stores terminal (done & ~timeout) — bootstraps through timeouts.
+  - obs/next_obs stored as float16 — halves VRAM footprint.
   - extract_max_v called ONCE per collection step; stored in buffer.
-  - vmap_step is NOT jit-wrapped here — outer train_chunk JIT fuses naturally.
-  - No reward scaling — alpha auto-tunes from a conservative init.
+  - 2 encoder passes per update: enc(obs) [trainable] + enc_tgt(next_obs) [frozen].
+  - Actor Q-eval reuses feat from critic pass — zero redundant CNN forwards.
 
-Fixes applied:
-  1. BUFFER_CAP 5M, LOG_EVERY 50 — buffer no longer fully overwritten per chunk.
-  2. tep restored — target Q uses a slow-moving encoder, not the volatile online one.
-  3. REWARD_SCALE removed — raw rewards, alpha starts at 0.01, target entropy -1.0.
-  4. Single enc(next_obs) pass in critic loss — no redundant CNN forward.
+Fixes Applied:
+  1. Actor Loss Zero-Forward: feat reused with new_chp, eliminating a redundant CNN pass.
+  2. Bellman Fix: Timelimit termination uses (1 - terminal) to bootstrap, not (1 - done).
+  3. VRAM Optimization: BUFFER_CAP=2_000_000 and obs store as float16 (14GB -> 2.7GB).
+  4. Reward / Alpha scaling: Rewards heavily scaled in jax_env_multi, alpha init at 1.0.
 """
 
 import os
@@ -42,15 +43,15 @@ from jax_wrappers import make_stacked_env, make_autoreset_env
 OBS_SIZE       = 342        # 9 (pose) + 9 (state_vec) + 324 (lidar)
 ACTION_DIM     = 2
 N_ENVS         = 2048
-BUFFER_CAP     = 5_000_000  # FIX 1: 5M — never overwritten in a single chunk
+BUFFER_CAP     = 2_000_000  # 2M — 102k transitions/chunk, ~20 chunks before overwrite
 BATCH_SIZE     = 2048
 WARMUP_STEPS   = 10_000
 GAMMA          = 0.99
 TAU            = 0.005
 LR             = 3e-4
-TARGET_ENTROPY = -1.0       # FIX 3: softer than -|A|=-2.0; balances exploration
+TARGET_ENTROPY = -1.0       # softer than -|A|=-2.0; balances exploration
 TOTAL_UPDATES  = 200_000
-LOG_EVERY      = 50         # FIX 1: 2048*50=102k << 5M buffer — proper off-policy
+LOG_EVERY      = 50         # 2048*50=102k << 2M cap — proper off-policy mixing
 SAVE_EVERY     = 5000
 MAX_GRAD_NORM  = 10.0
 
@@ -205,13 +206,17 @@ def extract_max_v(obs):
 
 
 # ── Replay buffer (on-GPU circular) ───────────────────────────────────────────
+# VRAM budget: obs/next_obs stored as float16 to halve memory.
+#   2M * 342 * 2B * 2 arrays = 2.74 GB (vs 5.47 GB with float32).
+# buf_sample casts back to float32 before returning — encoder sees full precision.
+# Field 'terminal' = done & ~timeout — only true environmental endings stored.
 def make_buffer(capacity):
     return {
-        "obs":      jnp.zeros((capacity, OBS_SIZE),   jnp.float32),
+        "obs":      jnp.zeros((capacity, OBS_SIZE),   jnp.float16),
         "action":   jnp.zeros((capacity, ACTION_DIM), jnp.float32),
         "reward":   jnp.zeros((capacity,),             jnp.float32),
-        "next_obs": jnp.zeros((capacity, OBS_SIZE),   jnp.float32),
-        "done":     jnp.zeros((capacity,),             jnp.float32),
+        "next_obs": jnp.zeros((capacity, OBS_SIZE),   jnp.float16),
+        "terminal": jnp.zeros((capacity,),             jnp.float32),
         "max_v":    jnp.zeros((capacity,),             jnp.float32),
         "ptr":      jnp.int32(0),
         "size":     jnp.int32(0),
@@ -219,16 +224,16 @@ def make_buffer(capacity):
 
 
 @jax.jit
-def buf_add(buf, obs, action, reward, next_obs, done, max_v):
+def buf_add(buf, obs, action, reward, next_obs, terminal, max_v):
     cap  = buf["obs"].shape[0]
     N    = obs.shape[0]
     idxs = (buf["ptr"] + jnp.arange(N)) % cap
     return {
-        "obs":      buf["obs"].at[idxs].set(obs),
+        "obs":      buf["obs"].at[idxs].set(obs.astype(jnp.float16)),
         "action":   buf["action"].at[idxs].set(action),
         "reward":   buf["reward"].at[idxs].set(reward),
-        "next_obs": buf["next_obs"].at[idxs].set(next_obs),
-        "done":     buf["done"].at[idxs].set(done),
+        "next_obs": buf["next_obs"].at[idxs].set(next_obs.astype(jnp.float16)),
+        "terminal": buf["terminal"].at[idxs].set(terminal),
         "max_v":    buf["max_v"].at[idxs].set(max_v),
         "ptr":      jnp.int32((buf["ptr"] + N) % cap),
         "size":     jnp.minimum(jnp.int32(buf["size"] + N), jnp.int32(cap)),
@@ -238,8 +243,12 @@ def buf_add(buf, obs, action, reward, next_obs, done, max_v):
 @jax.jit(static_argnames=["batch_size"])
 def buf_sample(buf, rng_key, batch_size: int):
     idxs = jax.random.randint(rng_key, (batch_size,), 0, buf["size"])
-    return (buf["obs"][idxs], buf["action"][idxs], buf["reward"][idxs],
-            buf["next_obs"][idxs], buf["done"][idxs], buf["max_v"][idxs])
+    return (buf["obs"][idxs].astype(jnp.float32),
+            buf["action"][idxs],
+            buf["reward"][idxs],
+            buf["next_obs"][idxs].astype(jnp.float32),
+            buf["terminal"][idxs],
+            buf["max_v"][idxs])
 
 
 # ── SAC update step ───────────────────────────────────────────────────────────
@@ -258,7 +267,7 @@ def buf_sample(buf, rng_key, batch_size: int):
 #   Total: 2 encoder passes (online obs + target next_obs)
 @jax.jit
 def sac_update(ep, eos, tep, ahp, ahos, chp, chos, thp, la, alo,
-               obs, action, reward, next_obs, done, max_v_obs, max_v_next, rng_key):
+               obs, action, reward, next_obs, terminal, max_v_obs, max_v_next, rng_key):
 
     rng_c, rng_a = jax.random.split(rng_key)
 
@@ -278,11 +287,10 @@ def sac_update(ep, eos, tep, ahp, ahos, chp, chos, thp, la, alo,
         # Target Q: target head on target features
         q1_t, q2_t = critic_head.apply({"params": thp}, feat_next, next_act)
 
-        # FIX 3: No reward scaling — raw rewards flow directly into backup.
-        # Alpha auto-tunes to match the reward magnitude.
         v_next = jnp.minimum(q1_t, q2_t) - alpha * next_lp
+        # terminal = done & ~timeout — bootstrap through time limits, zero at true endings
         backup = jax.lax.stop_gradient(
-            reward + GAMMA * (1.0 - done) * v_next
+            reward + GAMMA * (1.0 - terminal) * v_next
         )
 
         # Online Q: online encoder on obs — gradients flow into ep_
@@ -300,18 +308,17 @@ def sac_update(ep, eos, tep, ahp, ahos, chp, chos, thp, la, alo,
     new_ep  = optax.apply_updates(ep, e_upd)
     new_chp = optax.apply_updates(chp, ch_upd)
 
-    # ── 2. Actor loss — maximise Q - alpha * log_pi ───────────────────────────
-    # Encoder frozen for actor: gradients come only from Bellman via critic.
+    # ── 2. Actor loss ─────────────────────────────────────────────────────────
+    # Encoder frozen: stop_gradient(feat_obs_online) from critic pass is reused.
+    # Q-eval uses updated critic heads (new_chp) on the SAME frozen features.
+    # The param delta ep vs new_ep after one grad step is negligible — recomputing
+    # features with new_ep would burn a full 3-layer CNN for ~0 benefit.
     def _actor_loss(ahp_):
         alpha = jax.lax.stop_gradient(jnp.exp(la))
-        # Reuse online features from critic pass — zero extra encoder forward
         feat = jax.lax.stop_gradient(feat_obs_online)
         mean, log_std = actor_head.apply({"params": ahp_}, feat)
         action_new, log_pi = sample_action_sac_batched(rng_a, mean, log_std, max_v_obs)
-
-        # Use updated critic params with frozen encoder
-        feat_c = jax.lax.stop_gradient(encoder_net.apply({"params": new_ep}, obs))
-        q1, q2 = critic_head.apply({"params": new_chp}, feat_c, action_new)
+        q1, q2 = critic_head.apply({"params": new_chp}, feat, action_new)
         return jnp.mean(alpha * log_pi - jnp.minimum(q1, q2)), jnp.mean(log_pi)
 
     (a_loss, log_pi_mean), a_grads_head = jax.value_and_grad(
@@ -376,17 +383,18 @@ def train_chunk(ep, eos, tep, ahp, ahos, chp, chos,
             ep, ahp, es, eo, k_col, vmap_step, max_goal_dist, scenario_idx
         )
 
+        # Store terminal (not done) — timeouts are NOT absorbing states
         terminal = done & ~info["timeout"]
         new_buf = buf_add(buf, obs_b, env_a, rew, new_eo,
                           terminal.astype(jnp.float32), max_v_cur)
 
-        b_obs, b_act, b_rew, b_next, b_done, b_max_v = buf_sample(new_buf, k_samp, BATCH_SIZE)
+        b_obs, b_act, b_rew, b_next, b_terminal, b_max_v = buf_sample(new_buf, k_samp, BATCH_SIZE)
         b_max_v_next = extract_max_v(b_next)
 
         (new_ep, new_eos, new_tep, new_ahp, new_ahos,
          new_chp, new_chos, new_thp, new_la, new_alo, metrics) = sac_update(
             ep, eos, tep, ahp, ahos, chp, chos, thp, la, alo,
-            b_obs, b_act, b_rew, b_next, b_done, b_max_v, b_max_v_next, k_upd
+            b_obs, b_act, b_rew, b_next, b_terminal, b_max_v, b_max_v_next, k_upd
         )
 
         step_data = (rew, done, info["goal_reached"], info["collision"], info["passive_col"])
@@ -480,8 +488,10 @@ if __name__ == "__main__":
     eos  = enc_opt.init(ep)
     ahos = head_actor_opt.init(ahp)
     chos = head_critic_opt.init(chp)
-    # FIX 3: alpha=0.01 — conservative init so entropy doesn't drown raw rewards.
-    la   = jnp.array(jnp.log(0.01), dtype=jnp.float32)
+    # Alpha init: after /10 env scaling, rewards are O(10), Q-values O(100).
+    # alpha=1.0 gives entropy term ~1.0*log_pi ~ -2.0, i.e. ~2% of Q — sane ratio.
+    # Auto-tuning adjusts from here; too low causes premature entropy collapse.
+    la   = jnp.array(0.0, dtype=jnp.float32)  # log(1.0) = 0.0 → alpha = 1.0
     alo  = alpha_opt.init(la)
 
     print("Initialising environments...")
