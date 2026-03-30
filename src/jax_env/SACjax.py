@@ -3,7 +3,7 @@ SACjax.py — Soft Actor-Critic (shared-encoder, fused-JIT)
 
 Architecture:
   - ONE shared encoder (ep) updated only through critic loss.
-  - Actor head receives stop_gradient(feat_obs) — no encoder gradients from actor.
+  - Actor gradients flow into LidarCNN scaled by ACTOR_ENC_GRAD_SCALE=0.1.
   - Target LidarCNN (tlcp) & target Q branches (tq1p, tq2p) — EMA of online params.
   - Buffer stores terminal (done & ~timeout) — bootstraps through timeouts.
   - obs/next_obs stored as float16 — halves VRAM footprint.
@@ -70,6 +70,19 @@ MAX_GRAD_NORM  = 10.0
 MAX_V_OBS_IDX  = 11
 LOG_STD_EPS    = 1e-6
 
+# ── Perception normalization ───────────────────────────────────────────────────
+# LiDAR rays are in meters. Normalize to [0,1] before the first Conv to prevent
+# the CNN from wasting early training steps rescaling weights for meter-scale inputs.
+# VERIFY this matches the MAX_RANGE constant in jax_env.py before running.
+LIDAR_MAX_RANGE = 10.0   # metres — set to your env's actual max sensor range
+
+# ── Actor-encoder gradient coupling ───────────────────────────────────────────
+# Scale factor applied to actor gradients flowing back into LidarCNN.
+# 0.0 = full stop_gradient (old behaviour, critic-only encoder)
+# 0.1 = soft coupling — actor can shape perception without destabilising critic
+# 1.0 = full coupling (aggressive, not recommended without careful LR tuning)
+ACTOR_ENC_GRAD_SCALE = 0.1
+
 CKPT_DIR  = "checkpoints_sac"
 CKPT_PATH = f"{CKPT_DIR}/sac_best.msgpack"
 
@@ -117,6 +130,14 @@ def init_env_state(rng_key, max_goal_dist: float = 3.0, scenario_idx: int = -1):
 # each critic branch has its own independent MLP that fuses cnn_feat with the
 # global state. This breaks the correlation between Q1 and Q2 at the level
 # where function approximation errors actually accumulate.
+#
+# Orthogonal init with gain=√2 for ReLU layers throughout.
+# LiDAR input is normalized to [0,1] before first Conv (see LIDAR_MAX_RANGE).
+
+_orth_relu = nn.initializers.orthogonal(scale=jnp.sqrt(2.0))   # ReLU layers
+_orth_out  = nn.initializers.orthogonal(scale=0.01)             # output heads (near-uniform init)
+
+
 class LidarCNN(nn.Module):
     stack_dim: int = 3
     num_rays:  int = 108
@@ -130,11 +151,18 @@ class LidarCNN(nn.Module):
         state_vec  = x[..., pose_size : pose_size + state_size]
         lidar_flat = x[..., pose_size + state_size:]
 
+        # Normalize LiDAR to [0,1]. Raw meter values (e.g. 0–10m) cause CNN
+        # weight scaling issues for the first ~50k steps without this.
+        lidar_flat = lidar_flat / LIDAR_MAX_RANGE
+
         batch_shape  = lidar_flat.shape[:-1]
         lidar_cnn    = lidar_flat.reshape((*batch_shape, self.num_rays, self.stack_dim))
-        cnn = nn.relu(nn.Conv(features=32, kernel_size=(7,), strides=(2,), padding='SAME')(lidar_cnn))
-        cnn = nn.relu(nn.Conv(features=64, kernel_size=(5,), strides=(2,), padding='SAME')(cnn))
-        cnn = nn.relu(nn.Conv(features=64, kernel_size=(3,), strides=(2,), padding='SAME')(cnn))
+        cnn = nn.relu(nn.Conv(features=32, kernel_size=(7,), strides=(2,), padding='SAME',
+                              kernel_init=_orth_relu)(lidar_cnn))
+        cnn = nn.relu(nn.Conv(features=64, kernel_size=(5,), strides=(2,), padding='SAME',
+                              kernel_init=_orth_relu)(cnn))
+        cnn = nn.relu(nn.Conv(features=64, kernel_size=(3,), strides=(2,), padding='SAME',
+                              kernel_init=_orth_relu)(cnn))
         cnn_feat = nn.LayerNorm()(cnn.reshape((*batch_shape, -1)))
 
         # Return cnn_feat + raw pose/state — downstream modules fuse them independently.
@@ -145,8 +173,11 @@ class LidarCNN(nn.Module):
 
 class ActorHead(nn.Module):
     """Actor: fuses cnn_feat + global state into mean/log_std.
-    Receives stop_gradient(cnn_feat) from the shared LidarCNN — encoder
-    gradients flow only through critic loss (same design as before).
+    Actor gradients flow back into LidarCNN scaled by ACTOR_ENC_GRAD_SCALE (0.1).
+    This allows the encoder to learn navigation-relevant spatial features
+    (e.g. pedestrian trajectory direction) that the critic alone might ignore,
+    while the small scale prevents actor gradients from destabilising the CNN.
+    Output layers use scale=0.01 init → near-uniform policy at start of training.
     """
     action_dim:  int   = ACTION_DIM
     LOG_STD_MIN: float = -5.0
@@ -156,13 +187,14 @@ class ActorHead(nn.Module):
     def __call__(self, cnn_feat: jnp.ndarray, pose_stack: jnp.ndarray,
                  state_vec: jnp.ndarray):
         global_in   = jnp.concatenate([pose_stack, state_vec], axis=-1)
-        global_feat = nn.relu(nn.Dense(128)(global_in))
-        global_feat = nn.relu(nn.Dense(64)(global_feat))
+        global_feat = nn.relu(nn.Dense(128, kernel_init=_orth_relu)(global_in))
+        global_feat = nn.relu(nn.Dense(64,  kernel_init=_orth_relu)(global_feat))
         fused  = jnp.concatenate([cnn_feat, global_feat], axis=-1)
-        shared = nn.relu(nn.Dense(256)(fused))
-        feat   = nn.relu(nn.Dense(128)(shared))
-        mean    = nn.Dense(self.action_dim, name='mean')(feat)
-        log_std = nn.Dense(self.action_dim, name='log_std')(feat)
+        shared = nn.relu(nn.Dense(256, kernel_init=_orth_relu)(fused))
+        feat   = nn.relu(nn.Dense(128, kernel_init=_orth_relu)(shared))
+        # Small-scale init on output layers → near-uniform policy at t=0
+        mean    = nn.Dense(self.action_dim, kernel_init=_orth_out, name='mean')(feat)
+        log_std = nn.Dense(self.action_dim, kernel_init=_orth_out, name='log_std')(feat)
         log_std = jnp.clip(log_std, self.LOG_STD_MIN, self.LOG_STD_MAX)
         return mean, log_std
 
@@ -174,17 +206,19 @@ class CriticBranch(nn.Module):
     perception features are value-neutral; the correlation that causes
     overestimation bias in Double-Q learning comes from the learned value
     representation layers, which are now fully decoupled.
+    Orthogonal init with gain=√2 throughout; output uses default init (Q-values
+    should not be artificially near-zero at init, unlike the policy).
     """
     @nn.compact
     def __call__(self, cnn_feat: jnp.ndarray, pose_stack: jnp.ndarray,
                  state_vec: jnp.ndarray, action: jnp.ndarray):
         global_in   = jnp.concatenate([pose_stack, state_vec], axis=-1)
-        global_feat = nn.relu(nn.Dense(128)(global_in))
-        global_feat = nn.relu(nn.Dense(64)(global_feat))
+        global_feat = nn.relu(nn.Dense(128, kernel_init=_orth_relu)(global_in))
+        global_feat = nn.relu(nn.Dense(64,  kernel_init=_orth_relu)(global_feat))
         fused  = jnp.concatenate([cnn_feat, global_feat, action], axis=-1)
-        q = nn.relu(nn.Dense(256)(fused))
-        q = nn.relu(nn.Dense(128)(q))
-        return jnp.squeeze(nn.Dense(1)(q), axis=-1)
+        q = nn.relu(nn.Dense(256, kernel_init=_orth_relu)(fused))
+        q = nn.relu(nn.Dense(128, kernel_init=_orth_relu)(q))
+        return jnp.squeeze(nn.Dense(1)(q), axis=-1)   # default init for Q output
 
 
 # Module instances (stateless — params stored separately)
@@ -295,10 +329,17 @@ def buf_sample(buf, rng_key, batch_size: int):
 #   la   / alo    — log alpha + opt state
 #
 # CNN passes per update:
-#   lidar_cnn(obs)       — online, trainable via critic loss         [1]
-#   lidar_cnn_tgt(next)  — target, stop_grad, for target Q backup   [1]
-#   lidar_cnn(obs)       — actor, stop_grad reuse of above          [0]
-#   Total: 2 CNN passes
+#   lidar_cnn(obs)       — online, trainable via critic loss            [1]
+#   lidar_cnn_tgt(next)  — target, stop_grad, for target Q backup      [1]
+#   lidar_cnn(obs)       — actor, re-run with grad × ACTOR_ENC_SCALE   [1]
+#   Total: 3 CNN passes  (was 2 with stop_gradient; cost is justified)
+#
+# Actor→encoder gradient coupling:
+#   Critic pass: full gradient into lcp (critic shapes encoder)
+#   Actor pass:  gradient scaled by ACTOR_ENC_GRAD_SCALE=0.1 into lcp
+#   Net encoder gradient = c_grad_cnn + 0.1 * a_grad_cnn
+#   This lets the actor nudge perception toward navigation-relevant features
+#   without destabilising the critic's value representation.
 @jax.jit
 def sac_update(lcp, lcos, tlcp, ahp, ahos, q1p, q1os, q2p, q2os,
                tq1p, tq2p, la, alo,
@@ -311,7 +352,7 @@ def sac_update(lcp, lcos, tlcp, ahp, ahos, q1p, q1os, q2p, q2os,
         alpha = jax.lax.stop_gradient(jnp.exp(la))
 
         # Target CNN pass on next_obs — frozen, used for both actor sampling
-        # and target Q computation (tep pattern preserved with new naming).
+        # and target Q computation.
         cnn_next, pose_next, sv_next = jax.lax.stop_gradient(
             lidar_cnn.apply({"params": tlcp}, next_obs)
         )
@@ -327,53 +368,63 @@ def sac_update(lcp, lcos, tlcp, ahp, ahos, q1p, q1os, q2p, q2os,
             reward + GAMMA * (1.0 - terminal) * v_next
         )
 
-        # Online Q: shared CNN on obs — gradients flow into lcp_
+        # Online Q: shared CNN on obs — full gradient flows into lcp_
         cnn_obs, pose_obs, sv_obs = lidar_cnn.apply({"params": lcp_}, obs)
         q1 = critic_q1.apply({"params": q1p_}, cnn_obs, pose_obs, sv_obs, action)
         q2 = critic_q2.apply({"params": q2p_}, cnn_obs, pose_obs, sv_obs, action)
         loss = jnp.mean((q1 - backup) ** 2) + jnp.mean((q2 - backup) ** 2)
-        return loss, (jnp.mean(backup), cnn_obs, pose_obs, sv_obs)
+        return loss, jnp.mean(backup)
 
-    (c_loss, (q_mean, cnn_obs_online, pose_obs_online, sv_obs_online)), \
-        (c_grads_cnn, c_grads_q1, c_grads_q2) = jax.value_and_grad(
-            _critic_loss, argnums=(0, 1, 2), has_aux=True
-        )(lcp, q1p, q2p)
+    (c_loss, q_mean), (c_grads_cnn, c_grads_q1, c_grads_q2) = jax.value_and_grad(
+        _critic_loss, argnums=(0, 1, 2), has_aux=True
+    )(lcp, q1p, q2p)
 
-    lc_upd, new_lcos = lidar_cnn_opt.update(c_grads_cnn, lcos, lcp)
-    q1_upd, new_q1os = head_q1_opt.update(c_grads_q1,   q1os, q1p)
-    q2_upd, new_q2os = head_q2_opt.update(c_grads_q2,   q2os, q2p)
-    new_lcp = optax.apply_updates(lcp, lc_upd)
+    q1_upd, new_q1os = head_q1_opt.update(c_grads_q1, q1os, q1p)
+    q2_upd, new_q2os = head_q2_opt.update(c_grads_q2, q2os, q2p)
     new_q1p = optax.apply_updates(q1p, q1_upd)
     new_q2p = optax.apply_updates(q2p, q2_upd)
 
-    # ── 2. Actor loss ─────────────────────────────────────────────────────────
-    # CNN frozen: reuse stop_gradient features from critic pass above.
-    # Q-eval uses updated branches (new_q1p, new_q2p) on same frozen features.
-    def _actor_loss(ahp_):
+    # ── 2. Actor loss — with scaled encoder gradient ──────────────────────────
+    # Actor is differentiated w.r.t. both ahp (head) and lcp (encoder).
+    # The encoder gradient from this path is scaled by ACTOR_ENC_GRAD_SCALE
+    # before being summed with the critic's encoder gradient.
+    # This gives the actor a voice in shaping perception without destabilising
+    # the critic's representation (0.1 = soft nudge, not a takeover).
+    def _actor_loss(ahp_, lcp_actor):
         alpha = jax.lax.stop_gradient(jnp.exp(la))
-        cnn_f  = jax.lax.stop_gradient(cnn_obs_online)
-        pose_f = jax.lax.stop_gradient(pose_obs_online)
-        sv_f   = jax.lax.stop_gradient(sv_obs_online)
+        # Fresh CNN pass — actor's gradient flows through lcp_actor
+        cnn_f, pose_f, sv_f = lidar_cnn.apply({"params": lcp_actor}, obs)
         mean, log_std = actor_head.apply({"params": ahp_}, cnn_f, pose_f, sv_f)
         action_new, log_pi = sample_action_sac_batched(rng_a, mean, log_std, max_v_obs)
-        q1 = critic_q1.apply({"params": new_q1p}, cnn_f, pose_f, sv_f, action_new)
-        q2 = critic_q2.apply({"params": new_q2p}, cnn_f, pose_f, sv_f, action_new)
+        # Q-eval uses updated branches; stop_gradient on Q params (actor doesn't shape critic)
+        q1 = critic_q1.apply({"params": jax.lax.stop_gradient(new_q1p)}, cnn_f, pose_f, sv_f, action_new)
+        q2 = critic_q2.apply({"params": jax.lax.stop_gradient(new_q2p)}, cnn_f, pose_f, sv_f, action_new)
         return jnp.mean(alpha * log_pi - jnp.minimum(q1, q2)), jnp.mean(log_pi)
 
-    (a_loss, log_pi_mean), a_grads_head = jax.value_and_grad(
-        _actor_loss, has_aux=True
-    )(ahp)
+    (a_loss, log_pi_mean), (a_grads_head, a_grads_cnn_raw) = jax.value_and_grad(
+        _actor_loss, argnums=(0, 1), has_aux=True
+    )(ahp, lcp)
 
     ah_upd, new_ahos = head_actor_opt.update(a_grads_head, ahos, ahp)
     new_ahp = optax.apply_updates(ahp, ah_upd)
 
-    # ── 3. Alpha update ───────────────────────────────────────────────────────
+    # ── 3. Encoder update — critic gradient + scaled actor gradient ───────────
+    # Combine critic and actor encoder gradients. Actor contribution is scaled
+    # down by ACTOR_ENC_GRAD_SCALE to maintain encoder stability.
+    combined_cnn_grads = jax.tree_util.tree_map(
+        lambda cg, ag: cg + ACTOR_ENC_GRAD_SCALE * ag,
+        c_grads_cnn, a_grads_cnn_raw
+    )
+    lc_upd, new_lcos = lidar_cnn_opt.update(combined_cnn_grads, lcos, lcp)
+    new_lcp = optax.apply_updates(lcp, lc_upd)
+
+    # ── 4. Alpha update ───────────────────────────────────────────────────────
     log_pi_sg = jax.lax.stop_gradient(log_pi_mean)
     al_grad   = jax.grad(lambda a: -a * (log_pi_sg + TARGET_ENTROPY))(la)
     al_upd, new_alo = alpha_opt.update(al_grad, alo)
     new_la = optax.apply_updates(la, al_upd)
 
-    # ── 4. Soft target update — CNN and both Q branches ───────────────────────
+    # ── 5. Soft target update — CNN and both Q branches ───────────────────────
     new_tlcp = jax.tree_util.tree_map(lambda t, o: TAU * o + (1.0 - TAU) * t, tlcp, new_lcp)
     new_tq1p = jax.tree_util.tree_map(lambda t, o: TAU * o + (1.0 - TAU) * t, tq1p, new_q1p)
     new_tq2p = jax.tree_util.tree_map(lambda t, o: TAU * o + (1.0 - TAU) * t, tq2p, new_q2p)
@@ -407,7 +458,7 @@ def collect_step(lcp, ahp, env_state, env_obs, rng_key, vmap_step, max_goal_dist
 
 
 # ── Fused GPU train chunk ─────────────────────────────────────────────────────
-@functools.partial(jax.jit, static_argnums=(12,))
+@functools.partial(jax.jit, static_argnums=(13,))
 def train_chunk(lcp, lcos, tlcp, ahp, ahos,
                 q1p, q1os, q2p, q2os, tq1p, tq2p,
                 la, alo, vmap_step,
