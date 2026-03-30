@@ -79,7 +79,7 @@ ENTROPY_COEF = 3e-4
 # FIX 1: actor/critic grads are zeroed below this step count.
 # At ~960 FPS x 64 envs, 3000 steps ≈ 10s wall time.
 # Watch WM loss: once it stabilises below ~0.4 you can lower this.
-WM_WARMUP_STEPS = 3_000
+WM_WARMUP_STEPS = 20_000
 
 OBS_DIM    = 342
 ACTION_DIM = 2
@@ -278,9 +278,12 @@ def train_step(rng_key, buffer_state, params, opt_states, step_count):
     new_opt_states = {'wm': new_wm_opt,    'actor': new_act_opt,    'critic': new_crit_opt}
     metrics = {
         'wm_loss':     wm_loss,
+        'obs_loss':    wm_aux[0],
+        'rew_loss':    wm_aux[1],
+        'cont_loss':   wm_aux[2],
+        'kl_loss':     wm_aux[3],
         'actor_loss':  act_loss,
         'critic_loss': critic_loss,
-        'kl_loss':     wm_aux[3],
         'wm_warming':  1.0 - wm_warm_mask,   # 1.0 during warmup, 0.0 after
     }
     return new_params, new_opt_states, metrics
@@ -463,7 +466,7 @@ if __name__ == "__main__":
     # 5. Main training loop
     print("Starting Optimized Main Training Loop...")
     CHUNK_SIZE  = 50
-    TOTAL_STEPS = 100_000
+    TOTAL_STEPS = 2_000_000
 
     for step in range(0, TOTAL_STEPS, CHUNK_SIZE):
         t0 = time.time()
@@ -488,6 +491,10 @@ if __name__ == "__main__":
 
         if step % 100 == 0:
             avg_wm     = float(jnp.mean(metrics_history['wm_loss']))
+            avg_obs    = float(jnp.mean(metrics_history['obs_loss']))
+            avg_rew    = float(jnp.mean(metrics_history['rew_loss']))
+            avg_cont   = float(jnp.mean(metrics_history['cont_loss']))
+            avg_kl     = float(jnp.mean(metrics_history['kl_loss']))
             avg_actor  = float(jnp.mean(metrics_history['actor_loss']))
             avg_critic = float(jnp.mean(metrics_history['critic_loss']))
             fps        = (NUM_ENVS * CHUNK_SIZE) / (time.time() - t0)
@@ -498,7 +505,8 @@ if __name__ == "__main__":
             print(
                 f"Step {step:05d} | "
                 f"FPS: {fps:.0f} | "
-                f"WM: {avg_wm:.3f} | "
+                f"WM: {avg_wm:.3f} "
+                f"(obs={avg_obs:.3f} rew={avg_rew:.3f} cont={avg_cont:.3f} kl={avg_kl:.3f}) | "
                 f"Act: {avg_actor:.4f} | "
                 f"Crit: {avg_critic:.4f} | "
                 f"Ret: {ret_val:.1f} | "
