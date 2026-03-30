@@ -214,6 +214,11 @@ def train_step(rng_key, buffer_state, params, opt_states):
             rewards[:-1], values[:-1], continues[:-1], bootstrap, GAMMA, LAMBDA)
 
         advantages  = jax.lax.stop_gradient(lambda_returns - values[:-1])
+
+        jax.debug.print("lambda_returns  mean={x:.2f}  std={y:.2f}", x=jnp.mean(lambda_returns), y=jnp.std(lambda_returns))
+        jax.debug.print("values          mean={x:.2f}  std={y:.2f}", x=jnp.mean(values[:-1]), y=jnp.std(values[:-1]))
+        jax.debug.print("advantages      mean={x:.2f}  std={y:.2f}", x=jnp.mean(advantages), y=jnp.std(advantages))
+
         actor_loss  = -jnp.mean(traj['log_prob'][:-1] * advantages)
         # BUG B FIX: single negation only — we want to maximise entropy,
         # i.e. minimise -entropy = -mean(-log_prob) = mean(log_prob).
@@ -449,8 +454,8 @@ if __name__ == "__main__":
 
     # 5. Main Training Loop (Mega-JIT)
     print("Starting Optimized Main Training Loop...")
-    CHUNK_SIZE = 50  # Numero di step eseguiti interamente su GPU per ogni iterazione Python
-    TOTAL_STEPS = 100_000
+    CHUNK_SIZE = 1#50  # Numero di step eseguiti interamente su GPU per ogni iterazione Python
+    TOTAL_STEPS = 20#100_000
     
     for step in range(0, TOTAL_STEPS, CHUNK_SIZE):
         t0 = time.time()
