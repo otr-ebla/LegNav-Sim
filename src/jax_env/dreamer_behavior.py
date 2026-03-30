@@ -1,11 +1,11 @@
 """
 dreamer_behavior.py — Actor-Critic and Latent Imagination Engine
 
-No crash-level bugs in this file. Minor cleanup only:
-  - unroll_imagination return value simplified: final_h/final_z were always
-    discarded by the caller with `_, _`; the function now returns only `traj`
-    so the API matches actual usage and avoids confusion.
-  - All other logic (sample_action, compute_lambda_returns, scan) was correct.
+Architectural upgrades:
+  - LAYER NORM: nn.LayerNorm injected after every Dense and before every swish
+    activation in DreamerActor and DreamerCritic. Prevents internal covariate
+    shift under symlog-distorted reward gradients.
+  - unroll_imagination returns only `traj` (final h/z discarded by all callers).
 """
 
 import jax
@@ -27,9 +27,9 @@ class DreamerActor(nn.Module):
     def __call__(self, h_t: jnp.ndarray,
                  z_t: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
         x = jnp.concatenate([h_t, z_t], axis=-1)
-        x = nn.relu(nn.Dense(DETERMINISTIC_SIZE)(x))
-        x = nn.relu(nn.Dense(DETERMINISTIC_SIZE)(x))
-        x = nn.relu(nn.Dense(DETERMINISTIC_SIZE)(x))
+        x = nn.swish(nn.LayerNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
+        x = nn.swish(nn.LayerNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
+        x = nn.swish(nn.LayerNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
         mean    = nn.Dense(self.action_dim)(x)
         std_raw = nn.Dense(self.action_dim)(x)
         std     = jax.nn.softplus(std_raw) + self.min_std
@@ -40,10 +40,10 @@ class DreamerCritic(nn.Module):
     @nn.compact
     def __call__(self, h_t: jnp.ndarray, z_t: jnp.ndarray) -> jnp.ndarray:
         x = jnp.concatenate([h_t, z_t], axis=-1)
-        x = nn.relu(nn.Dense(DETERMINISTIC_SIZE)(x))
-        x = nn.relu(nn.Dense(DETERMINISTIC_SIZE)(x))
-        x = nn.relu(nn.Dense(DETERMINISTIC_SIZE)(x))
-        return jnp.squeeze(nn.Dense(1)(x), axis=-1)
+        x = nn.swish(nn.LayerNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
+        x = nn.swish(nn.LayerNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
+        x = nn.swish(nn.LayerNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
+        return nn.Dense(255)(x)
 
 
 # ---------------------------------------------------------------------------
