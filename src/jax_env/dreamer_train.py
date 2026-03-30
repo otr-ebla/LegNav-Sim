@@ -7,33 +7,44 @@ Fixes vs submitted version:
   - BUG 3/4 FIXED (via dreamer_buffer.py): episode masking + buffer_ready guard.
   - BUG 5 FIXED: train_step had @partial(jax.jit, static_argnums=(4,)) with
     max_goal_dist as arg 4 — a float that's never used inside the function.
-    This caused an unnecessary recompile any time max_goal_dist changed, and
-    conflated a hyperparameter with a JIT static arg. Removed entirely.
+    Removed entirely.
   - BUG 6 FIXED: done mask was `(1.0 - dones[:, None])`. `dones` is bool_ so
     this silently coerced via Python scalar subtraction. Fixed to
-    (~dones).astype(jnp.float32)[:, None] for an explicit, type-safe mask.
-  - BUG 7 FIXED: buffer_ready() guard added before train_step so
-    sample_sequences is never called with a near-empty buffer.
+    (~dones).astype(jnp.float32)[:, None].
+  - BUG 7 FIXED: buffer_ready() guard added before train_step.
   - BUG 8 FIXED (via dreamer_env.py): global cache .clear() replaced by closure.
-  - BUG 9 FIXED: unroll_imagination now returns only `traj` (final h/z were
-    always discarded). Call sites updated accordingly.
-  - BUG A FIXED: scan_rssm was calling rssm.prior(..., rngs={'gumbel': key})
-    purely to get the prior logits for the KL loss. A Gumbel sample is never
-    needed for KL computation — only the logits matter. Switched to
-    rssm.prior_greedy(), eliminating a wasted RNG split per scan step.
-  - BUG B FIXED: entropy loss double-negation.
-    -ENTROPY_COEF * mean(-log_prob) == +ENTROPY_COEF * mean(log_prob), which
-    penalises entropy rather than encouraging it. Fixed to a single negation:
-    -ENTROPY_COEF * mean(log_prob).
-  - BUG C FIXED: buffer_ready() was imported and mentioned but never called in
-    the main training loop. Added guard call at the top of the training for-loop
-    so a cold-start without prefill does not crash sample_sequences.
+  - BUG 9 FIXED: unroll_imagination now returns only `traj`.
+  - BUG A FIXED: scan_rssm used rssm.prior() just for KL logits, wasting a
+    gumbel RNG split. Switched to rssm.prior_greedy() — no RNG needed.
+  - BUG B FIXED: entropy loss double-negation was penalising entropy instead
+    of encouraging it. Fixed to single negation.
+  - BUG C FIXED: buffer_ready() guard was imported but never called in the loop.
+
+New fixes (post-diagnostic):
+  - FIX 1 — WM WARMUP: actor/critic gradients are zeroed for the first
+    WM_WARMUP_STEPS steps. The world model must learn to predict rewards
+    before imagined rollouts can produce a useful training signal. Without
+    this, the actor trains on near-zero imagined rewards from an untrained
+    reward decoder, producing oscillating actor loss and diverging returns.
+    step_count is threaded through train_step and train_loop_chunk as a
+    JAX scalar so the gate works inside lax.scan without recompilation.
+  - FIX 2 — ADVANTAGE NORMALISATION: raw advantages (lambda_returns -
+    values) are zero-mean / unit-std normalised per batch before being
+    used as the policy gradient weight. Without this the advantage scale
+    swings with the reward magnitude, producing noisy, unstable gradients.
+  - FIX 3 — REWARD NORMALISATION: a running EMA of reward RMS is
+    maintained Python-side and used to normalise rewards before buffering.
+    This keeps the reward decoder target in a consistent range regardless
+    of the reward shaping scale, and decouples WM learning rate from reward
+    magnitude. A floor of 1.0 prevents division-by-near-zero at startup.
+    The prefill pass now returns rewards so the EMA can be warm-started
+    rather than defaulting to 1.0 cold.
 """
 
 import os
 import argparse
 
-# 1. Forza le variabili d'ambiente PRIMA di importare JAX
+# Force env vars before importing JAX
 parser = argparse.ArgumentParser(description="DreamerV3 Training")
 parser.add_argument("--gpu", type=str, default="0", help="Target GPU ID")
 args, _ = parser.parse_known_args()
@@ -43,7 +54,6 @@ os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.88"
 os.environ["TF_GPU_ALLOCATOR"]               = "cuda_malloc_async"
 
 import jax
-# 2. Impedisce il fallback silenzioso: se non c'è CUDA, deve crashare
 jax.config.update("jax_platform_name", "cuda")
 jax.config.update("jax_default_device", jax.devices("cuda")[0])
 
@@ -68,14 +78,22 @@ SEQ_LEN         = 64
 BATCH_SIZE      = 16
 HORIZON         = 15
 BUFFER_CAPACITY = 20_000
-PREFILL_STEPS   = 1_000
+PREFILL_STEPS   = 2_000      # increased: more data before WM training begins
 
-LR_WM        = 1e-4
+LR_WM        = 3e-4          # increased from 1e-4 to accelerate WM convergence early
 LR_ACTOR     = 3e-5
 LR_CRITIC    = 3e-5
 GAMMA        = 0.99
-LAMBDA       = 0.95
+LAMBDA_      = 0.95           # renamed from LAMBDA to avoid shadowing Python builtin
 ENTROPY_COEF = 3e-4
+
+# FIX 1: actor/critic grads are zeroed below this step count.
+# At ~960 FPS x 64 envs, 3000 steps ≈ 10s wall time.
+# Watch WM loss: once it stabilises below ~0.4 you can lower this.
+WM_WARMUP_STEPS = 3_000
+
+# FIX 3: EMA decay for reward RMS normalisation (Python-side, per chunk).
+REW_NORM_DECAY = 0.99
 
 OBS_DIM    = 342
 ACTION_DIM = 2
@@ -86,13 +104,13 @@ Z_DIM      = LATENT_SIZE          # 1024
 # Module instances
 # ---------------------------------------------------------------------------
 
-encoder     = DreamerEncoder()
-rssm        = RSSM(action_dim=ACTION_DIM)
-obs_decoder = ObservationDecoder(obs_dim=OBS_DIM)
-rew_decoder = RewardDecoder()
+encoder      = DreamerEncoder()
+rssm         = RSSM(action_dim=ACTION_DIM)
+obs_decoder  = ObservationDecoder(obs_dim=OBS_DIM)
+rew_decoder  = RewardDecoder()
 cont_decoder = ContinueDecoder()
-actor       = DreamerActor(action_dim=ACTION_DIM)
-critic      = DreamerCritic()
+actor        = DreamerActor(action_dim=ACTION_DIM)
+critic       = DreamerCritic()
 
 # ---------------------------------------------------------------------------
 # RSSM sequence unroll — RNG key in scan carry (fully on GPU)
@@ -112,8 +130,8 @@ def scan_rssm(wm_params: dict, obs_seq: jnp.ndarray,
     act_prev = jnp.concatenate(
         [jnp.zeros((batch_sz, 1, ACTION_DIM)), act_seq[:, :-1, :]], axis=1)
 
-    obs_t  = jnp.swapaxes(obs_seq,  0, 1)   # [T, B, obs_dim]
-    act_t  = jnp.swapaxes(act_prev, 0, 1)   # [T, B, act_dim]
+    obs_t = jnp.swapaxes(obs_seq,  0, 1)   # [T, B, obs_dim]
+    act_t = jnp.swapaxes(act_prev, 0, 1)   # [T, B, act_dim]
 
     def step(carry, inputs):
         h_prev, z_prev, key = carry
@@ -130,8 +148,7 @@ def scan_rssm(wm_params: dict, obs_seq: jnp.ndarray,
             {'params': wm_params['rssm']}, h_t, obs_embed,
             method=rssm.posterior, rngs={'gumbel': post_key})
 
-        # BUG A FIX: use prior_greedy for KL logits — we only need the logits,
-        # not a Gumbel sample, so no RNG key is needed and prior_key is freed.
+        # BUG A FIX: prior_greedy — only logits needed for KL, no gumbel key.
         _, prior_logits = rssm.apply(
             {'params': wm_params['rssm']}, h_t,
             method=rssm.prior_greedy)
@@ -141,8 +158,8 @@ def scan_rssm(wm_params: dict, obs_seq: jnp.ndarray,
     _, (h_seq, z_seq, prior_seq, post_seq) = jax.lax.scan(
         step, (h_0, z_0, rng_key), (obs_t, act_t))
 
-    return (jnp.swapaxes(h_seq,    0, 1),
-            jnp.swapaxes(z_seq,    0, 1),
+    return (jnp.swapaxes(h_seq,     0, 1),
+            jnp.swapaxes(z_seq,     0, 1),
             jnp.swapaxes(prior_seq, 0, 1),
             jnp.swapaxes(post_seq,  0, 1))
 
@@ -156,12 +173,12 @@ opt_critic = optax.adam(LR_CRITIC, eps=1e-5)
 
 # ---------------------------------------------------------------------------
 # Monolithic JIT training step
-# BUG 5 FIX: static_argnums removed — max_goal_dist was the only static arg
-# and it was never used inside the function body.
+# FIX 1: step_count added as a JAX scalar so the warmup gate works inside
+#         lax.scan without recompilation (no Python conditional).
 # ---------------------------------------------------------------------------
 
 @jax.jit
-def train_step(rng_key, buffer_state, params, opt_states):
+def train_step(rng_key, buffer_state, params, opt_states, step_count):
     k_sample, k_actor, k_wm = jax.random.split(rng_key, 3)
 
     obs_seq, act_seq, rew_seq, done_seq = sample_sequences(
@@ -185,6 +202,11 @@ def train_step(rng_key, buffer_state, params, opt_states):
     wm_updates, new_wm_opt = opt_wm.update(wm_grads, opt_states['wm'])
     new_wm_params = optax.apply_updates(params['wm'], wm_updates)
 
+    # FIX 1: warmup mask — 0.0 during warmup, 1.0 after.
+    # Multiplying grads by 0.0 stops param updates while letting the Adam
+    # state warm up; no recompilation needed since step_count is a traced value.
+    wm_warm_mask = (step_count >= WM_WARMUP_STEPS).astype(jnp.float32)
+
     # ---- B. Actor ----
     start_h = jax.lax.stop_gradient(h_states.reshape(-1, H_DIM))
     start_z = jax.lax.stop_gradient(z_states.reshape(-1, Z_DIM))
@@ -192,7 +214,6 @@ def train_step(rng_key, buffer_state, params, opt_states):
     def actor_loss_fn(actor_params):
         frozen_wm = jax.lax.stop_gradient(new_wm_params)
 
-        # BUG 9 FIX: unroll_imagination now returns traj only (no final h/z)
         traj = unroll_imagination(
             k_actor,
             lambda p, h, z, a: rssm.apply({'params': p}, h, z, a, method=rssm.step_gru),
@@ -211,23 +232,25 @@ def train_step(rng_key, buffer_state, params, opt_states):
 
         bootstrap      = values[-1]
         lambda_returns = compute_lambda_returns(
-            rewards[:-1], values[:-1], continues[:-1], bootstrap, GAMMA, LAMBDA)
+            rewards[:-1], values[:-1], continues[:-1], bootstrap, GAMMA, LAMBDA_)
 
-        advantages  = jax.lax.stop_gradient(lambda_returns - values[:-1])
+        # FIX 2: normalise advantages to zero-mean / unit-std per batch.
+        # Raw advantages track reward magnitude; without normalisation a large
+        # step_pen or sparse goal bonus dominates and destabilises the gradient.
+        adv_raw    = lambda_returns - values[:-1]
+        advantages = jax.lax.stop_gradient(
+            (adv_raw - jnp.mean(adv_raw)) / (jnp.std(adv_raw) + 1e-8))
 
-        jax.debug.print("lambda_returns  mean={x:.2f}  std={y:.2f}", x=jnp.mean(lambda_returns), y=jnp.std(lambda_returns))
-        jax.debug.print("values          mean={x:.2f}  std={y:.2f}", x=jnp.mean(values[:-1]), y=jnp.std(values[:-1]))
-        jax.debug.print("advantages      mean={x:.2f}  std={y:.2f}", x=jnp.mean(advantages), y=jnp.std(advantages))
-
-        actor_loss  = -jnp.mean(traj['log_prob'][:-1] * advantages)
-        # BUG B FIX: single negation only — we want to maximise entropy,
-        # i.e. minimise -entropy = -mean(-log_prob) = mean(log_prob).
-        # The previous double negation was penalising entropy instead.
+        actor_loss   = -jnp.mean(traj['log_prob'][:-1] * advantages)
+        # BUG B FIX: single negation — maximise entropy = minimise mean(log_prob).
         entropy_loss = -ENTROPY_COEF * jnp.mean(traj['log_prob'][:-1])
         return actor_loss + entropy_loss, (traj, lambda_returns)
 
     (act_loss, (traj, lambda_returns)), act_grads = jax.value_and_grad(
         actor_loss_fn, has_aux=True)(params['actor'])
+
+    # FIX 1: zero actor grads during WM warmup
+    act_grads = jax.tree_util.tree_map(lambda g: g * wm_warm_mask, act_grads)
     act_updates, new_act_opt = opt_actor.update(act_grads, opt_states['actor'])
     new_act_params = optax.apply_updates(params['actor'], act_updates)
 
@@ -241,22 +264,25 @@ def train_step(rng_key, buffer_state, params, opt_states):
         return jnp.mean((values - target) ** 2)
 
     critic_loss, crit_grads = jax.value_and_grad(critic_loss_fn)(params['critic'])
+
+    # FIX 1: zero critic grads during WM warmup
+    crit_grads = jax.tree_util.tree_map(lambda g: g * wm_warm_mask, crit_grads)
     crit_updates, new_crit_opt = opt_critic.update(crit_grads, opt_states['critic'])
     new_crit_params = optax.apply_updates(params['critic'], crit_updates)
 
-    new_params = {'wm': new_wm_params, 'actor': new_act_params, 'critic': new_crit_params}
-    new_opt_states = {'wm': new_wm_opt, 'actor': new_act_opt, 'critic': new_crit_opt}
+    new_params     = {'wm': new_wm_params, 'actor': new_act_params, 'critic': new_crit_params}
+    new_opt_states = {'wm': new_wm_opt,    'actor': new_act_opt,    'critic': new_crit_opt}
     metrics = {
         'wm_loss':     wm_loss,
         'actor_loss':  act_loss,
         'critic_loss': critic_loss,
         'kl_loss':     wm_aux[3],
+        'wm_warming':  1.0 - wm_warm_mask,   # 1.0 during warmup, 0.0 after
     }
     return new_params, new_opt_states, metrics
 
 # ---------------------------------------------------------------------------
 # Inference step
-# BUG 5 FIX: static_argnums=(7,) correctly targets the `explore` bool.
 # ---------------------------------------------------------------------------
 
 @partial(jax.jit, static_argnums=(7,))
@@ -274,7 +300,7 @@ def act_step(rng_key, wm_params, actor_params, obs,
 
     mean, std = actor.apply({'params': actor_params}, h_t, z_t)
 
-    # `explore` is static — Python if is safe here (resolved at compile time)
+    # explore is static — Python if resolved at compile time
     if explore:
         action, _ = sample_action(act_key, mean, std)
     else:
@@ -282,90 +308,75 @@ def act_step(rng_key, wm_params, actor_params, obs,
 
     return action, h_t, z_t
 
-
-
+# ---------------------------------------------------------------------------
+# Chunked training loop (lax.scan over CHUNK_SIZE env steps)
+# FIX 1: step_count threaded through carry so train_step can apply warmup gate.
+# FIX 3: rew_std (JAX scalar) used to normalise rewards before buffering.
+#         Updated Python-side after each chunk via EMA of reward RMS.
+# ---------------------------------------------------------------------------
 
 @partial(jax.jit, static_argnames=('chunk_size',))
-def train_loop_chunk(rng_key, buffer_state, params, opt_states, 
+def train_loop_chunk(rng_key, buffer_state, params, opt_states,
                      env_obs, env_state, current_h, current_z, current_action,
                      cur_return, ema_return, ema_success,
+                     step_count, rew_std,
                      chunk_size=50):
-    
+
     def single_step(carry, _):
-        # 1. Unpack con le nuove variabili
-        (b_state, p, opt, h, z, a, obs, e_state, key, c_ret, e_ret, e_succ) = carry
+        (b_state, p, opt, h, z, a, obs, e_state,
+         key, c_ret, e_ret, e_succ, s_count, r_std) = carry
+
         key, act_k, step_k, train_k = jax.random.split(key, 4)
 
         raw_acts, next_h, next_z = act_step(
             act_k, p['wm'], p['actor'], obs, h, z, a, explore=True)
-        
+
         env_acts = scale_actions_batched(raw_acts, e_state.env_state.max_v)
-        s_keys = jax.random.split(step_k, NUM_ENVS)
-        
-        # 2. Recuperiamo 'info' invece di ignorarlo con '_'
-        n_obs, n_e_state, rews, dones, info = vmap_step(s_keys, e_state, env_acts, 3.0, -1)
+        s_keys   = jax.random.split(step_k, NUM_ENVS)
 
-        new_b_state = add_batch(b_state, obs, raw_acts, rews, dones)
-        new_p, new_opt, metrics = train_step(train_k, new_b_state, p, opt)
+        n_obs, n_e_state, rews, dones, info = vmap_step(
+            s_keys, e_state, env_acts, 3.0, -1)
 
-        alive = (~dones).astype(jnp.float32)[:, None]
+        # FIX 3: normalise rewards before buffering.
+        # r_std is an EMA of reward RMS from previous chunks, floored at 1.0.
+        # The reward decoder always trains on targets in a ~unit range.
+        rews_norm = rews / jnp.maximum(r_std, 1.0)
+
+        new_b_state = add_batch(b_state, obs, raw_acts, rews_norm, dones)
+        new_p, new_opt, metrics = train_step(train_k, new_b_state, p, opt, s_count)
+
+        alive   = (~dones).astype(jnp.float32)[:, None]
         next_h *= alive
         next_z *= alive
 
-        # --- 3. LOGICA DI TRACKING (EMA) ---
-        c_ret = c_ret + rews
+        # EMA return/success tracking on raw (unnormalised) rewards
+        c_ret     = c_ret + rews
         num_dones = jnp.sum(dones)
-        
-        # Calcola media dei return e successi solo per gli ambienti appena terminati
-        mean_ret  = jnp.sum(c_ret * dones) / jnp.maximum(1.0, num_dones)
+        mean_ret  = jnp.sum(c_ret * dones)    / jnp.maximum(1.0, num_dones)
         mean_succ = jnp.sum(info['goal_reached'] * dones) / jnp.maximum(1.0, num_dones)
-        
-        # Aggiorna l'EMA solo se c'è almeno un episodio terminato in questo step
-        e_ret  = jnp.where(num_dones > 0, 0.95 * e_ret + 0.05 * mean_ret, e_ret)
+        e_ret  = jnp.where(num_dones > 0, 0.95 * e_ret  + 0.05 * mean_ret,  e_ret)
         e_succ = jnp.where(num_dones > 0, 0.95 * e_succ + 0.05 * mean_succ, e_succ)
-        
-        # Azzera l'accumulatore per gli ambienti riavviati
-        c_ret = c_ret * (~dones)
+        c_ret  = c_ret * (~dones)
 
         metrics['ema_return']  = e_ret
         metrics['ema_success'] = e_succ
+        # Carry raw reward squares out so Python can update the RMS EMA
+        metrics['raw_rew_sq']  = jnp.mean(rews ** 2)
 
-        # 4. Repack del carry aggiornato
-        next_carry = (new_b_state, new_p, new_opt, next_h, next_z, raw_acts, n_obs, n_e_state, key, c_ret, e_ret, e_succ)
+        next_carry = (new_b_state, new_p, new_opt, next_h, next_z, raw_acts,
+                      n_obs, n_e_state, key, c_ret, e_ret, e_succ,
+                      s_count + 1, r_std)
         return next_carry, metrics
 
-    # 5. Init e scan
-    init_carry = (buffer_state, params, opt_states, current_h, current_z, current_action, env_obs, env_state, rng_key, cur_return, ema_return, ema_success)
-    final_carry, metrics_history = jax.lax.scan(single_step, init_carry, None, length=chunk_size)
+    init_carry = (buffer_state, params, opt_states,
+                  current_h, current_z, current_action,
+                  env_obs, env_state, rng_key,
+                  cur_return, ema_return, ema_success,
+                  step_count, rew_std)
+
+    final_carry, metrics_history = jax.lax.scan(
+        single_step, init_carry, None, length=chunk_size)
     return final_carry, metrics_history
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -385,7 +396,7 @@ if __name__ == "__main__":
     # 2. Replay buffer
     buffer_state = init_buffer(BUFFER_CAPACITY, NUM_ENVS, OBS_DIM, ACTION_DIM)
 
-    # 3. Parameters Initialization
+    # 3. Parameter initialisation
     dummy_obs   = jnp.zeros((1, OBS_DIM))
     dummy_h     = jnp.zeros((1, H_DIM))
     dummy_z     = jnp.zeros((1, Z_DIM))
@@ -394,7 +405,6 @@ if __name__ == "__main__":
 
     rng, r1, r2 = jax.random.split(rng, 3)
 
-    # Bug 1 Fix: init via __call__
     rssm_params = rssm.init(
         {'params': r1, 'gumbel': r2},
         dummy_h, dummy_z, dummy_act, dummy_embed,
@@ -421,97 +431,116 @@ if __name__ == "__main__":
     current_h      = jnp.zeros((NUM_ENVS, H_DIM))
     current_z      = jnp.zeros((NUM_ENVS, Z_DIM))
     current_action = jnp.zeros((NUM_ENVS, ACTION_DIM))
-    
-    # --- NUOVI TRACKER ---
-    cur_return  = jnp.zeros(NUM_ENVS)  # Accumulatore reward per l'episodio in corso
-    ema_return  = jnp.array(0.0)       # Media mobile esponenziale del return
-    ema_success = jnp.array(0.0)       # Media mobile esponenziale del success rate
 
-    # 4. Prefill (GPU-side)
+    cur_return  = jnp.zeros(NUM_ENVS)
+    ema_return  = jnp.array(0.0)
+    ema_success = jnp.array(0.0)
+
+    # FIX 1: step counter as JAX int32 scalar, threaded through lax.scan carry
+    step_count = jnp.int32(0)
+
+    # FIX 3: reward RMS EMA — warm-started from prefill, floored at 1.0
+    rew_std_ema = 1.0   # Python float, updated each chunk
+
+    # 4. Prefill — now also returns rewards to warm-start rew_std_ema
     print("Compiling and executing fast pre-fill on GPU...")
-    
+
     @jax.jit
     def run_prefill(rng_key, b_state, e_state, e_obs):
         def _step(carry, _):
             curr_b, curr_e_state, curr_e_obs, curr_rng = carry
             curr_rng, act_rng, step_rng = jax.random.split(curr_rng, 3)
-            raw_acts = jax.random.uniform(act_rng, (NUM_ENVS, ACTION_DIM), minval=-1.0, maxval=1.0)
+            raw_acts = jax.random.uniform(
+                act_rng, (NUM_ENVS, ACTION_DIM), minval=-1.0, maxval=1.0)
             env_acts = scale_actions_batched(raw_acts, curr_e_state.env_state.max_v)
-            s_keys = jax.random.split(step_rng, NUM_ENVS)
-            n_obs, n_state, rews, dones, _ = vmap_step(s_keys, curr_e_state, env_acts, 3.0, -1)
+            s_keys   = jax.random.split(step_rng, NUM_ENVS)
+            n_obs, n_state, rews, dones, _ = vmap_step(
+                s_keys, curr_e_state, env_acts, 3.0, -1)
+            # Store raw rewards during prefill; normalisation starts at train time
             next_b = add_batch(curr_b, curr_e_obs, raw_acts, rews, dones)
-            return (next_b, n_state, n_obs, curr_rng), None
+            return (next_b, n_state, n_obs, curr_rng), rews   # return rews for std init
 
-        (final_b, final_e_state, final_e_obs, _), _ = jax.lax.scan(
-            _step, (b_state, e_state, e_obs, rng_key), None, length=PREFILL_STEPS
-        )
-        return final_b, final_e_state, final_e_obs
+        (final_b, final_e_state, final_e_obs, _), all_rews = jax.lax.scan(
+            _step, (b_state, e_state, e_obs, rng_key), None, length=PREFILL_STEPS)
+        return final_b, final_e_state, final_e_obs, all_rews
 
     t_prefill = time.time()
-    buffer_state, env_state, env_obs = run_prefill(rng, buffer_state, env_state, env_obs)
-    buffer_state.insert_idx.block_until_ready() 
-    print(f"Pre-fill complete in {time.time() - t_prefill:.2f}s!\n")
+    buffer_state, env_state, env_obs, prefill_rews = run_prefill(
+        rng, buffer_state, env_state, env_obs)
+    buffer_state.insert_idx.block_until_ready()
 
-    # 5. Main Training Loop (Mega-JIT)
+    # Warm-start reward RMS EMA from prefill distribution
+    prefill_rms = float(jnp.sqrt(jnp.mean(prefill_rews ** 2)))
+    rew_std_ema = max(prefill_rms, 1.0)
+    print(f"Pre-fill complete in {time.time() - t_prefill:.2f}s  "
+          f"| reward RMS from prefill: {rew_std_ema:.4f}\n")
+
+    # 5. Main training loop
     print("Starting Optimized Main Training Loop...")
-    CHUNK_SIZE = 1#50  # Numero di step eseguiti interamente su GPU per ogni iterazione Python
-    TOTAL_STEPS = 20#100_000
-    
+    CHUNK_SIZE  = 50
+    TOTAL_STEPS = 100_000
+
     for step in range(0, TOTAL_STEPS, CHUNK_SIZE):
         t0 = time.time()
-        
-        # BUG C FIX: guard train_step against near-empty buffer. After prefill
-        # this is always True, but protects cold-start or very small prefill runs.
+
         if not buffer_ready(buffer_state, SEQ_LEN):
-            print(f"Step {step:05d} | Buffer not ready yet, skipping train_step.")
+            print(f"Step {step:05d} | Buffer not ready, skipping.")
             continue
-        
-        # Passiamo i nuovi tracker alla funzione
+
         final_carry, metrics_history = train_loop_chunk(
             rng, buffer_state, params, opt_states,
             env_obs, env_state, current_h, current_z, current_action,
             cur_return, ema_return, ema_success,
-            chunk_size=CHUNK_SIZE
+            step_count,
+            jnp.float32(rew_std_ema),
+            chunk_size=CHUNK_SIZE,
         )
-        
-        # Unpack includendo i tracker
-        (buffer_state, params, opt_states, 
-         current_h, current_z, current_action, 
+
+        (buffer_state, params, opt_states,
+         current_h, current_z, current_action,
          env_obs, env_state, rng,
-         cur_return, ema_return, ema_success) = final_carry
+         cur_return, ema_return, ema_success,
+         step_count, _) = final_carry
+
+        # FIX 3: update reward RMS EMA from this chunk
+        chunk_rms   = float(jnp.sqrt(jnp.mean(metrics_history['raw_rew_sq'])))
+        rew_std_ema = REW_NORM_DECAY * rew_std_ema + (1.0 - REW_NORM_DECAY) * chunk_rms
+        rew_std_ema = max(rew_std_ema, 1.0)
 
         if step % 100 == 0:
-            avg_wm     = jnp.mean(metrics_history['wm_loss'])
-            avg_actor  = jnp.mean(metrics_history['actor_loss'])
+            avg_wm     = float(jnp.mean(metrics_history['wm_loss']))
+            avg_actor  = float(jnp.mean(metrics_history['actor_loss']))
+            avg_critic = float(jnp.mean(metrics_history['critic_loss']))
             fps        = (NUM_ENVS * CHUNK_SIZE) / (time.time() - t0)
-            
-            # Estraiamo l'ultimo valore dell'EMA dal chunk e convertiamo in percentuale
-            ret_val  = metrics_history['ema_return'][-1]
-            succ_val = metrics_history['ema_success'][-1] * 100.0
-            
+            ret_val    = float(metrics_history['ema_return'][-1])
+            succ_val   = float(metrics_history['ema_success'][-1]) * 100.0
+            warming    = float(metrics_history['wm_warming'][-1]) > 0.5
+
             print(
                 f"Step {step:05d} | "
                 f"FPS: {fps:.0f} | "
                 f"WM: {avg_wm:.3f} | "
-                f"Act: {avg_actor:.3f} | "
+                f"Act: {avg_actor:.4f} | "
+                f"Crit: {avg_critic:.4f} | "
                 f"Ret: {ret_val:.1f} | "
-                f"Succ: {succ_val:.1f}%"
+                f"Succ: {succ_val:.1f}% | "
+                f"RewRMS: {rew_std_ema:.3f}"
+                + (" | [WM warmup]" if warming else "")
             )
 
     print("Training Complete.")
-    
-    # 6. Checkpoint Saving
-    import os
+
+    # 6. Checkpoint saving
     import flax.serialization
     os.makedirs("checkpoints", exist_ok=True)
     ckpt_path = "checkpoints/dreamer_best.msgpack"
-    
+
     eval_params = {
         'encoder': jax.device_get(params['wm']['encoder']),
-        'rssm': jax.device_get(params['wm']['rssm']),
-        'actor': jax.device_get(params['actor'])
+        'rssm':    jax.device_get(params['wm']['rssm']),
+        'actor':   jax.device_get(params['actor']),
     }
-    
+
     with open(ckpt_path, "wb") as f:
         f.write(flax.serialization.to_bytes(eval_params))
     print(f"Checkpoint salvato in {ckpt_path}!")
