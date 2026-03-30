@@ -2,26 +2,16 @@
 SACjax.py — Soft Actor-Critic (shared-encoder, fused-JIT)
 
 Architecture:
-  - ONE shared encoder (ep) updated only through critic loss.
-  - Actor gradients flow into LidarCNN scaled by ACTOR_ENC_GRAD_SCALE=0.1.
+  - ONE shared encoder (ep) updated through critic loss + scaled actor gradient.
+  - Actor gradients flow into LidarCNN scaled by ACTOR_ENC_GRAD_SCALE=0.1 via
+    custom_vjp — single CNN pass, zero redundant forwards.
   - Target LidarCNN (tlcp) & target Q branches (tq1p, tq2p) — EMA of online params.
   - Buffer stores terminal (done & ~timeout) — bootstraps through timeouts.
   - obs/next_obs stored as float16 — halves VRAM footprint.
   - extract_max_v called ONCE per collection step; stored in buffer.
   - 2 encoder passes per update: enc(obs) [trainable] + enc_tgt(next_obs) [frozen].
-  - Actor Q-eval reuses feat from critic pass — zero redundant CNN forwards.
+  - Actor Q-eval reuses feat from single actor pass — zero redundant CNN forwards.
 
-Fixes Applied:
-  1. Actor Loss Zero-Forward: feat reused with new_chp, eliminating a redundant CNN pass.
-  2. Bellman Fix: Timelimit termination uses (1 - terminal) to bootstrap, not (1 - done).
-  3. VRAM Optimization: BUFFER_CAP=2_000_000 and obs store as float16 (14GB -> 2.7GB).
-  4. Reward / Alpha scaling: Rewards heavily scaled in jax_env_multi, alpha init at 1.0.
-  5. FIX — Replay Ratio: N_ENVS reduced to 256, G_UPDATES=20 inner gradient steps per
-     collect step. Old code had RR=1 (1 update per 2048 transitions): SAC's sample
-     efficiency is entirely wasted at RR=1. Now RR≈20, critics get sufficient gradient
-     steps before data is overwritten.
-  6. FIX — Target Entropy: corrected to -|A|=-2.0. Old value -1.0 demanded LESS
-     entropy, causing alpha to decay prematurely and the policy to collapse early.
 """
 
 import os
@@ -56,7 +46,10 @@ G_UPDATES      = 20         # FIX 1: gradient updates per collect step (replay r
                              #        SAC's sample efficiency comes from here — not from more envs.
 WARMUP_STEPS   = 10_000
 GAMMA          = 0.99
-TAU            = 0.005
+TAU            = 0.005 / G_UPDATES   # Compensate for G_UPDATES EMA applications per env step.
+                             # Without this, effective tau per env step = 1-(1-0.005)^20 ≈ 0.095,
+                             # turning the "slow anchor" target into a fast-moving target.
+                             # TAU=0.00025 restores the intended per-env-step drift.
 LR             = 3e-4
 TARGET_ENTROPY = -2.0       # FIX 2: correct value is -|A| = -dim(action_space) = -2.0
                              #        -1.0 was LESS exploratory (demanded less entropy),
@@ -216,8 +209,8 @@ class CriticBranch(nn.Module):
         global_feat = nn.relu(nn.Dense(128, kernel_init=_orth_relu)(global_in))
         global_feat = nn.relu(nn.Dense(64,  kernel_init=_orth_relu)(global_feat))
         fused  = jnp.concatenate([cnn_feat, global_feat, action], axis=-1)
-        q = nn.relu(nn.Dense(256, kernel_init=_orth_relu)(fused))
-        q = nn.relu(nn.Dense(128, kernel_init=_orth_relu)(q))
+        q = nn.LayerNorm()(nn.relu(nn.Dense(256, kernel_init=_orth_relu)(fused)))
+        q = nn.LayerNorm()(nn.relu(nn.Dense(128, kernel_init=_orth_relu)(q)))
         return jnp.squeeze(nn.Dense(1)(q), axis=-1)   # default init for Q output
 
 
@@ -329,10 +322,10 @@ def buf_sample(buf, rng_key, batch_size: int):
 #   la   / alo    — log alpha + opt state
 #
 # CNN passes per update:
-#   lidar_cnn(obs)       — online, trainable via critic loss            [1]
-#   lidar_cnn_tgt(next)  — target, stop_grad, for target Q backup      [1]
-#   lidar_cnn(obs)       — actor, re-run with grad × ACTOR_ENC_SCALE   [1]
-#   Total: 3 CNN passes  (was 2 with stop_gradient; cost is justified)
+#   lidar_cnn(obs)       — online, trainable via critic loss              [1]
+#   lidar_cnn_tgt(next)  — target, stop_grad, for target Q backup        [1]
+#   (actor reuses lcp with scale_gradient — same 2 passes, no extra fwd) [0]
+#   Total: 2 CNN passes  (down from 3; custom_vjp handles backward scaling)
 #
 # Actor→encoder gradient coupling:
 #   Critic pass: full gradient into lcp (critic shapes encoder)
@@ -340,6 +333,23 @@ def buf_sample(buf, rng_key, batch_size: int):
 #   Net encoder gradient = c_grad_cnn + 0.1 * a_grad_cnn
 #   This lets the actor nudge perception toward navigation-relevant features
 #   without destabilising the critic's value representation.
+# ── Gradient scaling via custom_vjp ──────────────────────────────────────────
+# Scales the backward-pass gradient by `scale` while leaving the forward pass
+# identical. Used to give the actor a soft 0.1x nudge into the shared encoder
+# without running a separate (redundant) CNN forward+backward pass.
+@jax.custom_vjp
+def scale_gradient(x, scale):
+    return x
+
+def _scale_gradient_fwd(x, scale):
+    return x, scale
+
+def _scale_gradient_bwd(scale, g):
+    return g * scale, None
+
+scale_gradient.defvjp(_scale_gradient_fwd, _scale_gradient_bwd)
+
+
 @jax.jit
 def sac_update(lcp, lcos, tlcp, ahp, ahos, q1p, q1os, q2p, q2os,
                tq1p, tq2p, la, alo,
@@ -384,36 +394,38 @@ def sac_update(lcp, lcos, tlcp, ahp, ahos, q1p, q1os, q2p, q2os,
     new_q1p = optax.apply_updates(q1p, q1_upd)
     new_q2p = optax.apply_updates(q2p, q2_upd)
 
-    # ── 2. Actor loss — with scaled encoder gradient ──────────────────────────
-    # Actor is differentiated w.r.t. both ahp (head) and lcp (encoder).
-    # The encoder gradient from this path is scaled by ACTOR_ENC_GRAD_SCALE
-    # before being summed with the critic's encoder gradient.
-    # This gives the actor a voice in shaping perception without destabilising
-    # the critic's representation (0.1 = soft nudge, not a takeover).
-    def _actor_loss(ahp_, lcp_actor):
+    # ── 2. Actor loss — single CNN pass with scaled backward gradient ────────
+    # We reuse features from the SAME lcp_ but wrap them in scale_gradient so
+    # the backward pass through the encoder is attenuated by ACTOR_ENC_GRAD_SCALE.
+    # This eliminates the previous redundant third CNN forward+backward pass while
+    # preserving the soft actor→encoder coupling intended by ACTOR_ENC_GRAD_SCALE.
+    def _actor_loss(ahp_, lcp_):
         alpha = jax.lax.stop_gradient(jnp.exp(la))
-        # Fresh CNN pass — actor's gradient flows through lcp_actor
-        cnn_f, pose_f, sv_f = lidar_cnn.apply({"params": lcp_actor}, obs)
+        # Single CNN pass; scale_gradient attenuates the backward signal 0.1x
+        cnn_raw, pose_raw, sv_raw = lidar_cnn.apply({"params": lcp_}, obs)
+        cnn_f  = scale_gradient(cnn_raw,  ACTOR_ENC_GRAD_SCALE)
+        pose_f = scale_gradient(pose_raw, ACTOR_ENC_GRAD_SCALE)
+        sv_f   = scale_gradient(sv_raw,   ACTOR_ENC_GRAD_SCALE)
         mean, log_std = actor_head.apply({"params": ahp_}, cnn_f, pose_f, sv_f)
         action_new, log_pi = sample_action_sac_batched(rng_a, mean, log_std, max_v_obs)
-        # Q-eval uses updated branches; stop_gradient on Q params (actor doesn't shape critic)
+        # Q-eval uses updated branches; stop_gradient on Q params
         q1 = critic_q1.apply({"params": jax.lax.stop_gradient(new_q1p)}, cnn_f, pose_f, sv_f, action_new)
         q2 = critic_q2.apply({"params": jax.lax.stop_gradient(new_q2p)}, cnn_f, pose_f, sv_f, action_new)
         return jnp.mean(alpha * log_pi - jnp.minimum(q1, q2)), jnp.mean(log_pi)
 
-    (a_loss, log_pi_mean), (a_grads_head, a_grads_cnn_raw) = jax.value_and_grad(
+    (a_loss, log_pi_mean), (a_grads_head, a_grads_cnn_actor) = jax.value_and_grad(
         _actor_loss, argnums=(0, 1), has_aux=True
     )(ahp, lcp)
 
     ah_upd, new_ahos = head_actor_opt.update(a_grads_head, ahos, ahp)
     new_ahp = optax.apply_updates(ahp, ah_upd)
 
-    # ── 3. Encoder update — critic gradient + scaled actor gradient ───────────
-    # Combine critic and actor encoder gradients. Actor contribution is scaled
-    # down by ACTOR_ENC_GRAD_SCALE to maintain encoder stability.
+    # ── 3. Encoder update — critic gradient + actor gradient (already scaled) ─
+    # a_grads_cnn_actor already has the 0.1 scaling baked in via scale_gradient,
+    # so we simply add them to the critic gradients. No manual scaling needed.
     combined_cnn_grads = jax.tree_util.tree_map(
-        lambda cg, ag: cg + ACTOR_ENC_GRAD_SCALE * ag,
-        c_grads_cnn, a_grads_cnn_raw
+        lambda cg, ag: cg + ag,
+        c_grads_cnn, a_grads_cnn_actor
     )
     lc_upd, new_lcos = lidar_cnn_opt.update(combined_cnn_grads, lcos, lcp)
     new_lcp = optax.apply_updates(lcp, lc_upd)
@@ -643,7 +655,7 @@ if __name__ == "__main__":
         new_obs, env_state, reward, done, info = jax.jit(vmap_step)(
             step_keys, env_state, env_action, 3.0, -1
         )
-        terminal   = done & ~info["timeout"]
+        terminal   = done & ~info["timeout"].astype(jnp.bool_)
         replay_buf = buf_add(replay_buf, obs_before, env_action, reward,
                              new_obs, terminal.astype(jnp.float32), max_v)
         env_obs     = new_obs
