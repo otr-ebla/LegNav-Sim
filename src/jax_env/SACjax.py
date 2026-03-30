@@ -4,7 +4,7 @@ SACjax.py — Soft Actor-Critic (shared-encoder, fused-JIT)
 Architecture:
   - ONE shared encoder (ep) updated only through critic loss.
   - Actor head receives stop_gradient(feat_obs) — no encoder gradients from actor.
-  - Target encoder (tep) & target critic head (thp) — EMA of online (ep, chp).
+  - Target LidarCNN (tlcp) & target Q branches (tq1p, tq2p) — EMA of online params.
   - Buffer stores terminal (done & ~timeout) — bootstraps through timeouts.
   - obs/next_obs stored as float16 — halves VRAM footprint.
   - extract_max_v called ONCE per collection step; stored in buffer.
@@ -16,6 +16,12 @@ Fixes Applied:
   2. Bellman Fix: Timelimit termination uses (1 - terminal) to bootstrap, not (1 - done).
   3. VRAM Optimization: BUFFER_CAP=2_000_000 and obs store as float16 (14GB -> 2.7GB).
   4. Reward / Alpha scaling: Rewards heavily scaled in jax_env_multi, alpha init at 1.0.
+  5. FIX — Replay Ratio: N_ENVS reduced to 256, G_UPDATES=20 inner gradient steps per
+     collect step. Old code had RR=1 (1 update per 2048 transitions): SAC's sample
+     efficiency is entirely wasted at RR=1. Now RR≈20, critics get sufficient gradient
+     steps before data is overwritten.
+  6. FIX — Target Entropy: corrected to -|A|=-2.0. Old value -1.0 demanded LESS
+     entropy, causing alpha to decay prematurely and the policy to collapse early.
 """
 
 import os
@@ -42,16 +48,21 @@ from jax_wrappers import make_stacked_env, make_autoreset_env
 # ── Constants ─────────────────────────────────────────────────────────────────
 OBS_SIZE       = 342        # 9 (pose) + 9 (state_vec) + 324 (lidar)
 ACTION_DIM     = 2
-N_ENVS         = 2048
-BUFFER_CAP     = 2_000_000  # 2M — 102k transitions/chunk, ~20 chunks before overwrite
-BATCH_SIZE     = 2048
+N_ENVS         = 256        # FIX 1: reduced from 2048; large N_ENVS drowns the buffer
+                             #        faster than G updates can replay — overwrite before reuse.
+BUFFER_CAP     = 2_000_000  # 2M — with N_ENVS=256: ~7800 steps to fill → plenty of mixing
+BATCH_SIZE     = 512        # FIX 1: kept proportional to N_ENVS; smaller is fine for SAC
+G_UPDATES      = 20         # FIX 1: gradient updates per collect step (replay ratio = G/1 ≫ 1)
+                             #        SAC's sample efficiency comes from here — not from more envs.
 WARMUP_STEPS   = 10_000
 GAMMA          = 0.99
 TAU            = 0.005
 LR             = 3e-4
-TARGET_ENTROPY = -1.0       # softer than -|A|=-2.0; balances exploration
+TARGET_ENTROPY = -2.0       # FIX 2: correct value is -|A| = -dim(action_space) = -2.0
+                             #        -1.0 was LESS exploratory (demanded less entropy),
+                             #        causing premature alpha decay and policy collapse.
 TOTAL_UPDATES  = 200_000
-LOG_EVERY      = 50         # 2048*50=102k << 2M cap — proper off-policy mixing
+LOG_EVERY      = 50         # chunks; each chunk = N_ENVS*LOG_EVERY env steps collected
 SAVE_EVERY     = 5000
 MAX_GRAD_NORM  = 10.0
 
@@ -98,8 +109,15 @@ def init_env_state(rng_key, max_goal_dist: float = 3.0, scenario_idx: int = -1):
     return env_obs, env_state, vmap_step
 
 
-# ── Shared obs encoder ────────────────────────────────────────────────────────
-class ObsEncoder(nn.Module):
+# ── Shared LiDAR CNN encoder ──────────────────────────────────────────────────
+# Extracts spatial features from the stacked LiDAR scan only.
+# Shared across actor, Q1, and Q2 — LiDAR perception is a pure observation
+# feature with no value-specific bias, so sharing is safe and saves compute.
+# The decoupling that matters (Fix: Double-Q Fallacy) happens BELOW this layer:
+# each critic branch has its own independent MLP that fuses cnn_feat with the
+# global state. This breaks the correlation between Q1 and Q2 at the level
+# where function approximation errors actually accumulate.
+class LidarCNN(nn.Module):
     stack_dim: int = 3
     num_rays:  int = 108
 
@@ -112,65 +130,80 @@ class ObsEncoder(nn.Module):
         state_vec  = x[..., pose_size : pose_size + state_size]
         lidar_flat = x[..., pose_size + state_size:]
 
-        batch_shape = lidar_flat.shape[:-1]
-        lidar_cnn   = lidar_flat.reshape((*batch_shape, self.num_rays, self.stack_dim))
+        batch_shape  = lidar_flat.shape[:-1]
+        lidar_cnn    = lidar_flat.reshape((*batch_shape, self.num_rays, self.stack_dim))
         cnn = nn.relu(nn.Conv(features=32, kernel_size=(7,), strides=(2,), padding='SAME')(lidar_cnn))
         cnn = nn.relu(nn.Conv(features=64, kernel_size=(5,), strides=(2,), padding='SAME')(cnn))
         cnn = nn.relu(nn.Conv(features=64, kernel_size=(3,), strides=(2,), padding='SAME')(cnn))
         cnn_feat = nn.LayerNorm()(cnn.reshape((*batch_shape, -1)))
 
-        global_in   = jnp.concatenate([pose_stack, state_vec], axis=-1)
-        global_feat = nn.relu(nn.Dense(128)(global_in))
-        global_feat = nn.relu(nn.Dense(64)(global_feat))
-
-        fused  = jnp.concatenate([cnn_feat, global_feat], axis=-1)
-        shared = nn.relu(nn.Dense(256)(fused))
-        return nn.relu(nn.Dense(128)(shared))
+        # Return cnn_feat + raw pose/state — downstream modules fuse them independently.
+        return cnn_feat, pose_stack, state_vec
 
 
 # ── Head networks ─────────────────────────────────────────────────────────────
 
 class ActorHead(nn.Module):
+    """Actor: fuses cnn_feat + global state into mean/log_std.
+    Receives stop_gradient(cnn_feat) from the shared LidarCNN — encoder
+    gradients flow only through critic loss (same design as before).
+    """
     action_dim:  int   = ACTION_DIM
     LOG_STD_MIN: float = -5.0
     LOG_STD_MAX: float =  2.0
 
     @nn.compact
-    def __call__(self, feat: jnp.ndarray):
+    def __call__(self, cnn_feat: jnp.ndarray, pose_stack: jnp.ndarray,
+                 state_vec: jnp.ndarray):
+        global_in   = jnp.concatenate([pose_stack, state_vec], axis=-1)
+        global_feat = nn.relu(nn.Dense(128)(global_in))
+        global_feat = nn.relu(nn.Dense(64)(global_feat))
+        fused  = jnp.concatenate([cnn_feat, global_feat], axis=-1)
+        shared = nn.relu(nn.Dense(256)(fused))
+        feat   = nn.relu(nn.Dense(128)(shared))
         mean    = nn.Dense(self.action_dim, name='mean')(feat)
         log_std = nn.Dense(self.action_dim, name='log_std')(feat)
         log_std = jnp.clip(log_std, self.LOG_STD_MIN, self.LOG_STD_MAX)
         return mean, log_std
 
 
-class CriticHead(nn.Module):
+class CriticBranch(nn.Module):
+    """Single Q-network branch.
+    Has its OWN independent global MLP and fusion layers — completely separate
+    from the other branch. The shared LidarCNN upstream is safe because raw
+    perception features are value-neutral; the correlation that causes
+    overestimation bias in Double-Q learning comes from the learned value
+    representation layers, which are now fully decoupled.
+    """
     @nn.compact
-    def __call__(self, feat: jnp.ndarray, action: jnp.ndarray):
-        q_in = jnp.concatenate([feat, action], axis=-1)
-
-        q1 = nn.relu(nn.Dense(256, name='q1_l1')(q_in))
-        q1 = nn.relu(nn.Dense(128, name='q1_l2')(q1))
-        q1 = jnp.squeeze(nn.Dense(1, name='q1_out')(q1), axis=-1)
-
-        q2 = nn.relu(nn.Dense(256, name='q2_l1')(q_in))
-        q2 = nn.relu(nn.Dense(128, name='q2_l2')(q2))
-        q2 = jnp.squeeze(nn.Dense(1, name='q2_out')(q2), axis=-1)
-
-        return q1, q2
+    def __call__(self, cnn_feat: jnp.ndarray, pose_stack: jnp.ndarray,
+                 state_vec: jnp.ndarray, action: jnp.ndarray):
+        global_in   = jnp.concatenate([pose_stack, state_vec], axis=-1)
+        global_feat = nn.relu(nn.Dense(128)(global_in))
+        global_feat = nn.relu(nn.Dense(64)(global_feat))
+        fused  = jnp.concatenate([cnn_feat, global_feat, action], axis=-1)
+        q = nn.relu(nn.Dense(256)(fused))
+        q = nn.relu(nn.Dense(128)(q))
+        return jnp.squeeze(nn.Dense(1)(q), axis=-1)
 
 
 # Module instances (stateless — params stored separately)
-encoder_net = ObsEncoder()
-actor_head  = ActorHead()
-critic_head = CriticHead()
+lidar_cnn    = LidarCNN()
+actor_head   = ActorHead()
+critic_q1    = CriticBranch()   # independent params → decorrelated estimators
+critic_q2    = CriticBranch()   # independent params → decorrelated estimators
 
 
 # ── Optimisers ────────────────────────────────────────────────────────────────
-# Three param groups: shared encoder (ep), actor head (ahp), critic head (chp).
-# Encoder updated via critic loss only.
-enc_opt         = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
+# Param groups:
+#   lcp / lcos   — shared LidarCNN params + opt state (updated via critic loss only)
+#   ahp / ahos   — actor head params + opt state
+#   q1p / q1os   — Q1 CriticBranch params + opt state
+#   q2p / q2os   — Q2 CriticBranch params + opt state  (separate → decorrelated)
+lidar_cnn_opt   = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
 head_actor_opt  = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
-head_critic_opt = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
+head_q1_opt     = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
+head_q2_opt     = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
 alpha_opt       = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
 
 
@@ -253,72 +286,78 @@ def buf_sample(buf, rng_key, batch_size: int):
 
 # ── SAC update step ───────────────────────────────────────────────────────────
 # Param layout:
-#   ep  / eos     — shared online encoder params + opt state
-#   tep           — target encoder (EMA of ep)
-#   ahp / ahos    — actor head params + opt state
-#   chp / chos    — online critic head params + opt state
-#   thp           — target critic head (EMA of chp)
-#   la  / alo     — log alpha + opt state
+#   lcp  / lcos   — shared LidarCNN params + opt state
+#   tlcp          — target LidarCNN (EMA of lcp)
+#   ahp  / ahos   — actor head params + opt state
+#   q1p  / q1os   — Q1 branch params + opt state
+#   q2p  / q2os   — Q2 branch params + opt state  (INDEPENDENT of q1p → decorrelated)
+#   tq1p / tq2p   — target Q-branch params (EMA of q1p / q2p)
+#   la   / alo    — log alpha + opt state
 #
 # CNN passes per update:
-#   enc(obs)       — online, trainable via critic loss      [1]
-#   enc_tgt(next)  — target, stop_grad, for target Q       [1]
-#   enc(obs)       — for actor, stop_grad reuse of above   [0]
-#   Total: 2 encoder passes (online obs + target next_obs)
+#   lidar_cnn(obs)       — online, trainable via critic loss         [1]
+#   lidar_cnn_tgt(next)  — target, stop_grad, for target Q backup   [1]
+#   lidar_cnn(obs)       — actor, stop_grad reuse of above          [0]
+#   Total: 2 CNN passes
 @jax.jit
-def sac_update(ep, eos, tep, ahp, ahos, chp, chos, thp, la, alo,
+def sac_update(lcp, lcos, tlcp, ahp, ahos, q1p, q1os, q2p, q2os,
+               tq1p, tq2p, la, alo,
                obs, action, reward, next_obs, terminal, max_v_obs, max_v_next, rng_key):
 
     rng_c, rng_a = jax.random.split(rng_key)
 
     # ── 1. Critic loss — Bellman backup ──────────────────────────────────────
-    def _critic_loss(ep_, chp_):
+    def _critic_loss(lcp_, q1p_, q2p_):
         alpha = jax.lax.stop_gradient(jnp.exp(la))
 
-        # FIX 2+4: Single target encoder pass on next_obs — used for BOTH
-        # the actor's next-action sampling AND the target Q computation.
-        # tep is EMA of ep, so features are stable.
-        feat_next = jax.lax.stop_gradient(
-            encoder_net.apply({"params": tep}, next_obs)
+        # Target CNN pass on next_obs — frozen, used for both actor sampling
+        # and target Q computation (tep pattern preserved with new naming).
+        cnn_next, pose_next, sv_next = jax.lax.stop_gradient(
+            lidar_cnn.apply({"params": tlcp}, next_obs)
         )
-        mean_n, lgs_n = actor_head.apply({"params": ahp}, feat_next)
+        mean_n, lgs_n = actor_head.apply({"params": ahp}, cnn_next, pose_next, sv_next)
         next_act, next_lp = sample_action_sac_batched(rng_c, mean_n, lgs_n, max_v_next)
 
-        # Target Q: target head on target features
-        q1_t, q2_t = critic_head.apply({"params": thp}, feat_next, next_act)
+        # Target Q: min over two independent target branches
+        q1_t = critic_q1.apply({"params": tq1p}, cnn_next, pose_next, sv_next, next_act)
+        q2_t = critic_q2.apply({"params": tq2p}, cnn_next, pose_next, sv_next, next_act)
 
         v_next = jnp.minimum(q1_t, q2_t) - alpha * next_lp
-        # terminal = done & ~timeout — bootstrap through time limits, zero at true endings
         backup = jax.lax.stop_gradient(
             reward + GAMMA * (1.0 - terminal) * v_next
         )
 
-        # Online Q: online encoder on obs — gradients flow into ep_
-        feat_obs = encoder_net.apply({"params": ep_}, obs)
-        q1, q2   = critic_head.apply({"params": chp_}, feat_obs, action)
+        # Online Q: shared CNN on obs — gradients flow into lcp_
+        cnn_obs, pose_obs, sv_obs = lidar_cnn.apply({"params": lcp_}, obs)
+        q1 = critic_q1.apply({"params": q1p_}, cnn_obs, pose_obs, sv_obs, action)
+        q2 = critic_q2.apply({"params": q2p_}, cnn_obs, pose_obs, sv_obs, action)
         loss = jnp.mean((q1 - backup) ** 2) + jnp.mean((q2 - backup) ** 2)
-        return loss, (jnp.mean(backup), feat_obs)
+        return loss, (jnp.mean(backup), cnn_obs, pose_obs, sv_obs)
 
-    (c_loss, (q_mean, feat_obs_online)), (c_grads_enc, c_grads_head) = jax.value_and_grad(
-        _critic_loss, argnums=(0, 1), has_aux=True
-    )(ep, chp)
+    (c_loss, (q_mean, cnn_obs_online, pose_obs_online, sv_obs_online)), \
+        (c_grads_cnn, c_grads_q1, c_grads_q2) = jax.value_and_grad(
+            _critic_loss, argnums=(0, 1, 2), has_aux=True
+        )(lcp, q1p, q2p)
 
-    e_upd,  new_eos  = enc_opt.update(c_grads_enc, eos, ep)
-    ch_upd, new_chos = head_critic_opt.update(c_grads_head, chos, chp)
-    new_ep  = optax.apply_updates(ep, e_upd)
-    new_chp = optax.apply_updates(chp, ch_upd)
+    lc_upd, new_lcos = lidar_cnn_opt.update(c_grads_cnn, lcos, lcp)
+    q1_upd, new_q1os = head_q1_opt.update(c_grads_q1,   q1os, q1p)
+    q2_upd, new_q2os = head_q2_opt.update(c_grads_q2,   q2os, q2p)
+    new_lcp = optax.apply_updates(lcp, lc_upd)
+    new_q1p = optax.apply_updates(q1p, q1_upd)
+    new_q2p = optax.apply_updates(q2p, q2_upd)
 
     # ── 2. Actor loss ─────────────────────────────────────────────────────────
-    # Encoder frozen: stop_gradient(feat_obs_online) from critic pass is reused.
-    # Q-eval uses updated critic heads (new_chp) on the SAME frozen features.
-    # The param delta ep vs new_ep after one grad step is negligible — recomputing
-    # features with new_ep would burn a full 3-layer CNN for ~0 benefit.
+    # CNN frozen: reuse stop_gradient features from critic pass above.
+    # Q-eval uses updated branches (new_q1p, new_q2p) on same frozen features.
     def _actor_loss(ahp_):
         alpha = jax.lax.stop_gradient(jnp.exp(la))
-        feat = jax.lax.stop_gradient(feat_obs_online)
-        mean, log_std = actor_head.apply({"params": ahp_}, feat)
+        cnn_f  = jax.lax.stop_gradient(cnn_obs_online)
+        pose_f = jax.lax.stop_gradient(pose_obs_online)
+        sv_f   = jax.lax.stop_gradient(sv_obs_online)
+        mean, log_std = actor_head.apply({"params": ahp_}, cnn_f, pose_f, sv_f)
         action_new, log_pi = sample_action_sac_batched(rng_a, mean, log_std, max_v_obs)
-        q1, q2 = critic_head.apply({"params": new_chp}, feat, action_new)
+        q1 = critic_q1.apply({"params": new_q1p}, cnn_f, pose_f, sv_f, action_new)
+        q2 = critic_q2.apply({"params": new_q2p}, cnn_f, pose_f, sv_f, action_new)
         return jnp.mean(alpha * log_pi - jnp.minimum(q1, q2)), jnp.mean(log_pi)
 
     (a_loss, log_pi_mean), a_grads_head = jax.value_and_grad(
@@ -334,10 +373,10 @@ def sac_update(ep, eos, tep, ahp, ahos, chp, chos, thp, la, alo,
     al_upd, new_alo = alpha_opt.update(al_grad, alo)
     new_la = optax.apply_updates(la, al_upd)
 
-    # ── 4. Soft target update — BOTH encoder and critic head ──────────────────
-    # FIX 2: tep tracks ep via EMA so target features are stable.
-    new_tep = jax.tree_util.tree_map(lambda t, o: TAU * o + (1.0 - TAU) * t, tep, new_ep)
-    new_thp = jax.tree_util.tree_map(lambda t, o: TAU * o + (1.0 - TAU) * t, thp, new_chp)
+    # ── 4. Soft target update — CNN and both Q branches ───────────────────────
+    new_tlcp = jax.tree_util.tree_map(lambda t, o: TAU * o + (1.0 - TAU) * t, tlcp, new_lcp)
+    new_tq1p = jax.tree_util.tree_map(lambda t, o: TAU * o + (1.0 - TAU) * t, tq1p, new_q1p)
+    new_tq2p = jax.tree_util.tree_map(lambda t, o: TAU * o + (1.0 - TAU) * t, tq2p, new_q2p)
 
     metrics = {
         "critic_loss": c_loss,
@@ -346,18 +385,19 @@ def sac_update(ep, eos, tep, ahp, ahos, chp, chos, thp, la, alo,
         "log_pi":      log_pi_mean,
         "q_mean":      q_mean,
     }
-    return (new_ep, new_eos, new_tep, new_ahp, new_ahos,
-            new_chp, new_chos, new_thp, new_la, new_alo, metrics)
+    return (new_lcp, new_lcos, new_tlcp, new_ahp, new_ahos,
+            new_q1p, new_q1os, new_q2p, new_q2os,
+            new_tq1p, new_tq2p, new_la, new_alo, metrics)
 
 
 # ── Collection step ───────────────────────────────────────────────────────────
 @functools.partial(jax.jit, static_argnums=(5,))
-def collect_step(ep, ahp, env_state, env_obs, rng_key, vmap_step, max_goal_dist, scenario_idx):
-    """Compute max_v ONCE, sample action, step env."""
+def collect_step(lcp, ahp, env_state, env_obs, rng_key, vmap_step, max_goal_dist, scenario_idx):
+    """Compute max_v ONCE, sample action via shared CNN + actor head, step env."""
     max_v = extract_max_v(env_obs)
     k_act, k_step = jax.random.split(rng_key)
-    feat = encoder_net.apply({"params": ep}, env_obs)
-    mean, log_std = actor_head.apply({"params": ahp}, feat)
+    cnn_feat, pose_stack, state_vec = lidar_cnn.apply({"params": lcp}, env_obs)
+    mean, log_std = actor_head.apply({"params": ahp}, cnn_feat, pose_stack, state_vec)
     env_action, _ = sample_action_sac_batched(k_act, mean, log_std, max_v)
     step_keys = jax.random.split(k_step, N_ENVS)
     new_obs, new_state, reward, done, info = vmap_step(
@@ -367,20 +407,22 @@ def collect_step(ep, ahp, env_state, env_obs, rng_key, vmap_step, max_goal_dist,
 
 
 # ── Fused GPU train chunk ─────────────────────────────────────────────────────
-@functools.partial(jax.jit, static_argnums=(10,))
-def train_chunk(ep, eos, tep, ahp, ahos, chp, chos,
-                thp, la, alo, vmap_step,
+@functools.partial(jax.jit, static_argnums=(12,))
+def train_chunk(lcp, lcos, tlcp, ahp, ahos,
+                q1p, q1os, q2p, q2os, tq1p, tq2p,
+                la, alo, vmap_step,
                 buf, es, eo, key,
                 max_goal_dist, scenario_idx):
 
     def _loop_body(carry, _):
-        (ep, eos, tep, ahp, ahos, chp, chos,
-         thp, la, alo, buf, es, eo, key) = carry
-        key, k_col, k_samp, k_upd = jax.random.split(key, 4)
+        (lcp, lcos, tlcp, ahp, ahos,
+         q1p, q1os, q2p, q2os, tq1p, tq2p,
+         la, alo, buf, es, eo, key) = carry
+        key, k_col, k_upd_base = jax.random.split(key, 3)
 
-        # Collect — max_v decoded ONCE inside collect_step
+        # ── Collect ONE step across all envs ──────────────────────────────────
         new_eo, new_es, obs_b, env_a, rew, done, info, max_v_cur = collect_step(
-            ep, ahp, es, eo, k_col, vmap_step, max_goal_dist, scenario_idx
+            lcp, ahp, es, eo, k_col, vmap_step, max_goal_dist, scenario_idx
         )
 
         # Store terminal (not done) — timeouts are NOT absorbing states
@@ -388,23 +430,45 @@ def train_chunk(ep, eos, tep, ahp, ahos, chp, chos,
         new_buf = buf_add(buf, obs_b, env_a, rew, new_eo,
                           terminal.astype(jnp.float32), max_v_cur)
 
-        b_obs, b_act, b_rew, b_next, b_terminal, b_max_v = buf_sample(new_buf, k_samp, BATCH_SIZE)
-        b_max_v_next = extract_max_v(b_next)
+        # ── G gradient updates per collect step (replay ratio = G) ────────────
+        def _update_step(update_carry, upd_idx):
+            (lcp_, lcos_, tlcp_, ahp_, ahos_,
+             q1p_, q1os_, q2p_, q2os_, tq1p_, tq2p_, la_, alo_) = update_carry
+            k_samp = jax.random.fold_in(k_upd_base, upd_idx * 2)
+            k_upd  = jax.random.fold_in(k_upd_base, upd_idx * 2 + 1)
+            b_obs, b_act, b_rew, b_next, b_terminal, b_max_v = buf_sample(
+                new_buf, k_samp, BATCH_SIZE
+            )
+            b_max_v_next = extract_max_v(b_next)
+            (new_lcp_, new_lcos_, new_tlcp_, new_ahp_, new_ahos_,
+             new_q1p_, new_q1os_, new_q2p_, new_q2os_,
+             new_tq1p_, new_tq2p_, new_la_, new_alo_, metrics_) = sac_update(
+                lcp_, lcos_, tlcp_, ahp_, ahos_,
+                q1p_, q1os_, q2p_, q2os_, tq1p_, tq2p_, la_, alo_,
+                b_obs, b_act, b_rew, b_next, b_terminal, b_max_v, b_max_v_next, k_upd
+            )
+            return (new_lcp_, new_lcos_, new_tlcp_, new_ahp_, new_ahos_,
+                    new_q1p_, new_q1os_, new_q2p_, new_q2os_,
+                    new_tq1p_, new_tq2p_, new_la_, new_alo_), metrics_
 
-        (new_ep, new_eos, new_tep, new_ahp, new_ahos,
-         new_chp, new_chos, new_thp, new_la, new_alo, metrics) = sac_update(
-            ep, eos, tep, ahp, ahos, chp, chos, thp, la, alo,
-            b_obs, b_act, b_rew, b_next, b_terminal, b_max_v, b_max_v_next, k_upd
+        update_carry_init = (lcp, lcos, tlcp, ahp, ahos,
+                             q1p, q1os, q2p, q2os, tq1p, tq2p, la, alo)
+        (new_lcp, new_lcos, new_tlcp, new_ahp, new_ahos,
+         new_q1p, new_q1os, new_q2p, new_q2os,
+         new_tq1p, new_tq2p, new_la, new_alo), all_update_metrics = jax.lax.scan(
+            _update_step, update_carry_init, jnp.arange(G_UPDATES)
         )
+        metrics = jax.tree_util.tree_map(lambda x: x[-1], all_update_metrics)
 
         step_data = (rew, done, info["goal_reached"], info["collision"], info["passive_col"])
-        new_carry = (new_ep, new_eos, new_tep, new_ahp, new_ahos,
-                     new_chp, new_chos, new_thp, new_la, new_alo,
-                     new_buf, new_es, new_eo, key)
+        new_carry = (new_lcp, new_lcos, new_tlcp, new_ahp, new_ahos,
+                     new_q1p, new_q1os, new_q2p, new_q2os, new_tq1p, new_tq2p,
+                     new_la, new_alo, new_buf, new_es, new_eo, key)
         return new_carry, (step_data, metrics)
 
-    carry = (ep, eos, tep, ahp, ahos, chp, chos,
-             thp, la, alo, buf, es, eo, key)
+    carry = (lcp, lcos, tlcp, ahp, ahos,
+             q1p, q1os, q2p, q2os, tq1p, tq2p,
+             la, alo, buf, es, eo, key)
     new_carry, (all_step_data, all_metrics) = jax.lax.scan(
         _loop_body, carry, None, length=LOG_EVERY
     )
@@ -441,17 +505,21 @@ def collect_episode_outcomes(rewards, dones, goal_reached, collision, passive_co
 
 
 # ── Checkpoint ────────────────────────────────────────────────────────────────
-def save_checkpoint(ep, tep, ahp, chp, thp, eos, ahos, chos, la, alo, step):
+def save_checkpoint(lcp, tlcp, ahp, q1p, q2p, tq1p, tq2p,
+                    lcos, ahos, q1os, q2os, la, alo, step):
     os.makedirs(CKPT_DIR, exist_ok=True)
     bundle = {
-        "encoder_params":       jax.device_get(ep),
-        "target_enc_params":    jax.device_get(tep),
+        "lidar_cnn_params":     jax.device_get(lcp),
+        "target_cnn_params":    jax.device_get(tlcp),
         "actor_head_params":    jax.device_get(ahp),
-        "critic_head_params":   jax.device_get(chp),
-        "target_head_params":   jax.device_get(thp),
-        "encoder_opt":          jax.device_get(eos),
+        "q1_branch_params":     jax.device_get(q1p),
+        "q2_branch_params":     jax.device_get(q2p),
+        "target_q1_params":     jax.device_get(tq1p),
+        "target_q2_params":     jax.device_get(tq2p),
+        "lidar_cnn_opt":        jax.device_get(lcos),
         "actor_head_opt":       jax.device_get(ahos),
-        "critic_head_opt":      jax.device_get(chos),
+        "q1_opt":               jax.device_get(q1os),
+        "q2_opt":               jax.device_get(q2os),
         "log_alpha":            jax.device_get(la),
         "alpha_opt_state":      jax.device_get(alo),
         "step":                 int(step),
@@ -464,33 +532,40 @@ def save_checkpoint(ep, tep, ahp, chp, thp, eos, ahos, chos, la, alo, step):
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
 
-    print("SAC Training  (shared-encoder + target-encoder architecture)")
-    print(f"  N_ENVS={N_ENVS}  BUFFER={BUFFER_CAP:,}  BATCH={BATCH_SIZE}")
+    print("SAC Training  (shared LidarCNN + decoupled Q1/Q2 branches)")
+    print(f"  N_ENVS={N_ENVS}  BUFFER={BUFFER_CAP:,}  BATCH={BATCH_SIZE}  G_UPDATES={G_UPDATES}")
     print(f"  gamma={GAMMA}  tau={TAU}  lr={LR}  H*={TARGET_ENTROPY}")
-    print(f"  LOG_EVERY={LOG_EVERY}  transitions/chunk={N_ENVS*LOG_EVERY:,}\n")
+    print(f"  LOG_EVERY={LOG_EVERY}  transitions/chunk={N_ENVS*LOG_EVERY:,}  grad_updates/chunk={LOG_EVERY*G_UPDATES}\n")
 
     master_key = jax.random.PRNGKey(7)
     master_key, k_init, k_env, k_warmup = jax.random.split(master_key, 4)
     train_rng  = jax.random.PRNGKey(42)
 
-    dummy_obs  = jnp.zeros((2, OBS_SIZE),   dtype=jnp.float32)
-    dummy_feat = jnp.zeros((2, 128),        dtype=jnp.float32)
-    dummy_act  = jnp.zeros((2, ACTION_DIM), dtype=jnp.float32)
+    dummy_obs      = jnp.zeros((2, OBS_SIZE),   dtype=jnp.float32)
+    dummy_act      = jnp.zeros((2, ACTION_DIM), dtype=jnp.float32)
 
-    k_e, k_ah, k_ch = jax.random.split(k_init, 3)
+    k_lc, k_ah, k_q1, k_q2 = jax.random.split(k_init, 4)
 
-    ep  = encoder_net.init(k_e,  dummy_obs)["params"]               # shared online encoder
-    tep = jax.tree_util.tree_map(jnp.array, ep)                     # FIX 2: target encoder (EMA copy)
-    ahp = actor_head.init(k_ah, dummy_feat)["params"]               # actor head
-    chp = critic_head.init(k_ch, dummy_feat, dummy_act)["params"]   # critic head
-    thp = jax.tree_util.tree_map(jnp.array, chp)                    # target head (copy)
+    # Init shared LidarCNN
+    lcp  = lidar_cnn.init(k_lc, dummy_obs)["params"]
+    tlcp = jax.tree_util.tree_map(jnp.array, lcp)   # target CNN (EMA copy)
 
-    eos  = enc_opt.init(ep)
+    # Init actor — needs a forward pass through lidar_cnn to get feature shapes
+    dummy_cnn_feat, dummy_pose, dummy_sv = lidar_cnn.apply({"params": lcp}, dummy_obs)
+    ahp  = actor_head.init(k_ah, dummy_cnn_feat, dummy_pose, dummy_sv)["params"]
+
+    # Init independent Q1 and Q2 branches
+    q1p  = critic_q1.init(k_q1, dummy_cnn_feat, dummy_pose, dummy_sv, dummy_act)["params"]
+    q2p  = critic_q2.init(k_q2, dummy_cnn_feat, dummy_pose, dummy_sv, dummy_act)["params"]
+    tq1p = jax.tree_util.tree_map(jnp.array, q1p)   # target Q1 (EMA copy)
+    tq2p = jax.tree_util.tree_map(jnp.array, q2p)   # target Q2 (EMA copy)
+
+    lcos = lidar_cnn_opt.init(lcp)
     ahos = head_actor_opt.init(ahp)
-    chos = head_critic_opt.init(chp)
+    q1os = head_q1_opt.init(q1p)
+    q2os = head_q2_opt.init(q2p)
     # Alpha init: after /10 env scaling, rewards are O(10), Q-values O(100).
     # alpha=1.0 gives entropy term ~1.0*log_pi ~ -2.0, i.e. ~2% of Q — sane ratio.
-    # Auto-tuning adjusts from here; too low causes premature entropy collapse.
     la   = jnp.array(0.0, dtype=jnp.float32)  # log(1.0) = 0.0 → alpha = 1.0
     alo  = alpha_opt.init(la)
 
@@ -522,7 +597,7 @@ if __name__ == "__main__":
                              new_obs, terminal.astype(jnp.float32), max_v)
         env_obs     = new_obs
         total_steps += N_ENVS
-    print("Warmup done. JIT compiling train_chunk (this may take ~1 min)...")
+    print("Warmup done. JIT compiling train_chunk (this may take ~5 min — nested scan)...")
 
     hdr = (f"{'Upd':>7} | {'Steps':>10} | {'EpRet':>7} | "
            f"{'Suc%':>5} {'ACo%':>5} {'PCo%':>5} {'Tmo%':>5} | "
@@ -541,22 +616,24 @@ if __name__ == "__main__":
                            "pcol_pct", "tmo_pct", "n_ep"])
     _log_file.flush()
 
-    # Print every 10th chunk = every 500 updates (10 * LOG_EVERY=50)
+    # Print every 10th chunk
     PRINT_EVERY_CHUNKS = 10
 
     while n_updates < TOTAL_UPDATES:
         t0 = time.time()
 
         new_carry, all_step_data, all_metrics = train_chunk(
-            ep, eos, tep, ahp, ahos, chp, chos,
-            thp, la, alo, vmap_step,
+            lcp, lcos, tlcp, ahp, ahos,
+            q1p, q1os, q2p, q2os, tq1p, tq2p,
+            la, alo, vmap_step,
             replay_buf, env_state, env_obs, train_rng,
             3.0, -1
         )
-        (ep, eos, tep, ahp, ahos, chp, chos,
-         thp, la, alo, replay_buf, env_state, env_obs, train_rng) = new_carry
+        (lcp, lcos, tlcp, ahp, ahos,
+         q1p, q1os, q2p, q2os, tq1p, tq2p,
+         la, alo, replay_buf, env_state, env_obs, train_rng) = new_carry
 
-        n_updates   += LOG_EVERY
+        n_updates   += LOG_EVERY * G_UPDATES
         total_steps += N_ENVS * LOG_EVERY
 
         ep_rets, ep_suc, ep_col, ep_pcol, ep_tmo, ep_msk = \
@@ -602,7 +679,8 @@ if __name__ == "__main__":
         if is_better and n_ep > 0:
             best_suc = suc_pct
             best_ret = mean_ret
-            save_checkpoint(ep, tep, ahp, chp, thp, eos, ahos, chos, la, alo, n_updates)
+            save_checkpoint(lcp, tlcp, ahp, q1p, q2p, tq1p, tq2p,
+                            lcos, ahos, q1os, q2os, la, alo, n_updates)
 
     elapsed = time.time() - t_start
     print(f"\nSAC done! {elapsed/3600:.2f}h | Best success: {best_suc:.1f}%  Best reward: {best_ret:.1f}")
