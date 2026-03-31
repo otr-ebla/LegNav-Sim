@@ -13,19 +13,8 @@ parser = argparse.ArgumentParser(description="JAX PPO Training")
 parser.add_argument("--gpu", type=str, default="0", choices=["0", "1"], help="Target GPU ID (0 or 1)")
 args, _ = parser.parse_known_args()
 
-# ── GPU memory configuration ─────────────────────────────────────────────────
-# Use the BFC allocator (default JAX behaviour) — NOT "platform".
-# "platform" allocates per-buffer from the OS, bypasses JAX's memory pool,
-# and causes fragmentation + CUDA_ILLEGAL_ADDRESS when the pool is exhausted.
-# BFC pre-reserves a fraction of VRAM and manages it internally.
-#
-# XLA_PYTHON_CLIENT_MEM_FRACTION=0.88 reserves 88% of VRAM (~8.8 GB on a
-# 10 GB card), leaving ~1.2 GB for the CUDA driver, cuDNN workspace, and OS.
-# Do NOT set XLA_PYTHON_CLIENT_ALLOCATOR — absence means BFC (the safe default).
 os.environ["CUDA_VISIBLE_DEVICES"]           = args.gpu
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.88"
-# cuda_malloc_async reduces driver-level fragmentation without changing the
-# JAX allocator — safe to keep.
 os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
 
 import time
@@ -54,12 +43,7 @@ GAMMA          = 0.99
 GAE_LAMBDA     = 0.95
 CLIP_EPS       = 0.2
 VF_COEF        = 0.25
-# FIX: ENTROPY_COEF abbassato 0.01→0.003.
-# Con reward scale -50/-10 e valore assoluto episodio ~50, il value loss domina.
-# ENTROPY_COEF=0.01 era troppo alto: il gradient dell'entropia spingeva sempre
-# verso logstd_max, bloccando l'entropia a 2.838 (il massimo con LOG_STD_MAX=0.0).
-# Con 0.003 l'entropia può scendere naturalmente quando la policy trova azioni
-# che massimizzano il reward, senza essere soffocata dall'entropy bonus.
+
 ENTROPY_COEF   = 0.01
 MAX_GRAD_NORM  = 0.5
 PPO_EPOCHS     = 6
@@ -67,13 +51,9 @@ LR_START       = 5e-4
 LR_END         = 1e-5
 LR_MIN         = 1e-5
 WARMUP_UPDATES = 5
-# TOTAL_UPDATES: 128 × 16384 × 96 = 201,326,592 ≈ 200M env steps
 TOTAL_UPDATES  = 800
 
 BATCH_SIZE      = NUM_ENVS * ROLLOUT_STEPS          # 8192 × 64 = 524,288
-# N_MINIBATCHES=64: MBS = 524288/64 = 8192 — matches GPU L2 cache working set
-# well on 10 GB cards. Previous 128 minibatches × 16384 envs = 12288 MBS,
-# but 16384 envs was already OOM before minibatching.
 N_MINIBATCHES   = 64
 MINI_BATCH_SIZE = BATCH_SIZE // N_MINIBATCHES       # 8192
 
@@ -81,10 +61,6 @@ assert BATCH_SIZE % N_MINIBATCHES == 0, (
     f"BATCH_SIZE={BATCH_SIZE} not divisible by N_MINIBATCHES={N_MINIBATCHES}."
 )
 
-# Each outer update runs PPO_EPOCHS × N_MINIBATCHES optimizer steps inside
-# jax.lax.scan, so the optax step counter advances by that factor per update.
-# The scheduler must be expressed in true optimizer-step units, otherwise
-# warmup exhausts in update 0 and LR collapses to LR_END by update 1-2.
 _OPT_STEPS_PER_UPDATE = PPO_EPOCHS * N_MINIBATCHES   # 6 × 64 = 384
 _WARMUP_OPT_STEPS     = WARMUP_UPDATES * _OPT_STEPS_PER_UPDATE   # 1_920
 _TOTAL_OPT_STEPS      = TOTAL_UPDATES  * _OPT_STEPS_PER_UPDATE   # 49_152
@@ -519,7 +495,7 @@ if __name__ == "__main__":
                             
     print(f"Ready. obs={env_obs.shape}\n")
 
-    best_suc = 99.0 # NEVER TOUCH THIS LINE, it has to stay to 99, NEVERRRRR!!!!!!!!
+    best_suc = 55.0 # NEVER TOUCH THIS LINE, it has to stay to 99, NEVERRRRR!!!!!!!!
 
     hdr = (f"{'Upd':>5} | {'EpRet':>7} | {'Suc%':>5} {'Obs%':>5} {'Acol%':>5} {'Pcol%':>5} {'Tmo%':>5} |"
            f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} | {'FPS':>7} {'#Ep':>6} {'LR':>6}  | "

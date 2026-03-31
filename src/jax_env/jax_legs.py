@@ -40,20 +40,20 @@ PUBLIC API:
 
 import jax
 import jax.numpy as jnp
-from jax_env import PEOPLE_RADIUS
+from config import SimConfig
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-LEG_RADIUS   = 0.11     # m   — LiDAR cross-section
-#PEOPLE_RADIUS = 0.20    # m   — body cylinder radius (mirrors jax_env.PEOPLE_RADIUS)
-HIP_WIDTH    = 0.25     # m   — lateral separation between feet
+LEG_RADIUS   = SimConfig.LEG_RADIUS     # m   — LiDAR cross-section
+PEOPLE_RADIUS = SimConfig.PEOPLE_RADIUS    # m   — body cylinder radius (mirrors jax_env.PEOPLE_RADIUS)
+HIP_WIDTH    = SimConfig.HIP_WIDTH     # m   — lateral separation between feet
 STEP_SPEED   = 2.5      # m/s — reference speed for cadence scaling
 STEP_FREQ    = 3.5        # half-steps/s — lower = longer, more visible strides
 SPEED_THRESH = 0.1    # m/s — below this, feet freeze
 LEG_LEASH_MAX = 0.6   # m   — max allowed foot-to-body distance (leash safety net)
 
 # Shoe geometry
-SHOE_LENGTH  = 0.3    # m   — toe-to-heel length
-SHOE_WIDTH   = LEG_RADIUS * 1.6  # m   — matches leg circle diameter (0.17 m)
+SHOE_LENGTH  = SimConfig.SHOE_LENGTH    # m   — toe-to-heel length
+SHOE_WIDTH   = SimConfig.SHOE_WIDTH  # m   — matches leg circle diameter (0.17 m)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -85,7 +85,7 @@ def _next_plant(side, speed):
     cadence        = STEP_FREQ * speed_factor
     swing_duration = 1.0 / cadence
 
-    fwd_offset = speed * swing_duration * 0.8
+    fwd_offset = speed * swing_duration * 0.5 - SHOE_LENGTH * 0.5   # forward offset places foot under future hip, not behind
     lat_offset = HIP_WIDTH * 0.5 * side
     return jnp.array([fwd_offset, lat_offset])   # (2,) local offset
 
@@ -221,7 +221,7 @@ def _update_single(fs_i, person_i, dt):
 
     # ── Phase advance ─────────────────────────────────────────────────────────
     speed_factor = jnp.clip(speed / STEP_SPEED, 0.3, 1.0)
-    cadence      = STEP_FREQ * speed_factor
+    cadence      = 1#STEP_FREQ * speed_factor
     new_phase    = (phase + cadence * dt) % 1.0
 
     # crossed = True when phase wrapped around 0 → new step began

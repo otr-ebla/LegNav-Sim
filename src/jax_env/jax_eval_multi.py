@@ -49,7 +49,7 @@ def _parse_args():
     p.add_argument("--no-legs",  dest="use_legs", action="store_false")
     p.add_argument("--ghost-body", action="store_true",
                    help="Overlay JHSFM body ring on top of legs.")
-    p.add_argument("--sensor-noise", action="store_true", default=False,
+    p.add_argument("--sensor-noise", action="store_true", default=True,
                    help="Enable Salt&Pepper sensor noise (off by default for clean eval).")
     p.add_argument("--watch", action="store_true", default=False,
                    help="Watch the checkpoint file and hot-reload weights when modified.")
@@ -255,7 +255,7 @@ def _build_tqc():
 # ── Default checkpoint paths ───────────────────────────────────────────────────
 
 _DEFAULT_CKPT = {
-    "ppo":  "checkpoints/ppo_model_best.msgpack",
+    "ppo":  "checkpoints/ppo_classic_best.msgpack",#"checkpoints/ppo_model_best.msgpack",
     "shac": "checkpoints/shac_best.msgpack",
     "sac":  "checkpoints_sac/sac_best.msgpack",
     "tqc":  "checkpoints_tqc/tqc_best.msgpack",

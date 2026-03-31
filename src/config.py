@@ -15,10 +15,15 @@ class SimConfig:
     ROOM_SIZE = (ROOM_SIDE_LENGTH, ROOM_SIDE_LENGTH)  # meters
     MAX_STEPS = 600
     HUMANS_RADIUS = 0.6  # meters
+    PEOPLE_RADIUS = 0.6
     HUMANS_VELOCITY = 1.0 # m/s
     NUM_OBSTACLES = 25
     NUM_HUMANS = 5
     RADIUS_EXTENDED = 0.3
+    LEG_RADIUS = 0.08
+    SHOE_WIDTH = 0.12
+    SHOE_LENGTH = 0.3
+    HIP_WIDTH = 0.32
 
 
 class LidarConfig:

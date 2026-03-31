@@ -51,31 +51,7 @@ _PROGRESS_COEF =  1.5
 _STEP_PEN      =  -0.008
 
 # Jerk penalty — discourages angular velocity changes (smooth paths).
-_JERK_WEIGHT   =   0.008
-
-# ── Comfort penalty parameters (replaces old clearance-factor multiplier) ─────
-# OLD DESIGN (broken): clearance_factor multiplied progress reward.
-#   With 12 humans in 12×12m, closest_shoe_surface < 0.8m ~49% of the time,
-#   so CF < 0.5 half the time → progress reward suppressed → robot freezes.
-#
-# NEW DESIGN: progress reward is ALWAYS at full strength (never multiplied).
-#   Instead, an additive comfort penalty discourages lingering near humans.
-#   The robot is free to pass through crowded zones (progress pulls it forward)
-#   but learns to prefer wider paths when available.
-#
-# comfort_penalty = -_COMFORT_COEF * max(0, 1 - d / _COMFORT_DIST) * (1 + v/max_v)
-#
-#   _COMFORT_DIST : radius of the "personal space" zone [m]
-#                   Humans closer than this generate a per-step penalty.
-#   _COMFORT_COEF : base penalty magnitude at d=0 (body contact distance).
-#                   Scaled by (1 + v/max_v) so fast approaches cost more.
-#
-# Intuition for the policy:
-#   d > 1.2 m → no comfort penalty, full progress
-#   d = 0.6 m → penalty ≈ -0.075 * (1 + v/max_v)  → prefers wider path
-#   d = 0.0 m → penalty ≈ -0.15  * (1 + v/max_v)  → strong deterrent
-#   But even at d=0 the net reward of moving toward goal is still positive
-#   (progress ≈ 1.2/step vs penalty ≈ 0.3) → robot never freezes.
+_JERK_WEIGHT   =   0.016
 
 _COMFORT_DIST  = 1.2   # m — personal space boundary
 _COMFORT_COEF  = 0.015 # base penalty at d=0 (before speed scaling) — /10 from 0.15
@@ -421,11 +397,6 @@ def step_env(key, state, action, ghost_robot: bool = True):
     static_obs_collision = (closest_cir < ROBOT_RADIUS) | (closest_box < ROBOT_RADIUS)
 
     # ── 5c. Shoe-box collisions (USE_LEGS=True only, resolved at trace time) ───
-    # When USE_LEGS=True the shoe AABB is the primary human contact surface.
-    # Each shoe contact is classified active/passive with the same logic as body
-    # contacts: active if robot was moving toward the shoe's owner and v >= 0.1.
-    # When USE_LEGS=False these flags are all False — collision uses the body
-    # circle threshold from 5a instead.
     if USE_LEGS:
         shoe_boxes = get_shoe_boxes(new_people, new_foot_state)   # (2*N, 4)
 
