@@ -1,41 +1,6 @@
 """
 jax_legs.py — Planted-Foot Gait Model (Body-Centric Reference Frame)
 ======================================================================
-Fix 1 — Body-centric interpolation (eliminates rubber-band stretching):
-  swing_target and swing_start are stored as LOCAL OFFSETS in the person's
-  body frame at step-initiation time: [fwd_component, lat_component].
-  Each frame, world positions are reconstructed as:
-      body_xy + R(theta) @ local_offset
-  Because the offset is relative to the pelvis, any JHSFM push-out that
-  teleports the body automatically carries the feet with it. The absolute
-  world anchors that caused stretching are gone.
-
-Fix 2 — Kinematic leash (permanent safety net):
-  After world-space reconstruction, if any foot is more than LEG_LEASH_MAX
-  metres from the body centre it is snapped back to the natural hip baseline.
-  This costs a single jnp.where per foot and prevents any residual anomaly
-  from slow drift, extreme push-outs, or scenario teleportation.
-
-Fix 3 (pre-existing) — Forward anticipation in _next_plant:
-  Target is placed at body + fwd*(speed*swing_duration*0.8) ± hip/2 so the
-  foot lands roughly under the future hip rather than behind it.
-
-STATE stored per human (inside EnvState.foot_state):
-  foot_state : (N, 10) float32
-    [0:2]  left_foot_xy       — current WORLD position of left foot  (for rendering)
-    [2:4]  right_foot_xy      — current WORLD position of right foot (for rendering)
-    [4]    phase              — gait phase in [0, 1)
-    [5]    stance_leg         — 0.0=left is stance / right swings,
-                                1.0=right is stance / left swings
-    [6:8]  swing_target_local — swing target as LOCAL body-frame offset [fwd, lat]
-    [8:10] swing_start_local  — swing start  as LOCAL body-frame offset [fwd, lat]
-                                (frozen at the moment a new step begins)
-
-PUBLIC API:
-  init_foot_state(people, key)                    → foot_state (N, 10)
-  advance_feet(foot_state, people, dt)            → foot_state (N, 10)
-  get_leg_positions(foot_state)                   → left_xy (N,2), right_xy (N,2)
-  get_leg_circles(people, foot_state, use_legs)   → (2N,3) or (N,3)
 """
 
 import jax
@@ -67,27 +32,7 @@ def _fwd_lat(theta):
     return fwd, lat
 
 
-def _next_plant(side, speed):
-    """
-    Compute where the swing foot should plant next, as a LOCAL body-frame offset.
 
-    Returning a local offset [fwd_component, lat_component] instead of an
-    absolute world coordinate means the target is immune to JHSFM push-outs:
-    when the body teleports, the offset stays valid and the world position is
-    reconstructed correctly from the new body position each frame.
-
-      side  : float  +1.0 = left foot,  -1.0 = right foot
-      speed : float  current walking speed (m/s)
-
-    Returns local_offset (2,): [fwd_offset, lat_offset]
-    """
-    speed_factor   = jnp.clip(speed / STEP_SPEED, 0.3, 1.0)
-    cadence        = STEP_FREQ * speed_factor
-    swing_duration = 1.0 / cadence
-
-    fwd_offset = speed * swing_duration * 0.5 - SHOE_LENGTH * 0.5   # forward offset places foot under future hip, not behind
-    lat_offset = HIP_WIDTH * 0.5 * side
-    return jnp.array([fwd_offset, lat_offset])   # (2,) local offset
 
 
 # ── Initialisation ────────────────────────────────────────────────────────────
@@ -126,197 +71,104 @@ def init_foot_state(people: jnp.ndarray, key: jnp.ndarray) -> jnp.ndarray:
     # Stagger phases so humans aren't all in sync
     phase = jax.random.uniform(key, (N,), minval=0.0, maxval=1.0)
 
-    # Derive stance from phase: 0→0.5 = right swings (left stance), 0.5→1 = left swings
-    stance = jnp.where(phase < 0.5, 0.0, 1.0)   # 0=left stance, 1=right stance
-
-    # Local offsets at rest: [0 fwd, ±half lat] — foot is directly at hip baseline
-    # These are the local-frame offsets; no forward anticipation at init (speed=0)
-    left_local  = jnp.stack([jnp.zeros(N), jnp.full(N,  half)], axis=-1)   # (N,2)
-    right_local = jnp.stack([jnp.zeros(N), jnp.full(N, -half)], axis=-1)   # (N,2)
-
-    # swing_target_local = local offset of the swinging foot's *current* planted pos
-    swing_target_local = jnp.where(
-        stance[:, None] == 0.0,
-        right_local,   # right is swinging
-        left_local,    # left  is swinging
-    )
-    # swing_start_local matches target at init (no step in progress)
-    swing_start_local = swing_target_local
-
     left_theta  = theta
     right_theta = theta
 
     return jnp.concatenate([
-        left_xy,                 # [0:2]
-        right_xy,                # [2:4]
-        phase[:, None],          # [4]
-        stance[:, None],         # [5]
-        swing_target_local,      # [6:8]
-        swing_start_local,       # [8:10]
-        left_theta[:, None],     # [10]
-        right_theta[:, None],    # [11]
+        left_xy,                 # [0:2] current left pos
+        right_xy,                # [2:4] current right pos
+        phase[:, None],          # [4]   gait phase
+        left_xy,                 # [5:7] left anchor (where foot was planted)
+        right_xy,                # [7:9] right anchor (where foot was planted)
+        jnp.zeros((N, 1)),       # [9]   padding to keep thetas stable at indices 10,11
+        left_theta[:, None],     # [10]  left heading
+        right_theta[:, None],    # [11]  right heading
     ], axis=-1)   # (N, 12)
 
 
-# ── Per-step update ───────────────────────────────────────────────────────────
-
-def _local_to_world(local_offset, body_xy, fwd, lat):
-    """
-    Transform a 2D local body-frame offset to world coordinates.
-
-      local_offset : (2,)  [fwd_component, lat_component]
-      body_xy      : (2,)  body centre in world space
-      fwd          : (2,)  forward unit vector
-      lat          : (2,)  lateral unit vector
-
-    Returns world_pos (2,).
-    """
-    return body_xy + fwd * local_offset[0] + lat * local_offset[1]
-
-
-def _world_to_local(world_pos, body_xy, fwd, lat):
-    """
-    Convert a world position to a local body-frame offset.
-
-      world_pos : (2,)  position in world space
-      body_xy   : (2,)  body centre in world space
-      fwd       : (2,)  forward unit vector
-      lat       : (2,)  lateral unit vector
-
-    Returns local_offset (2,) = [fwd_component, lat_component].
-    """
-    delta = world_pos - body_xy
-    return jnp.array([jnp.dot(delta, fwd), jnp.dot(delta, lat)])
 
 
 def _update_single(fs_i, person_i, dt):
-    """
-    Update one human's foot state for one env timestep.
+    """Update one human's foot state using real-time Inverse Kinematics."""
+    left_curr    = fs_i[0:2]
+    right_curr   = fs_i[2:4]
+    phase        = fs_i[4]
+    left_anchor  = fs_i[5:7]
+    right_anchor = fs_i[7:9]
+    left_theta   = fs_i[10]
+    right_theta  = fs_i[11]
 
-    fs_i     : (10,)  foot state
-    person_i : (≥5,)  people row [px, py, vx, vy, theta, ...]
-    dt       : float  env timestep (seconds)
-
-    All interpolation happens in LOCAL body-frame coordinates.
-    World positions [0:4] are reconstructed from local offsets each frame
-    using the current body pose, so JHSFM push-outs carry the feet with the
-    body automatically (Fix 1).  A leash clamp (Fix 2) then guarantees no
-    foot can ever stray more than LEG_LEASH_MAX metres from the body.
-    """
-    left_xy           = fs_i[0:2]    # world — used as planted anchor when stance
-    right_xy          = fs_i[2:4]    # world — used as planted anchor when stance
-    phase             = fs_i[4]
-    stance            = fs_i[5]      # 0 = left stance / right swings
-                                     # 1 = right stance / left swings
-    swing_target_local = fs_i[6:8]   # local offset [fwd, lat]
-    swing_start_local  = fs_i[8:10]  # local offset [fwd, lat], frozen at step start
-    left_theta        = fs_i[10]
-    right_theta       = fs_i[11]
-
-    px    = person_i[0]
-    py    = person_i[1]
-    vx    = person_i[2]
-    vy    = person_i[3]
-    theta = person_i[4]
-    speed = jnp.sqrt(vx**2 + vy**2 + 1e-8)
-
+    px, py, vx, vy, theta = person_i[0], person_i[1], person_i[2], person_i[3], person_i[4]
+    speed = jnp.hypot(vx, vy) + 1e-8
     body_xy = jnp.array([px, py])
-    fwd, lat = _fwd_lat(theta[None])   # (1,2) each
-    fwd = fwd[0]; lat = lat[0]         # (2,)
+
+    cos_t, sin_t = jnp.cos(theta), jnp.sin(theta)
+    fwd = jnp.array([cos_t, sin_t])
+    lat = jnp.array([-sin_t, cos_t])
 
     is_moving = speed > SPEED_THRESH
 
-    # ── Phase advance ─────────────────────────────────────────────────────────
-    speed_factor = jnp.clip(speed / STEP_SPEED, 0.3, 1.0)
-    cadence      = 1#STEP_FREQ * speed_factor
-    new_phase    = (phase + cadence * dt) % 1.0
+    # 1. Phase advance (Corrected cadence without hardcode)
+    cadence   = STEP_FREQ * jnp.clip(speed / STEP_SPEED, 0.3, 1.0)
+    new_phase = (phase + cadence * dt) % 1.0
 
-    # crossed = True when phase wrapped around 0 → new step began
-    crossed = new_phase < phase
+    # 2. Dynamic Targets: Where feet SHOULD land based on CURRENT velocity and body pos
+    stride_len   = speed * (1.0 / cadence) * 0.5 - SHOE_LENGTH * 0.5
+    target_left  = body_xy + fwd * stride_len + lat * (HIP_WIDTH * 0.5)
+    target_right = body_xy + fwd * stride_len - lat * (HIP_WIDTH * 0.5)
 
-    # ── Interpolate swing foot in LOCAL space, then lift to world ────────────
-    # t advances smoothly within [0, 1) over one half-cycle.
-    # Both swing_start_local and swing_target_local are frozen local offsets,
-    # so their world positions track the body automatically on every frame.
-    t = new_phase
-    swing_local = swing_start_local * (1.0 - t) + swing_target_local * t
-    swing_xy    = _local_to_world(swing_local, body_xy, fwd, lat)
+    # 3. Detect Phase Crossings to plant the feet and update anchors
+    crossed_half = (phase < 0.5) & (new_phase >= 0.5)
+    crossed_zero = (phase > 0.5) & (new_phase < 0.5)
+    
+    # When a foot plants, its anchor becomes the current target.
+    new_left_anchor  = jnp.where(crossed_zero, target_left,  left_anchor)
+    new_right_anchor = jnp.where(crossed_half, target_right, right_anchor)
 
-    # ── On plant: swap stance, compute new step targets ───────────────────────
-    new_stance = jnp.where(crossed, 1.0 - stance, stance)
+    # 4. Leash Safety Net: Applied directly to the anchors
+    hip_left  = body_xy + lat * (HIP_WIDTH * 0.5)
+    hip_right = body_xy - lat * (HIP_WIDTH * 0.5)
+    l_dist = jnp.hypot(new_left_anchor[0] - px, new_left_anchor[1] - py)
+    r_dist = jnp.hypot(new_right_anchor[0] - px, new_right_anchor[1] - py)
+    
+    new_left_anchor  = jnp.where(l_dist > LEG_LEASH_MAX, hip_left,  new_left_anchor)
+    new_right_anchor = jnp.where(r_dist > LEG_LEASH_MAX, hip_right, new_right_anchor)
 
-    # New local targets for the foot that will next swing
-    # (after crossing, the previously-stance foot becomes the new swing foot)
-    next_left_local  = _next_plant(+1.0, speed)
-    next_right_local = _next_plant(-1.0, speed)
+    # 5. Swing Interpolation: lerp from anchor to real-time target
+    is_left_stance = new_phase < 0.5
+    t_right = new_phase * 2.0
+    t_left  = (new_phase - 0.5) * 2.0
+    
+    swing_left  = new_left_anchor  * (1.0 - t_left)  + target_left  * t_left
+    swing_right = new_right_anchor * (1.0 - t_right) + target_right * t_right
 
-    new_swing_target_local = jnp.where(
-        crossed,
-        jnp.where(stance == 0.0, next_left_local, next_right_local),
-        swing_target_local,
-    )
+    new_left_curr  = jnp.where(is_left_stance, new_left_anchor, swing_left)
+    new_right_curr = jnp.where(is_left_stance, swing_right, new_right_anchor)
 
-    # Freeze swing_start_local at the moment a new step begins.
-    # The new start = where the newly-swinging foot is currently planted,
-    # expressed as a local offset from the body at the crossing instant.
-    left_local_now  = _world_to_local(left_xy,  body_xy, fwd, lat)
-    right_local_now = _world_to_local(right_xy, body_xy, fwd, lat)
-    new_swing_start_on_cross = jnp.where(
-        stance == 0.0,
-        left_local_now,   # left was stance → left now becomes the swing foot
-        right_local_now,  # right was stance → right now becomes the swing foot
-    )
-    new_swing_start_local = jnp.where(crossed, new_swing_start_on_cross, swing_start_local)
-
-    # ── Write swing position to the correct foot ──────────────────────────────
-    # Stance foot stays at its planted world position (not modified by swing interp)
-    new_right_xy = jnp.where(stance == 0.0, swing_xy,  right_xy)
-    new_left_xy  = jnp.where(stance == 1.0, swing_xy,  left_xy)
-
-    # On plant: snap the foot that finished swinging to its exact target (world)
-    target_world = _local_to_world(swing_target_local, body_xy, fwd, lat)
-    new_right_xy = jnp.where(crossed & (stance == 0.0), target_world, new_right_xy)
-    new_left_xy  = jnp.where(crossed & (stance == 1.0), target_world, new_left_xy)
-
-    # ── Fix 2: Kinematic leash ────────────────────────────────────────────────
-    # If any foot drifts more than LEG_LEASH_MAX from the body (can happen after
-    # extreme JHSFM push-outs or scenario teleportation), snap it back to the
-    # natural hip baseline in world space.
-    left_hip_world  = _local_to_world(jnp.array([0.0,  HIP_WIDTH * 0.5]), body_xy, fwd, lat)
-    right_hip_world = _local_to_world(jnp.array([0.0, -HIP_WIDTH * 0.5]), body_xy, fwd, lat)
-
-    left_dist  = jnp.sqrt(jnp.sum((new_left_xy  - body_xy)**2) + 1e-8)
-    right_dist = jnp.sqrt(jnp.sum((new_right_xy - body_xy)**2) + 1e-8)
-
-    new_left_xy  = jnp.where(left_dist  > LEG_LEASH_MAX, left_hip_world,  new_left_xy)
-    new_right_xy = jnp.where(right_dist > LEG_LEASH_MAX, right_hip_world, new_right_xy)
-
-    # Update foot orientations: swing foot tracks body theta ONLY if speed > 0.5 m/s.
-    # If speed <= 0.5 m/s, both feet remain completely frozen to prevent RL collision noise.
+    # 6. Yaw Orientations
     fast_enough = speed > 0.05
-    new_left_theta  = jnp.where(fast_enough & (stance == 1.0), theta, left_theta)
-    new_right_theta = jnp.where(fast_enough & (stance == 0.0), theta, right_theta)
+    new_left_theta  = jnp.where(fast_enough & ~is_left_stance, theta, left_theta)
+    new_right_theta = jnp.where(fast_enough & is_left_stance, theta, right_theta)
 
-    # ── Freeze everything if stationary ───────────────────────────────────────
-    new_phase              = jnp.where(is_moving, new_phase,              phase)
-    new_stance             = jnp.where(is_moving, new_stance,             stance)
-    new_swing_target_local = jnp.where(is_moving, new_swing_target_local, swing_target_local)
-    new_swing_start_local  = jnp.where(is_moving, new_swing_start_local,  swing_start_local)
-    new_left_xy            = jnp.where(is_moving, new_left_xy,            left_xy)
-    new_right_xy           = jnp.where(is_moving, new_right_xy,           right_xy)
-    new_left_theta         = jnp.where(is_moving, new_left_theta,         left_theta)
-    new_right_theta        = jnp.where(is_moving, new_right_theta,        right_theta)
+    # 7. Freeze everything if stationary to prevent RL noise
+    new_phase        = jnp.where(is_moving, new_phase,        phase)
+    new_left_curr    = jnp.where(is_moving, new_left_curr,    left_curr)
+    new_right_curr   = jnp.where(is_moving, new_right_curr,   right_curr)
+    new_left_anchor  = jnp.where(is_moving, new_left_anchor,  left_anchor)
+    new_right_anchor = jnp.where(is_moving, new_right_anchor, right_anchor)
+    new_left_theta   = jnp.where(is_moving, new_left_theta,   left_theta)
+    new_right_theta  = jnp.where(is_moving, new_right_theta,  right_theta)
 
     return jnp.concatenate([
-        new_left_xy,                   # [0:2]
-        new_right_xy,                  # [2:4]
-        new_phase[None],               # [4]
-        new_stance[None],              # [5]
-        new_swing_target_local,        # [6:8]
-        new_swing_start_local,         # [8:10]
-        new_left_theta[None],          # [10]
-        new_right_theta[None],         # [11]
-    ])   # (12,)
+        new_left_curr,          # [0:2]
+        new_right_curr,         # [2:4]
+        new_phase[None],        # [4]
+        new_left_anchor,        # [5:7]
+        new_right_anchor,       # [7:9]
+        jnp.zeros((1,)),        # [9] Padding
+        new_left_theta[None],   # [10]
+        new_right_theta[None],  # [11]
+    ])
 
 
 def advance_feet(
