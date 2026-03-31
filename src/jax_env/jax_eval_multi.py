@@ -375,11 +375,13 @@ def draw_humans(surface, state, foot_state_np, show_arrows, use_legs, show_body)
         if show_body:
             sx, sy = W(px, py)
             pygame.draw.circle(surface, C_BODY_RING, (sx, sy),
-                               max(3, int(_jax_env.PEOPLE_RADIUS * SCALE)), 1)
+                                max(3, int(_jax_env.PEOPLE_RADIUS * SCALE)), 1)
 
         if use_legs:
-            draw_shoe(surface, float(left_legs[i, 0]),  float(left_legs[i, 1]),  theta_h, col, border)
-            draw_shoe(surface, float(right_legs[i, 0]), float(right_legs[i, 1]), theta_h, col, border)
+            left_theta  = float(foot_state_np[i, 10])
+            right_theta = float(foot_state_np[i, 11])
+            draw_shoe(surface, float(left_legs[i, 0]),  float(left_legs[i, 1]),  left_theta, col, border)
+            draw_shoe(surface, float(right_legs[i, 0]), float(right_legs[i, 1]), right_theta, col, border)
             leg_r = max(2, int(LEG_RADIUS * SCALE))
             lx, ly = W(float(left_legs[i, 0]),  float(left_legs[i, 1]))
             rx_, ry_ = W(float(right_legs[i, 0]), float(right_legs[i, 1]))

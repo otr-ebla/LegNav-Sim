@@ -300,14 +300,15 @@ def draw_shoes_only(surface, state, foot_state_np, use_legs):
     left_legs_np, right_legs_np = _read_foot_positions_np(foot_state_np)
     n_people = int(state.people.shape[0])
     for i in range(n_people):
-        theta_h = float(state.people[i, 4])
+        left_theta  = float(foot_state_np[i, 10])
+        right_theta = float(foot_state_np[i, 11])
         col, border = _shoe_colour(i)
         draw_shoe(surface,
                   float(left_legs_np[i, 0]),  float(left_legs_np[i, 1]),
-                  theta_h, col, border)
+                  left_theta, col, border)
         draw_shoe(surface,
                   float(right_legs_np[i, 0]), float(right_legs_np[i, 1]),
-                  theta_h, col, border)
+                  right_theta, col, border)
 
 
 def draw_scene(surface, state, raw_lidar, foot_state_np, show_lidar, show_arrows, use_legs):
