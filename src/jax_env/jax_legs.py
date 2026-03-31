@@ -293,7 +293,7 @@ def _update_single(fs_i, person_i, dt):
 
     # Update foot orientations: swing foot tracks body theta ONLY if speed > 0.5 m/s.
     # If speed <= 0.5 m/s, both feet remain completely frozen to prevent RL collision noise.
-    fast_enough = speed > 0.5
+    fast_enough = speed > 0.05
     new_left_theta  = jnp.where(fast_enough & (stance == 1.0), theta, left_theta)
     new_right_theta = jnp.where(fast_enough & (stance == 0.0), theta, right_theta)
 
