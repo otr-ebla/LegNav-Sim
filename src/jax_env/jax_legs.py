@@ -291,10 +291,11 @@ def _update_single(fs_i, person_i, dt):
     new_left_xy  = jnp.where(left_dist  > LEG_LEASH_MAX, left_hip_world,  new_left_xy)
     new_right_xy = jnp.where(right_dist > LEG_LEASH_MAX, right_hip_world, new_right_xy)
 
-    # foot_state[10] and [11] store the completely frozen planted anchors.
-    # They update to the body's current heading ONLY on the exact frame the foot plants.
-    new_left_theta  = jnp.where(crossed & (stance == 1.0), theta, left_theta)
-    new_right_theta = jnp.where(crossed & (stance == 0.0), theta, right_theta)
+    # Update foot orientations: swing foot tracks body theta, stance foot is frozen.
+    # stance == 0.0 -> left is planted, right swings.
+    # stance == 1.0 -> right is planted, left swings.
+    new_left_theta  = jnp.where(stance == 1.0, theta, left_theta)
+    new_right_theta = jnp.where(stance == 0.0, theta, right_theta)
 
     # ── Freeze everything if stationary ───────────────────────────────────────
     new_phase              = jnp.where(is_moving, new_phase,              phase)
@@ -391,25 +392,11 @@ def get_shoe_boxes(
     """
     left_xy,  right_xy  = get_leg_positions(foot_state)   # (N, 2) each
 
-    # Extract the frozen planted anchors
-    left_anchor  = foot_state[:, 10]
-    right_anchor = foot_state[:, 11]
-    
-    # Extract phase (t) and stance to interpolate the swinging foot dynamically
-    t      = foot_state[:, 4]
-    stance = foot_state[:, 5]
-    theta  = people[:, 4]  # Body heading
-    
-    # Smoothly interpolate the swinging foot from its planted anchor to the body heading
-    d_left  = (theta - left_anchor + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
-    d_right = (theta - right_anchor + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
-    
-    actual_left  = left_anchor  + jnp.where(stance == 1.0, t * d_left, 0.0)
-    actual_right = right_anchor + jnp.where(stance == 0.0, t * d_right, 0.0)
-
     # Stack into (2N,) arrays directly
     all_xy    = jnp.concatenate([left_xy, right_xy], axis=0)         # (2N, 2)
-    all_theta = jnp.concatenate([actual_left, actual_right], axis=0) # (2N,)
+    
+    # Left and right thetas are already correctly updated in the step logic
+    all_theta = jnp.concatenate([foot_state[:, 10], foot_state[:, 11]], axis=0) # (2N,)
 
     # Compute forward vectors for every single shoe independently
     fwd, _ = _fwd_lat(all_theta)                                   # (2N, 2)
