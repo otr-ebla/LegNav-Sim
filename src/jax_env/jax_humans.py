@@ -20,17 +20,10 @@ PEOPLE ARRAY (N, 8) — unchanged:
 import jax
 import jax.numpy as jnp
 
-# ── Differentiable soft_clip (replaces jnp.clip in pushout ops) ─────────────────────
-# jnp.clip has zero gradient when saturated. soft_clip uses softplus so the
-# gradient is always non-zero, letting BPTT receive signal near walls.
-# beta=25 makes the softplus very tight (within 0.03m of the hard boundary),
-# so the simulation physics are almost identical in forward mode.
+
 _BETA = 25.0
 
-def _soft_clip_scalar(x, lo, hi):
-    below  = lo + jax.nn.softplus(_BETA * (x - lo)) / _BETA
-    result = hi - jax.nn.softplus(_BETA * (hi - below)) / _BETA
-    return result
+
 
 # ── Force tuning for dt=0.15s ─────────────────────────────────────────────────
 # Rule of thumb: F/m * dt < v_max  →  F < m*v_max/dt = 75*1.3/0.15 ≈ 650 N
@@ -160,6 +153,16 @@ def _robot_force(px, py, rx, ry, distract):
 # ── Hard push-out (position correction) ──────────────────────────────────────
 # Forces alone can't prevent penetration at dt=0.15. We explicitly resolve
 # overlaps AFTER integration so people can never be inside obstacles.
+
+def _soft_clip_scalar(x, min_val, max_val, k=100.0):
+    """
+    Differentiable soft clipping using softplus.
+    k controls the sharpness of the clip (higher = closer to hard clip).
+    """
+    # Apply lower bound smoothly
+    lb = min_val + jax.nn.softplus(k * (x - min_val)) / k
+    # Apply upper bound smoothly
+    return max_val - jax.nn.softplus(k * (max_val - lb)) / k
 
 def _pushout_walls(px, py, r, room_w, room_h):
     # DIFF FIX: soft_clip instead of jnp.clip → gradient flows at boundaries

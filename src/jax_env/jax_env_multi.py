@@ -1,32 +1,5 @@
 """
-jax_env_multi.py — Core 2D Navigation Environment with JHSFM
-
-FIXES vs previous version:
-
-  FIX #5 — passive_col penalty ridotta da -60 a -20:
-    La passive_col si verifica quando il robot è fermo e un umano ci cammina
-    sopra. Il robot non può evitarla. Una penalità di -60 era sproporzionata
-    e incoraggiava la policy a muoversi freneticamente vicino agli umani per
-    "scappare" invece di navigare efficientemente. Con -20 rimane un segnale
-    negativo (non stare in mezzo al traffico) senza dominare il reward.
-
-  DIFFERENTIABILITY OVERHAUL (SHAC):
-    step_env is now natively fully differentiable so SHAC can backpropagate
-    exact gradients through the real simulator — no surrogate reward needed.
-
-    Changes:
-      • soft_clip() replaces jnp.clip() for action/position clamping.
-        jnp.clip has zero gradient when saturated; soft_clip (softplus-based)
-        returns a non-zero gradient at the boundary, allowing BPTT to learn
-        that pushing into a wall is bad.
-      • Boolean collision flags replaced by sigmoid soft-indicators for reward.
-        Hard bool flags have zero gradient; sigmoids give a smooth collision
-        signal that propagates into the actor gradient.
-      • Terminal jnp.where cascade replaced by a smooth reward sum.
-        jnp.where(done, CONST, reward) kills the gradient wherever done=True;
-        sigmoid indicators smoothly blend terminal and dense rewards.
-      • Boolean `done` is preserved for episode-reset logic but is wrapped in
-        stop_gradient so it never contaminates the BPTT graph.
+jax_env_multi.py — Core 2D Navigation Environment with JHSFM and multiple human-robot navigation scenarios
 """
 
 import jax
@@ -48,95 +21,65 @@ from jax_scenarios import generate_scenario
 from jax_legs import advance_feet, init_foot_state, get_shoe_boxes, get_leg_positions, LEG_RADIUS as _LEG_R
 
 try:
-    from src.jhsfm_utils.JHSFM.jhsfm.hsfm_diff import step as hsfm_step
+    from src.jhsfm_utils.JHSFM.jhsfm.hsfm import step as hsfm_step
     from src.jhsfm_utils.JHSFM.jhsfm.utils import get_standard_humans_parameters
 except ImportError:
-    from src.jhsfm_utils.JHSFM.jhsfm.hsfm_diff import step as hsfm_step
+    from src.jhsfm_utils.JHSFM.jhsfm.hsfm import step as hsfm_step
     from jhsfm_utils.JHSFM.jhsfm.utils import get_standard_humans_parameters
 
 __all__ = ["reset_env", "step_env", "EnvState", "get_obs"]
 
 HSFM_DT    = 0.01
 
-# ── Differentiable soft_clip ────────────────────────────────────────────────────
-# Replaces jnp.clip in robot kinematics so SHAC gets non-zero gradients
-# even when the robot is at/beyond a boundary (wall, speed limit).
-# beta=25: softplus tracks hard clip to within ~0.03m. Forward physics are
-# effectively unchanged; only the backward gradient differs.
-_SC_BETA = 25.0
 
-def _soft_clip(x, lo, hi, beta=_SC_BETA):
-    """Differentiable drop-in for jnp.clip(x, lo, hi)."""
-    below  = lo + jax.nn.softplus(beta * (x - lo)) / beta
-    result = hi - jax.nn.softplus(beta * (hi - below)) / beta
-    return result
 
-# ── Reward constants ─────────────────────────────────────────────────────────
-#
-# Design philosophy: minimal hand-engineering, maximal emergence.
-#
-# The core reward is:
-#
-#   social_progress = Δdist_to_goal × clearance_factor(closest_human)
-#
-# where clearance_factor ∈ [0,1] is a smooth sigmoid that:
-#   → equals ~1 when the robot is comfortably far from all humans
-#   → drops toward 0 as it enters the personal-space zone
-#   → reaches 0 at the intimate zone boundary
-#
-# This single multiplicative term encodes the social priority rule:
-# "yield to humans" emerges because progress near humans is worth almost
-# nothing, so the policy learns that detouring around them (even at a
-# distance cost) is better than passing through.  Stopping to let a
-# crossing human pass also becomes rational: zero progress × anything = 0,
-# whereas waiting a few steps and then resuming full progress is better.
-#
-# No separate yield/escape/proxemic/overspeed/aim terms are needed.
-# The jerk penalty keeps trajectories smooth (humans walk smoothly).
-# Terminal rewards remain for hard constraints.
+# Terminal rewards (all /10 from original to keep Q-values O(100) not O(1000)).
+# This ensures alpha*log_pi remains a meaningful fraction of the critic signal
+# so the entropy term actually shapes the policy during early training.
+_R_GOAL        =  10.0
+_R_OBS_COL     =  -9.0
+_R_WALL_COL    =  -9.0
+_R_ACTIVE_COL  =  -9.0
 
-# Terminal rewards
-_R_GOAL        =  200.0
-_R_OBS_COL     =  -90.0
-_R_WALL_COL    =  -90.0
-_R_ACTIVE_COL  =  -90.0
-# FIX #5: ridotto da -60 a -20. La passive_col avviene quando il robot è
-# FERMO e un umano gli cammina sopra — il robot non può fare molto per
-# evitarla. Una penalità di -60 (quasi pari alla active_col) era sproporzionata
-# e insegnava alla policy a muoversi freneticamente per "scappare" dagli umani
-# invece di navigare efficientemente. Con -20 rimane un segnale negativo
-# (incentiva a non stare in mezzo al traffico) senza dominare il reward.
-_R_PASSIVE_COL =  -20.0
-_R_TIMEOUT     =   -5.0
+_R_PASSIVE_COL =  -3.5
+_R_TIMEOUT     =  -9.0
 
-# Progress scaling — how much a metre of progress toward goal is worth
-# when the robot is in completely open space (clearance_factor = 1).
-_PROGRESS_COEF =   3.0
+
+_PROGRESS_COEF =  1.5
 
 # Step penalty — small constant cost per timestep, encourages efficiency.
-_STEP_PEN      =  -0.02
+_STEP_PEN      =  -0.008
 
 # Jerk penalty — discourages angular velocity changes (smooth paths).
-# Larger than before because smoothness is the only trajectory shaping left.
-_JERK_WEIGHT   =   2.0
+_JERK_WEIGHT   =   0.008
 
-# ── Clearance factor parameters ───────────────────────────────────────────────
-# clearance_factor(d) = sigmoid((d - _CF_CENTER) / _CF_SLOPE)
+# ── Comfort penalty parameters (replaces old clearance-factor multiplier) ─────
+# OLD DESIGN (broken): clearance_factor multiplied progress reward.
+#   With 12 humans in 12×12m, closest_shoe_surface < 0.8m ~49% of the time,
+#   so CF < 0.5 half the time → progress reward suppressed → robot freezes.
 #
-#   _CF_CENTER : distance at which clearance_factor = 0.5 [m]
-#                Set to personal space boundary (~1.2 m).
-#                At this distance the progress reward is halved.
-#   _CF_SLOPE  : controls steepness of the sigmoid [m]
-#                Smaller → sharper boundary; larger → softer gradient.
-#                0.4 m gives a transition from ~0.1 to ~0.9 over ~1.8 m.
+# NEW DESIGN: progress reward is ALWAYS at full strength (never multiplied).
+#   Instead, an additive comfort penalty discourages lingering near humans.
+#   The robot is free to pass through crowded zones (progress pulls it forward)
+#   but learns to prefer wider paths when available.
+#
+# comfort_penalty = -_COMFORT_COEF * max(0, 1 - d / _COMFORT_DIST) * (1 + v/max_v)
+#
+#   _COMFORT_DIST : radius of the "personal space" zone [m]
+#                   Humans closer than this generate a per-step penalty.
+#   _COMFORT_COEF : base penalty magnitude at d=0 (body contact distance).
+#                   Scaled by (1 + v/max_v) so fast approaches cost more.
 #
 # Intuition for the policy:
-#   d > 2.0 m  → clearance_factor ≈ 0.95  → almost full progress reward
-#   d = 1.2 m  → clearance_factor = 0.50  → progress halved → slow down
-#   d = 0.7 m  → clearance_factor ≈ 0.10  → progress worth almost nothing → stop/detour
-#   d < 0.5 m  → clearance_factor ≈ 0.02  → collision imminent, no progress matters
-_CF_CENTER = 1.2   # m — personal space boundary (Hall 1966)
-_CF_SLOPE  = 0.4   # m — sigmoid steepness
+#   d > 1.2 m → no comfort penalty, full progress
+#   d = 0.6 m → penalty ≈ -0.075 * (1 + v/max_v)  → prefers wider path
+#   d = 0.0 m → penalty ≈ -0.15  * (1 + v/max_v)  → strong deterrent
+#   But even at d=0 the net reward of moving toward goal is still positive
+#   (progress ≈ 1.2/step vs penalty ≈ 0.3) → robot never freezes.
+
+_COMFORT_DIST  = 1.2   # m — personal space boundary
+_COMFORT_COEF  = 0.015 # base penalty at d=0 (before speed scaling) — /10 from 0.15
+
 N_SUBSTEPS = int(DT / HSFM_DT)
 NUM_PEOPLE = 12
 
@@ -166,15 +109,17 @@ def build_hsfm_obstacles(obs_boxes):
         ])
 
     box_edges = jax.vmap(box_to_edges)(obs_boxes)
-    all_edges = jnp.concatenate([room_edges[None, ...], box_edges], axis=0)
-    return jnp.tile(all_edges[None, ...], (NUM_PEOPLE + 1, 1, 1, 1, 1))
+    # Return (num_obs_groups, 4, 2, 2) — NOT tiled per-agent.
+    # hsfm.py's vectorized_single_update uses in_axes obstacles=None so all
+    # agents share the same obstacle array instead of each getting an identical copy.
+    return jnp.concatenate([room_edges[None, ...], box_edges], axis=0)
 
 
-def reset_env(key: jax.Array, min_goal_dist: float = 3.0, scenario_idx: int = -1):
+def reset_env(key: jax.Array, max_goal_dist: float = 3.0, scenario_idx: int = -1):
     k_main, k_legs, k_obs = jax.random.split(key, 3)
 
     rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people = \
-        generate_scenario(k_main, min_goal_dist, scenario_idx)
+        generate_scenario(k_main, max_goal_dist, scenario_idx)
     
     #max_v = 0.8
 
@@ -218,11 +163,9 @@ def step_env(key, state, action, ghost_robot: bool = True):
     """
     k_step, k_obs = jax.random.split(key)
 
-    # ── 1. Robot Kinematics (DIFF: soft_clip on action and position) ────────────
-    # soft_clip matches jnp.clip in forward mode to within ~0.03 m/s / 0.03 rad/s
-    # but has non-zero gradient at the boundary for BPTT.
-    target_v = _soft_clip(action[0], 0.0, state.max_v)
-    target_w = _soft_clip(action[1], -1.0, 1.0)
+    # ── 1. Robot Kinematics ───────────────────────────────────────────────────────
+    target_v = jnp.clip(action[0], 0.0, state.max_v)
+    target_w = jnp.clip(action[1], -1.0, 1.0)
 
     mid_theta = state.theta + 0.5 * target_w * DT
     new_theta = (state.theta + target_w * DT + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
@@ -232,23 +175,14 @@ def step_env(key, state, action, ghost_robot: bool = True):
     # Boolean wall_collision for episode logic (stop_grad'd later)
     wall_collision = (raw_x < ROBOT_RADIUS) | (raw_x > ROOM_W - ROBOT_RADIUS) | \
                      (raw_y < ROBOT_RADIUS) | (raw_y > ROOM_H - ROBOT_RADIUS)
-    # Smooth wall penetration depth for differentiable reward
-    _wall_pen_x = jax.nn.softplus(_SC_BETA * (ROBOT_RADIUS - raw_x)) / _SC_BETA + \
-                  jax.nn.softplus(_SC_BETA * (raw_x - (ROOM_W - ROBOT_RADIUS))) / _SC_BETA
-    _wall_pen_y = jax.nn.softplus(_SC_BETA * (ROBOT_RADIUS - raw_y)) / _SC_BETA + \
-                  jax.nn.softplus(_SC_BETA * (raw_y - (ROOM_H - ROBOT_RADIUS))) / _SC_BETA
-    wall_col_soft = jax.nn.sigmoid((_wall_pen_x + _wall_pen_y - 0.02) / 0.005)
 
-    # DIFF: soft_clip keeps gradient alive near walls
-    new_x = _soft_clip(raw_x, ROBOT_RADIUS, ROOM_W - ROBOT_RADIUS)
-    new_y = _soft_clip(raw_y, ROBOT_RADIUS, ROOM_H - ROBOT_RADIUS)
+    new_x = jnp.clip(raw_x, ROBOT_RADIUS, ROOM_W - ROBOT_RADIUS)
+    new_y = jnp.clip(raw_y, ROBOT_RADIUS, ROOM_H - ROBOT_RADIUS)
 
     # ── 2. JHSFM substeps ─────────────────────────────────────────────────────
     hsfm_params      = get_standard_humans_parameters(NUM_PEOPLE + 1)
     static_obstacles = build_hsfm_obstacles(state.obs_boxes)
 
-    # Ghost robot: hide position from HSFM so humans ignore the robot.
-    # ghost_robot is a Python bool → resolved at trace time, zero overhead.
     if ghost_robot:
         hsfm_rx = jnp.array(_GHOST_POS)
         hsfm_ry = jnp.array(_GHOST_POS)
@@ -256,48 +190,49 @@ def step_env(key, state, action, ghost_robot: bool = True):
         hsfm_rx = new_x
         hsfm_ry = new_y
 
+    # Build goal arrays for humans using the active waypoint per human.
+    idx_h    = state.people[:, 10]
+    g1x_h, g1y_h = state.people[:, 6], state.people[:, 7]
+    g2x_h, g2y_h = state.people[:, 8], state.people[:, 9]
+    h_goals_pre = jnp.stack([
+        jnp.where(idx_h == 0, g1x_h, g2x_h),
+        jnp.where(idx_h == 0, g1y_h, g2y_h),
+    ], axis=-1)   # (N, 2)
+
+    r_goal_row  = jnp.array([[state.goal_x, state.goal_y]])  # (1, 2)
+    ext_goals_pre = jnp.concatenate([h_goals_pre, r_goal_row], axis=0)  # (N+1, 2)
+
+    r_state_row = jnp.array([[
+        hsfm_rx, hsfm_ry,
+        target_v * jnp.cos(new_theta),
+        target_v * jnp.sin(new_theta),
+        new_theta, target_w
+    ]])   # (1, 6)
+
+    h_state_init   = state.people[:, :6]   # (N, 6)
+    ext_state_init = jnp.concatenate([h_state_init, r_state_row], axis=0)  # (N+1, 6)
+
     def _hsfm_substep(carry, _):
-        h_state, r_state = carry
-        idx  = state.people[:, 10]
-        g1x, g1y = state.people[:, 6], state.people[:, 7]
-        g2x, g2y = state.people[:, 8], state.people[:, 9]
-        gx   = jnp.where(idx == 0, g1x, g2x)
-        gy   = jnp.where(idx == 0, g1y, g2y)
-        h_goals    = jnp.stack([gx, gy], axis=-1)
-        r_goal     = jnp.array([state.goal_x, state.goal_y])
-        ext_state  = jnp.concatenate([h_state, r_state[None, :]], axis=0)
-        ext_goals  = jnp.concatenate([h_goals, r_goal[None, :]], axis=0)
-        next_ext   = hsfm_step(ext_state, ext_goals, hsfm_params, static_obstacles, HSFM_DT)
-        next_h     = next_ext[:-1]
+        ext_state = carry
+        # Goals are constant across substeps — pass pre-built ext_goals_pre
+        next_ext  = hsfm_step(ext_state, ext_goals_pre, hsfm_params, static_obstacles, HSFM_DT)
 
         # Do not clamp dummy humans — they live at -999 intentionally
-        is_dummy_sub = idx < 0.0
-        clamped_x  = jnp.where(is_dummy_sub, next_h[:, 0],
-                                jnp.clip(next_h[:, 0], 0.1, ROOM_W - 0.1))
-        clamped_y  = jnp.where(is_dummy_sub, next_h[:, 1],
-                                jnp.clip(next_h[:, 1], 0.1, ROOM_H - 0.1))
-        next_h     = next_h.at[:, 0].set(clamped_x).at[:, 1].set(clamped_y)
-        return (next_h, r_state), None
+        next_h       = next_ext[:-1]
+        is_dummy_sub = state.people[:, 10] < 0.0
+        clamped_x    = jnp.where(is_dummy_sub, next_h[:, 0],
+                                 jnp.clip(next_h[:, 0], 0.1, ROOM_W - 0.1))
+        clamped_y    = jnp.where(is_dummy_sub, next_h[:, 1],
+                                 jnp.clip(next_h[:, 1], 0.1, ROOM_H - 0.1))
+        # Preserve robot row unchanged; only humans are clamped
+        clamped_ext  = next_ext.at[:-1, 0].set(clamped_x).at[:-1, 1].set(clamped_y)
+        return clamped_ext, None
 
-    h_state_init = state.people[:, :6]
-    # r_state uses ghost position for HSFM but true kinematics elsewhere
-    r_state_init = jnp.array([hsfm_rx, hsfm_ry,
-                               target_v * jnp.cos(new_theta),
-                               target_v * jnp.sin(new_theta),
-                               new_theta, target_w])
-    (new_h_state, _), _ = jax.lax.scan(
-        _hsfm_substep, (h_state_init, r_state_init), None, length=N_SUBSTEPS
+    final_ext, _ = jax.lax.scan(
+        _hsfm_substep, ext_state_init, None, length=N_SUBSTEPS
     )
-    # BUG FIX 1: Stop gradient through HSFM substeps.
-    # BPTT depth without this: H_outer × N_SUBSTEPS = 32 × 15 = 480 steps.
-    # The HSFM Jacobian has eigenvalues > 1 in crowded scenarios, so gradients
-    # explode multiplicatively over 480 steps (AGN up to 200+ observed).
-    # Human positions are not controlled by the actor — only robot kinematics
-    # are. The relevant BPTT path is: actor_params → action → robot kinematics
-    # → dist_to_humans/goal/obstacles → reward. Human positions contribute only
-    # noise amplified over 480 steps.  stop_gradient reduces BPTT depth to H
-    # outer steps only.
-    new_h_state = jax.lax.stop_gradient(new_h_state)
+    new_h_state = final_ext[:-1]   # (N, 6) — drop robot row
+ 
 
     # ── 3. Waypoint toggle & Respawn Logic ────────────────────────────────────
     idx_cur = state.people[:, 10]
@@ -306,8 +241,8 @@ def step_env(key, state, action, ghost_robot: bool = True):
     gx_cur   = jnp.where(idx_cur == 0, g1x, g2x)
     gy_cur   = jnp.where(idx_cur == 0, g1y, g2y)
 
-    dist_to_goal = jnp.sqrt((new_h_state[:, 0] - gx_cur)**2 +
-                             (new_h_state[:, 1] - gy_cur)**2 + 1e-8)
+    #dist_to_goal = jnp.sqrt((new_h_state[:, 0] - gx_cur)**2 +(new_h_state[:, 1] - gy_cur)**2 + 1e-8)
+    dist_to_goal = jnp.hypot(new_h_state[:, 0] - gx_cur, new_h_state[:, 1] - gy_cur)
 
     # Only toggle active humans (idx >= 0) to stop dummies from reviving
     new_idx = jnp.where((dist_to_goal < 0.5) & (idx_cur >= 0.0),
@@ -397,8 +332,10 @@ def step_env(key, state, action, ghost_robot: bool = True):
     new_foot_state = jnp.where(needs_respawn[:, None], fresh_foot_state, advanced_foot_state)
 
     # ── 4. Distance helpers ───────────────────────────────────────────────────
-    prev_dist = jnp.sqrt((state.x - state.goal_x)**2 + (state.y - state.goal_y)**2 + 1e-8)
-    new_dist  = jnp.sqrt((new_x  - state.goal_x)**2 + (new_y  - state.goal_y)**2 + 1e-8)
+    #prev_dist = jnp.sqrt((state.x - state.goal_x)**2 + (state.y - state.goal_y)**2 + 1e-8)
+    prev_dist = jnp.hypot(state.x - state.goal_x, state.y - state.goal_y)
+    #new_dist  = jnp.sqrt((new_x  - state.goal_x)**2 + (new_y  - state.goal_y)**2 + 1e-8)
+    new_dist  = jnp.hypot(new_x  - state.goal_x, new_y  - state.goal_y)
 
     left_xy, right_xy = get_leg_positions(new_foot_state)   # (N,2) each
 
@@ -408,19 +345,36 @@ def step_env(key, state, action, ghost_robot: bool = True):
 
     dx_p = center_x - new_x
     dy_p = center_y - new_y
-    dists_p = jnp.sqrt(dx_p**2 + dy_p**2 + 1e-8)
+    #dists_p = jnp.sqrt(dx_p**2 + dy_p**2 + 1e-8)
+    dists_p = jnp.hypot(dx_p, dy_p)
 
     # Mask dummies from all distance/collision logic
     active_mask    = new_people[:, 10] >= 0.0
     # BUG FIX 2: Replace jnp.inf with large finite sentinel for dummy humans.
-    # jnp.min over an array containing jnp.inf can produce NaN gradients in
-    # XLA's backward pass when inf wins the reduction (gradient of the inf
-    # branch is NaN-contaminated).  Using a large finite value avoids this
-    # while keeping dummy humans effectively invisible to all distance logic.
-    # 1e4 >> ROOM_W/H (~12m) so it never affects the min for active humans.
     _DUMMY_DIST = 1e4
     dists_p_active = jnp.where(active_mask, dists_p, _DUMMY_DIST)
-    closest_human  = jnp.min(dists_p_active)
+    closest_human  = jnp.min(dists_p_active)   # body-centre dist — used for collision FOV logic
+
+
+    if USE_LEGS:
+        shoe_boxes_cf = get_shoe_boxes(new_people, new_foot_state)   # (2N, 4)
+        N_cf = NUM_PEOPLE
+        owner_idx_cf   = jnp.concatenate([jnp.arange(N_cf), jnp.arange(N_cf)])  # (2N,)
+        owner_active_cf = active_mask[owner_idx_cf]                              # (2N,)
+
+        def _shoe_dist_cf(box):
+            cx, cy, hw, hh = box
+            ddx = jnp.maximum(jnp.abs(new_x - cx) - hw, 0.0)
+            ddy = jnp.maximum(jnp.abs(new_y - cy) - hh, 0.0)
+            return jnp.sqrt(ddx**2 + ddy**2 + 1e-8)
+
+        shoe_dists_cf = jax.vmap(_shoe_dist_cf)(shoe_boxes_cf)          # (2N,)
+        shoe_dists_cf = jnp.where(owner_active_cf, shoe_dists_cf, _DUMMY_DIST)
+        # Subtract ROBOT_RADIUS so we get surface-to-surface gap
+        closest_shoe_surface = jnp.maximum(0.0, jnp.min(shoe_dists_cf) - ROBOT_RADIUS)
+    else:
+        # Fallback: body circle edge-to-edge (original formula)
+        closest_shoe_surface = jnp.maximum(0.0, closest_human - PEOPLE_RADIUS - ROBOT_RADIUS)
 
     # ── 5. Collision Detection ───────────────────────────────────────────────────
 
@@ -453,13 +407,14 @@ def step_env(key, state, action, ghost_robot: bool = True):
     # ── 5b. Static obstacle collisions ────────────────────────────────────────────
     dx_c = state.obs_circles[:, 0] - new_x
     dy_c = state.obs_circles[:, 1] - new_y
-    closest_cir = jnp.min(jnp.sqrt(dx_c**2 + dy_c**2 + 1e-8) - state.obs_circles[:, 2])
+    dists_c = jnp.hypot(dx_c, dy_c)
+    closest_cir = jnp.min(dists_c - state.obs_circles[:, 2])
 
     def _box_dist(box):
         cx, cy, hw, hh = box
         ddx = jnp.maximum(jnp.abs(new_x - cx) - hw, 0.0)
         ddy = jnp.maximum(jnp.abs(new_y - cy) - hh, 0.0)
-        return jnp.sqrt(ddx**2 + ddy**2 + 1e-8)
+        return jnp.hypot(ddx, ddy)
 
     closest_box = jnp.min(jax.vmap(_box_dist)(state.obs_boxes))
 
@@ -512,107 +467,48 @@ def step_env(key, state, action, ghost_robot: bool = True):
     goal_reached = new_dist < GOAL_RADIUS
     done         = goal_reached | collision | timeout
 
-    # ── 5e. Smooth collision indicators for differentiable reward ────────────────
-    # These sigmoid soft-indicators give SHAC a non-zero gradient signal near
-    # collision events, unlike the boolean flags above which kill the grad.
-    # Sharpness k=20 (width ~0.05m): smooth but still near-binary in practice.
-    _k = 20.0  # sigmoid sharpness (1/m or 1/step)
+    # ── 6. Reward ───────────────────────────────────────────────────────────────
 
-    # Goal: sigmoid centered on GOAL_RADIUS
-    goal_col_soft = jax.nn.sigmoid(_k * (GOAL_RADIUS - new_dist))
+    # — 6a. Comfort penalty (spazio personale spaziale)
+    comfort_violations = jnp.maximum(0.0, 1.0 - dists_p_active / _COMFORT_DIST)
+    comfort_pen = -_COMFORT_COEF * jnp.sum(comfort_violations)
 
-    # Static obstacles: smooth indicator from closest distances
-    obs_col_soft = jax.nn.sigmoid(_k * (ROBOT_RADIUS - closest_cir)) + \
-                   jax.nn.sigmoid(_k * (ROBOT_RADIUS - closest_box))
-    obs_col_soft = jnp.clip(obs_col_soft, 0.0, 1.0)  # sum may exceed 1
+    # — 6b. NEW: Yield Penalty (Gradiente di Frenata Dinamica)
+    # Recuperato e riadattato da jax_env.py per forzare l'agente a rallentare
+    human_angles = jnp.arctan2(dy_p, dx_p)
+    rel_angles   = (human_angles - new_theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
 
-    # Human body collision soft indicator
-    if USE_LEGS:
-        body_thresh_soft = ROBOT_RADIUS + _LEG_R
-    else:
-        body_thresh_soft = ROBOT_RADIUS + PEOPLE_RADIUS
-    # Per-human collision probability, masked by active humans
-    human_col_probs = jax.nn.sigmoid(_k * (body_thresh_soft - dists_p)) * active_mask
-    human_col_soft  = jnp.max(human_col_probs)  # worst-case human
+    YIELD_DIST = 1.5
+    YIELD_FOV  = 2*jnp.pi
 
-    # ── 6. Reward (fully differentiable for SHAC) ────────────────────────────────
-    #
-    # Dense shaping terms (fully smooth, gradients flow everywhere):
-    #   social_progress = sigmoid-clearance-weighted Δdist
-    #   step_pen, jerk_pen = constant / quadratic
-    #
-    # Terminal-like terms (sigmoid soft-indicators, never zero-out gradients):
-    #   goal_bonus     = _R_GOAL * sigmoid((GOAL_RADIUS  - dist) * k)
-    #   obs_pen        = _R_OBS_COL  * soft_obs_col_indicator
-    #   wall_pen       = _R_WALL_COL * soft_wall_col_indicator
-    #   human_pen      = mix of active / passive soft indicators
-    #
-    # All terms are SUMMED (no hard jnp.where switch), so BPTT sees gradients
-    # through every term at every timestep, including near terminal events.
-    #
-    # Note: The magnitude of goal_bonus / collision terms is scaled so they
-    # dominate around the event but remain finite elsewhere. The sigmoid
-    # saturates away from the event, so far-from-terminal steps the dense
-    # shape terms (progress + jerk) dominate as before.
+    in_yield_zone = (dists_p_active < YIELD_DIST) & (jnp.abs(rel_angles) < YIELD_FOV) & active_mask
+    is_yield_situation = jnp.any(in_yield_zone)
 
-    # — 6a. Clearance factor (unchanged) ──────────────────────────────────
-    edge_to_edge   = jnp.maximum(0.0, closest_human - PEOPLE_RADIUS - ROBOT_RADIUS)
-    clearance_factor = jax.nn.sigmoid((edge_to_edge - _CF_CENTER) / _CF_SLOPE)
+    closest_yield_dist = jnp.min(jnp.where(in_yield_zone, dists_p_active, 100.0))
+    urgency = jnp.where(is_yield_situation, (YIELD_DIST - closest_yield_dist) / YIELD_DIST, 0.0)
 
-    # — 6b. Dense shaping (smooth, unchanged) ────────────────────────────
+    # Penalità massiccia se il robot tiene il gas premuto verso un umano.
+    # Il -2.0 compensa abbondantemente il reward di progresso (+0.15/step),
+    # rendendo la frenata (target_v = 0) l'unica azione matematicamente vantaggiosa.
+    yield_penalty = -0.4 * urgency * target_v  # /10 from -4.0
+
+    # — 6c. Dense shaping ─────────────────────────────────────────────────
     progress         = prev_dist - new_dist
-    social_progress  = _PROGRESS_COEF * progress * clearance_factor
+    social_progress  = _PROGRESS_COEF * progress
     step_pen         = _STEP_PEN
     jerk_pen         = -_JERK_WEIGHT * (target_w - state.w) ** 2
-    dense_reward     = social_progress + step_pen + jerk_pen
+    
+    # Aggiungiamo la yield_penalty al totale
+    dense_reward     = social_progress + step_pen + jerk_pen + comfort_pen + yield_penalty
 
-    # — 6c. Smooth terminal bonus / penalty terms (DIFF: sigmoid, not jnp.where)
-    #
-    # Each soft indicator ∈ [0,1] is multiplied by the corresponding terminal
-    # reward magnitude.  All terms are SUMMED so no gradient is killed by a
-    # hard branch.  Far from the terminal boundary the sigmoid saturates and
-    # each term contributes nearly zero, leaving dense_reward dominant.
-    # BUG FIX 3: Reduce terminal sigmoid sharpness from 20 → 8.
-    # With _k_term=20 the gradient of the goal bonus w.r.t. distance at the
-    # inflection point is _R_GOAL × _k_term × 0.25 = 200 × 20 × 0.25 = 1000.
-    # This compounds with the BPTT chain over H steps, contributing to the
-    # observed AGN explosion even after Fix 1 (HSFM stop_gradient).
-    # _k_term=8 → max gradient = 200 × 8 × 0.25 = 400 (2.5× reduction).
-    # The transition width is ~1/_k_term ≈ 0.125m, still sharper than
-    # GOAL_RADIUS=0.3m so the goal bonus fires precisely.
-    _k_term = 8.0
-
-    # Goal bonus (positive): peaks sharply as robot enters GOAL_RADIUS
-    goal_bonus = _R_GOAL * jax.nn.sigmoid(_k_term * (GOAL_RADIUS - new_dist))
-
-    # Obstacle penalty (negative)
-    obs_pen = _R_OBS_COL * obs_col_soft
-
-    # Wall penalty (negative)
-    wall_pen = _R_WALL_COL * wall_col_soft
-
-    # Human penalty: active (robot moving into human ahead) vs passive
-    active_col_probs = human_col_probs * (in_fwd_fov & in_prox).astype(jnp.float32)
-    active_col_soft  = jnp.where(target_v >= 0.1, jnp.max(active_col_probs), 0.0)
-    # BUG FIX 4: Replace boolean ~obs_collision & ~wall_collision guard with
-    # smooth soft indicators.  The original jnp.where(bool, ..., 0.0) kills the
-    # gradient through the passive collision term whenever a wall or static
-    # obstacle collision occurs (gradient of jnp.where w.r.t. a boolean condition
-    # is 0).  Using the already-computed soft indicators preserves gradients:
-    # when obs_col_soft / wall_col_soft → 1 the passive penalty is smoothly
-    # suppressed; when they → 0 (no hard collision) it fires normally.
-    _no_hard_col_soft = 1.0 - jnp.clip(obs_col_soft + wall_col_soft, 0.0, 1.0)
-    passive_col_soft = _no_hard_col_soft * jnp.max(
-        human_col_probs * (~(in_fwd_fov & in_prox)).astype(jnp.float32)
-    )
-    human_pen = _R_ACTIVE_COL * active_col_soft + _R_PASSIVE_COL * passive_col_soft
-
-    # Timeout soft indicator: activates sharply as step count approaches MAX_STEPS
-    timeout_soft = jax.nn.sigmoid(_k_term * ((state.time_step + 1) / MAX_STEPS - 1.0))
-    timeout_pen  = _R_TIMEOUT * timeout_soft
-
-    # — 6d. Total reward — sum of dense + smooth terminal terms
-    reward = dense_reward + goal_bonus + obs_pen + wall_pen + human_pen + timeout_pen
+    # — 6d. Terminal cascades ─────────────────────────────────────────────
+    reward = dense_reward
+    reward = jnp.where(goal_reached, _R_GOAL, reward)
+    reward = jnp.where(obs_collision & ~goal_reached, _R_OBS_COL, reward)
+    reward = jnp.where(wall_collision & ~obs_collision & ~goal_reached, _R_WALL_COL, reward)
+    reward = jnp.where(active_col & ~obs_collision & ~wall_collision & ~goal_reached, _R_ACTIVE_COL, reward)
+    reward = jnp.where(passive_col & ~active_col & ~obs_collision & ~wall_collision & ~goal_reached, _R_PASSIVE_COL, reward)
+    reward = jnp.where(timeout & ~goal_reached & ~collision, _R_TIMEOUT, reward)
 
     new_state = state.replace(
         x=new_x, y=new_y, theta=new_theta,
@@ -628,6 +524,9 @@ def step_env(key, state, action, ghost_robot: bool = True):
     obs, sp_mask = get_obs(new_state, k_obs)
     new_state = new_state.replace(sp_mask=sp_mask)
 
+ 
+    instant_col = collision & (state.time_step == 0)
+
     info = {
         "discount":      jnp.where(done, 0.0, 1.0),
         "goal_reached":  goal_reached,
@@ -637,5 +536,12 @@ def step_env(key, state, action, ghost_robot: bool = True):
         "closest_human": closest_human,
         "sp_mask":       sp_mask,
         "timeout":       timeout,
+        "instant_col":   instant_col,
+        "rew_yield":     yield_penalty,
+        # ── NEW: Export reward components for debugging ──
+        "rew_prog":      social_progress,
+        "rew_step":      jnp.array(step_pen),
+        "rew_jerk":      jerk_pen,
+        "rew_comf":      comfort_pen,
     }
     return obs, new_state, reward, done, info

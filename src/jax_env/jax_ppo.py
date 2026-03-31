@@ -1,43 +1,6 @@
 """
-jax_ppo.py — Single-GPU PPO Training  (GPU 0)
-===============================================
-FIXES vs previous version:
+jax_ppo.py — Single-GPU PPO Training  (GPU 0), must train always with GPU, no CPU, never CPU
 
-  FIX — _vmap_step stale-closure (Bug #3, coordinated with jax_train.py):
-    init_env_state() now returns (env_obs, env_state, vmap_step).
-    collect_rollouts receives vmap_step as an explicit static arg.
-    On curriculum stage change, the new vmap_step object triggers a retrace
-    so the new min_goal_dist actually propagates into the rollout loop.
-    cur_stage is now properly tracked and printed.
-
-  FIX — rolling_suc EMA alpha 0.03 → 0.1 (Issue #10):
-    With α=0.03 the time constant was ~33 updates, causing the agent to
-    spend 60-80 updates at the wrong curriculum stage. α=0.1 (~10-update
-    lag) is appropriate for a 400-update run with 3 stage transitions.
-
-  FIX — Scheduler step-count mismatch (Critical):
-    The optax step counter is incremented once per optimizer.update() call.
-    Because ppo_update_epoch runs N_MINIBATCHES=200 updates inside a
-    jax.lax.scan, and run_ppo_updates scans over PPO_EPOCHS=6 epochs, the
-    optimizer advances by 200×6=1200 steps per outer training update.
-    The old WARMUP_UPDATES=10 and TOTAL_UPDATES=400 were in outer-update
-    units, so the scheduler saw 1200 steps per outer update and exhausted
-    warmup (10 steps) halfway through the very first outer update, then
-    hit LR_END by outer update 1-2, silently killing all learning.
-    FIX: _WARMUP_OPT_STEPS and _TOTAL_OPT_STEPS scale by
-    _OPT_STEPS_PER_UPDATE = PPO_EPOCHS × N_MINIBATCHES = 1200, so the
-    scheduler now spans the correct real optimizer-step range.
-    lr_now display is also fixed to query scheduler at the true step.
-
-  FIX — Curriculum thresholds alzate (Bug #3):
-    Le vecchie soglie (10%, 20%, 35%...) facevano scattare il curriculum
-    troppo presto. Con rolling_suc EMA α=0.1 un singolo rollout fortunato
-    a ~11% poteva portare rolling_suc oltre la soglia del 10%, saltando
-    al distanza 2.5m prima che il comportamento base fosse consolidato.
-    Fix: soglie alzate a (25%, 38%, 50%...) — ogni stage richiede ~2×
-    il successo del precedente. GHOST_PROB_STAGES allineate di conseguenza.
-
-  All previous hyperparameters and PPO logic are carried.
 """
 
 import os
@@ -69,6 +32,7 @@ import time
 import warnings
 import jax
 import jax.numpy as jnp
+import functools
 
 # ALWAYS index 0, regardless of which physical GPU you chose
 jax.config.update("jax_default_device", jax.devices("cuda")[0])
@@ -80,24 +44,31 @@ import numpy as np
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 from jax_network import EndToEndActorCritic
-from jax_train import collect_rollouts, init_env_state, NUM_ENVS, ROLLOUT_STEPS, OBS_SIZE
+#from jax_network import DecoupledActorCritic
+from jax_train import collect_rollouts, init_env_state, rebuild_vmap_step, NUM_ENVS, ROLLOUT_STEPS, OBS_SIZE
+
+
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 GAMMA          = 0.99
 GAE_LAMBDA     = 0.95
 CLIP_EPS       = 0.2
 VF_COEF        = 0.25
-# ENTROPY_COEF raised 0.003→0.01: entropy collapsed from H=0.38 to H=-0.30
-# by upd 55 with the old value — policy was prematurily converging.
+# FIX: ENTROPY_COEF abbassato 0.01→0.003.
+# Con reward scale -50/-10 e valore assoluto episodio ~50, il value loss domina.
+# ENTROPY_COEF=0.01 era troppo alto: il gradient dell'entropia spingeva sempre
+# verso logstd_max, bloccando l'entropia a 2.838 (il massimo con LOG_STD_MAX=0.0).
+# Con 0.003 l'entropia può scendere naturalmente quando la policy trova azioni
+# che massimizzano il reward, senza essere soffocata dall'entropy bonus.
 ENTROPY_COEF   = 0.01
 MAX_GRAD_NORM  = 0.5
 PPO_EPOCHS     = 6
 LR_START       = 5e-4
-LR_END         = 1e-4
+LR_END         = 1e-5
 LR_MIN         = 1e-5
 WARMUP_UPDATES = 5
 # TOTAL_UPDATES: 128 × 16384 × 96 = 201,326,592 ≈ 200M env steps
-TOTAL_UPDATES  = 400
+TOTAL_UPDATES  = 800
 
 BATCH_SIZE      = NUM_ENVS * ROLLOUT_STEPS          # 8192 × 64 = 524,288
 # N_MINIBATCHES=64: MBS = 524288/64 = 8192 — matches GPU L2 cache working set
@@ -119,35 +90,80 @@ _WARMUP_OPT_STEPS     = WARMUP_UPDATES * _OPT_STEPS_PER_UPDATE   # 1_920
 _TOTAL_OPT_STEPS      = TOTAL_UPDATES  * _OPT_STEPS_PER_UPDATE   # 49_152
 
 network = EndToEndActorCritic(action_dim=2)
+#network = DecoupledActorCritic(action_dim=2)
 
 # ── Curriculum ────────────────────────────────────────────────────────────────
-# Each entry: (suc_pct_threshold, min_goal_dist)
-# FIX #3: soglie alzate per evitare curriculum prematuro.
-# Con le vecchie soglie (10%, 20%, 35%...) la policy saltava allo stage
-# successivo con success rate ancora troppo bassa (~11% → stage 1).
-# Il robot non aveva consolidato il comportamento base prima di dover
-# navigare distanze più lunghe, causando regressione immediata post-jump.
-# Nuove soglie: ogni stage richiede ~2x il successo precedente;
-# il primo stage (1.5m→2.5m) ora richiede 25% invece di 10%.
+# Each entry: (suc_pct_threshold, max_goal_dist)
+# The curriculum controls the MAXIMUM distance the goal can be from the robot.
+# Stage 0: goal within 1.5m — robot learns basic goal-seeking.
+# As success rate rises, max_goal_dist increases — robot must navigate farther.
 CURRICULUM_STAGES = [
     (25.0, 1.5),
     (38.0, 2.5),
     (50.0, 4.0),
-    (60.0, 5.0),   # intermediate stage — old 4.0m→6.5m jump caused stall
+    (60.0, 5.0),
     (70.0, 6.5),
     (80.0, 8.0),
     (101., 9.0),
 ]
 
 GHOST_PROB_STAGES = [
-    # FIX #3: allineate alle nuove soglie curriculum.
-    # Il ghost inizia a degradare solo dopo che la policy è stabile (≥50%),
-    # non a 35% come prima quando era ancora in fase di consolidamento.
     (50.0, 1.0),
     (65.0, 0.8),
     (78.0, 0.6),
     (101., 0.4),
 ]
+
+from flax import struct
+
+@struct.dataclass
+class RunningMeanStd:
+    mean: jnp.ndarray
+    var: jnp.ndarray
+    count: jnp.ndarray
+
+    @classmethod
+    def create(cls):
+        return cls(mean=jnp.array(0.0), var=jnp.array(1.0), count=jnp.array(1e-4))
+
+    def update(self, x: jnp.ndarray):
+        batch_mean = jnp.mean(x)
+        batch_var = jnp.var(x)
+        batch_count = x.size
+
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+
+        new_mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + jnp.square(delta) * self.count * batch_count / tot_count
+        new_var = M2 / tot_count
+
+        return self.replace(mean=new_mean, var=new_var, count=tot_count)
+
+@jax.jit
+def normalize_batch_rewards(rewards, dones, running_ret, rms_state, gamma):
+    """
+    Calculates discounted returns, updates the running statistics,
+    and scales the rewards by the running standard deviation.
+    """
+    def _step(ret, t):
+        r, d = t
+        ret = r + gamma * ret * (1.0 - d)
+        return ret, ret
+
+    # Scan over the ROLLOUT_STEPS axis
+    running_ret, returns = jax.lax.scan(_step, running_ret, (rewards, dones))
+
+    # Update running stats with the flattened returns
+    new_rms_state = rms_state.update(returns.flatten())
+
+    # Normalize rewards and clip to [-10, 10] to prevent extreme gradient spikes
+    normalized_rewards = rewards / jnp.sqrt(new_rms_state.var + 1e-8)
+    normalized_rewards = jnp.clip(normalized_rewards, -10.0, 10.0)
+
+    return normalized_rewards, running_ret, new_rms_state
 
 def curriculum_ghost_prob(suc_pct: float) -> float:
     for threshold, prob in GHOST_PROB_STAGES:
@@ -155,7 +171,7 @@ def curriculum_ghost_prob(suc_pct: float) -> float:
             return prob
     return GHOST_PROB_STAGES[-1][1]
 
-def curriculum_min_goal_dist(suc_pct: float) -> float:
+def curriculum_max_goal_dist(suc_pct: float) -> float:
     for threshold, dist in CURRICULUM_STAGES:
         if suc_pct < threshold:
             return dist
@@ -188,6 +204,62 @@ optimizer = optax.chain(
 )
 
 
+@functools.partial(jax.jit, static_argnums=(4, 7, 8))
+def ppo_train_chunk(train_state, env_state, env_obs, rms_state, vmap_step, running_ret, rng_key, max_goal_dist, scenario_idx):
+    """
+    Esegue LOG_EVERY update completi di PPO interamente su GPU.
+    Nessuna sincronizzazione con il processore host fino alla fine del blocco.
+    """
+    def _update_step(carry, _):
+        (ts, es, eo, rms, r_ret, key) = carry
+        key, k_roll, k_upd = jax.random.split(key, 3)
+
+        # 1. Raccolta dati (fusa direttamente nell'update)
+        rollout_history, next_es, next_eo, last_val = collect_rollouts(
+            k_roll, ts[0], network.apply, vmap_step, es, eo, max_goal_dist, scenario_idx
+        )
+
+        # 2. Normalizzazione dinamica dei reward
+        rewards, new_r_ret, new_rms = normalize_batch_rewards(
+            rollout_history["rewards"], rollout_history["dones"], r_ret, rms, GAMMA
+        )
+
+        # 3. Calcolo GAE
+        adv, ret = compute_gae(
+            rewards, rollout_history["values"], rollout_history["dones"], last_val
+        )
+
+        # 4. Aggiornamento Pesi (Actor e Critic)
+        new_ts, mean_loss, aux = run_ppo_updates(
+            ts,
+            rollout_history["obs"].reshape(-1, OBS_SIZE),
+            rollout_history["actions"].reshape(-1, 2),
+            adv.reshape(-1),
+            ret.reshape(-1),
+            rollout_history["log_probs"].reshape(-1),
+            rollout_history["max_v"].reshape(-1),   # FIX 1: Jacobian correction
+            k_upd
+        )
+
+        # Dati da restituire per il logging a fine chunk
+        step_data = (
+            rollout_history["rewards"], rollout_history["dones"],
+            rollout_history["goal_reached"], rollout_history["collision"],
+            rollout_history["passive_col"], rollout_history["active_col"]
+        )
+        
+        new_carry = (new_ts, next_es, next_eo, new_rms, new_r_ret, key)
+        return new_carry, (step_data, mean_loss, aux)
+
+    # Scansiona per LOG_EVERY update
+    carry = (train_state, env_state, env_obs, rms_state, running_ret, rng_key)
+    new_carry, (all_step_data, all_losses, all_aux) = jax.lax.scan(
+        _update_step, carry, None, length=LOG_EVERY
+    )
+    
+    return new_carry, all_step_data, all_losses, all_aux
+
+
 def save_checkpoint(params, opt_state, filepath="checkpoints/ppo_model_best.msgpack"):
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     bundle = {"params": jax.device_get(params), "opt_state": jax.device_get(opt_state)}
@@ -204,6 +276,54 @@ def load_checkpoint(dummy_params, dummy_opt_state,
         {"params": dummy_params, "opt_state": dummy_opt_state}, raw
     )
     return bundle["params"], bundle["opt_state"]
+
+
+
+# ── Fused Episode Outcomes ──────────────────────────────────────────────────
+@jax.jit
+def collect_episode_outcomes_chunked(rewards, dones, goal_reached, collision, passive_col, active_col):
+    """
+    Accumulates episode outcomes across the entire chunk (LOG_EVERY, ROLLOUT_STEPS, NUM_ENVS).
+    This matches the SAC implementation to avoid pulling massive tensors back to the CPU.
+    """
+    def _scan(carry, t):
+        ep_ret = carry
+        r, d, g, c, p, a = t
+        ep_ret = ep_ret + r
+
+        is_suc  = g
+        is_acol = a & ~is_suc
+        is_pcol = p & ~is_suc
+        is_obs  = c & ~a & ~p & ~is_suc
+        is_tmo  = d & ~is_suc & ~c
+
+        out_ret  = jnp.where(d, ep_ret, 0.0)
+        out_suc  = jnp.where(d, is_suc.astype(jnp.float32),  0.0)
+        out_obs  = jnp.where(d, is_obs.astype(jnp.float32),  0.0)
+        out_acol = jnp.where(d, is_acol.astype(jnp.float32), 0.0)
+        out_pcol = jnp.where(d, is_pcol.astype(jnp.float32), 0.0)
+        out_tmo  = jnp.where(d, is_tmo.astype(jnp.float32),  0.0)
+        out_msk  = d.astype(jnp.float32)
+
+        ep_ret = jnp.where(d, 0.0, ep_ret)
+        return ep_ret, (out_ret, out_suc, out_obs, out_acol, out_pcol, out_tmo, out_msk)
+
+    # Flatten the first two dimensions (LOG_EVERY * ROLLOUT_STEPS) so we can scan over time
+    N_ENVS = rewards.shape[-1]
+    flat_len = rewards.shape[0] * rewards.shape[1]
+    
+    r_flat = rewards.reshape(flat_len, N_ENVS)
+    d_flat = dones.reshape(flat_len, N_ENVS)
+    g_flat = goal_reached.reshape(flat_len, N_ENVS)
+    c_flat = collision.reshape(flat_len, N_ENVS)
+    p_flat = passive_col.reshape(flat_len, N_ENVS)
+    a_flat = active_col.reshape(flat_len, N_ENVS)
+
+    _, (ep_rets, ep_suc, ep_obs, ep_acol, ep_pcol, ep_tmo, ep_msk) = jax.lax.scan(
+        _scan, jnp.zeros(N_ENVS),
+        (r_flat, d_flat, g_flat, c_flat, p_flat, a_flat)
+    )
+    return ep_rets.ravel(), ep_suc.ravel(), ep_obs.ravel(), ep_acol.ravel(), ep_pcol.ravel(), ep_tmo.ravel(), ep_msk.ravel()
 
 
 @jax.jit
@@ -227,12 +347,27 @@ def compute_gae(rewards, values, dones, last_val):
 
 
 @jax.jit
-def ppo_loss_fn(params, obs, actions, advantages, returns, old_log_probs):
+def ppo_loss_fn(params, obs, actions, advantages, returns, old_log_probs, mean_max_v):
+    """
+    FIX 1: log_prob is now computed with the same squash correction applied
+    during rollout collection. Without this, the importance ratio
+    exp(log_prob - old_log_prob) is mathematically invalid because old_log_prob
+    was collected with the Jacobian correction but the recomputed log_prob here
+    was not — causing the ratio to diverge and the PPO clip to be ineffective.
+    mean_max_v is the mean of the per-env max_v from the minibatch (scalar),
+    used as a fixed-point for the Jacobian approximation.
+    """
     mean, logstd, values = network.apply({"params": params}, obs)
     std = jnp.exp(logstd)
 
-    z        = (actions - mean) / (std + 1e-8)
-    log_prob = jnp.sum(-0.5 * (z ** 2 + jnp.log(2.0 * jnp.pi)) - logstd, axis=-1)
+    # Squash-corrected log_prob — must match batched_sample_action in jax_train.py
+    z             = (actions - mean) / (std + 1e-8)
+    base_log_prob = jnp.sum(-0.5 * (z ** 2 + jnp.log(2.0 * jnp.pi)) - logstd, axis=-1)
+    v_squash = jax.nn.sigmoid(actions[:, 0])
+    w_squash = jnp.tanh(actions[:, 1])
+    log_dv   = jnp.log(v_squash * (1.0 - v_squash) * mean_max_v + 1e-6)
+    log_dw   = jnp.log(1.0 - w_squash ** 2 + 1e-6)
+    log_prob = base_log_prob - (log_dv + log_dw)
 
     ratio       = jnp.exp(jnp.clip(log_prob - old_log_probs, -5.0, 5.0))
     policy_loss = -jnp.mean(jnp.minimum(
@@ -250,13 +385,13 @@ def ppo_loss_fn(params, obs, actions, advantages, returns, old_log_probs):
 
 @jax.jit
 def ppo_update_epoch(carry, perm):
-    params, opt_state, obs, actions, adv, ret, old_lp = carry
+    params, opt_state, obs, actions, adv, ret, old_lp, mean_max_v = carry
 
     def _mb_step(mb_carry, mb_idx):
         p, os_ = mb_carry
         idx = jax.lax.dynamic_slice(perm, (mb_idx * MINI_BATCH_SIZE,), (MINI_BATCH_SIZE,))
         (loss, aux), grads = jax.value_and_grad(ppo_loss_fn, has_aux=True)(
-            p, obs[idx], actions[idx], adv[idx], ret[idx], old_lp[idx]
+            p, obs[idx], actions[idx], adv[idx], ret[idx], old_lp[idx], mean_max_v
         )
         updates, new_os = optimizer.update(grads, os_, p)
         return (optax.apply_updates(p, updates), new_os), (loss, aux)
@@ -264,84 +399,92 @@ def ppo_update_epoch(carry, perm):
     (new_p, new_os), (losses, auxes) = jax.lax.scan(
         _mb_step, (params, opt_state), jnp.arange(N_MINIBATCHES)
     )
-    return (new_p, new_os, obs, actions, adv, ret, old_lp), (losses, auxes)
+    return (new_p, new_os, obs, actions, adv, ret, old_lp, mean_max_v), (losses, auxes)
 
 
 @jax.jit
 def run_ppo_updates(train_state, obs_flat, actions_flat, adv_flat, ret_flat,
-                    old_lp_flat, rng_key):
+                    old_lp_flat, max_v_flat, rng_key):
+    """
+    FIX 1: max_v_flat (shape: BATCH_SIZE,) is the per-sample max_v from rollout.
+    mean_max_v (scalar) is used as a fixed-point for the Jacobian approximation
+    in ppo_loss_fn — this avoids per-sample branching inside jax.lax.scan while
+    remaining a good approximation since max_v variance is low within a batch.
+    """
     params, opt_state = train_state
+    mean_max_v = jnp.mean(max_v_flat)
 
     adv_flat = (adv_flat - adv_flat.mean()) / (adv_flat.std() + 1e-8)
 
     perms = jax.vmap(lambda k: jax.random.permutation(k, BATCH_SIZE))(
         jax.random.split(rng_key, PPO_EPOCHS)
     )
-    carry = (params, opt_state, obs_flat, actions_flat, adv_flat, ret_flat, old_lp_flat)
+    carry = (params, opt_state, obs_flat, actions_flat, adv_flat, ret_flat, old_lp_flat, mean_max_v)
     carry, (all_losses, all_auxes) = jax.lax.scan(ppo_update_epoch, carry, perms)
     last_aux = jax.tree_util.tree_map(lambda x: x[-1, -1], all_auxes)
     return (carry[0], carry[1]), all_losses.mean(), last_aux
 
 
 @jax.jit
-def collect_episode_outcomes(rewards, dones, goal_reached, collision, passive_col):
+def collect_episode_outcomes(rewards, dones, goal_reached, collision, passive_col, active_col):
     """
     Build mutually exclusive episode outcome categories that sum to 100%.
-
-    From jax_env:
-      collision   = human_col | obs_col | wall_col  (includes passive)
-      passive_col = human_col & robot_stopped & human_in_fov  (subset of collision)
-
-    So active_col = collision & ~passive_col  (wall/obs/active human — robot's fault)
-       passive_col = passive_col              (human walked into stopped robot)
-
-    Priority (applied in order, each exclusive):
-      1. success     : goal_reached
-      2. active_col  : collision & ~passive_col & ~goal_reached
-      3. passive_col : passive_col & ~goal_reached
-      4. timeout     : done & ~goal_reached & ~collision
+    
+    Categories:
+      1. success : goal_reached
+      2. obs_col : wall or static obstacle collision
+      3. acol    : active human collision
+      4. pcol    : passive human collision
+      5. timeout : done without success or collision
     """
     N = rewards.shape[1]
 
     def _scan(carry, t):
         ep_ret = carry
-        r, d, g, c, p = t
+        r, d, g, c, p, a = t
         ep_ret = ep_ret + r
 
-        # Split collision into mutually exclusive sub-types first.
-        # p (passive_col) is always a subset of c (collision), so:
-        #   active = c & ~p  (wall/obs/moving-robot human collision)
-        #   passive = p      (human walked into stationary robot)
-        act_col = c & ~p
-
-        # Now build strict priority masks (each episode falls in exactly one).
+        # Strict priority masks (each episode falls in exactly one)
         is_suc  = g
-        is_acol = act_col & ~is_suc
-        is_pcol = p       & ~is_suc
-        is_tmo  = d & ~is_suc & ~act_col & ~p
+        is_acol = a & ~is_suc
+        is_pcol = p & ~is_suc
+        is_obs  = c & ~a & ~p & ~is_suc
+        is_tmo  = d & ~is_suc & ~c
 
         out_ret  = jnp.where(d, ep_ret, 0.0)
         out_suc  = jnp.where(d, is_suc.astype(jnp.float32),  0.0)
-        out_col  = jnp.where(d, is_acol.astype(jnp.float32), 0.0)
+        out_obs  = jnp.where(d, is_obs.astype(jnp.float32),  0.0)
+        out_acol = jnp.where(d, is_acol.astype(jnp.float32), 0.0)
         out_pcol = jnp.where(d, is_pcol.astype(jnp.float32), 0.0)
         out_tmo  = jnp.where(d, is_tmo.astype(jnp.float32),  0.0)
         out_msk  = d.astype(jnp.float32)
 
         ep_ret = jnp.where(d, 0.0, ep_ret)
-        return ep_ret, (out_ret, out_suc, out_col, out_pcol, out_tmo, out_msk)
+        return ep_ret, (out_ret, out_suc, out_obs, out_acol, out_pcol, out_tmo, out_msk)
 
-    _, (ep_rets, ep_suc, ep_col, ep_pcol, ep_tmo, ep_msk) = jax.lax.scan(
+    _, (ep_rets, ep_suc, ep_obs, ep_acol, ep_pcol, ep_tmo, ep_msk) = jax.lax.scan(
         _scan, jnp.zeros(N),
-        (rewards, dones, goal_reached, collision, passive_col)
+        (rewards, dones, goal_reached, collision, passive_col, active_col)
     )
-    return ep_rets.ravel(), ep_suc.ravel(), ep_col.ravel(), ep_pcol.ravel(), ep_tmo.ravel(), ep_msk.ravel()
+    return ep_rets.ravel(), ep_suc.ravel(), ep_obs.ravel(), ep_acol.ravel(), ep_pcol.ravel(), ep_tmo.ravel(), ep_msk.ravel()
+
+
+
+
+
+
+
+
+
+
+
+
 
 if __name__ == "__main__":
-
-    print(f"PPO Training — GPU {args.gpu}  [30-min mode]") # <-- Updated to use args.gpu    print(f"  Envs       : {NUM_ENVS}  x  steps {ROLLOUT_STEPS}  =  {BATCH_SIZE:,} batch")
+    print(f"PPO Training — GPU {args.gpu}  [Classic Mode]")
+    print(f"  Envs       : {NUM_ENVS}  x  steps {ROLLOUT_STEPS}  =  {BATCH_SIZE:,} batch")
     print(f"  Minibatches: {N_MINIBATCHES} x {MINI_BATCH_SIZE} | epochs {PPO_EPOCHS}")
-    print(f"  VF_COEF={VF_COEF}  ENTROPY_COEF={ENTROPY_COEF}  LR warmup {LR_MIN}->{LR_START} then decay ->{LR_END}")
-    print(f"  OBS_SIZE={OBS_SIZE}  log_std: state-dependent, bias=-1.0, clamp [{-4.0},{0.5}]")
+    print(f"  VF_COEF={VF_COEF}  ENTROPY_COEF={ENTROPY_COEF}")
     print(f"  Curriculum stages: {CURRICULUM_STAGES}\n")
 
     rng = jax.random.PRNGKey(42)
@@ -353,50 +496,36 @@ if __name__ == "__main__":
     opt_state   = optimizer.init(params)
     train_state = (params, opt_state)
 
-    ckpt_path       = "checkpoints/ppo_model_best.msgpack"
-    LOAD_CHECKPOINT = False
-    if LOAD_CHECKPOINT and os.path.exists(ckpt_path):
-        try:
-            params, opt_state = load_checkpoint(params, opt_state, ckpt_path)
-            train_state = (params, opt_state)
-            print("Resumed from checkpoint.")
-        except Exception as e:
-            print(f"Checkpoint load failed ({e}), starting fresh.")
-    else:
-        print("Starting fresh.")
+    # Usa nomi separati così non tocchi i modelli vecchi
+    ckpt_path       = "checkpoints/ppo_classic_best.msgpack"
+    final_ckpt_path = "checkpoints/ppo_classic_final.msgpack"
 
     # ── Curriculum state ──────────────────────────────────────────────────────
-    cur_min_dist = curriculum_min_goal_dist(0.0)
+    cur_max_dist = curriculum_max_goal_dist(0.0)
     cur_stage    = _curriculum_stage(0.0)
-    cur_ghost    = curriculum_ghost_prob(0.0)   # ghost_prob for current stage
-    rolling_suc  = 0.0   # FIX Issue #10: EMA alpha raised to 0.1 below
+    cur_ghost    = curriculum_ghost_prob(0.0)
+    rolling_suc  = 0.0   
+    highest_rolling_suc = 0.0  
 
-    print(f"Curriculum: starting stage {cur_stage}, min_goal_dist={cur_min_dist:.1f} m, ghost_prob={cur_ghost:.1f}")
+    cur_scenario = 0 if rolling_suc < 35.0 else -1
+    
+    print(f"Curriculum: starting stage {cur_stage}, max_goal_dist={cur_max_dist:.1f} m, ghost_prob={cur_ghost:.1f}, scenario={cur_scenario}")
 
     print("Initialising environments...")
-    # FIX Bug #3: init_env_state returns vmap_step; thread it into collect_rollouts.
-    env_obs, env_state, vmap_step = init_env_state(env_rng, min_goal_dist=cur_min_dist,
-                                                    ghost_prob=cur_ghost)
+    env_obs, env_state, vmap_step = init_env_state(env_rng, ghost_prob=cur_ghost)
+
+    rms_state = RunningMeanStd.create()
+    running_ret = jnp.zeros(NUM_ENVS)                                
+                            
     print(f"Ready. obs={env_obs.shape}\n")
 
-    best_suc = 56.0   # FIX: was 65.0 — hardcoded floor meant no checkpoint was ever
-                     # written when the run peaked at 61.8%. Now saves from the first
-                     # improvement, then only on new highs.
+    best_suc = 99.0 # NEVER TOUCH THIS LINE, it has to stay to 99, NEVERRRRR!!!!!!!!
 
-    hdr = (f"{'Upd':>5} | {'EpRet':>7} | {'Suc%':>5} {'Col%':>5} {'Pcol%':>5} {'Tmo%':>5} |"
-           f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} | {'FPS':>7} {'#Ep':>6} {'LR':>6}| "
-           f"{'Stage':>5} {'MinDist':>7} {'Ghost':>6} {'Time':>6}")
+    hdr = (f"{'Upd':>5} | {'EpRet':>7} | {'Suc%':>5} {'Obs%':>5} {'Acol%':>5} {'Pcol%':>5} {'Tmo%':>5} |"
+           f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} | {'FPS':>7} {'#Ep':>6} {'LR':>6}  | "
+           f"{'Stage':>5} {'MaxDist':>7} {'Ghost':>6} {'Time':>6}")
     print(hdr)
     print("─" * len(hdr))
-
-    # ── Training log (CSV) — read by benchmark_eval.py for the curves panel ──
-    _LOG_PATH = "checkpoints/ppo_training_log.csv"
-    os.makedirs("checkpoints", exist_ok=True)
-    _log_file   = open(_LOG_PATH, "w", newline="")
-    _log_writer = csv.writer(_log_file)
-    _log_writer.writerow(["step", "mean_ep_reward", "suc_pct", "col_pct",
-                           "pcol_pct", "tmo_pct", "n_ep"])
-    _log_file.flush()
 
     t_start = time.time()
 
@@ -404,61 +533,81 @@ if __name__ == "__main__":
         t0 = time.time()
 
         rng, rollout_rng, update_rng = jax.random.split(rng, 3)
-        # FIX Bug #3: pass vmap_step explicitly as static arg.
-        rollout_history, env_state, env_obs = collect_rollouts(
-            rollout_rng, train_state[0], network.apply, vmap_step, env_state, env_obs
+        rollout_history, env_state, env_obs, last_val = collect_rollouts(
+            rollout_rng, train_state[0], network.apply, vmap_step, env_state, env_obs, 
+            cur_max_dist, cur_scenario
         )
 
-        rewards      = rollout_history["rewards"]
+        raw_rewards  = rollout_history["rewards"]
         values       = rollout_history["values"]
         dones        = rollout_history["dones"]
+
+        rewards, running_ret, rms_state = normalize_batch_rewards(
+            raw_rewards, dones, running_ret, rms_state, GAMMA
+        )
+
         obs_all      = rollout_history["obs"]
         acts_all     = rollout_history["actions"]
         lp_all       = rollout_history["log_probs"]
+        max_v_all    = rollout_history["max_v"]     # FIX 1: per-step per-env max_v
         goal_reached = rollout_history["goal_reached"]
         collision    = rollout_history["collision"]
-        passive_col  = rollout_history["passive_col"]  # <-- ADD THIS LINE
+        passive_col  = rollout_history["passive_col"]  
+        active_col   = rollout_history["active_col"]   
 
-        ep_rets, ep_suc, ep_col, ep_pcol, ep_tmo, ep_msk = collect_episode_outcomes(
-            rewards, dones, goal_reached, collision, passive_col
+        ep_rets, ep_suc, ep_obs, ep_acol, ep_pcol, ep_tmo, ep_msk = collect_episode_outcomes(
+            raw_rewards, dones, goal_reached, collision, passive_col, active_col
         )
 
         n_ep = int(ep_msk.sum())
         if n_ep > 0:
             mean_ret = float((ep_rets * ep_msk).sum() / n_ep)
             suc_pct  = float((ep_suc * ep_msk).sum() / n_ep) * 100.0
-            col_pct  = float((ep_col * ep_msk).sum() / n_ep) * 100.0
-            pcol_pct = float((ep_pcol * ep_msk).sum() / n_ep) * 100.0  # <-- CALCULATE PASSIVE COLLISION PCT
+            obs_pct  = float((ep_obs * ep_msk).sum() / n_ep) * 100.0
+            acol_pct = float((ep_acol * ep_msk).sum() / n_ep) * 100.0
+            pcol_pct = float((ep_pcol * ep_msk).sum() / n_ep) * 100.0
             tmo_pct  = float((ep_tmo * ep_msk).sum() / n_ep) * 100.0
         else:
-            mean_ret, suc_pct, col_pct, pcol_pct, tmo_pct = 0.0, 0.0, 0.0, 0.0, 0.0
+            mean_ret, suc_pct, obs_pct, acol_pct, pcol_pct, tmo_pct = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
         # ── Curriculum update ─────────────────────────────────────────────────
-        # FIX Issue #10: alpha raised from 0.03 → 0.1 for faster stage transitions.
         if n_ep > 0:
             rolling_suc = 0.9 * rolling_suc + 0.1 * suc_pct
+            highest_rolling_suc = max(highest_rolling_suc, rolling_suc)
 
-        new_min_dist = curriculum_min_goal_dist(rolling_suc)
-        new_stage    = _curriculum_stage(rolling_suc)
-        new_ghost    = curriculum_ghost_prob(rolling_suc)
+        new_max_dist = curriculum_max_goal_dist(highest_rolling_suc)
+        new_stage    = _curriculum_stage(highest_rolling_suc)
+        new_ghost    = curriculum_ghost_prob(highest_rolling_suc)
+        
+        # Sblocco degli scenari
+        if highest_rolling_suc < 35.0:
+            new_scenario = 0
+        elif highest_rolling_suc < 50.0:
+            new_scenario = 1
+        elif highest_rolling_suc < 60.0:
+            new_scenario = 2
+        else:
+            new_scenario = -1
 
-        # Reinitialise envs if either goal distance OR ghost_prob changed.
-        # ghost_prob change means make_stacked_env needs to be rebuilt with a new
-        # closure — the vmap_step object changes, triggering JAX retrace.
-        if new_min_dist > cur_min_dist or new_ghost < cur_ghost:
-            cur_min_dist = new_min_dist
+        if new_max_dist > cur_max_dist or new_ghost < cur_ghost or new_scenario != cur_scenario:
+            cur_max_dist = new_max_dist
             cur_stage    = new_stage
-            cur_ghost    = new_ghost
+            cur_scenario = new_scenario
 
-            rng, reinit_rng = jax.random.split(rng)
-            # FIX Bug #3: capture new vmap_step; also passes updated ghost_prob.
-            env_obs, env_state, vmap_step = init_env_state(reinit_rng,
-                                                            min_goal_dist=cur_min_dist,
-                                                            ghost_prob=cur_ghost)
-            print(f"  → Curriculum reinit: stage={cur_stage}, dist={cur_min_dist:.1f}m, "
-                  f"ghost_prob={cur_ghost:.1f}")
+            if new_ghost < cur_ghost:
+                cur_ghost = new_ghost
+                # FIX 4: Rebuild ONLY the vmap_step closure — do NOT wipe env_state.
+                # The old code called init_env_state here, which reset all 8192 live
+                # environments from the host, destroying the temporal link for GAE:
+                # last_val was computed for the old episodes but value targets were
+                # calculated for freshly spawned unrelated episodes — massive noise.
+                # Now we only rebuild the step kernel (which bakes the new ghost bool),
+                # and existing episodes continue uninterrupted from next step onward.
+                vmap_step = rebuild_vmap_step(cur_ghost)
+                print(f"  -> Ghost closure rebuilt: ghost_prob={cur_ghost:.1f} (env_state preserved)")
+            else:
+                print(f"  -> Curriculum advanced: stage={cur_stage}, dist={cur_max_dist:.1f}m, scenario={cur_scenario}")
 
-        _, _, last_val = network.apply({"params": train_state[0]}, env_obs)
         advantages, returns = compute_gae(rewards, values, dones, last_val)
 
         train_state, mean_loss, aux = run_ppo_updates(
@@ -468,6 +617,7 @@ if __name__ == "__main__":
             advantages.reshape(-1),
             returns.reshape(-1),
             lp_all.reshape(-1),
+            max_v_all.reshape(-1),   # FIX 1: pass max_v for Jacobian correction
             update_rng
         )
 
@@ -479,18 +629,12 @@ if __name__ == "__main__":
             elapsedtime = (time.time() - t_start)/60.0
             print(
                 f"{update:>5d} | {mean_ret:>7.1f} | "
-                f"{suc_pct:>4.1f}% {col_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% | "
-                f"{float(mean_loss):>7.4f} {float(p_loss):>6.3f} "
-                f"{float(v_loss):>6.3f} {float(entropy):>6.3f} | "
+                f"{suc_pct:>4.1f}% {obs_pct:>4.1f}% {acol_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% | "
+                f"{float(mean_loss):>7.2f} {float(p_loss):>6.2f} "
+                f"{float(v_loss):>6.2f} {float(entropy):>6.2f} | "
                 f"{fps:>7,.0f} {n_ep:>6d} {lr_now:.2e} | "
-                f"{cur_stage:>5d} {cur_min_dist:>5.1f}m {cur_ghost:>5.1f}g {elapsedtime:>5.1f}min"
+                f"{cur_stage:>5d} {cur_max_dist:>5.1f}m {cur_ghost:>5.1f}g {elapsedtime:>5.1f}min"
             )
-            # ── CSV log row — total_env_steps for aligned x-axis ───────────────
-            total_env_steps = (update + 1) * NUM_ENVS * ROLLOUT_STEPS
-            _log_writer.writerow([total_env_steps, round(mean_ret, 4),
-                                   round(suc_pct, 4), round(col_pct, 4),
-                                   round(pcol_pct, 4), round(tmo_pct, 4), n_ep])
-            _log_file.flush()
 
         if suc_pct > best_suc and n_ep > 0:
             best_suc = suc_pct
@@ -498,10 +642,4 @@ if __name__ == "__main__":
 
     elapsed = time.time() - t_start
     print(f"\nDone! {elapsed/3600:.2f}h | Best success: {best_suc:.1f}%")
-
-    _log_file.close()
-    print(f"Training log saved -> {_LOG_PATH}")
-
-    # Save the final model state regardless of its performance
-    final_ckpt_path = "checkpoints/ppo_model_final.msgpack"
     save_checkpoint(train_state[0], train_state[1], final_ckpt_path)

@@ -1,28 +1,21 @@
-"""
-jax_scenarios.py — Modular Scenario Generator (JHSFM Version)
-==============================================================
-Fully vectorized implementation for massive GPU parallelization.
-No jax.lax.while_loop used. Rejection sampling is replaced with 
-Parallel Batch Guessing (Tensorized Selection) to eliminate warp divergence.
-
-Outputs an 11-element array per human to support JHSFM waypoints:
-[x, y, vx, vy, theta, omega, g1x, g1y, g2x, g2y, goal_idx]
-"""
-
+# jax_scenarios.py
 import jax
 import jax.numpy as jnp
 
 ROOM_W = 12.0
 ROOM_H = 12.0
 ROBOT_RADIUS = 0.2
-PEOPLE_RADIUS = 0.2
+PEOPLE_RADIUS = 0.4   # FIX: was 0.2 — must match jax_env.py (PEOPLE_RADIUS=0.4)
+                      # With 0.2, PERSON_ROBOT_CLEAR=0.7m but body_thresh=0.6m -> margin <0.1m
+                      # -> immediate collisions at first step guaranteed
 GOAL_RADIUS = 0.3
 NUM_PEOPLE = 12
 NUM_OBS_CIR = 6
 NUM_OBS_BOX = 6
 
-# Number of parallel guesses for spatial generation
-N_GUESSES = 32
+# FIX: increased 32->64 — with 12 humans + 6 circles + 6 boxes in 12x12m, 32 guesses
+# silently fail (argmax returns index 0 even if not safe).
+N_GUESSES = 64
 
 def _min_dist_to_circles(x, y, circles):
     dx = circles[:, 0] - x
@@ -57,10 +50,22 @@ def _batch_sample_safe_pos(key, clearance, obs_circles, obs_boxes, min_val, max_
     best_idx = jnp.argmax(is_safe_mask)
     return guesses_x[best_idx], guesses_y[best_idx]
 
+def generate_scenario(key: jnp.ndarray, max_goal_dist: float, scenario_idx: int = -1):
+    """
+    Generate a scenario.
+    """
+    # Minimum goal distance floor — goal never spawns inside the robot
+    _MIN_GOAL_FLOOR = 0.8
 
-def generate_scenario(key: jnp.ndarray, min_goal_dist: float, scenario_idx: int = -1):
     k_scen, k_branch = jax.random.split(key)
-    idx = jnp.where(scenario_idx < 0, jax.random.randint(k_scen, (), 0, 7), jnp.int32(scenario_idx))
+    
+    # Sample a random scenario normally
+    sampled_idx = jax.random.randint(k_scen, (), 0, 7)
+    
+    # If the user requested a specific scenario, use it
+    idx = jnp.where(scenario_idx < 0, sampled_idx, jnp.int32(scenario_idx))
+    
+    # REMOVED the hardcoded curriculum logic here.
 
     def pack_human(px, py, th, g1x, g1y, g2x, g2y):
         return jnp.stack([
@@ -105,7 +110,8 @@ def generate_scenario(key: jnp.ndarray, min_goal_dist: float, scenario_idx: int 
         
         def check_goal_safe(x, y):
             safe_env = _is_safe(x, y, GOAL_CLEARANCE, obs_circles, obs_boxes)
-            dist_ok = jnp.sqrt((x - rx)**2 + (y - ry)**2) >= min_goal_dist
+            dist = jnp.sqrt((x - rx)**2 + (y - ry)**2)
+            dist_ok = (dist >= _MIN_GOAL_FLOOR) & (dist <= max_goal_dist)
             return safe_env & dist_ok
             
         g_safe_mask = jax.vmap(check_goal_safe)(g_guesses_x, g_guesses_y)
@@ -113,9 +119,13 @@ def generate_scenario(key: jnp.ndarray, min_goal_dist: float, scenario_idx: int 
         gx, gy = g_guesses_x[g_best_idx], g_guesses_y[g_best_idx]
 
         # Vectorized People Spawn
-        PERSON_CLEARANCE = PEOPLE_RADIUS + 0.15
-        PERSON_ROBOT_CLEAR = ROBOT_RADIUS + PEOPLE_RADIUS + 0.3
-        PERSON_GOAL_CLEAR = GOAL_RADIUS + PEOPLE_RADIUS + 0.1
+        PERSON_CLEARANCE   = PEOPLE_RADIUS + 0.15
+        # FIX: was +0.3 -> center-to-center clearance = 0.2+0.2+0.3 = 0.7m
+        # but body_thresh in jax_env = 0.2+0.4 = 0.6m -> real margin < 0.1m
+        # after a single human step -> immediate collision guaranteed.
+        # With PEOPLE_RADIUS now corrected to 0.4: 0.2+0.4+0.6 = 1.2m -> safe margin.
+        PERSON_ROBOT_CLEAR = ROBOT_RADIUS + PEOPLE_RADIUS + 0.6
+        PERSON_GOAL_CLEAR  = GOAL_RADIUS + PEOPLE_RADIUS + 0.3
 
         def init_person(pkey):
             pk_pos, pk_g1x, pk_g1y = jax.random.split(pkey, 3)

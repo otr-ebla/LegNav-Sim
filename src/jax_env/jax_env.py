@@ -1,37 +1,6 @@
 """
 jax_env.py — Core 2D Navigation Environment
 ============================================
-PATCH — Leg-pair LiDAR simulation (on top of all previous fixes):
-
-  NEW: USE_LEGS flag (module-level bool).
-    Set USE_LEGS = True  → each human emits 2 small leg circles in LiDAR
-    Set USE_LEGS = False → legacy single-cylinder model (for ablation)
-
-  NEW: EnvState.leg_phases  (NUM_PEOPLE,) float32
-    Per-human gait phase that advances every step. Stored in state so that
-    jax.lax.scan / vmap across envs keeps each environment's gait independent.
-
-  CHANGED: get_obs
-    Uses jax_legs.get_leg_circles() instead of building people_circles
-    directly. The circles fed to compute_lidar are now 2*N leg circles
-    (radius=LEG_RADIUS=0.08 m) instead of N body circles (PEOPLE_RADIUS=0.2 m).
-    → No change to OBS_SIZE or network input layout.
-
-  CHANGED: reset_env
-    Initialises leg_phases with random uniform offsets in [0, 2π) so
-    humans don't all start mid-stride simultaneously.
-
-  CHANGED: step_env
-    Advances leg_phases via jax_legs.advance_phase() before building new_state.
-
-  COLLISION detection (rewards) is UNCHANGED — still uses body centres.
-  This is intentional: leg-phase jitter would corrupt the reward signal.
-
-  To toggle legs from CLI, set the env variable or pass --legs to eval scripts:
-    USE_LEGS is read from the module-level constant; eval/train scripts can
-    override it via:
-        import jax_env; jax_env.USE_LEGS = False
-
 Previous fixes: A (LiDAR anchor), B (passive_col), C (resample cap),
                 D (no nested JIT), E (person spawn clearance).
 Obs layout (single frame): pose(3) + state_vec(9) + lidar(NUM_RAYS) = 120
@@ -45,11 +14,12 @@ from flax import struct
 from jax_physics import compute_lidar
 from jax_humans import update_all_humans
 from jax_legs import get_leg_circles, get_shoe_boxes, advance_feet, init_foot_state, LEG_RADIUS
+from config import SimConfig, RobotConfig, LidarConfig
 
 # ── Feature flags ─────────────────────────────────────────────────────────────
 # Flip USE_LEGS to False for cylinder-model baseline/ablation training.
 # Eval scripts can override: import jax_env; jax_env.USE_LEGS = False
-USE_LEGS = False
+USE_LEGS = True
 
 # DIFFERENTIABILITY: Set SENSOR_NOISE = False in SHAC training to get a
 # deterministic gradient path through the observation.  Noise adds variance to
@@ -60,17 +30,17 @@ USE_LEGS = False
 SENSOR_NOISE = True
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-DT             = 0.15
-MAX_STEPS      = 600
-NUM_RAYS       = 108
+DT             = RobotConfig.DT
+MAX_STEPS      = SimConfig.MAX_STEPS
+NUM_RAYS       = LidarConfig.NUM_RAYS
 REAR_RAYS      = 4
 NUM_PEOPLE     = 18
 NUM_OBS_CIR    = 7
 NUM_OBS_BOX    = 7
 ROOM_W         = 12.0
 ROOM_H         = 12.0
-ROBOT_RADIUS   = 0.2
-PEOPLE_RADIUS  = 0.4
+ROBOT_RADIUS   = RobotConfig.RADIUS
+PEOPLE_RADIUS  = SimConfig.HUMANS_RADIUS
 MAX_LIDAR_DIST = 12.0
 FOV            = math.pi         # 180° forward-facing LiDAR
 GOAL_RADIUS    = 0.3
@@ -198,7 +168,7 @@ def get_obs(state: EnvState, key: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray
     )
 
     inv_lidar = jnp.clip(
-        (MAX_LIDAR_DIST - raw_lidar) / (MAX_LIDAR_DIST - ROBOT_RADIUS), 0.0, 1.0
+        (MAX_LIDAR_DIST - noisy_lidar) / (MAX_LIDAR_DIST - ROBOT_RADIUS), 0.0, 1.0
     )
     rear_prox_vec = jnp.clip(
         (MAX_LIDAR_DIST - rear_raw) / (MAX_LIDAR_DIST - ROBOT_RADIUS), 0.0, 1.0
@@ -236,7 +206,7 @@ def get_obs(state: EnvState, key: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray
 
 # ── Reset ─────────────────────────────────────────────────────────────────────
 
-def reset_env(key: jnp.ndarray, min_goal_dist: float = DEFAULT_MIN_GOAL_DIST):
+def reset_env(key: jnp.ndarray, max_goal_dist: float = 3.0, **kwargs):
     k1, k2, k3, k4, k5, k6, k7, k8, k9, k_legs, k_obs = jax.random.split(key, 11)
 
     max_v  = jax.random.uniform(k1, minval=0.2, maxval=2.0)
@@ -292,8 +262,10 @@ def reset_env(key: jnp.ndarray, min_goal_dist: float = DEFAULT_MIN_GOAL_DIST):
 
     def _goal_cond(carry):
         gx, gy, k, i = carry
-        too_close = jnp.sqrt((gx - rx)**2 + (gy - ry)**2) < min_goal_dist
-        return (too_close | ~_is_safe(gx, gy, GOAL_CLEARANCE, obs_circles, obs_boxes)) & \
+        dist = jnp.sqrt((gx - rx)**2 + (gy - ry)**2)
+        # Keeps goal outside the robot (0.8m) but within the curriculum max_goal_dist
+        bad_dist = (dist < 0.8) | (dist > max_goal_dist) 
+        return (bad_dist | ~_is_safe(gx, gy, GOAL_CLEARANCE, obs_circles, obs_boxes)) & \
                (i < MAX_RESAMPLE_ITERS)
 
     def _goal_body(carry):
@@ -370,7 +342,7 @@ def reset_env(key: jnp.ndarray, min_goal_dist: float = DEFAULT_MIN_GOAL_DIST):
 
 # ── Step ──────────────────────────────────────────────────────────────────────
 
-def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
+def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray, **kwargs):
     dt = DT
 
     target_v = jnp.clip(action[0], 0.0,  state.max_v)
@@ -516,10 +488,11 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
     passive_col = (passive_col_body | passive_col_shoe) & ~obs_collision & ~wall_collision
 
     # ── End of Episode Flags ──────────────────────────────────────────────────
-    collision    = active_col | passive_col | obs_collision | wall_collision
-    timeout      = (state.time_step + 1) >= MAX_STEPS
-    goal_reached = new_dist < GOAL_RADIUS
-    done         = goal_reached | collision | timeout
+    human_collision = active_col | passive_col
+    collision       = human_collision | obs_collision | wall_collision
+    timeout         = (state.time_step + 1) >= MAX_STEPS
+    goal_reached    = new_dist < GOAL_RADIUS
+    done            = goal_reached | collision | timeout
 
     # ── Dense Rewards ─────────────────────────────────────────────────────────
 
@@ -610,6 +583,7 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray):
         "goal_reached":  goal_reached,
         "collision":     collision,
         "passive_col":   passive_col,
+        "active_col":    active_col,    # <-- Added this line
         "closest_human": closest_human,
         "sp_mask":       sp_mask,
     }

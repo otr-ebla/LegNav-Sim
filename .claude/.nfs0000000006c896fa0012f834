@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source /home/alberto_vaglio/miniforge3/envs/2drlenv/bin/activate)",
+      "Bash(python3 SHAC_jax.py --envs 512 --updates 200 --gpu 0)",
+      "Bash(conda env:*)",
+      "Bash(mamba env:*)",
+      "Read(//home/alberto_vaglio/**)",
+      "Bash(conda activate:*)",
+      "Bash(ssh jack:*)",
+      "Bash(source /home/alberto_vaglio/indoor-rl-nav/2drlenv/bin/activate)",
+      "Bash(python3 SHAC_jax.py --load checkpoints/shac_best.msgpack --h-max 32)",
+      "Bash(python3 -c \":*)",
+      "Read(//home/alberto_vaglio/indoor-rl-nav/.claude/worktrees/great-cori/src/jax_env/**)",
+      "Bash(nvidia-smi --query-gpu=utilization.gpu,memory.used,power.draw --format=csv,noheader)",
+      "Bash(python3 SHAC_jax.py --load checkpoints/shac_best.msgpack --h-max 32 --rolling-init 0.3)",
+      "Bash(python3 SHAC_jax.py --load checkpoints/shac_final.msgpack --h-max 32 --stage 4 --updates 4000)"
+    ]
+  }
+}
