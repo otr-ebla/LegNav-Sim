@@ -291,11 +291,11 @@ def _update_single(fs_i, person_i, dt):
     new_left_xy  = jnp.where(left_dist  > LEG_LEASH_MAX, left_hip_world,  new_left_xy)
     new_right_xy = jnp.where(right_dist > LEG_LEASH_MAX, right_hip_world, new_right_xy)
 
-    # Update foot orientations: swing foot tracks body theta, stance foot is frozen.
-    # stance == 0.0 -> left is planted, right swings.
-    # stance == 1.0 -> right is planted, left swings.
-    new_left_theta  = jnp.where(stance == 1.0, theta, left_theta)
-    new_right_theta = jnp.where(stance == 0.0, theta, right_theta)
+    # Update foot orientations: swing foot tracks body theta ONLY if speed > 0.5 m/s.
+    # If speed <= 0.5 m/s, both feet remain completely frozen to prevent RL collision noise.
+    fast_enough = speed > 10
+    new_left_theta  = jnp.where(fast_enough & (stance == 1.0), theta, left_theta)
+    new_right_theta = jnp.where(fast_enough & (stance == 0.0), theta, right_theta)
 
     # ── Freeze everything if stationary ───────────────────────────────────────
     new_phase              = jnp.where(is_moving, new_phase,              phase)
