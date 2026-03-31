@@ -14,6 +14,7 @@ from flax import struct
 from jax_physics import compute_lidar
 from jax_humans import update_all_humans
 from jax_legs import get_leg_circles, get_shoe_boxes, advance_feet, init_foot_state, LEG_RADIUS
+from config import SimConfig, RobotConfig, LidarConfig
 
 # ── Feature flags ─────────────────────────────────────────────────────────────
 # Flip USE_LEGS to False for cylinder-model baseline/ablation training.
@@ -29,17 +30,17 @@ USE_LEGS = True
 SENSOR_NOISE = True
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-DT             = 0.15
-MAX_STEPS      = 600
-NUM_RAYS       = 108
+DT             = RobotConfig.DT
+MAX_STEPS      = SimConfig.MAX_STEPS
+NUM_RAYS       = LidarConfig.NUM_RAYS
 REAR_RAYS      = 4
 NUM_PEOPLE     = 18
 NUM_OBS_CIR    = 7
 NUM_OBS_BOX    = 7
 ROOM_W         = 12.0
 ROOM_H         = 12.0
-ROBOT_RADIUS   = 0.2
-PEOPLE_RADIUS  = 0.4
+ROBOT_RADIUS   = RobotConfig.RADIUS
+PEOPLE_RADIUS  = SimConfig.HUMANS_RADIUS
 MAX_LIDAR_DIST = 12.0
 FOV            = math.pi         # 180° forward-facing LiDAR
 GOAL_RADIUS    = 0.3

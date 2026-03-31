@@ -51,3 +51,4 @@ triton==3.5.1
 typing_extensions==4.15.0
 tzdata==2025.2
 Werkzeug==3.1.4
+pygame==2.6.1

@@ -1,29 +1,64 @@
-# Byte-compiled / cached files
+# --- Python & Build ---
 __pycache__/
 *.py[cod]
-*.pyo
-
-# Virtual environments
-venv/
-.venv/
-env/
-.conda/
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
 *.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
 
-# OS / editor junk
+# --- Virtual Environments ---
+.venv/
+venv/
+env/
+2drlenv/
+.conda/
+bin/
+include/
+share/
+
+# --- RL Data & Training Outputs (PESANTI) ---
+logs/
+runs/
+wandb/
+ppo_*_tb/
+checkpoints/
+models/
+*.log
+*.csv
+# Se hai file di risultati specifici come quello visto nel tuo ls:
+fast_dwa_results.csv
+
+# --- Jupyter Notebooks ---
+.ipynb_checkpoints
+
+# --- OS / IDE Junk ---
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+.vscode/
+.idea/
 *.swp
 
-# Logs / outputs
-*.log
-ppo_*_tb/
-wandb/
-runs/
-
-# Models (optional, if you don't want to push them)
-
-# Il nome specifico del tuo virtual environment
-2drlenv/
-
-# La cartella che contiene i file giganti di TensorBoard (quelli da 200MB)
-logs/
+# --- JAX / XLA ---
+# Se JAX genera file di cache per la compilazione (XLA_FLAGS)
+.jax_cache/
