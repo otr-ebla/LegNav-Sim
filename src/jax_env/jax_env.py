@@ -392,10 +392,9 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray, **kwargs):
     # Still paused after decrement = should be frozen this step
     is_stopped_h = new_timers > 0                                        # (N,)
 
-    # Clamp velocity to zero for stopped humans (vx col 2, vy col 3)
-    frozen_vx    = jnp.where(is_stopped_h, 0.0, new_people[:, 2])
-    frozen_vy    = jnp.where(is_stopped_h, 0.0, new_people[:, 3])
-    new_people   = new_people.at[:, 2].set(frozen_vx).at[:, 3].set(frozen_vy)
+    # Prevent JHSFM drift by carrying over the old state entirely, with zeroed velocities.
+    frozen_people = state.people.at[:, 2:4].set(0.0)
+    new_people = jnp.where(is_stopped_h[:, None], frozen_people, new_people)
 
     # ── Advance leg gait phases ───────────────────────────────────────────────
     new_foot_state = advance_feet(state.foot_state, new_people, dt)

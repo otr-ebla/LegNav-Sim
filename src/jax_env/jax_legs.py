@@ -143,6 +143,9 @@ def init_foot_state(people: jnp.ndarray, key: jnp.ndarray) -> jnp.ndarray:
     # swing_start_local matches target at init (no step in progress)
     swing_start_local = swing_target_local
 
+    left_theta  = theta
+    right_theta = theta
+
     return jnp.concatenate([
         left_xy,                 # [0:2]
         right_xy,                # [2:4]
@@ -150,7 +153,9 @@ def init_foot_state(people: jnp.ndarray, key: jnp.ndarray) -> jnp.ndarray:
         stance[:, None],         # [5]
         swing_target_local,      # [6:8]
         swing_start_local,       # [8:10]
-    ], axis=-1)   # (N, 10)
+        left_theta[:, None],     # [10]
+        right_theta[:, None],    # [11]
+    ], axis=-1)   # (N, 12)
 
 
 # ── Per-step update ───────────────────────────────────────────────────────────
@@ -205,6 +210,8 @@ def _update_single(fs_i, person_i, dt):
                                      # 1 = right stance / left swings
     swing_target_local = fs_i[6:8]   # local offset [fwd, lat]
     swing_start_local  = fs_i[8:10]  # local offset [fwd, lat], frozen at step start
+    left_theta        = fs_i[10]
+    right_theta       = fs_i[11]
 
     px    = person_i[0]
     py    = person_i[1]
@@ -284,6 +291,11 @@ def _update_single(fs_i, person_i, dt):
     new_left_xy  = jnp.where(left_dist  > LEG_LEASH_MAX, left_hip_world,  new_left_xy)
     new_right_xy = jnp.where(right_dist > LEG_LEASH_MAX, right_hip_world, new_right_xy)
 
+    # The swing foot smoothly tracks the body's current heading. 
+    # The stance foot remains completely locked in its previous orientation.
+    new_left_theta  = jnp.where(stance == 1.0, theta, left_theta)
+    new_right_theta = jnp.where(stance == 0.0, theta, right_theta)
+
     # ── Freeze everything if stationary ───────────────────────────────────────
     new_phase              = jnp.where(is_moving, new_phase,              phase)
     new_stance             = jnp.where(is_moving, new_stance,             stance)
@@ -291,6 +303,8 @@ def _update_single(fs_i, person_i, dt):
     new_swing_start_local  = jnp.where(is_moving, new_swing_start_local,  swing_start_local)
     new_left_xy            = jnp.where(is_moving, new_left_xy,            left_xy)
     new_right_xy           = jnp.where(is_moving, new_right_xy,           right_xy)
+    new_left_theta         = jnp.where(is_moving, new_left_theta,         left_theta)
+    new_right_theta        = jnp.where(is_moving, new_right_theta,        right_theta)
 
     return jnp.concatenate([
         new_left_xy,                   # [0:2]
@@ -299,7 +313,9 @@ def _update_single(fs_i, person_i, dt):
         new_stance[None],              # [5]
         new_swing_target_local,        # [6:8]
         new_swing_start_local,         # [8:10]
-    ])   # (10,)
+        new_left_theta[None],          # [10]
+        new_right_theta[None],         # [11]
+    ])   # (12,)
 
 
 def advance_feet(
@@ -373,31 +389,32 @@ def get_shoe_boxes(
 
     Returns (2N, 4)  [cx, cy, hw, hh]  — left shoes first, then right shoes.
     """
-    theta = people[:, 4]            # (N,)
-    fwd, _ = _fwd_lat(theta)        # (N, 2)
-
     left_xy,  right_xy  = get_leg_positions(foot_state)   # (N, 2) each
+
+    # Extract independent orientations instead of using the body pelvis heading
+    left_theta  = foot_state[:, 10]
+    right_theta = foot_state[:, 11]
+
+    # Stack into (2N,) arrays directly
+    all_xy    = jnp.concatenate([left_xy, right_xy], axis=0)       # (2N, 2)
+    all_theta = jnp.concatenate([left_theta, right_theta], axis=0) # (2N,)
+
+    # Compute forward vectors for every single shoe independently
+    fwd, _ = _fwd_lat(all_theta)                                   # (2N, 2)
 
     half_L = SHOE_LENGTH * 0.5
     half_W = SHOE_WIDTH  * 0.5
 
-    # Shoe centres: foot position + forward offset of half the shoe length
-    left_cx  = left_xy  + fwd * half_L    # (N, 2)
-    right_cx = right_xy + fwd * half_L    # (N, 2)
+    # Shoe centres: planted position + forward offset of half the shoe length
+    all_cx = all_xy + fwd * half_L                                 # (2N, 2)
 
-    # AABB half-extents of a rotated rectangle (standard formula)
-    abs_cos = jnp.abs(jnp.cos(theta))   # (N,)
-    abs_sin = jnp.abs(jnp.sin(theta))   # (N,)
-    hw = abs_cos * half_L + abs_sin * half_W   # (N,)
-    hh = abs_sin * half_L + abs_cos * half_W   # (N,)
+    # AABB half-extents using the independent foot angle
+    abs_cos = jnp.abs(jnp.cos(all_theta))                          # (2N,)
+    abs_sin = jnp.abs(jnp.sin(all_theta))                          # (2N,)
+    all_hw = abs_cos * half_L + abs_sin * half_W                   # (2N,)
+    all_hh = abs_sin * half_L + abs_cos * half_W                   # (2N,)
 
-    # Stack left and right: (2N, 4)
-    all_cx = jnp.concatenate([left_cx[:, 0],  right_cx[:, 0]],  axis=0)
-    all_cy = jnp.concatenate([left_cx[:, 1],  right_cx[:, 1]],  axis=0)
-    all_hw = jnp.concatenate([hw, hw],  axis=0)
-    all_hh = jnp.concatenate([hh, hh],  axis=0)
-
-    return jnp.stack([all_cx, all_cy, all_hw, all_hh], axis=-1)   # (2N, 4)
+    return jnp.stack([all_cx[:, 0], all_cx[:, 1], all_hw, all_hh], axis=-1)   # (2N, 4)
 
 
 # ── Backward compatibility shim ───────────────────────────────────────────────

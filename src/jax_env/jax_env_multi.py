@@ -294,9 +294,8 @@ def step_env(key, state, action, ghost_robot: bool = True):
     freeze           = is_stopped_h & active_mask_stop
 
     # Clamp px=0,1 vx=2, vy=3, omega=5 for stopped humans
-    new_people = new_people.at[:, 2].set(jnp.where(freeze, 0.0, new_people[:, 2]))
-    new_people = new_people.at[:, 3].set(jnp.where(freeze, 0.0, new_people[:, 3]))
-    new_people = new_people.at[:, 5].set(jnp.where(freeze, 0.0, new_people[:, 5]))
+    frozen_people = state.people.at[:, 2:4].set(0.0).at[:, 5].set(0.0)
+    new_people = jnp.where(freeze[:, None], frozen_people, new_people)
 
     # 1. Advance the continuous gait phase for everyone
     advanced_foot_state = advance_feet(state.foot_state, new_people, DT)
