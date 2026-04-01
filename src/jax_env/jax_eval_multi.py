@@ -143,18 +143,18 @@ def _build_ppo_shac():
         bundle = flax.serialization.msgpack_restore(raw)
         return bundle.get("params", bundle)
 
-    def infer(params, obs, max_v, hidden=None):
-        # Heuristic basata sulla shape di Dense_0
+    def infer(params, obs, max_v):
+        # Heuristic based on the shape of Dense_0
         is_old_arch = ("Dense_0" in params and params["Dense_0"]["kernel"].shape == (18, 128))
         
         if is_old_arch:
-            # Passiamo i parametri alla vecchia architettura
+            # Pass the parameters to the old architecture
             mean, _, _ = net_old.apply({"params": params}, obs[None])
-            return scale_action_to_env(jnp.squeeze(mean, 0), float(max_v)), hidden
+            return scale_action_to_env(jnp.squeeze(mean, 0), float(max_v))
         
-        # Nuova architettura stateless
+        # New stateless architecture
         mean, _, _ = net_new.apply({"params": params}, obs[None])
-        return scale_action_to_env(jnp.squeeze(mean, 0), float(max_v)), hidden
+        return scale_action_to_env(jnp.squeeze(mean, 0), float(max_v))
 
     return init_params, load, infer, 0
 
