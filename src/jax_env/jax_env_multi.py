@@ -485,14 +485,14 @@ def step_env(key, state, action, ghost_robot: bool = True):
     step_pen         = _STEP_PEN
     
     # Harsh absolute penalty for jittering (prevents micro-oscillations)
-    # smooth_pen       = -_SMOOTH_WEIGHT * jnp.abs(target_w - state.w)
-    # # Quadratic penalty on rotation magnitude (encourages driving straight)
-    # rot_pen          = -_ROT_WEIGHT * (target_w ** 2)
+    smooth_pen       = -_SMOOTH_WEIGHT * jnp.abs(target_w - state.w)
+    # Quadratic penalty on rotation magnitude (encourages driving straight)
+    rot_pen          = -_ROT_WEIGHT * (target_w ** 2)
     
-    # Aggiungiamo la yield_penalty al totale
-    dense_reward     = social_progress + step_pen + comfort_pen #+ smooth_pen + rot_pen + yield_penalty
+    # Minimal baseline + smoothness
+    dense_reward     = social_progress + step_pen + smooth_pen + rot_pen + comfort_pen
 
-   # — 6d. Terminal cascades ─────────────────────────────────────────────
+    # — 6d. Terminal cascades ─────────────────────────────────────────────
     reward = dense_reward
     reward = jnp.where(goal_reached, _R_GOAL, reward)
     reward = jnp.where(obs_collision & ~goal_reached, _R_OBS_COL, reward)
@@ -528,11 +528,10 @@ def step_env(key, state, action, ghost_robot: bool = True):
         "timeout":       timeout,
         "instant_col":   instant_col,
         "rew_yield":     jnp.array(0.0),
-
         "rew_prog":      social_progress,
         "rew_step":      jnp.array(step_pen),
-        "rew_smooth":    jnp.array(0.0),
-        "rew_rot":       jnp.array(0.0),
+        "rew_smooth":    smooth_pen,
+        "rew_rot":       rot_pen,
         "rew_comf":      comfort_pen,
     }
     return obs, new_state, reward, done, info
