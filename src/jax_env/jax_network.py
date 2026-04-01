@@ -14,7 +14,9 @@ CHANGES vs previous version:
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
+from flax.linen.initializers import orthogonal, constant
 from typing import Tuple
+import numpy as np
 
 LOG_STD_MIN = -4.0
 LOG_STD_MAX =  0.0
@@ -57,32 +59,29 @@ class EndToEndActorCritic(nn.Module):
         # ── Global state MLP ──────────────────────────────────────────────────
         global_in = jnp.concatenate([pose_stack, state_vec], axis=-1)
 
-        # ── Fused trunk (pre-GRU) ─────────────────────────────────────────────
+        # Feature Projection prima della memoria (Orthogonal init for ReLU: sqrt(2))
         fused  = jnp.concatenate([cnn_feat, global_in], axis=-1)
-        shared = nn.relu(nn.Dense(256)(fused))
-        shared = nn.relu(nn.Dense(GRU_HIDDEN_SIZE)(shared))
+        fused_proj = nn.relu(nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(fused))
 
-        # ── GRU memory cell ───────────────────────────────────────────────────
-        # nn.GRUCell signature: (carry, inputs) → (new_carry, new_carry)
-        # We use the new_carry as our recurrent feature vector.
-        gru_cell = nn.GRUCell(features=GRU_HIDDEN_SIZE)
-        new_hidden, gru_out = gru_cell(hidden, shared)
-        # gru_out == new_hidden for a single-step GRUCell call.
+        # Integrazione GRU: il carry viene aggiornato step-by-step
+        gru = nn.GRUCell(features=128)
+        new_hidden, gru_out = gru(hidden, fused_proj)
 
-        # ── Actor head ────────────────────────────────────────────────────────
-        actor_mean = nn.Dense(self.action_dim)(gru_out)
+        # Shared trunk (Orthogonal init for ReLU: sqrt(2))
+        shared = nn.relu(nn.Dense(128, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(gru_out))
 
-        # FIX: tanh squashing keeps gradients alive at the log_std boundaries
-        logstd_param = self.param('log_std', nn.initializers.constant(-1.0), (self.action_dim,))
+        # Actor mean (Orthogonal init scaled to 0.01 to start with 0-mean actions)
+        actor_mean = nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(shared)
+
+        # Actor log_std
+        logstd_param = self.param('log_std', constant(-1.0), (self.action_dim,))
         actor_logstd_raw = jnp.broadcast_to(logstd_param, actor_mean.shape)
-        actor_logstd = (
-            LOG_STD_MIN
-            + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (jnp.tanh(actor_logstd_raw) + 1.0)
-        )
+        actor_logstd = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (jnp.tanh(actor_logstd_raw) + 1.0)
 
-        # ── Critic head ───────────────────────────────────────────────────────
-        critic = nn.relu(nn.Dense(64)(gru_out))
-        value  = nn.Dense(1)(critic)
+        # Minimal critic head
+        critic = nn.relu(nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(shared))
+        # Value output (Orthogonal init scaled to 1.0)
+        value  = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(critic)
 
         return actor_mean, actor_logstd, jnp.squeeze(value, axis=-1), new_hidden
 
