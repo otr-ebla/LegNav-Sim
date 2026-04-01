@@ -48,10 +48,11 @@ _R_TIMEOUT     =  -9.0
 _PROGRESS_COEF =  1.5
 
 # Step penalty — small constant cost per timestep, encourages efficiency.
-_STEP_PEN      =  -0.008
+_STEP_PEN      =  -0.08
 
-# Jerk penalty — discourages angular velocity changes (smooth paths).
-_JERK_WEIGHT   =   0.016
+# Smoothness & Rotation penalties (Fixed for hardware limits)
+_SMOOTH_WEIGHT =   0.40    # Harsh linear penalty for changes in angular velocity
+_ROT_WEIGHT    =   0.08    # Quadratic penalty on rotation magnitude to encourage straight paths
 
 _COMFORT_DIST  = 1.2   # m — personal space boundary
 _COMFORT_COEF  = 0.015 # base penalty at d=0 (before speed scaling) — /10 from 0.15
@@ -481,10 +482,14 @@ def step_env(key, state, action, ghost_robot: bool = True):
     progress         = prev_dist - new_dist
     social_progress  = _PROGRESS_COEF * progress
     step_pen         = _STEP_PEN
-    jerk_pen         = -_JERK_WEIGHT * (target_w - state.w) ** 2
+    
+    # Harsh absolute penalty for jittering (prevents micro-oscillations)
+    smooth_pen       = -_SMOOTH_WEIGHT * jnp.abs(target_w - state.w)
+    # Quadratic penalty on rotation magnitude (encourages driving straight)
+    rot_pen          = -_ROT_WEIGHT * (target_w ** 2)
     
     # Aggiungiamo la yield_penalty al totale
-    dense_reward     = social_progress + step_pen + jerk_pen + comfort_pen + yield_penalty
+    dense_reward     = social_progress + step_pen + smooth_pen + rot_pen + comfort_pen + yield_penalty
 
     # — 6d. Terminal cascades ─────────────────────────────────────────────
     reward = dense_reward
@@ -526,7 +531,8 @@ def step_env(key, state, action, ghost_robot: bool = True):
         # ── NEW: Export reward components for debugging ──
         "rew_prog":      social_progress,
         "rew_step":      jnp.array(step_pen),
-        "rew_jerk":      jerk_pen,
+        "rew_smooth":    smooth_pen,
+        "rew_rot":       rot_pen,
         "rew_comf":      comfort_pen,
     }
     return obs, new_state, reward, done, info
