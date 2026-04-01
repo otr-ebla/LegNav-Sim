@@ -1,26 +1,15 @@
 """
-jax_train.py — Rollout Collection
-===================================
-CHANGES vs previous version:
+jax_train.py — Rollout Collection (Stateless — no GRU)
 
-  GRU MEMORY SUPPORT:
-    - collect_rollouts now maintains a `hidden` carry in the lax.scan loop.
-    - At each step, `hidden` is updated by the network and then masked to zero
-      for any environment that just terminated (done=True). This prevents a
-      completed episode's memory from contaminating the next episode in the
-      same environment slot.
-    - The rollout buffer stores `hiddens` — the hidden state BEFORE each step
-      (i.e. the input hidden to the network that produced actions/values). This
-      is the "initial hidden" TBPTT needs to re-run the GRU during the update.
-    - `last_hidden` is returned alongside `last_val` so ppo.py can bootstrap
-      the GAE correctly.
-    - The initial hidden passed to collect_rollouts is the live carry from the
-      previous rollout chunk (TRUE TBPTT across rollout boundaries).
-
-  UNCHANGED:
-    - Ghost-prob curriculum and vmap_step caching logic.
-    - Dynamic curriculum variables (max_goal_dist, scenario_idx).
-    - ROLLOUT_STEPS = 64, NUM_ENVS = 8192.
+CHANGES vs GRU version:
+  - `hidden` completamente rimosso da collect_rollouts e da tutti i carry.
+  - network.apply ora chiamato come apply_fn({"params": params}, obs) — nessun
+    secondo argomento hidden.
+  - Il rollout buffer NON contiene più 'hiddens' — il PPO loss è ora un forward
+    pass piatto su (T*N, D), nessun scan nel loss.
+  - last_val calcolato con forward pass diretto (nessun hidden da passare).
+  - init_env_state non restituisce più hidden.
+  - Tutto il resto (curriculum, vmap_step, ghost_prob) è invariato.
 """
 
 import os
@@ -33,7 +22,6 @@ from jax_network import (
     EndToEndActorCritic,
     scale_actions_batched,
     squash_corrected_log_prob,
-    GRU_HIDDEN_SIZE,
 )
 
 
@@ -56,14 +44,10 @@ NUM_ENVS      = 512
 ROLLOUT_STEPS = 128
 OBS_SIZE      = 3 * 3 + 9 + 108 * 3    # 342
 
-_VMAP_STEP_CACHE: dict = {}   # {ghost_robot_bool: vmap_step_fn}
+_VMAP_STEP_CACHE: dict = {}
 
 
 def init_env_state(rng_key, max_goal_dist: float = 3.0, ghost_prob: float = 1.0, scenario_idx: int = -1):
-    """
-    Initialise all NUM_ENVS environments and return the vmap_step closure.
-    Only called once at startup, and when ghost_prob changes (see rebuild_vmap_step).
-    """
     ghost_robot = (ghost_prob >= 0.5)
 
     reset_stacked, step_stacked = make_stacked_env(
@@ -90,10 +74,6 @@ def init_env_state(rng_key, max_goal_dist: float = 3.0, ghost_prob: float = 1.0,
 
 
 def rebuild_vmap_step(ghost_prob: float):
-    """
-    Rebuild ONLY the vmap_step closure when ghost_prob changes at a curriculum
-    transition — without touching env_state or env_obs (see original comments).
-    """
     ghost_robot = (ghost_prob >= 0.5)
     cache_key   = ghost_robot
 
@@ -110,16 +90,10 @@ def rebuild_vmap_step(ghost_prob: float):
 
 
 def batched_sample_action(rng_key, mean, logstd, max_v):
-    """
-    Sample raw actions and compute log_prob corrected for sigmoid/tanh squashing.
-    max_v is the per-env max velocity array (shape: NUM_ENVS,).
-    """
-    std     = jnp.exp(logstd)
-    noise   = jax.random.normal(rng_key, shape=mean.shape)
+    std         = jnp.exp(logstd)
+    noise       = jax.random.normal(rng_key, shape=mean.shape)
     raw_actions = mean + noise * std
-
-    # Unified math logic. Stop duplicating equations.
-    log_probs = squash_corrected_log_prob(raw_actions, mean, logstd, max_v)
+    log_probs   = squash_corrected_log_prob(raw_actions, mean, logstd, max_v)
     return raw_actions, log_probs
 
 
@@ -131,29 +105,25 @@ def collect_rollouts(
     vmap_step,
     env_state,
     env_obs,
-    hidden,          # (NUM_ENVS, GRU_HIDDEN_SIZE) — live carry from previous chunk
     max_goal_dist,
     scenario_idx,
 ):
     """
     Collect ROLLOUT_STEPS steps across NUM_ENVS environments.
+    STATELESS: nessun hidden carry. Network è puro feedforward (+ attention sul frame stack).
 
     Returns:
       rollout_history  — dict of (ROLLOUT_STEPS, NUM_ENVS, ...) tensors
-                         including 'hiddens' = GRU input hidden at each step
-      new_state        — environment state after the final step
-      new_obs          — observation after the final step
-      new_hidden       — GRU carry after the final step (for the next chunk)
-      last_val         — critic bootstrap value at new_obs / new_hidden
+      new_state        — environment state dopo l'ultimo step
+      new_obs          — osservazione dopo l'ultimo step
+      last_val         — bootstrap value al termine del chunk
     """
     def _env_step(carry, _):
-        current_state, current_obs, current_hidden, current_rng = carry
+        current_state, current_obs, current_rng = carry
         current_rng, action_rng, step_rng = jax.random.split(current_rng, 3)
 
-        # Forward pass — network now takes hidden and returns new_hidden
-        mean, logstd, values, next_hidden = apply_fn(
-            {"params": params}, current_obs, current_hidden
-        )
+        # Forward pass stateless: solo obs
+        mean, logstd, values = apply_fn({"params": params}, current_obs)
 
         max_v = current_state.env_state.max_v
         raw_actions, log_probs = batched_sample_action(action_rng, mean, logstd, max_v)
@@ -164,11 +134,6 @@ def collect_rollouts(
             step_keys, current_state, env_actions, max_goal_dist, scenario_idx
         )
 
-        # ── Done-masking: reset hidden to zero for terminated environments ────
-        # Shape: (NUM_ENVS, 1) broadcast over hidden dim
-        mask = (1.0 - dones.astype(jnp.float32))[:, None]
-        masked_hidden = next_hidden * mask
-
         transition = {
             "obs":          current_obs,
             "actions":      raw_actions,
@@ -177,19 +142,18 @@ def collect_rollouts(
             "rewards":      rewards,
             "dones":        dones,
             "max_v":        max_v,
-            "hiddens":      current_hidden,   # GRU input at this step — needed for TBPTT
             "goal_reached": infos["goal_reached"],
             "collision":    infos["collision"],
             "passive_col":  infos["passive_col"],
             "active_col":   infos["active_col"],
         }
-        return (next_state, next_obs, masked_hidden, current_rng), transition
+        return (next_state, next_obs, current_rng), transition
 
-    (new_state, new_obs, new_hidden, _), rollout_history = jax.lax.scan(
-        _env_step, (env_state, env_obs, hidden, rng_key), None, length=ROLLOUT_STEPS
+    (new_state, new_obs, _), rollout_history = jax.lax.scan(
+        _env_step, (env_state, env_obs, rng_key), None, length=ROLLOUT_STEPS
     )
 
-    # Bootstrap critic value at the end of the chunk
-    _, _, last_val, _ = apply_fn({"params": params}, new_obs, new_hidden)
+    # Bootstrap: forward pass stateless sull'ultima osservazione
+    _, _, last_val = apply_fn({"params": params}, new_obs)
 
-    return rollout_history, new_state, new_obs, new_hidden, last_val
+    return rollout_history, new_state, new_obs, last_val
