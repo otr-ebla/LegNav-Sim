@@ -36,10 +36,10 @@ HSFM_DT    = 0.01
 # Terminal rewards (all /10 from original to keep Q-values O(100) not O(1000)).
 # This ensures alpha*log_pi remains a meaningful fraction of the critic signal
 # so the entropy term actually shapes the policy during early training.
-_R_GOAL        =  10.0
-_R_OBS_COL     =  -9.0
-_R_WALL_COL    =  -9.0
-_R_ACTIVE_COL  =  -9.0
+_R_GOAL        =  20.0
+_R_OBS_COL     =  -7.0
+_R_WALL_COL    =  -7.0
+_R_ACTIVE_COL  =  -7.0
 
 _R_PASSIVE_COL =  -3.5
 _R_TIMEOUT     =  -9.0
@@ -462,22 +462,22 @@ def step_env(key, state, action, ghost_robot: bool = True):
 
     # — 6b. NEW: Yield Penalty (Gradiente di Frenata Dinamica)
     # Recuperato e riadattato da jax_env.py per forzare l'agente a rallentare
-    human_angles = jnp.arctan2(dy_p, dx_p)
-    rel_angles   = (human_angles - new_theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
+    # human_angles = jnp.arctan2(dy_p, dx_p)
+    # rel_angles   = (human_angles - new_theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
 
-    YIELD_DIST = 1.5
-    YIELD_FOV  = 2*jnp.pi
+    # YIELD_DIST = 1.5
+    # YIELD_FOV  = 2*jnp.pi
 
-    in_yield_zone = (dists_p_active < YIELD_DIST) & (jnp.abs(rel_angles) < YIELD_FOV) & active_mask
-    is_yield_situation = jnp.any(in_yield_zone)
+    # in_yield_zone = (dists_p_active < YIELD_DIST) & (jnp.abs(rel_angles) < YIELD_FOV) & active_mask
+    # is_yield_situation = jnp.any(in_yield_zone)
 
-    closest_yield_dist = jnp.min(jnp.where(in_yield_zone, dists_p_active, 100.0))
-    urgency = jnp.where(is_yield_situation, (YIELD_DIST - closest_yield_dist) / YIELD_DIST, 0.0)
+    # closest_yield_dist = jnp.min(jnp.where(in_yield_zone, dists_p_active, 100.0))
+    # urgency = jnp.where(is_yield_situation, (YIELD_DIST - closest_yield_dist) / YIELD_DIST, 0.0)
 
-    # Penalità massiccia se il robot tiene il gas premuto verso un umano.
-    # Il -2.0 compensa abbondantemente il reward di progresso (+0.15/step),
-    # rendendo la frenata (target_v = 0) l'unica azione matematicamente vantaggiosa.
-    yield_penalty = -0.4 * urgency * target_v  # /10 from -4.0
+    # # Penalità massiccia se il robot tiene il gas premuto verso un umano.
+    # # Il -2.0 compensa abbondantemente il reward di progresso (+0.15/step),
+    # # rendendo la frenata (target_v = 0) l'unica azione matematicamente vantaggiosa.
+    # yield_penalty = -0.4 * urgency * target_v  # /10 from -4.0
 
     # — 6c. Dense shaping ─────────────────────────────────────────────────
     progress         = prev_dist - new_dist
@@ -485,14 +485,14 @@ def step_env(key, state, action, ghost_robot: bool = True):
     step_pen         = _STEP_PEN
     
     # Harsh absolute penalty for jittering (prevents micro-oscillations)
-    smooth_pen       = -_SMOOTH_WEIGHT * jnp.abs(target_w - state.w)
-    # Quadratic penalty on rotation magnitude (encourages driving straight)
-    rot_pen          = -_ROT_WEIGHT * (target_w ** 2)
+    # smooth_pen       = -_SMOOTH_WEIGHT * jnp.abs(target_w - state.w)
+    # # Quadratic penalty on rotation magnitude (encourages driving straight)
+    # rot_pen          = -_ROT_WEIGHT * (target_w ** 2)
     
     # Aggiungiamo la yield_penalty al totale
-    dense_reward     = social_progress + step_pen + smooth_pen + rot_pen + comfort_pen + yield_penalty
+    dense_reward     = social_progress + step_pen + comfort_pen #+ smooth_pen + rot_pen + yield_penalty
 
-    # — 6d. Terminal cascades ─────────────────────────────────────────────
+   # — 6d. Terminal cascades ─────────────────────────────────────────────
     reward = dense_reward
     reward = jnp.where(goal_reached, _R_GOAL, reward)
     reward = jnp.where(obs_collision & ~goal_reached, _R_OBS_COL, reward)
@@ -507,15 +507,14 @@ def step_env(key, state, action, ghost_robot: bool = True):
         people=new_people,
         time_step=state.time_step + 1,
         foot_state=new_foot_state,
-        time_stopped=jnp.int32(0),    # unused in new reward; kept for compat
+        time_stopped=jnp.int32(0),    
         human_stop_timers=new_timers,
-        escape_timer=jnp.int32(0),    # unused in new reward; kept for compat
+        escape_timer=jnp.int32(0),    
     )
 
     obs, sp_mask = get_obs(new_state, k_obs)
     new_state = new_state.replace(sp_mask=sp_mask)
 
- 
     instant_col = collision & (state.time_step == 0)
 
     info = {
@@ -528,12 +527,12 @@ def step_env(key, state, action, ghost_robot: bool = True):
         "sp_mask":       sp_mask,
         "timeout":       timeout,
         "instant_col":   instant_col,
-        "rew_yield":     yield_penalty,
-        # ── NEW: Export reward components for debugging ──
+        "rew_yield":     jnp.array(0.0),
+
         "rew_prog":      social_progress,
         "rew_step":      jnp.array(step_pen),
-        "rew_smooth":    smooth_pen,
-        "rew_rot":       rot_pen,
+        "rew_smooth":    jnp.array(0.0),
+        "rew_rot":       jnp.array(0.0),
         "rew_comf":      comfort_pen,
     }
     return obs, new_state, reward, done, info
