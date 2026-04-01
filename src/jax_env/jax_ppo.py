@@ -42,6 +42,7 @@ os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
 
 import time
 import warnings
+import random as _random
 import jax
 import jax.numpy as jnp
 import functools
@@ -67,8 +68,7 @@ GAE_LAMBDA     = 0.95
 CLIP_EPS       = 0.2
 VF_COEF        = 0.25
 ENTROPY_COEF   = 0.015   # valore stage 0 — usato solo per il print iniziale
-# Decay per stage: la policy mantiene abbastanza esplorazione per ogni livello
-# del curriculum indipendentemente da quanti update ci vogliono per avanzare.
+# Decay per stage: esplorazione calibrata su ogni livello del curriculum
 # Stage:                 0      1      2      3      4      5      6
 ENTROPY_COEF_BY_STAGE = [0.015, 0.012, 0.008, 0.005, 0.003, 0.002, 0.001]
 MAX_GRAD_NORM  = 0.5
@@ -110,6 +110,14 @@ GHOST_PROB_STAGES = [
     (82.0, 0.5),   
     (101., 0.3),
 ]
+
+# Probabilità di usare scenario random (-1) vs scenario 0 fisso, per stage.
+# Stage 0-1: solo scenario 0 (robot impara a navigare senza struttura)
+# Stage 2+:  mix crescente — il robot inizia a vedere scenari strutturati
+# Stage:                  0     1     2     3     4     5     6
+SCENARIO_RANDOM_PROB = [0.0,  0.0,  0.2,  0.4,  0.6,  0.8,  1.0]
+# Probabilità 0.0 → scenario_idx=0 fisso
+# Probabilità 1.0 → scenario_idx=-1 (tutti i 7 scenari in modo uniforme)
 
 from flax import struct
 
@@ -426,9 +434,6 @@ if __name__ == "__main__":
 
         rng, rollout_rng, update_rng = jax.random.split(rng, 3)
 
-        # Entropy coefficient dallo stage corrente del curriculum
-        entropy_coef = jnp.array(ENTROPY_COEF_BY_STAGE[cur_stage])
-
         # collect_rollouts stateless: non restituisce più hidden
         rollout_history, env_state, env_obs, last_val = collect_rollouts(
             rollout_rng, train_state[0], network.apply, vmap_step,
@@ -476,15 +481,15 @@ if __name__ == "__main__":
         new_stage    = _curriculum_stage(highest_rolling_suc)
         new_ghost    = curriculum_ghost_prob(highest_rolling_suc)
 
-        if new_max_dist < 8.0:
-            new_scenario = 0
-        else:
-            new_scenario = -1
+        # Scenario per-update: campionato Python-side in base alla probabilità dello stage corrente.
+        # SCENARIO_RANDOM_PROB[stage] = prob di usare -1 (random tra tutti i 7 scenari).
+        # Prob complementare → scenario 0 fisso (random statico, più semplice).
+        _scen_rand_prob = SCENARIO_RANDOM_PROB[new_stage]
+        new_scenario = -1 if (_random.random() < _scen_rand_prob) else 0
 
-        if new_max_dist > cur_max_dist or new_ghost < cur_ghost or new_scenario != cur_scenario:
+        if new_max_dist > cur_max_dist or new_ghost < cur_ghost or new_stage != cur_stage:
             cur_max_dist = new_max_dist
             cur_stage    = new_stage
-            cur_scenario = new_scenario
 
             if new_ghost < cur_ghost:
                 cur_ghost = new_ghost
@@ -492,7 +497,12 @@ if __name__ == "__main__":
                 print(f"  -> Ghost closure rebuilt: ghost_prob={cur_ghost:.1f}")
             else:
                 print(f"  -> Curriculum advanced: stage={cur_stage}, dist={cur_max_dist:.1f}m, "
-                      f"scenario={cur_scenario}")
+                      f"scen_rand_prob={_scen_rand_prob:.0%}")
+
+        cur_scenario = new_scenario
+
+        # Entropy coefficient dallo stage corrente
+        entropy_coef = jnp.array(ENTROPY_COEF_BY_STAGE[cur_stage])
 
         advantages, returns = compute_gae(rewards, values, dones, last_val)
 
@@ -516,13 +526,15 @@ if __name__ == "__main__":
             lr_now       = float(scheduler(update * _OPT_STEPS_PER_UPDATE))
             ent_coef_now = float(entropy_coef)
             elapsedtime  = (time.time() - t_start) / 60.0
+            scen_prob    = SCENARIO_RANDOM_PROB[cur_stage]
             print(
                 f"{update:>5d} | {mean_ret:>7.1f} | "
                 f"{suc_pct:>4.1f}% {obs_pct:>4.1f}% {acol_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% | "
                 f"{float(mean_loss):>7.2f} {float(p_loss):>6.2f} "
                 f"{float(v_loss):>6.2f} {float(entropy):>6.2f} | "
                 f"{fps:>7,.0f} {n_ep:>6d} {lr_now:.2e} | "
-                f"{cur_stage:>5d} {cur_max_dist:>5.1f}m {cur_ghost:>5.1f}g {ent_coef_now:.4f}e {elapsedtime:>5.1f}min"
+                f"{cur_stage:>5d} {cur_max_dist:>5.1f}m {cur_ghost:>5.1f}g "
+                f"{ent_coef_now:.4f}e {scen_prob:.0%}s {elapsedtime:>5.1f}min"
             )
 
         if suc_pct > best_suc and n_ep > 0:
