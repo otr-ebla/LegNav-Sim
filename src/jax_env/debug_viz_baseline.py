@@ -281,11 +281,19 @@ def draw_panel(surface, fonts, ep, step, ep_ret, max_v, v, w,
         xs = radar_cx + np.cos(angles) * dists
         ys = radar_cy + np.sin(angles) * dists
         for i, (rx2, ry2) in enumerate(zip(xs, ys)):
-            if sp_mask[i] and raw_lidar[i] >= MAX_LIDAR_DIST - 0.1:
+            if sp_mask[i]:
                 col = (180, 50, 220)
             else:
                 col = (220, 50, 50)
             pygame.draw.circle(surface, col, (int(rx2), int(ry2)), 2)
+            
+        for factor in [0.33, 0.66, 1.0]:
+            dist_val = MAX_LIDAR_DIST * factor
+            lbl = fonts["tiny"].render(f"{dist_val:.1f}m", True, (150, 150, 160))
+            lx = radar_cx - lbl.get_width() // 2
+            ly = radar_cy + int(radar_r * factor) - lbl.get_height()
+            if factor == 1.0: ly -= 2
+            surface.blit(lbl, (lx, ly))
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 

@@ -36,11 +36,11 @@ class EndToEndActorCritic(nn.Module):
 
         # Global state MLP
         global_in   = jnp.concatenate([pose_stack, state_vec], axis=-1)
-        global_feat = nn.relu(nn.Dense(128)(global_in))
-        global_feat = nn.relu(nn.Dense(64)(global_feat))
+        #global_feat = nn.relu(nn.Dense(128)(global_in))
+        #global_feat = nn.relu(nn.Dense(64)(global_feat))
 
         # Shared trunk (Questo garantisce i 135k FPS!)
-        fused  = jnp.concatenate([cnn_feat, global_feat], axis=-1)
+        fused  = jnp.concatenate([cnn_feat, global_in], axis=-1)
         shared = nn.relu(nn.Dense(256)(fused))
         shared = nn.relu(nn.Dense(128)(shared))
 
@@ -57,8 +57,8 @@ class EndToEndActorCritic(nn.Module):
         actor_logstd = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (jnp.tanh(actor_logstd_raw) + 1.0)
 
         # Critic head
-        critic = nn.relu(nn.Dense(128)(shared))
-        critic = nn.relu(nn.Dense(64)(critic))
+        #critic = nn.relu(nn.Dense(128)(shared))
+        critic = nn.relu(nn.Dense(64)(shared))
         value  = nn.Dense(1)(critic)
 
         return actor_mean, actor_logstd, jnp.squeeze(value, axis=-1)
@@ -91,7 +91,7 @@ def squash_corrected_log_prob(raw_actions: jnp.ndarray, mean: jnp.ndarray,
     std = jnp.exp(logstd)
     z   = (raw_actions - mean) / (std + 1e-8)
     base_log_prob = jnp.sum(-0.5 * (z ** 2 + jnp.log(2.0 * jnp.pi)) - logstd, axis=-1)
-    return base_log_prob - _squash_log_jacobian(raw_actions, max_v)
+    return base_log_prob - _squash_log_jacobian(raw_actions, max_v) # it uses above function to correct the log_prob
 
 
 def sample_action(rng_key: jnp.ndarray, mean: jnp.ndarray, logstd: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
