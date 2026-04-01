@@ -85,6 +85,7 @@ class EnvState:
     sp_mask:            jnp.ndarray
     human_stop_timers:  jnp.ndarray
     escape_timer:       jnp.int32     # unused in new reward; kept for checkpoint compat
+    is_ghost:           jnp.ndarray
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -333,6 +334,7 @@ def reset_env(key: jnp.ndarray, max_goal_dist: float = 3.0, **kwargs):
         sp_mask=jnp.zeros(NUM_RAYS, dtype=jnp.bool_),
         human_stop_timers=jnp.zeros(NUM_PEOPLE, dtype=jnp.int32),
         escape_timer=0,
+        is_ghost=jnp.array(False, dtype=jnp.bool_),
     )
 
     obs, sp_mask = get_obs(state, k_obs)
