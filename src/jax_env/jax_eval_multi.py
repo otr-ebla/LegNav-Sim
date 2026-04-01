@@ -122,27 +122,35 @@ class _OldPPOActor(nn.Module):
 
 
 def _build_ppo_shac():
-    from jax_network import EndToEndActorCritic, scale_action_to_env
+    from jax_network import EndToEndActorCritic, scale_action_to_env, GRU_HIDDEN_SIZE
 
     net_new = EndToEndActorCritic(action_dim=ACTION_DIM)
     net_old = _OldPPOActor(action_dim=ACTION_DIM)
     rng = jax.random.PRNGKey(0)
-    init_params = net_new.init(rng, jnp.zeros((1, OBS_SIZE)))["params"]
+    # New arch requires a dummy hidden carry for init
+    dummy_hidden = jnp.zeros((1, GRU_HIDDEN_SIZE))
+    init_params  = net_new.init(rng, jnp.zeros((1, OBS_SIZE)), dummy_hidden)["params"]
 
     def load(path):
         with open(path, "rb") as f:
             raw = f.read()
         bundle = flax.serialization.msgpack_restore(raw)
-        # SHAC saves the full training bundle; PPO saves just params.
         return bundle.get("params", bundle)
 
-    def infer(params, obs, max_v):
+    def infer(params, obs, max_v, hidden):
+        """
+        GRU-aware inference.
+        hidden : (1, GRU_HIDDEN_SIZE)  — must be passed and stored by the caller.
+        Returns (action (2,), new_hidden (1, GRU_HIDDEN_SIZE)).
+        """
         is_old_arch = ("Dense_6" in params and params["Dense_6"]["kernel"].shape[0] == 960)
-        net = net_old if is_old_arch else net_new
-        mean, _, _ = net.apply({"params": params}, obs[None])
-        return scale_action_to_env(jnp.squeeze(mean, 0), float(max_v))
+        if is_old_arch:
+            mean, _, _ = net_old.apply({"params": params}, obs[None])
+            return scale_action_to_env(jnp.squeeze(mean, 0), float(max_v)), hidden
+        mean, _, _, new_hidden = net_new.apply({"params": params}, obs[None], hidden)
+        return scale_action_to_env(jnp.squeeze(mean, 0), float(max_v)), new_hidden
 
-    return init_params, load, infer
+    return init_params, load, infer, GRU_HIDDEN_SIZE
 
 
 # ── SAC ────────────────────────────────────────────────────────────────────────
@@ -265,11 +273,11 @@ _DEFAULT_CKPT = {
 
 def build_policy(algo):
     if algo in ("ppo", "shac"):
-        return _build_ppo_shac()
+        return _build_ppo_shac()   # returns (init_params, load, infer, gru_hidden_size)
     elif algo == "sac":
-        return _build_sac()
+        return _build_sac() + (0,) # no GRU — pad with 0
     elif algo == "tqc":
-        return _build_tqc()
+        return _build_tqc() + (0,) # no GRU — pad with 0
     else:
         raise ValueError(f"Unknown algo: {algo}")
 
@@ -533,8 +541,9 @@ def main():
     print(f"   Human model: {'LEGS' if use_legs else 'CYLINDERS'}")
     print(f"   Sensor noise: {'ON' if args.sensor_noise else 'OFF'}\n")
 
-    # Build policy (init params, loader, inference fn)
-    init_params, load_fn, infer_fn = build_policy(algo)
+    # Build policy (init params, loader, inference fn, gru_hidden_size)
+    init_params, load_fn, infer_fn, gru_hidden_size = build_policy(algo)
+    use_gru = (gru_hidden_size > 0)
 
     try:
         params = load_fn(ckpt)
@@ -562,6 +571,13 @@ def main():
 
     rng, reset_rng = jax.random.split(rng)
     obs, stacked_state = fast_reset(reset_rng)
+
+    # ── GRU hidden state (per-episode, reset on every episode boundary) ────────
+    def _make_hidden():
+        if use_gru:
+            return jnp.zeros((1, gru_hidden_size))
+        return None
+    gru_hidden = _make_hidden()
 
     ep=0; ep_steps=0; ep_reward=0.0; ep_hist=[]
     paused=False; show_lidar=True; show_arrows=True; show_body=args.ghost_body
@@ -592,6 +608,7 @@ def main():
                     fast_reset, fast_step = build_fast_reset(current_scenario)
                     rng, reset_rng = jax.random.split(rng)
                     obs, stacked_state = fast_reset(reset_rng)
+                    gru_hidden = _make_hidden()
                     ep_reward=0.0; ep_steps=0; banner_t=0
                 if k == pygame.K_7:
                     evaluation_mode  = "random"
@@ -599,10 +616,12 @@ def main():
                     fast_reset, fast_step = build_fast_reset(current_scenario)
                     rng, reset_rng = jax.random.split(rng)
                     obs, stacked_state = fast_reset(reset_rng)
+                    gru_hidden = _make_hidden()
                     ep_reward=0.0; ep_steps=0; banner_t=0
                 if k == pygame.K_r:
                     rng, reset_rng = jax.random.split(rng)
                     obs, stacked_state = fast_reset(reset_rng)
+                    gru_hidden = _make_hidden()
                     ep_reward=0.0; ep_steps=0; banner_t=0
 
         if paused: clock.tick(10); continue
@@ -618,7 +637,10 @@ def main():
                 pass
 
         # ── Inference ────────────────────────────────────────────────────────
-        env_action = infer_fn(params, obs, stacked_state.env_state.max_v)
+        if use_gru:
+            env_action, gru_hidden = infer_fn(params, obs, stacked_state.env_state.max_v, gru_hidden)
+        else:
+            env_action = infer_fn(params, obs, stacked_state.env_state.max_v)
 
         rng, step_rng = jax.random.split(rng)
         obs, stacked_state, reward, done, info = fast_step(step_rng, stacked_state, env_action)
@@ -648,6 +670,7 @@ def main():
         pygame.display.flip(); clock.tick(FPS_TARGET)
 
         if done:
+            gru_hidden = _make_hidden()  # reset memory at episode boundary
             goal = bool(info["goal_reached"]); col = bool(info["collision"])
             pcol = bool(info["passive_col"]); tmo = not goal and not col
             active_col = col and not pcol
