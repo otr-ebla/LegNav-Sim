@@ -60,7 +60,7 @@ GAE_LAMBDA     = 0.95
 CLIP_EPS       = 0.2
 VF_COEF        = 0.25
 
-ENTROPY_COEF   = 0.05
+ENTROPY_COEF   = 0.02
 MAX_GRAD_NORM  = 0.5
 PPO_EPOCHS     = 6
 LR_START       = 2.5e-4

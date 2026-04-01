@@ -52,8 +52,8 @@ def _verify_gpu():
 GPU_DEVICE = _verify_gpu()
 
 # Config
-NUM_ENVS      = 1024
-ROLLOUT_STEPS = 64
+NUM_ENVS      = 512
+ROLLOUT_STEPS = 128
 OBS_SIZE      = 3 * 3 + 9 + 108 * 3    # 342
 
 _VMAP_STEP_CACHE: dict = {}   # {ghost_robot_bool: vmap_step_fn}
