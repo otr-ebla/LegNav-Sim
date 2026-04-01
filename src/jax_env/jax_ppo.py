@@ -60,10 +60,10 @@ GAE_LAMBDA     = 0.95
 CLIP_EPS       = 0.2
 VF_COEF        = 0.25
 
-ENTROPY_COEF   = 0.01
+ENTROPY_COEF   = 0.05
 MAX_GRAD_NORM  = 0.5
 PPO_EPOCHS     = 6
-LR_START       = 5e-4
+LR_START       = 2.5e-4
 LR_END         = 1e-5
 LR_MIN         = 1e-5
 WARMUP_UPDATES = 5
@@ -544,13 +544,22 @@ if __name__ == "__main__":
         new_stage    = _curriculum_stage(highest_rolling_suc)
         new_ghost    = curriculum_ghost_prob(highest_rolling_suc)
 
-        if highest_rolling_suc < 35.0:
+        # if highest_rolling_suc < 35.0:
+        #     new_scenario = 0
+        # elif highest_rolling_suc < 50.0:
+        #     new_scenario = 1
+        # elif highest_rolling_suc < 60.0:
+        #     new_scenario = 2
+        # else:
+        #     new_scenario = -1
+
+        # The agent must first master long-distance navigation (> 6.5m) in open space (scenario 0)
+        # before being subjected to complex social structures with hardcoded 8m+ goals.
+        if new_max_dist < 8.0:
             new_scenario = 0
-        elif highest_rolling_suc < 50.0:
-            new_scenario = 1
-        elif highest_rolling_suc < 60.0:
-            new_scenario = 2
         else:
+            # Once it can travel far, train on ALL scenarios simultaneously (-1)
+            # to force generalization and prevent catastrophic forgetting.
             new_scenario = -1
 
         if new_max_dist > cur_max_dist or new_ghost < cur_ghost or new_scenario != cur_scenario:
