@@ -66,7 +66,7 @@ GAMMA          = 0.99
 GAE_LAMBDA     = 0.95
 CLIP_EPS       = 0.2
 VF_COEF        = 0.25
-ENTROPY_COEF   = 0.05   # alzato da 0.02: contrasta il collasso prematuro della policy
+ENTROPY_COEF   = 0.02   # alzato da 0.02: contrasta il collasso prematuro della policy
 MAX_GRAD_NORM  = 0.5
 PPO_EPOCHS     = 6
 LR_START       = 2.5e-4
@@ -102,9 +102,9 @@ CURRICULUM_STAGES = [
 
 GHOST_PROB_STAGES = [
     (50.0, 1.0),
-    (65.0, 0.8),
-    (78.0, 0.6),
-    (101., 0.4),
+    (65.0, 0.7),
+    (75.0, 0.5),
+    (101., 0.3),
 ]
 
 from flax import struct

@@ -39,13 +39,13 @@ HSFM_DT    = 0.01
 _R_GOAL        =  20.0
 _R_OBS_COL     =  -7.0
 _R_WALL_COL    =  -7.0
-_R_ACTIVE_COL  =  -7.0
+_R_ACTIVE_COL  =  -9.0
 
 _R_PASSIVE_COL =  -3.5
 _R_TIMEOUT     =  -9.0
 
 
-_PROGRESS_COEF =  1.5
+_PROGRESS_COEF =  2.0
 
 # Step penalty — small constant cost per timestep, encourages efficiency.
 # Step penalty — small constant cost per timestep, encourages efficiency.
