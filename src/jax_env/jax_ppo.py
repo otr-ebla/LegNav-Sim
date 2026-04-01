@@ -66,9 +66,11 @@ GAMMA          = 0.99
 GAE_LAMBDA     = 0.95
 CLIP_EPS       = 0.2
 VF_COEF        = 0.25
-ENTROPY_COEF       = 0.015   # valore iniziale (update 0)
-ENTROPY_COEF_FINAL = 0.001   # valore finale (update TOTAL_UPDATES)
-# Decay lineare: coef(t) = ENTROPY_COEF - (ENTROPY_COEF - ENTROPY_COEF_FINAL) * t / TOTAL_UPDATES
+ENTROPY_COEF   = 0.015   # valore stage 0 — usato solo per il print iniziale
+# Decay per stage: la policy mantiene abbastanza esplorazione per ogni livello
+# del curriculum indipendentemente da quanti update ci vogliono per avanzare.
+# Stage:                 0      1      2      3      4      5      6
+ENTROPY_COEF_BY_STAGE = [0.015, 0.012, 0.008, 0.005, 0.003, 0.002, 0.001]
 MAX_GRAD_NORM  = 0.5
 PPO_EPOCHS     = 6
 LR_START       = 2.5e-4
@@ -249,7 +251,7 @@ def ppo_loss_fn(
     returns_mb,     # (MB,)
     old_log_probs,  # (MB,)
     max_v_mb,       # (MB,)
-    entropy_coef,   # () — scalare JAX, varia con il decay lineare
+    entropy_coef,   # () — scalare JAX, varia per stage curriculum
 ):
     """
     Forward pass parallelo su MB = MINI_BATCH_SIZE sample.
@@ -319,7 +321,7 @@ def run_ppo_updates(train_state, obs_seq, actions_seq, adv_seq, ret_seq,
                     old_lp_seq, max_v_seq, rng_key, entropy_coef):
     """
     obs_seq: (T, N, OBS_SIZE) — reshapato a (T*N, OBS_SIZE) per il loss piatto.
-    entropy_coef: scalare JAX con il valore corrente del decay lineare.
+    entropy_coef: scalare JAX con il valore dello stage corrente.
     """
     params, opt_state = train_state
 
@@ -424,10 +426,8 @@ if __name__ == "__main__":
 
         rng, rollout_rng, update_rng = jax.random.split(rng, 3)
 
-        # Decay lineare entropy coefficient: 0.015 → 0.001 lungo tutto il training
-        entropy_coef = jnp.array(
-            ENTROPY_COEF - (ENTROPY_COEF - ENTROPY_COEF_FINAL) * update / max(TOTAL_UPDATES - 1, 1)
-        )
+        # Entropy coefficient dallo stage corrente del curriculum
+        entropy_coef = jnp.array(ENTROPY_COEF_BY_STAGE[cur_stage])
 
         # collect_rollouts stateless: non restituisce più hidden
         rollout_history, env_state, env_obs, last_val = collect_rollouts(
@@ -513,9 +513,9 @@ if __name__ == "__main__":
 
         if update % 5 == 0:
             p_loss, v_loss, entropy = aux
-            lr_now      = float(scheduler(update * _OPT_STEPS_PER_UPDATE))
+            lr_now       = float(scheduler(update * _OPT_STEPS_PER_UPDATE))
             ent_coef_now = float(entropy_coef)
-            elapsedtime = (time.time() - t_start) / 60.0
+            elapsedtime  = (time.time() - t_start) / 60.0
             print(
                 f"{update:>5d} | {mean_ret:>7.1f} | "
                 f"{suc_pct:>4.1f}% {obs_pct:>4.1f}% {acol_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% | "
