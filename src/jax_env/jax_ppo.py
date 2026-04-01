@@ -66,7 +66,7 @@ GAMMA          = 0.99
 GAE_LAMBDA     = 0.95
 CLIP_EPS       = 0.2
 VF_COEF        = 0.25
-ENTROPY_COEF   = 0.02   # alzato da 0.02: contrasta il collasso prematuro della policy
+ENTROPY_COEF   = 0.015   # alzato da 0.02: contrasta il collasso prematuro della policy
 MAX_GRAD_NORM  = 0.5
 PPO_EPOCHS     = 6
 LR_START       = 2.5e-4
@@ -74,7 +74,7 @@ LR_END         = 1e-5
 LR_MIN         = 1e-5
 WARMUP_UPDATES = 5
 
-TOTAL_UPDATES  = 1000
+TOTAL_UPDATES  = 10000
 
 # ── Minibatch geometry ────────────────────────────────────────────────────────
 # Loss piatto su (T*N) sample. Shuffle su tutto il batch poi split in minibatch.
