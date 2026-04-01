@@ -24,7 +24,18 @@ import jax
 import jax.numpy as jnp
 from jax_env_multi import reset_env, step_env
 from jax_wrappers import make_stacked_env, make_autoreset_env
-from jax_network import scale_actions_batched
+from jax_network import scale_actions_batched, squash_corrected_log_prob
+
+
+
+def batched_sample_action(rng_key, mean, logstd, max_v):
+    std     = jnp.exp(logstd)
+    noise   = jax.random.normal(rng_key, shape=mean.shape)
+    raw_actions = mean + noise * std
+    
+    # Unified math logic. Stop duplicating equations.
+    log_probs = squash_corrected_log_prob(raw_actions, mean, logstd, max_v)
+    return raw_actions, log_probs
 
 def _verify_gpu():
     try:

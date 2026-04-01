@@ -91,8 +91,8 @@ def build_hsfm_obstacles(obs_boxes):
     return jnp.concatenate([room_edges[None, ...], box_edges], axis=0)
 
 
-def reset_env(key: jax.Array, max_goal_dist: float = 3.0, scenario_idx: int = -1):
-    k_main, k_legs, k_obs = jax.random.split(key, 3)
+def reset_env(key: jax.Array, max_goal_dist: float = 3.0, scenario_idx: int = -1, ghost_prob: float = 1.0):
+    k_main, k_legs, k_obs, k_ghost = jax.random.split(key, 4)
 
     rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people = \
         generate_scenario(k_main, max_goal_dist, scenario_idx)
@@ -100,6 +100,7 @@ def reset_env(key: jax.Array, max_goal_dist: float = 3.0, scenario_idx: int = -1
     #max_v = 0.8
 
     foot_state = init_foot_state(people, k_legs)
+    is_ghost   = jax.random.bernoulli(k_ghost, p=ghost_prob)
 
     state = EnvState(
         x=rx, y=ry, theta=rtheta, v=0.0, w=0.0,
@@ -111,6 +112,7 @@ def reset_env(key: jax.Array, max_goal_dist: float = 3.0, scenario_idx: int = -1
         sp_mask=jnp.zeros(108, dtype=jnp.bool_),
         human_stop_timers=jnp.zeros(NUM_PEOPLE, dtype=jnp.int32),
         escape_timer=0,
+        is_ghost=is_ghost,
     )
 
     obs, sp_mask = get_obs(state, k_obs)
@@ -159,13 +161,6 @@ def step_env(key, state, action, ghost_robot: bool = True):
     hsfm_params      = get_standard_humans_parameters(NUM_PEOPLE + 1)
     static_obstacles = build_hsfm_obstacles(state.obs_boxes)
 
-    if ghost_robot:
-        hsfm_rx = jnp.array(_GHOST_POS)
-        hsfm_ry = jnp.array(_GHOST_POS)
-    else:
-        hsfm_rx = new_x
-        hsfm_ry = new_y
-
     # Build goal arrays for humans using the active waypoint per human.
     idx_h    = state.people[:, 10]
     g1x_h, g1y_h = state.people[:, 6], state.people[:, 7]
@@ -178,34 +173,54 @@ def step_env(key, state, action, ghost_robot: bool = True):
     r_goal_row  = jnp.array([[state.goal_x, state.goal_y]])  # (1, 2)
     ext_goals_pre = jnp.concatenate([h_goals_pre, r_goal_row], axis=0)  # (N+1, 2)
 
-    r_state_row = jnp.array([[
-        hsfm_rx, hsfm_ry,
-        target_v * jnp.cos(new_theta),
-        target_v * jnp.sin(new_theta),
-        new_theta, target_w
-    ]])   # (1, 6)
-
     h_state_init   = state.people[:, :6]   # (N, 6)
-    ext_state_init = jnp.concatenate([h_state_init, r_state_row], axis=0)  # (N+1, 6)
+    
+    # Initialize ext_state with a dummy robot row; updated dynamically per-substep
+    # Initialize ext_state with a dummy robot row; updated dynamically per-substep
+    dummy_r_state = jnp.zeros((1, 6))
+    ext_state_init = jnp.concatenate([h_state_init, dummy_r_state], axis=0)
 
-    def _hsfm_substep(carry, _):
+    # Precompute dummy mask outside the loop to save inner-loop FLOPs
+    is_dummy_sub = state.people[:, 10] < 0.0
+
+    def _hsfm_substep(carry, step_idx):
         ext_state = carry
+        # Interpolate robot position for fluid physics over the 0.15s window
+        alpha = (step_idx + 1) / N_SUBSTEPS
+        interp_x = state.x + alpha * (new_x - state.x)
+        interp_y = state.y + alpha * (new_y - state.y)
+        
+        hsfm_rx = jnp.where(state.is_ghost, _GHOST_POS, interp_x)
+        hsfm_ry = jnp.where(state.is_ghost, _GHOST_POS, interp_y)
+
+        r_state_row = jnp.array([
+            hsfm_rx, hsfm_ry,
+            target_v * jnp.cos(new_theta),
+            target_v * jnp.sin(new_theta),
+            new_theta, target_w
+        ])
+        
+        # Inject accurate real-time robot state into ext_state before stepping
+        ext_state = ext_state.at[-1].set(r_state_row)
+
         # Goals are constant across substeps — pass pre-built ext_goals_pre
         next_ext  = hsfm_step(ext_state, ext_goals_pre, hsfm_params, static_obstacles, HSFM_DT)
 
-        # Do not clamp dummy humans — they live at -999 intentionally
+        # Extract human state to apply clamping
         next_h       = next_ext[:-1]
-        is_dummy_sub = state.people[:, 10] < 0.0
+
+        # Clamping: do not clamp dummy humans, keep them at -999
         clamped_x    = jnp.where(is_dummy_sub, next_h[:, 0],
                                  jnp.clip(next_h[:, 0], 0.1, ROOM_W - 0.1))
         clamped_y    = jnp.where(is_dummy_sub, next_h[:, 1],
                                  jnp.clip(next_h[:, 1], 0.1, ROOM_H - 0.1))
+                                 
         # Preserve robot row unchanged; only humans are clamped
         clamped_ext  = next_ext.at[:-1, 0].set(clamped_x).at[:-1, 1].set(clamped_y)
         return clamped_ext, None
 
     final_ext, _ = jax.lax.scan(
-        _hsfm_substep, ext_state_init, None, length=N_SUBSTEPS
+        _hsfm_substep, ext_state_init, jnp.arange(N_SUBSTEPS)
     )
     new_h_state = final_ext[:-1]   # (N, 6) — drop robot row
  

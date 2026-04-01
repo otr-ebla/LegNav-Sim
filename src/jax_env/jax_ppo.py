@@ -32,7 +32,7 @@ import numpy as np
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-from jax_network import EndToEndActorCritic
+from jax_network import EndToEndActorCritic, squash_corrected_log_prob
 #from jax_network import DecoupledActorCritic
 from jax_train import collect_rollouts, init_env_state, rebuild_vmap_step, NUM_ENVS, ROLLOUT_STEPS, OBS_SIZE
 
@@ -324,29 +324,14 @@ def compute_gae(rewards, values, dones, last_val):
 
 
 @jax.jit
-def ppo_loss_fn(params, obs, actions, advantages, returns, old_log_probs, mean_max_v):
-    """
-    FIX 1: log_prob is now computed with the same squash correction applied
-    during rollout collection. Without this, the importance ratio
-    exp(log_prob - old_log_prob) is mathematically invalid because old_log_prob
-    was collected with the Jacobian correction but the recomputed log_prob here
-    was not — causing the ratio to diverge and the PPO clip to be ineffective.
-    mean_max_v is the mean of the per-env max_v from the minibatch (scalar),
-    used as a fixed-point for the Jacobian approximation.
-    """
+def ppo_loss_fn(params, obs, actions, advantages, returns, old_log_probs, max_v_batch):    
     mean, logstd, values = network.apply({"params": params}, obs)
-    std = jnp.exp(logstd)
 
-    # Squash-corrected log_prob — must match batched_sample_action in jax_train.py
-    z             = (actions - mean) / (std + 1e-8)
-    base_log_prob = jnp.sum(-0.5 * (z ** 2 + jnp.log(2.0 * jnp.pi)) - logstd, axis=-1)
-    v_squash = jax.nn.sigmoid(actions[:, 0])
-    w_squash = jnp.tanh(actions[:, 1])
-    log_dv   = jnp.log(v_squash * (1.0 - v_squash) * mean_max_v + 1e-6)
-    log_dw   = jnp.log(1.0 - w_squash ** 2 + 1e-6)
-    log_prob = base_log_prob - (log_dv + log_dw)
+    # Unified math logic. Exact per-environment jacobian correction.
+    log_prob = squash_corrected_log_prob(actions, mean, logstd, max_v_batch)
 
     ratio       = jnp.exp(jnp.clip(log_prob - old_log_probs, -5.0, 5.0))
+
     policy_loss = -jnp.mean(jnp.minimum(
         ratio * advantages,
         jnp.clip(ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS) * advantages,
@@ -362,13 +347,13 @@ def ppo_loss_fn(params, obs, actions, advantages, returns, old_log_probs, mean_m
 
 @jax.jit
 def ppo_update_epoch(carry, perm):
-    params, opt_state, obs, actions, adv, ret, old_lp, mean_max_v = carry
+    params, opt_state, obs, actions, adv, ret, old_lp, max_v_flat = carry
 
     def _mb_step(mb_carry, mb_idx):
         p, os_ = mb_carry
         idx = jax.lax.dynamic_slice(perm, (mb_idx * MINI_BATCH_SIZE,), (MINI_BATCH_SIZE,))
         (loss, aux), grads = jax.value_and_grad(ppo_loss_fn, has_aux=True)(
-            p, obs[idx], actions[idx], adv[idx], ret[idx], old_lp[idx], mean_max_v
+            p, obs[idx], actions[idx], adv[idx], ret[idx], old_lp[idx], max_v_flat[idx]
         )
         updates, new_os = optimizer.update(grads, os_, p)
         return (optax.apply_updates(p, updates), new_os), (loss, aux)
@@ -376,27 +361,20 @@ def ppo_update_epoch(carry, perm):
     (new_p, new_os), (losses, auxes) = jax.lax.scan(
         _mb_step, (params, opt_state), jnp.arange(N_MINIBATCHES)
     )
-    return (new_p, new_os, obs, actions, adv, ret, old_lp, mean_max_v), (losses, auxes)
+    return (new_p, new_os, obs, actions, adv, ret, old_lp, max_v_flat), (losses, auxes)
 
 
 @jax.jit
 def run_ppo_updates(train_state, obs_flat, actions_flat, adv_flat, ret_flat,
                     old_lp_flat, max_v_flat, rng_key):
-    """
-    FIX 1: max_v_flat (shape: BATCH_SIZE,) is the per-sample max_v from rollout.
-    mean_max_v (scalar) is used as a fixed-point for the Jacobian approximation
-    in ppo_loss_fn — this avoids per-sample branching inside jax.lax.scan while
-    remaining a good approximation since max_v variance is low within a batch.
-    """
     params, opt_state = train_state
-    mean_max_v = jnp.mean(max_v_flat)
 
     adv_flat = (adv_flat - adv_flat.mean()) / (adv_flat.std() + 1e-8)
 
     perms = jax.vmap(lambda k: jax.random.permutation(k, BATCH_SIZE))(
         jax.random.split(rng_key, PPO_EPOCHS)
     )
-    carry = (params, opt_state, obs_flat, actions_flat, adv_flat, ret_flat, old_lp_flat, mean_max_v)
+    carry = (params, opt_state, obs_flat, actions_flat, adv_flat, ret_flat, old_lp_flat, max_v_flat)
     carry, (all_losses, all_auxes) = jax.lax.scan(ppo_update_epoch, carry, perms)
     last_aux = jax.tree_util.tree_map(lambda x: x[-1, -1], all_auxes)
     return (carry[0], carry[1]), all_losses.mean(), last_aux

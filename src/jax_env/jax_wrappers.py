@@ -43,16 +43,11 @@ class StackedEnvState:
 
 
 def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3,
-                     num_rays: int = NUM_RAYS, ghost_robot: bool = True,
-                     ghost_prob: float = 1.0):
-    
-    # Resolve ghost_robot once at construction time — never a traced value.
-    if ghost_prob < 1.0:
-        ghost_robot = (_random.random() < ghost_prob)
+                     num_rays: int = NUM_RAYS, ghost_prob: float = 1.0):
 
     def reset_stacked(key, max_goal_dist: float = 3.0, **kwargs):
         # Passes any extra dynamic args (like scenario_idx) gracefully down to the environment
-        base_obs, base_state = base_reset_fn(key, max_goal_dist, **kwargs)
+        base_obs, base_state = base_reset_fn(key, max_goal_dist, ghost_prob=ghost_prob, **kwargs)
         pose      = base_obs[0:POSE_SIZE]
         state_vec = base_obs[POSE_SIZE : POSE_SIZE + STATE_VEC_SIZE]
         lidar     = base_obs[POSE_SIZE + STATE_VEC_SIZE:]
@@ -71,9 +66,8 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3,
         return flat_obs, stacked_state
 
     def step_stacked(key, state: StackedEnvState, action):
-        # ghost_robot is captured from the enclosing scope as a Python bool
         base_obs, new_base_state, reward, done, info = base_step_fn(
-            key, state.env_state, action, ghost_robot=ghost_robot
+            key, state.env_state, action
         )
 
         new_pose      = base_obs[0:POSE_SIZE]
