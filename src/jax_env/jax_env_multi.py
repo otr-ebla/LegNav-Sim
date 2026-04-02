@@ -47,6 +47,8 @@ _R_TIMEOUT     =  -9.0
 
 _PROGRESS_COEF =  2.0
 
+# ---- Reward shaping constants for social navigation ----
+
 # Step penalty — small constant cost per timestep, encourages efficiency.
 # Step penalty — small constant cost per timestep, encourages efficiency.
 _STEP_PEN      =  -0.025   # Drastically increased. Standing still is no longer a safe haven.
@@ -57,6 +59,14 @@ _ROT_WEIGHT    =   0.1    # Reduced to allow necessary initial exploration
 
 _COMFORT_DIST  = 1.2   # m — personal space boundary
 _COMFORT_COEF  = 0.015 # base penalty at d=0 (before speed scaling) — /10 from 0.15
+
+_YIELD_DIST    = 2.0   # m — distance to start yielding
+_YIELD_COEF    = 0.4   # max penalty when target_v is full and human is at 0 distance — /10 from 4.0
+_FREE_SPEED_COEF = 0.08 # bonus for moving at max speed when no humans are around — /10 from 0.8
+
+
+# -------------------
+
 
 N_SUBSTEPS = int(DT / HSFM_DT)
 NUM_PEOPLE = 12
@@ -460,7 +470,14 @@ def step_env(key, state, action, ghost_robot: bool = True):
     comfort_violations = jnp.maximum(0.0, 1.0 - dists_p_active / _COMFORT_DIST)
     comfort_pen = -_COMFORT_COEF * jnp.sum(comfort_violations)
 
-    # — 6b. NEW: Yield Penalty Dynamical Brake Gradient
+
+    # — --- 6b. NEW: Yield Penalty Dynamical Brake Gradient
+
+    yield_weight = jnp.maximum(0.0, 1.0 - dists_p_active/_YIELD_DIST) # consider only humans within the yield distance
+    yield_weight = yield_weight * in_fwd_fov.astype(jnp.float32)  # only consider humans in front
+    yield_pressure = jnp.max(yield_weight) # focus on the most critical human for yielding
+    yield_pen = -_YIELD_COEF * target_v * yield_pressure  # stronger penalty for moving fast when close to a human in front
+    free_speed_bonus = _FREE_SPEED_COEF * target_v * (1.0 - yield_pressure) # reward for moving when no humans are close in front
 
     
     # — 6c. Dense shaping ─────────────────────────────────────────────────
@@ -476,7 +493,7 @@ def step_env(key, state, action, ghost_robot: bool = True):
     spin_in_place_pen = jnp.where(target_v < 0.1, -0.5 * (target_w ** 2), 0.0)
     
     # Minimal baseline + smoothness
-    dense_reward     = social_progress + step_pen + smooth_pen + rot_pen + spin_in_place_pen + comfort_pen
+    dense_reward     = social_progress + step_pen + smooth_pen + rot_pen + spin_in_place_pen + comfort_pen + yield_pen + free_speed_bonus
     
 
     # — 6d. Terminal cascades ─────────────────────────────────────────────
@@ -520,5 +537,6 @@ def step_env(key, state, action, ghost_robot: bool = True):
         "rew_smooth":    smooth_pen,
         "rew_rot":       rot_pen,
         "rew_comf":      comfort_pen,
+        "rew_yield":     yield_pen + free_speed_bonus,
     }
     return obs, new_state, reward, done, info
