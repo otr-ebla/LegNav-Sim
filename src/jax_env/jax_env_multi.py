@@ -39,7 +39,7 @@ HSFM_DT    = 0.01
 _R_GOAL        =  20.0
 _R_OBS_COL     =  -7.0
 _R_WALL_COL    =  -7.0
-_R_ACTIVE_COL  =  -9.0
+_R_ACTIVE_COL  =  -50.0
 
 _R_PASSIVE_COL =  -3.5
 _R_TIMEOUT     =  -9.0
@@ -61,8 +61,8 @@ _COMFORT_DIST  = 1.2   # m — personal space boundary
 _COMFORT_COEF  = 0.015 # base penalty at d=0 (before speed scaling) — /10 from 0.15
 
 _YIELD_DIST    = 2.0   # m — distance to start yielding
-_YIELD_COEF    = 0.4   # max penalty when target_v is full and human is at 0 distance — /10 from 4.0
-_FREE_SPEED_COEF = 0.08 # bonus for moving at max speed when no humans are around — /10 from 0.8
+_YIELD_COEF    = 0.7   # max penalty when target_v is full and human is at 0 distance — /10 from 4.0
+_FREE_SPEED_COEF = 0.12 # bonus for moving at max speed when no humans are around — /10 from 0.8
 
 
 # -------------------
@@ -466,9 +466,9 @@ def step_env(key, state, action, ghost_robot: bool = True):
 
     # ── 6. Reward ───────────────────────────────────────────────────────────────
 
-    # — 6a. Comfort penalty (spazio personale spaziale)
-    comfort_violations = jnp.maximum(0.0, 1.0 - dists_p_active / _COMFORT_DIST)
-    comfort_pen = -_COMFORT_COEF * jnp.sum(comfort_violations)
+    # # — 6a. Comfort penalty (spazio personale spaziale)
+    # comfort_violations = jnp.maximum(0.0, 1.0 - dists_p_active / _COMFORT_DIST)
+    # comfort_pen = -_COMFORT_COEF * jnp.sum(comfort_violations)
 
 
     # — --- 6b. NEW: Yield Penalty Dynamical Brake Gradient
@@ -493,7 +493,7 @@ def step_env(key, state, action, ghost_robot: bool = True):
     spin_in_place_pen = jnp.where(target_v < 0.1, -0.5 * (target_w ** 2), 0.0)
     
     # Minimal baseline + smoothness
-    dense_reward     = social_progress + step_pen + smooth_pen + rot_pen + spin_in_place_pen + comfort_pen + yield_pen + free_speed_bonus
+    dense_reward     = social_progress + step_pen + smooth_pen + rot_pen + spin_in_place_pen + yield_pen + free_speed_bonus #+ comfort_pen 
     
 
     # — 6d. Terminal cascades ─────────────────────────────────────────────

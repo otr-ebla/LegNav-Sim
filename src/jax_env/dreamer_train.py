@@ -134,11 +134,18 @@ def scan_rssm(wm_params: dict, obs_seq: jnp.ndarray,
 # ---------------------------------------------------------------------------
 
 # V3: Adaptive Gradient Clipping (AGC) and LaProp
+# V3: Adaptive Gradient Clipping (AGC) and LaProp
 def make_optimizer(lr):
+    b1 = 0.9
+    b2 = 0.99
     return optax.chain(
         optax.zero_nans(),
         optax.adaptive_grad_clip(0.3),
-        optax.laprop(lr, b1=0.9, b2=0.99, eps=1e-20)
+        # LaProp: scale by RMS first, then apply momentum (trace) to normalized gradients
+        optax.scale_by_rms(decay=b2, eps=1e-20),
+        optax.trace(decay=b1, nesterov=False),
+        # Optax's trace accumulates as a sum, so we multiply by (1 - b1) to form an EMA
+        optax.scale(-lr * (1.0 - b1))
     )
 
 opt_wm     = make_optimizer(LR_WM)
@@ -173,7 +180,7 @@ def train_step(rng_key, buffer_state, params, opt_states, step_count, ema_s, slo
 
     (wm_loss, (wm_aux, h_states, z_states)), wm_grads = jax.value_and_grad(
         wm_loss_fn, has_aux=True)(params['wm'])
-    wm_updates, new_wm_opt = opt_wm.update(wm_grads, opt_states['wm'])
+    wm_updates, new_wm_opt = opt_wm.update(wm_grads, opt_states['wm'], params['wm'])
     new_wm_params = optax.apply_updates(params['wm'], wm_updates)
 
     # FIX 1: warmup mask — 0.0 during warmup, 1.0 after.
@@ -234,7 +241,7 @@ def train_step(rng_key, buffer_state, params, opt_states, step_count, ema_s, slo
 
     # FIX 1: zero actor grads during WM warmup
     act_grads = jax.tree_util.tree_map(lambda g: g * wm_warm_mask, act_grads)
-    act_updates, new_act_opt = opt_actor.update(act_grads, opt_states['actor'])
+    act_updates, new_act_opt = opt_actor.update(act_grads, opt_states['actor'], params['actor'])
     new_act_params = optax.apply_updates(params['actor'], act_updates)
 
     def critic_loss_fn(critic_params):
@@ -263,7 +270,7 @@ def train_step(rng_key, buffer_state, params, opt_states, step_count, ema_s, slo
 
     # FIX 1: zero critic grads during WM warmup
     crit_grads = jax.tree_util.tree_map(lambda g: g * wm_warm_mask, crit_grads)
-    crit_updates, new_crit_opt = opt_critic.update(crit_grads, opt_states['critic'])
+    crit_updates, new_crit_opt = opt_critic.update(crit_grads, opt_states['critic'], params['critic'])
     new_crit_params = optax.apply_updates(params['critic'], crit_updates)
     
     # Update slow critic parameters with 0.98 EMA decay
@@ -477,19 +484,21 @@ if __name__ == "__main__":
             print(f"Step {step:05d} | Buffer not ready, skipping.")
             continue
 
+        # Execute chunked training loop
         final_carry, metrics_history = train_loop_chunk(
-                rng, buffer_state, params, opt_states,
-                env_obs, env_state, current_h, current_z, current_action,
-                cur_return, ema_return, ema_success,
-                step_count, ema_s, slow_critic_params,
-                chunk_size=CHUNK_SIZE,
-            )
+            rng, buffer_state, params, opt_states,
+            env_obs, env_state, current_h, current_z, current_action,
+            cur_return, ema_return, ema_success,
+            step_count, ema_s, slow_critic_params,
+            chunk_size=CHUNK_SIZE,
+        )
 
-            (buffer_state, params, opt_states,
-             current_h, current_z, current_action,
-             env_obs, env_state, rng,
-             cur_return, ema_return, ema_success,
-             step_count, ema_s, slow_critic_params) = final_carry
+        # Unpack updated state
+        (buffer_state, params, opt_states,
+         current_h, current_z, current_action,
+         env_obs, env_state, rng,
+         cur_return, ema_return, ema_success,
+         step_count, ema_s, slow_critic_params) = final_carry
 
         if step % 100 == 0:
             avg_wm     = float(jnp.mean(metrics_history['wm_loss']))
