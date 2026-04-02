@@ -106,7 +106,8 @@ def compute_kl_loss(
     kl_prior_loss     = jnp.mean(jnp.maximum(kl_prior,     free_nats))
     kl_posterior_loss = jnp.mean(jnp.maximum(kl_posterior, free_nats))
 
-    loss   = 0.8 * kl_prior_loss + 0.2 * kl_posterior_loss
+    # V3 Dynamics and Representation loss weights: beta_dyn=1.0, beta_rep=0.1
+    loss   = 1.0 * kl_prior_loss + 0.1 * kl_posterior_loss
     raw_kl = jnp.mean(jnp.sum(posterior_probs * (posterior_log_probs - prior_log_probs), axis=-1))
     return loss, raw_kl
 

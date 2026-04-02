@@ -277,9 +277,10 @@ class DreamerEncoder(nn.Module):
         cnn = nn.swish(nn.Conv(features=32, kernel_size=(7,), strides=(2,), padding='SAME')(lidar_cnn))
         cnn = nn.swish(nn.Conv(features=64, kernel_size=(5,), strides=(2,), padding='SAME')(cnn))
         cnn = nn.swish(nn.Conv(features=64, kernel_size=(3,), strides=(2,), padding='SAME')(cnn))
-        cnn_feat = nn.LayerNorm()(cnn.reshape((*batch_shape, -1)))
+        cnn_feat = nn.RMSNorm()(cnn.reshape((*batch_shape, -1)))
 
-        global_in   = jnp.concatenate([pose_stack, state_vec], axis=-1)
+        # V3: Vector inputs must be symlog transformed
+        global_in   = symlog(jnp.concatenate([pose_stack, state_vec], axis=-1))
         global_feat = nn.swish(nn.Dense(128)(global_in))
 
         fused = jnp.concatenate([cnn_feat, global_feat], axis=-1)

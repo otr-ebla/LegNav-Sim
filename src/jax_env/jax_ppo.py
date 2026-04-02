@@ -429,8 +429,8 @@ if __name__ == "__main__":
     best_suc = 55.0  # NEVER TOUCH THIS LINE
 
     hdr = (f"{'Upd':>5} | {'EpRet':>7} | {'Suc%':>5} {'Obs%':>5} {'Acol%':>5} {'Pcol%':>5} {'Tmo%':>5} |"
-           f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} {'KL':>6} {'ClpF':>5} | {'FPS':>7} {'#Ep':>6} {'LR':>6}  | "
-           f"{'Stage':>5} {'MaxDist':>7} {'Ghost':>6} {'Time':>6}")
+           f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} {'KL':>6} {'ClpF':>5} | {'FPS':>7} {'#Ep':>6} {'LR':>8} | "
+           f"{'Stage':>5} {'MaxDist':>7} {'Ghost':>6} {'Ent':>7} {'Scen%':>5} {'Time':>8}")
     print(hdr)
     print("─" * len(hdr))
 
@@ -541,8 +541,8 @@ if __name__ == "__main__":
                 f"{float(v_loss):>6.2f} {float(entropy):>6.2f} "
                 f"{float(kl_div):>6.4f} {float(clip_frac):>4.2f} | "
                 f"{fps:>7,.0f} {n_ep:>6d} {lr_now:.2e} | "
-                f"{cur_stage:>5d} {cur_max_dist:>5.1f}m {cur_ghost:>5.1f}g "
-                f"{ent_coef_now:.4f}e {scen_prob:.0%}s {elapsedtime:>5.1f}min"
+                f"{cur_stage:>5d} {cur_max_dist:>6.1f}m {cur_ghost:>5.1f}g "
+                f"{ent_coef_now:>6.4f}e {scen_prob:>4.0%}s {elapsedtime:>5.1f}min"
             )
 
         if suc_pct > best_suc and n_ep > 0:
