@@ -562,10 +562,13 @@ def main():
     MAX_EVAL_GOAL_DIST = 9.0   # corrisponde all'ultimo stage del curriculum
 
     def build_fast_reset(scen_idx, max_goal_dist=MAX_EVAL_GOAL_DIST):
-        bound_reset = functools.partial(reset_env, scenario_idx=scen_idx,
-                                        max_goal_dist=max_goal_dist)
+        # Lambda invece di functools.partial: make_stacked_env passa max_goal_dist
+        # come argomento posizionale, quindi non deve essere già nel partial.
+        bound_reset = lambda key, mgd, **kw: reset_env(key, mgd, scenario_idx=scen_idx, **kw)
         rs, ss = make_stacked_env(bound_reset, step_env, stack_dim=3, ghost_prob=0.0)
-        return jax.jit(rs), jax.jit(ss)
+        jit_rs = jax.jit(lambda key: rs(key, max_goal_dist))
+        jit_ss = jax.jit(ss)
+        return jit_rs, jit_ss
 
     rng = jax.random.PRNGKey(42)
     evaluation_mode  = "random"
