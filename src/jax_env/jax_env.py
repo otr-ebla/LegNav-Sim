@@ -3,8 +3,8 @@ jax_env.py — Core 2D Navigation Environment
 ============================================
 Previous fixes: A (LiDAR anchor), B (passive_col), C (resample cap),
                 D (no nested JIT), E (person spawn clearance).
-Obs layout (single frame): pose(3) + state_vec(9) + lidar(NUM_RAYS) = 120
-Stacked × 3: 9 + 9 + 324 = 342  (UNCHANGED)
+Obs layout (single frame): pose(3) + state_vec(9) + lidar(NUM_RAYS) = 228
+Stacked × 3: 9 + 9 + 648 = 666
 """
 
 import math
@@ -42,7 +42,7 @@ ROOM_H         = 12.0
 ROBOT_RADIUS   = RobotConfig.RADIUS
 PEOPLE_RADIUS  = SimConfig.HUMANS_RADIUS
 MAX_LIDAR_DIST = 12.0
-FOV            = math.pi         # 180° forward-facing LiDAR
+FOV            = 2.0 * math.pi   # 360° full-circle LiDAR
 GOAL_RADIUS    = 0.3
 COMFORT_DIST   = 1.0
 COMFORT_COEF   = 0.03
@@ -54,7 +54,7 @@ DEFAULT_MIN_GOAL_DIST = 3.0
 
 STATE_VEC_SIZE  = 9   # v, w, max_v_norm, goal_dist, goal_align, rear_prox×4
 _MAX_GOAL_DIST  = math.sqrt(ROOM_W**2 + ROOM_H**2)
-SINGLE_OBS_SIZE = 3 + STATE_VEC_SIZE + NUM_RAYS   # 120
+SINGLE_OBS_SIZE = 3 + STATE_VEC_SIZE + NUM_RAYS   # 228
 
 # ── Human idle / stop-and-go behaviour ─────────────────────────────────────────────
 # Each step an active human has P_HUMAN_STOP probability of starting a stop.
@@ -125,14 +125,14 @@ def get_obs(state: EnvState, key: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray
       USE_LEGS=False → N_people + N_obs_circles     (cylinder model)
     compute_lidar handles variable circle counts via vmap, so this is fine.
 
-    OBS_SIZE = 342 is UNCHANGED — the output vector layout is identical.
+    OBS_SIZE = 666 — the output vector layout is identical.
     """
     # ── Build human geometry for LiDAR ───────────────────────────────────────
     # USE_LEGS is a Python bool → resolved at trace time, no conditional overhead
     human_circles = get_leg_circles(state.people, state.foot_state, use_legs=USE_LEGS)
     all_circles = jnp.concatenate([human_circles, state.obs_circles], axis=0)
 
-    # Front LiDAR sweep — 108 rays, FOV=π
+    # Full 360° LiDAR sweep — 216 rays, FOV=2π
     # NOTE: shoes are NOT included here — LiDAR only sees leg circles, not shoes.
     raw_lidar = compute_lidar(
         state.x, state.y, state.theta,
@@ -202,7 +202,7 @@ def get_obs(state: EnvState, key: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray
     ])
     state_vec = jnp.concatenate([state_vec_scalars, rear_prox_vec])  # (9,)
 
-    return jnp.concatenate([pose_vec, state_vec, inv_lidar]), sp_mask  # 3+9+108 = 120
+    return jnp.concatenate([pose_vec, state_vec, inv_lidar]), sp_mask  # 3+9+216 = 228
 
 
 # ── Reset ─────────────────────────────────────────────────────────────────────

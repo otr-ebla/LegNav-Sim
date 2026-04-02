@@ -93,7 +93,7 @@ class FrameStackAttention(nn.Module):
 class EndToEndActorCritic(nn.Module):
     action_dim: int
     stack_dim:  int = 3
-    num_rays:   int = 108
+    num_rays:   int = 216
 
     @nn.compact
     def __call__(

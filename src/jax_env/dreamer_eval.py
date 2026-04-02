@@ -50,7 +50,7 @@ def build_dreamer_policy():
             raw = f.read()
         # Inizializza dummy params per capire la struttura
         rng = jax.random.PRNGKey(0)
-        dummy_obs = jnp.zeros((1, 342))
+        dummy_obs = jnp.zeros((1, 666))
         dummy_h = jnp.zeros((1, DETERMINISTIC_SIZE))
         dummy_z = jnp.zeros((1, LATENT_SIZE))
         dummy_act = jnp.zeros((1, 2))

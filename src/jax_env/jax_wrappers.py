@@ -22,8 +22,8 @@ FIXES vs previous version:
     jax_ppo.py with the new ghost_prob, same as rebuilding for max_goal_dist.
     make_autoreset_env is ghost_agnostic (behaviour is locked in step_fn).
 
-Obs layout: [pose_stack(3*stack_dim=9) | state_vec(9) | lidar_stack(num_rays*stack_dim=324)]
-Total: 9 + 9 + 324 = 342
+Obs layout: [pose_stack(3*stack_dim=9) | state_vec(9) | lidar_stack(num_rays*stack_dim=648)]
+Total: 9 + 9 + 648 = 666
 """
 
 import jax

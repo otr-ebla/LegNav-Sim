@@ -70,7 +70,7 @@ class PatrolNodeJAX(Node):
         self.get_logger().info(f"🧠 Loading JAX PPO model from: {MODEL_PATH}")
         
         # Initialize network architecture
-        # OBS_SIZE is 342: (3 * 3) + 9 + (108 * 3)
+        # OBS_SIZE is 666: (3 * 3) + 9 + (216 * 3)
         self.obs_size = (POSE_SIZE * STACK_DIM) + STATE_VEC_SIZE + (NUM_RAYS * STACK_DIM)
         self.network = EndToEndActorCritic(action_dim=2, stack_dim=STACK_DIM, num_rays=NUM_RAYS)
         
@@ -125,7 +125,7 @@ class PatrolNodeJAX(Node):
 
     def scan_callback(self, msg):
         """
-        Interpolates the real LiDAR scan down to the 108 rays expected by the network,
+        Interpolates the real LiDAR scan down to the 216 rays expected by the network,
         covering the specific FOV used during training.
         """
         raw_ranges = np.array(msg.ranges)
@@ -139,7 +139,7 @@ class PatrolNodeJAX(Node):
         cleaned[cleaned < 0.05] = MAX_LIDAR_DIST 
         cleaned = np.clip(cleaned, 0.0, MAX_LIDAR_DIST)
 
-        # 2. Resample to 108 rays over the trained FOV
+        # 2. Resample to 216 rays over the trained FOV
         resampled = np.interp(target_angles, real_angles, cleaned, left=MAX_LIDAR_DIST, right=MAX_LIDAR_DIST)
 
         # 3. Normalize matching jax_eval_multi.py logic
@@ -173,7 +173,7 @@ class PatrolNodeJAX(Node):
             time_step=0,
             foot_state=jnp.zeros((12, 10)),
             time_stopped=0,
-            sp_mask=jnp.zeros(108, dtype=jnp.bool_)
+            sp_mask=jnp.zeros(NUM_RAYS, dtype=jnp.bool_)
         )
 
         self.rng, obs_key = jax.random.split(self.rng)
@@ -210,7 +210,7 @@ class PatrolNodeJAX(Node):
             lidar_stack_flat
         ]).astype(np.float32)
         
-        return jnp.array(obs_flat[None, :]) # Shape (1, 342)
+        return jnp.array(obs_flat[None, :]) # Shape (1, 666)
 
     def control_loop(self):
         # Wait for sensors

@@ -36,7 +36,7 @@ from jax_env_multi import reset_env, step_env
 from jax_wrappers import make_stacked_env, make_autoreset_env
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-OBS_SIZE       = 342        # 9 (pose) + 9 (state_vec) + 324 (lidar)
+OBS_SIZE       = 666        # 9 (pose) + 9 (state_vec) + 648 (lidar)
 ACTION_DIM     = 2
 N_ENVS         = 256        # FIX 1: reduced from 2048; large N_ENVS drowns the buffer
                              #        faster than G updates can replay — overwrite before reuse.
@@ -133,7 +133,7 @@ _orth_out  = nn.initializers.orthogonal(scale=0.01)             # output heads (
 
 class LidarCNN(nn.Module):
     stack_dim: int = 3
-    num_rays:  int = 108
+    num_rays:  int = 216
 
     @nn.compact
     def __call__(self, x):
@@ -267,7 +267,7 @@ def extract_max_v(obs):
 
 # ── Replay buffer (on-GPU circular) ───────────────────────────────────────────
 # VRAM budget: obs/next_obs stored as float16 to halve memory.
-#   2M * 342 * 2B * 2 arrays = 2.74 GB (vs 5.47 GB with float32).
+#   2M * 666 * 2B * 2 arrays = 5.33 GB (vs 10.66 GB with float32).
 # buf_sample casts back to float32 before returning — encoder sees full precision.
 # Field 'terminal' = done & ~timeout — only true environmental endings stored.
 def make_buffer(capacity):

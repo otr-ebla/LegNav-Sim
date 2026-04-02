@@ -41,7 +41,7 @@ from jax_env_multi import reset_env, step_env
 from jax_wrappers import make_stacked_env
 from jax_legs import LEG_RADIUS, HIP_WIDTH, SHOE_LENGTH, SHOE_WIDTH
 
-OBS_SIZE = 342
+OBS_SIZE = 666
 ACTION_DIM = 2
 
 # Must match SACjax.py exactly
@@ -53,7 +53,7 @@ _orth_out  = nn.initializers.orthogonal(scale=0.01)
 # ── SAC Split Architecture (mirrors SACjax.py) ────────────────────────────────
 class LidarCNN(nn.Module):
     stack_dim: int = 3
-    num_rays:  int = 108
+    num_rays:  int = 216
 
     @nn.compact
     def __call__(self, x):

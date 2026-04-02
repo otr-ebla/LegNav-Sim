@@ -68,7 +68,7 @@ from jax_env_multi import reset_env, step_env
 from jax_legs import LEG_RADIUS, SHOE_LENGTH, SHOE_WIDTH
 from jax_wrappers import make_stacked_env
 
-OBS_SIZE   = 342
+OBS_SIZE   = 666
 ACTION_DIM = 2
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -84,7 +84,7 @@ ACTION_DIM = 2
 class _OldPPOActor(nn.Module):
     action_dim: int
     stack_dim:  int = 3
-    num_rays:   int = 108
+    num_rays:   int = 216
 
     @nn.compact
     def __call__(self, x):
@@ -163,7 +163,7 @@ def _build_ppo_shac():
 
 class _SACEncoder(nn.Module):
     stack_dim: int = 3
-    num_rays:  int = 108
+    num_rays:  int = 216
 
     @nn.compact
     def __call__(self, x):
@@ -230,7 +230,7 @@ class _TQCActor(nn.Module):
         state_vec  = x[..., pose_size : pose_size + 9]
         lidar_flat = x[..., pose_size + 9:]
         bs = lidar_flat.shape[:-1]
-        cnn = lidar_flat.reshape((*bs, 108, 3))
+        cnn = lidar_flat.reshape((*bs, 216, 3))
         cnn = nn.relu(nn.Conv(32, (7,), strides=(2,), padding="SAME")(cnn))
         cnn = nn.relu(nn.Conv(64, (5,), strides=(2,), padding="SAME")(cnn))
         cnn = nn.relu(nn.Conv(64, (3,), strides=(2,), padding="SAME")(cnn))

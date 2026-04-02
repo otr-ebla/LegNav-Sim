@@ -45,7 +45,7 @@ import flax.linen as nn
 from TQCjac import TQCActorNetwork as _TQCActorNetwork
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-OBS_SIZE   = 342
+OBS_SIZE   = 666
 ACTION_DIM = 2
 N_ENVS     = 4096   # parallelism per (scenario, speed) cell — fits in VRAM
 

@@ -14,7 +14,7 @@ if project_root not in sys.path:
 
 from jax_env import (EnvState, get_obs,
                      ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS, DT,
-                     MAX_STEPS, GOAL_RADIUS,
+                     MAX_STEPS, GOAL_RADIUS, NUM_RAYS,
                      USE_LEGS,
                      P_HUMAN_STOP, STOP_MIN_STEPS, STOP_MAX_STEPS)
 from jax_scenarios import generate_scenario
@@ -111,7 +111,7 @@ def reset_env(key: jax.Array, max_goal_dist: float = 3.0, scenario_idx: int = -1
         time_step=0,
         foot_state=foot_state,
         time_stopped=0,
-        sp_mask=jnp.zeros(108, dtype=jnp.bool_),
+        sp_mask=jnp.zeros(NUM_RAYS, dtype=jnp.bool_),
         human_stop_timers=jnp.zeros(NUM_PEOPLE, dtype=jnp.int32),
         escape_timer=0,
         is_ghost=is_ghost,

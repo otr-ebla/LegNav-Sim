@@ -260,7 +260,7 @@ class RSSM(nn.Module):
 
 class DreamerEncoder(nn.Module):
     stack_dim: int = 3
-    num_rays:  int = 108
+    num_rays:  int = 216
 
     @nn.compact
     def __call__(self, obs: jnp.ndarray) -> jnp.ndarray:

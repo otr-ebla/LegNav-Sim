@@ -54,7 +54,7 @@ ENTROPY_COEF = 3e-4
 # Watch WM loss: once it stabilises below ~0.4 you can lower this.
 WM_WARMUP_STEPS = 20_000
 
-OBS_DIM    = 342
+OBS_DIM    = 666
 ACTION_DIM = 2
 H_DIM      = DETERMINISTIC_SIZE   # 512
 Z_DIM      = LATENT_SIZE          # 1024

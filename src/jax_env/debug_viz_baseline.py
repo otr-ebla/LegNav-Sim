@@ -302,7 +302,7 @@ def load_policy(path):
     from jax_network import EndToEndActorCritic
     import flax.serialization, optax
     net = EndToEndActorCritic(action_dim=2)
-    dummy = jnp.zeros((1, 342))
+    dummy = jnp.zeros((1, 666))
     p = net.init(jax.random.PRNGKey(0), dummy)["params"]
     try:
         o = optax.adam(1e-4).init(p)

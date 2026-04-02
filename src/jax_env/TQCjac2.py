@@ -43,7 +43,7 @@ from jax_env_multi import reset_env, step_env
 from jax_wrappers import make_stacked_env, make_autoreset_env
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
-OBS_SIZE       = 342
+OBS_SIZE       = 666
 ACTION_DIM     = 2
 N_ENVS         = 2048
 BUFFER_CAP     = 500_000
@@ -120,7 +120,7 @@ def init_env_state(rng_key, min_goal_dist: float = 3.0):
 # ── Shared obs encoder ────────────────────────────────────────────────────────
 class ObsEncoder(nn.Module):
     stack_dim: int = 3
-    num_rays:  int = 108
+    num_rays:  int = 216
     dtype: jnp.dtype = NET_DTYPE
     
     @nn.compact
