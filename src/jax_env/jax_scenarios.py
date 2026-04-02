@@ -254,13 +254,9 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float, scenario_idx: int 
         k1, k2, k3, k4, k5, k6, k7 = jax.random.split(k, 7)
         gap_center_x = jax.random.uniform(k1, minval=2.5, maxval=ROOM_W-2.5)
         
-        rx_raw = jax.random.uniform(k7, minval=1.0, maxval=ROOM_W-1.0)
-        dist_to_gap = rx_raw - gap_center_x
-        in_zone = jnp.abs(dist_to_gap) < 1.5
-        
-        push_dir = jnp.where(dist_to_gap >= 0.0, 1.0, -1.0)
-        rx = jnp.where(in_zone, gap_center_x + push_dir * 1.5, rx_raw)
-        rx = jnp.clip(rx, 1.0, ROOM_W - 1.0)
+        # Robot spawns in front of the gap (small jitter so it's not always exactly centered)
+        rx_jitter = jax.random.uniform(k7, minval=-0.4, maxval=0.4)
+        rx = jnp.clip(gap_center_x + rx_jitter, 1.0, ROOM_W - 1.0)
         
         ry, rtheta = 1.5, jnp.pi / 2.0
         gx, gy = gap_center_x, ROOM_H - 1.5
