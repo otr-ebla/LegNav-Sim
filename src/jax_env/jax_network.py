@@ -90,6 +90,50 @@ class FrameStackAttention(nn.Module):
         return nn.LayerNorm()(x + proj)   # (..., S, D) — residual connection
 
 
+class SharedEncoder(nn.Module):
+    """
+    Shared observation encoder — identical trunk to EndToEndActorCritic.
+    Enables SAC and TQC to use the exact same feature extractor as PPO
+    for fair algorithm comparison.
+
+    Input:  (..., OBS_SIZE)
+    Output: (..., 128) feature vector
+    """
+    stack_dim: int = 3
+    num_rays:   int = 216
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        pose_size  = 3 * self.stack_dim
+        state_size = _STATE_VEC_SIZE
+
+        pose_stack = x[..., :pose_size]
+        state_vec  = x[..., pose_size : pose_size + state_size]
+        lidar_flat = x[..., pose_size + state_size:]
+
+        batch_shape  = lidar_flat.shape[:-1]
+        lidar_frames = lidar_flat.reshape((*batch_shape, self.stack_dim, self.num_rays))
+
+        FRAME_FEAT  = 64
+        cnn_encoder = LidarFrameCNN(frame_feat=FRAME_FEAT)
+        frame_feats = [cnn_encoder(lidar_frames[..., i, :]) for i in range(self.stack_dim)]
+        frame_seq   = jnp.stack(frame_feats, axis=-2)
+        frame_seq   = nn.LayerNorm()(frame_seq)
+
+        attn_out  = FrameStackAttention()(frame_seq)
+        attn_flat = attn_out.reshape((*batch_shape, self.stack_dim * FRAME_FEAT))  # (..., 192)
+
+        global_in = jnp.concatenate([pose_stack, state_vec], axis=-1)
+        fused     = jnp.concatenate([attn_flat, global_in], axis=-1)
+
+        shared = nn.relu(
+            nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(fused)
+        )
+        return nn.relu(
+            nn.Dense(128, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(shared)
+        )  # (..., 128)
+
+
 class EndToEndActorCritic(nn.Module):
     action_dim: int
     stack_dim:  int = 3

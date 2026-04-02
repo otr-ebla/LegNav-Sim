@@ -50,33 +50,7 @@ LIDAR_MAX_RANGE = 10.0   # metres
 _orth_relu = nn.initializers.orthogonal(scale=jnp.sqrt(2.0))
 _orth_out  = nn.initializers.orthogonal(scale=0.01)
 
-# ── SAC Split Architecture (mirrors SACjax.py) ────────────────────────────────
-class LidarCNN(nn.Module):
-    stack_dim: int = 3
-    num_rays:  int = 216
-
-    @nn.compact
-    def __call__(self, x):
-        pose_size  = 3 * self.stack_dim   # 9
-        state_size = 5
-
-        pose_stack = x[..., :pose_size]
-        state_vec  = x[..., pose_size : pose_size + state_size]
-        lidar_flat = x[..., pose_size + state_size:]
-
-        lidar_flat = lidar_flat / LIDAR_MAX_RANGE
-
-        batch_shape  = lidar_flat.shape[:-1]
-        lidar_cnn    = lidar_flat.reshape((*batch_shape, self.num_rays, self.stack_dim))
-        cnn = nn.relu(nn.Conv(features=32, kernel_size=(7,), strides=(2,), padding='SAME',
-                              kernel_init=_orth_relu)(lidar_cnn))
-        cnn = nn.relu(nn.Conv(features=64, kernel_size=(5,), strides=(2,), padding='SAME',
-                              kernel_init=_orth_relu)(cnn))
-        cnn = nn.relu(nn.Conv(features=64, kernel_size=(3,), strides=(2,), padding='SAME',
-                              kernel_init=_orth_relu)(cnn))
-        cnn_feat = nn.LayerNorm()(cnn.reshape((*batch_shape, -1)))
-        return cnn_feat, pose_stack, state_vec
-
+from jax_network import SharedEncoder
 
 class ActorHead(nn.Module):
     action_dim:  int   = ACTION_DIM
@@ -84,16 +58,9 @@ class ActorHead(nn.Module):
     LOG_STD_MAX: float =  2.0
 
     @nn.compact
-    def __call__(self, cnn_feat: jnp.ndarray, pose_stack: jnp.ndarray,
-                 state_vec: jnp.ndarray):
-        global_in   = jnp.concatenate([pose_stack, state_vec], axis=-1)
-        global_feat = nn.relu(nn.Dense(128, kernel_init=_orth_relu)(global_in))
-        global_feat = nn.relu(nn.Dense(64,  kernel_init=_orth_relu)(global_feat))
-        fused  = jnp.concatenate([cnn_feat, global_feat], axis=-1)
-        shared = nn.relu(nn.Dense(256, kernel_init=_orth_relu)(fused))
-        feat   = nn.relu(nn.Dense(128, kernel_init=_orth_relu)(shared))
-        mean    = nn.Dense(self.action_dim, kernel_init=_orth_out, name='mean')(feat)
-        log_std = nn.Dense(self.action_dim, kernel_init=_orth_out, name='log_std')(feat)
+    def __call__(self, feat: jnp.ndarray):
+        mean    = nn.Dense(self.action_dim)(feat)
+        log_std = nn.Dense(self.action_dim)(feat)
         log_std = jnp.clip(log_std, self.LOG_STD_MIN, self.LOG_STD_MAX)
         return mean, log_std
 
@@ -108,7 +75,7 @@ def scale_action_sac(mean: jnp.ndarray, max_v: float) -> jnp.ndarray:
 def load_sac_checkpoint(filepath):
     with open(filepath, "rb") as f: raw = f.read()
     bundle = flax.serialization.msgpack_restore(raw)
-    return bundle["lidar_cnn_params"], bundle["actor_head_params"]
+    return bundle["enc_params"], bundle["actor_head_params"]
 
 
 # ── Configuration & Colors ────────────────────────────────────────────────────
@@ -322,15 +289,15 @@ def main():
     print(f"🚀 SAC Multi-Scenario Evaluation")
     print(f"   Human model: {'LEG-PAIR' if use_legs else 'CYLINDER'}")
 
-    encoder_net = LidarCNN()
+    encoder_net = SharedEncoder()
     actor_head  = ActorHead()
     rng = jax.random.PRNGKey(0)
     
     # Initialize network with dummy params
     dummy_obs = jnp.zeros((1, OBS_SIZE), dtype=jnp.float32)
     enc_params  = encoder_net.init(jax.random.split(rng)[1], dummy_obs)["params"]
-    _cf, _ps, _sv = encoder_net.apply({"params": enc_params}, dummy_obs)
-    head_params = actor_head.init(jax.random.split(rng)[1], _cf, _ps, _sv)["params"]
+    feat = encoder_net.apply({"params": enc_params}, dummy_obs)
+    head_params = actor_head.init(jax.random.split(rng)[1], feat)["params"]
 
     # EXPLICITLY LOAD SAC CHECKPOINT
     ckpt = args.ckpt
@@ -401,8 +368,8 @@ def main():
         if paused: clock.tick(10); continue
 
         # Forward pass through split SAC architecture
-        cnn_feat, pose_stack, state_vec = encoder_net.apply({"params": enc_params}, obs[None])
-        mean, _ = actor_head.apply({"params": head_params}, cnn_feat, pose_stack, state_vec)
+        feat = encoder_net.apply({"params": enc_params}, obs[None])
+        mean, _ = actor_head.apply({"params": head_params}, feat)
         
         # Squash action using SAC's specific scaling logic
         env_action = scale_action_sac(jnp.squeeze(mean, axis=0), float(stacked_state.env_state.max_v))

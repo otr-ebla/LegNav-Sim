@@ -460,26 +460,9 @@ def step_env(key, state, action, ghost_robot: bool = True):
     comfort_violations = jnp.maximum(0.0, 1.0 - dists_p_active / _COMFORT_DIST)
     comfort_pen = -_COMFORT_COEF * jnp.sum(comfort_violations)
 
-    # — 6b. NEW: Yield Penalty (Gradiente di Frenata Dinamica)
-    # Recuperato e riadattato da jax_env.py per forzare l'agente a rallentare
-    # human_angles = jnp.arctan2(dy_p, dx_p)
-    # rel_angles   = (human_angles - new_theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
+    # — 6b. NEW: Yield Penalty Dynamical Brake Gradient
 
-    # YIELD_DIST = 1.5
-    # YIELD_FOV  = 2*jnp.pi
-
-    # in_yield_zone = (dists_p_active < YIELD_DIST) & (jnp.abs(rel_angles) < YIELD_FOV) & active_mask
-    # is_yield_situation = jnp.any(in_yield_zone)
-
-    # closest_yield_dist = jnp.min(jnp.where(in_yield_zone, dists_p_active, 100.0))
-    # urgency = jnp.where(is_yield_situation, (YIELD_DIST - closest_yield_dist) / YIELD_DIST, 0.0)
-
-    # # Penalità massiccia se il robot tiene il gas premuto verso un umano.
-    # # Il -2.0 compensa abbondantemente il reward di progresso (+0.15/step),
-    # # rendendo la frenata (target_v = 0) l'unica azione matematicamente vantaggiosa.
-    # yield_penalty = -0.4 * urgency * target_v  # /10 from -4.0
-
-    # — 6c. Dense shaping ─────────────────────────────────────────────────
+    
     # — 6c. Dense shaping ─────────────────────────────────────────────────
     progress         = prev_dist - new_dist
     social_progress  = _PROGRESS_COEF * progress

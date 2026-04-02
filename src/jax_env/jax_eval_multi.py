@@ -167,29 +167,8 @@ def _build_ppo_shac():
 
 
 # ── SAC ────────────────────────────────────────────────────────────────────────
-
-class _SACEncoder(nn.Module):
-    stack_dim: int = 3
-    num_rays:  int = 216
-
-    @nn.compact
-    def __call__(self, x):
-        pose_size = 3 * self.stack_dim
-        pose_stack = x[..., :pose_size]
-        state_vec  = x[..., pose_size : pose_size + 5]
-        lidar_flat = x[..., pose_size + 5:]
-        bs = lidar_flat.shape[:-1]
-        cnn = lidar_flat.reshape((*bs, self.num_rays, self.stack_dim))
-        cnn = nn.relu(nn.Conv(32, (7,), strides=(2,), padding="SAME")(cnn))
-        cnn = nn.relu(nn.Conv(64, (5,), strides=(2,), padding="SAME")(cnn))
-        cnn = nn.relu(nn.Conv(64, (3,), strides=(2,), padding="SAME")(cnn))
-        cnn = nn.LayerNorm()(cnn.reshape((*bs, -1)))
-        g   = jnp.concatenate([pose_stack, state_vec], axis=-1)
-        g   = nn.relu(nn.Dense(128)(g))
-        g   = nn.relu(nn.Dense(64)(g))
-        f   = jnp.concatenate([cnn, g], axis=-1)
-        f   = nn.relu(nn.Dense(256)(f))
-        return nn.relu(nn.Dense(128)(f))
+# Uses SharedEncoder (same trunk as PPO) + SACActorHead.
+# Checkpoint keys: "enc_params", "actor_head_params".
 
 class _SACActorHead(nn.Module):
     @nn.compact
@@ -199,12 +178,13 @@ class _SACActorHead(nn.Module):
         return mean, jnp.clip(log_std, -5.0, 2.0)
 
 def _build_sac():
-    enc  = _SACEncoder()
+    from jax_network import SharedEncoder
+    enc  = SharedEncoder()
     head = _SACActorHead()
     rng  = jax.random.PRNGKey(0)
     dummy_obs  = jnp.zeros((1, OBS_SIZE))
-    dummy_feat = jnp.zeros((1, 128))
     enc_params  = enc.init(rng, dummy_obs)["params"]
+    dummy_feat  = enc.apply({"params": enc_params}, dummy_obs)
     head_params = head.init(rng, dummy_feat)["params"]
     init_params = (enc_params, head_params)
 
@@ -212,7 +192,7 @@ def _build_sac():
         with open(path, "rb") as f:
             raw = f.read()
         b = flax.serialization.msgpack_restore(raw)
-        return b["actor_enc_params"], b["actor_head_params"]
+        return b["enc_params"], b["actor_head_params"]
 
     def infer(params, obs, max_v):
         enc_p, head_p = params
@@ -228,42 +208,37 @@ def _build_sac():
 
 
 # ── TQC ────────────────────────────────────────────────────────────────────────
+# Uses SharedEncoder + TQCActorHead (Dense mean/log_std head).
+# Checkpoint keys: "enc_params", "actor_head_params".
 
-class _TQCActor(nn.Module):
+class _TQCActorHead(nn.Module):
     @nn.compact
-    def __call__(self, x):
-        pose_size = 9
-        pose_stack = x[..., :pose_size]
-        state_vec  = x[..., pose_size : pose_size + 5]
-        lidar_flat = x[..., pose_size + 5:]
-        bs = lidar_flat.shape[:-1]
-        cnn = lidar_flat.reshape((*bs, 216, 3))
-        cnn = nn.relu(nn.Conv(32, (7,), strides=(2,), padding="SAME")(cnn))
-        cnn = nn.relu(nn.Conv(64, (5,), strides=(2,), padding="SAME")(cnn))
-        cnn = nn.relu(nn.Conv(64, (3,), strides=(2,), padding="SAME")(cnn))
-        cnn = nn.LayerNorm()(cnn.reshape((*bs, -1)))
-        g   = jnp.concatenate([pose_stack, state_vec], axis=-1)
-        g   = nn.relu(nn.Dense(128)(g))
-        g   = nn.relu(nn.Dense(64)(g))
-        f   = nn.relu(nn.Dense(256)(jnp.concatenate([cnn, g], axis=-1)))
-        f   = nn.relu(nn.Dense(128)(f))
-        mean    = nn.Dense(ACTION_DIM)(f)
-        log_std = nn.Dense(ACTION_DIM)(f)
+    def __call__(self, feat):
+        mean    = nn.Dense(ACTION_DIM)(feat)
+        log_std = nn.Dense(ACTION_DIM)(feat)
         return mean, jnp.clip(log_std, -5.0, 2.0)
 
 def _build_tqc():
-    net = _TQCActor()
-    rng = jax.random.PRNGKey(0)
-    init_params = net.init(rng, jnp.zeros((1, OBS_SIZE)))["params"]
+    from jax_network import SharedEncoder
+    enc  = SharedEncoder()
+    head = _TQCActorHead()
+    rng  = jax.random.PRNGKey(0)
+    dummy_obs   = jnp.zeros((1, OBS_SIZE))
+    enc_params  = enc.init(rng, dummy_obs)["params"]
+    dummy_feat  = enc.apply({"params": enc_params}, dummy_obs)
+    head_params = head.init(rng, dummy_feat)["params"]
+    init_params = (enc_params, head_params)
 
     def load(path):
         with open(path, "rb") as f:
             raw = f.read()
         b = flax.serialization.msgpack_restore(raw)
-        return b["actor_params"]
+        return b["enc_params"], b["actor_head_params"]
 
     def infer(params, obs, max_v):
-        mean, _ = net.apply({"params": params}, obs[None])
+        enc_p, head_p = params
+        feat = enc.apply({"params": enc_p}, obs[None])
+        mean, _ = head.apply({"params": head_p}, feat)
         mean = jnp.squeeze(mean, 0)
         tanh_mean = jnp.tanh(mean)
         v = (tanh_mean[0] + 1.0) * 0.5 * float(max_v)

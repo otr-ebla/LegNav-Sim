@@ -117,34 +117,11 @@ def init_env_state(rng_key, min_goal_dist: float = 3.0):
     env_obs, env_state = vmap_reset(reset_keys)
     return env_obs, env_state, vmap_step
 
-# ── Shared obs encoder ────────────────────────────────────────────────────────
-class ObsEncoder(nn.Module):
-    stack_dim: int = 3
-    num_rays:  int = 216
-    dtype: jnp.dtype = NET_DTYPE
-    
-    @nn.compact
-    def __call__(self, x):
-        pose_size = 3 * self.stack_dim
-        state_size = 5
-        pose_stack = x[..., :pose_size]
-        state_vec  = x[..., pose_size : pose_size + state_size]
-        lidar_flat = x[..., pose_size + state_size:]
-        batch_shape = lidar_flat.shape[:-1]
-        
-        lidar_cnn = lidar_flat.reshape((*batch_shape, self.num_rays, self.stack_dim)).astype(self.dtype)
-        cnn = nn.relu(nn.Conv(features=32, kernel_size=(7,), strides=(2,), padding='SAME', dtype=self.dtype)(lidar_cnn))
-        cnn = nn.relu(nn.Conv(features=64, kernel_size=(5,), strides=(2,), padding='SAME', dtype=self.dtype)(cnn))
-        cnn = nn.relu(nn.Conv(features=64, kernel_size=(3,), strides=(2,), padding='SAME', dtype=self.dtype)(cnn))
-        cnn_feat = nn.LayerNorm(dtype=self.dtype)(cnn.reshape((*batch_shape, -1)))
-        
-        global_in = jnp.concatenate([pose_stack, state_vec], axis=-1).astype(self.dtype)
-        global_feat = nn.relu(nn.Dense(128, dtype=self.dtype)(global_in))
-        global_feat = nn.relu(nn.Dense(64, dtype=self.dtype)(global_feat))
-        
-        fused = jnp.concatenate([cnn_feat, global_feat], axis=-1)
-        shared = nn.relu(nn.Dense(256, dtype=self.dtype)(fused))
-        return nn.relu(nn.Dense(128, dtype=self.dtype)(shared))   
+# ── Shared obs encoder ──────────────────────────────────────────────────
+# SharedEncoder imported from jax_network — identical trunk to PPO's
+# EndToEndActorCritic (LidarFrameCNN + FrameStackAttention + MLP).
+# Same architecture across PPO, SAC and TQC for fair algorithm comparison.
+from jax_network import SharedEncoder
 
 # ── Split-head networks ───────────────────────────────────────────────────────
 class TQCActorHead(nn.Module):
@@ -182,7 +159,7 @@ class TQCCriticHeadEnsemble(nn.Module):
 _TAUS = (2.0 * jnp.arange(1, N_ATOMS + 1) - 1.0) / (2.0 * N_ATOMS)
 
 # Module instances
-encoder_net = ObsEncoder()
+encoder_net = SharedEncoder()
 actor_head  = TQCActorHead()
 critic_head = TQCCriticHeadEnsemble()
 
