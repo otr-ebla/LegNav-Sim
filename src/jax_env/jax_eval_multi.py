@@ -16,9 +16,9 @@ Usage:
 
 Keys:
   0-6   Lock scenario    7   Random mode
-  R     Reset episode    L   Toggle LiDAR
-  H     Toggle arrows    B   Toggle body ring
-  Q/Esc Quit
+  R     Reset episode    →   Skip episode (no stats)
+  L     Toggle LiDAR     H   Toggle arrows
+  B     Toggle body ring Q/Esc Quit
 """
 
 import argparse
@@ -485,6 +485,7 @@ def draw_panel(surface, fonts, algo, ep, step, ep_ret, max_v, v, w,
     txt(f"  Timeout  {stats['tmo']:>5.1f}%",  C_TIMEOUT); sep()
     txt("0-6 lock  7 random  R reset", C_DIM, "tiny")
     txt("L lidar  H arrows  B body  Q quit", C_DIM, "tiny")
+    txt("→ skip episode (no stats)", C_DIM, "tiny")
 
     if banner_t > 0:
         label, col = {
@@ -492,6 +493,7 @@ def draw_panel(surface, fonts, algo, ep, step, ep_ret, max_v, v, w,
             "collision"  : ("X  COLLISION",     C_COLLIDE),
             "passive_col": ("🚶 PASSIVE COL",   (200,100,100)),
             "timeout"    : ("⏱  TIMEOUT",       C_TIMEOUT),
+            "skipped"    : ("⏭  SKIPPED",       C_DIM),
         }.get(banner, ("", C_TEXT))
         if label:
             surf = fonts["big"].render(label, True, col)
@@ -593,7 +595,7 @@ def main():
         return {"suc":w[:,1].mean()*100,"col":w[:,2].mean()*100,
                 "tmo":w[:,3].mean()*100,"pcol":w[:,4].mean()*100}
 
-    print("🎮 Keys: 0-6 lock scenario | 7 random | R reset | L lidar | H arrows | B body | Q quit")
+    print("🎮 Keys: 0-6 lock scenario | 7 random | R reset | → skip (no stats) | L lidar | H arrows | B body | Q quit")
     if args.watch: print(f"👀 WATCH MODE ENABLED: Polling {ckpt} for updates.")
 
     while True:
@@ -624,6 +626,15 @@ def main():
                     rng, reset_rng = jax.random.split(rng)
                     obs, stacked_state = fast_reset(reset_rng)
                     ep_reward=0.0; ep_steps=0; banner_t=0
+                if k == pygame.K_RIGHT:
+                    # Skip this episode — do NOT record it in ep_hist
+                    if evaluation_mode == "random":
+                        current_scenario = random.randint(0, 6)
+                        fast_reset, fast_step = build_fast_reset(current_scenario)
+                    rng, reset_rng = jax.random.split(rng)
+                    obs, stacked_state = fast_reset(reset_rng)
+                    ep_reward=0.0; ep_steps=0
+                    banner="skipped"; banner_t=FPS_TARGET
 
         if paused: clock.tick(10); continue
 
