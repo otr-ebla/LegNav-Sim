@@ -78,7 +78,7 @@ LR_END         = 1e-5
 LR_MIN         = 1e-5
 WARMUP_UPDATES = 5
 
-TOTAL_UPDATES  = 10000
+TOTAL_UPDATES  = 1000
 
 # ── Minibatch geometry ────────────────────────────────────────────────────────
 # Loss piatto su (T*N) sample. Shuffle su tutto il batch poi split in minibatch.
@@ -278,7 +278,10 @@ def ppo_loss_fn(
     entropy_loss = -entropy_coef * entropy
     total_loss   = policy_loss + value_loss + entropy_loss
 
-    return total_loss, (policy_loss, value_loss, entropy)
+    kl_div    = jnp.mean(old_log_probs - log_prob)   # approx reverse KL
+    clip_frac = jnp.mean((jnp.abs(ratio - 1.0) > CLIP_EPS).astype(jnp.float32))
+
+    return total_loss, (policy_loss, value_loss, entropy, kl_div, clip_frac)
 
 
 # ── Minibatch update — shuffle su (T*N), split in N_MINIBATCHES chunk ─────────
@@ -422,7 +425,7 @@ if __name__ == "__main__":
     best_suc = 55.0  # NEVER TOUCH THIS LINE
 
     hdr = (f"{'Upd':>5} | {'EpRet':>7} | {'Suc%':>5} {'Obs%':>5} {'Acol%':>5} {'Pcol%':>5} {'Tmo%':>5} |"
-           f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} | {'FPS':>7} {'#Ep':>6} {'LR':>6}  | "
+           f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} {'KL':>6} {'ClpF':>5} | {'FPS':>7} {'#Ep':>6} {'LR':>6}  | "
            f"{'Stage':>5} {'MaxDist':>7} {'Ghost':>6} {'Time':>6}")
     print(hdr)
     print("─" * len(hdr))
@@ -522,7 +525,7 @@ if __name__ == "__main__":
         fps = BATCH_SIZE / (time.time() - t0)
 
         if update % 5 == 0:
-            p_loss, v_loss, entropy = aux
+            p_loss, v_loss, entropy, kl_div, clip_frac = aux
             lr_now       = float(scheduler(update * _OPT_STEPS_PER_UPDATE))
             ent_coef_now = float(entropy_coef)
             elapsedtime  = (time.time() - t_start) / 60.0
@@ -531,7 +534,8 @@ if __name__ == "__main__":
                 f"{update:>5d} | {mean_ret:>7.1f} | "
                 f"{suc_pct:>4.1f}% {obs_pct:>4.1f}% {acol_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% | "
                 f"{float(mean_loss):>7.2f} {float(p_loss):>6.2f} "
-                f"{float(v_loss):>6.2f} {float(entropy):>6.2f} | "
+                f"{float(v_loss):>6.2f} {float(entropy):>6.2f} "
+                f"{float(kl_div):>6.4f} {float(clip_frac):>4.2f} | "
                 f"{fps:>7,.0f} {n_ep:>6d} {lr_now:.2e} | "
                 f"{cur_stage:>5d} {cur_max_dist:>5.1f}m {cur_ghost:>5.1f}g "
                 f"{ent_coef_now:.4f}e {scen_prob:.0%}s {elapsedtime:>5.1f}min"

@@ -39,6 +39,31 @@ ATTN_HEADS      = 4    # numero di teste attention sul frame stack
 ATTN_HEAD_DIM   = 16   # dim per testa → QKV dim = ATTN_HEADS * ATTN_HEAD_DIM = 64
 
 
+class LidarFrameCNN(nn.Module):
+    """
+    CNN condivisa applicata su un singolo frame LiDAR (num_rays,).
+    Viene istanziata UNA VOLTA e chiamata 3 volte → weight sharing reale.
+
+    Input:  (..., num_rays)
+    Output: (..., FRAME_FEAT=64)
+    """
+    frame_feat: int = 64
+
+    @nn.compact
+    def __call__(self, frame: jnp.ndarray) -> jnp.ndarray:
+        batch_shape = frame.shape[:-1]
+        z = frame[..., None]                                               # (..., num_rays, 1)
+        z = nn.relu(nn.Conv(features=32, kernel_size=(7,), strides=(2,), padding='SAME')(z))
+        z = nn.relu(nn.Conv(features=64, kernel_size=(5,), strides=(2,), padding='SAME')(z))
+        z = nn.relu(nn.Conv(features=64, kernel_size=(3,), strides=(2,), padding='SAME')(z))
+        # z: (..., spatial=14, 64)
+        z_flat = z.reshape((*batch_shape, -1))                             # (..., 896)
+        return nn.relu(
+            nn.Dense(self.frame_feat,
+                     kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(z_flat)
+        )                                                                   # (..., 64)
+
+
 class FrameStackAttention(nn.Module):
     """
     1-layer Multi-Head Self-Attention sul frame stack LiDAR.
@@ -107,35 +132,29 @@ class EndToEndActorCritic(nn.Module):
         state_vec  = x[..., pose_size : pose_size + state_size]
         lidar_flat = x[..., pose_size + state_size:]
 
-        # ── 1-D CNN su ogni frame LiDAR individualmente ───────────────────────
-        # Reshape: (..., num_rays, stack_dim) → CNN condivisa per frame
+        # ── CNN shared per-frame → sequenza di token temporali ───────────────
+        # LidarFrameCNN è istanziata UNA VOLTA: tutte e 3 le call condividono
+        # gli stessi parametri → weight sharing reale (non simulato con nomi).
         batch_shape = lidar_flat.shape[:-1]
-        lidar_seq = lidar_flat.reshape((*batch_shape, self.num_rays, self.stack_dim))
 
-        # CNN applicata su canali = stack_dim (tratta i frame come canali)
-        cnn = nn.relu(nn.Conv(features=32, kernel_size=(7,), strides=(2,), padding='SAME')(lidar_seq))
-        cnn = nn.relu(nn.Conv(features=64, kernel_size=(5,), strides=(2,), padding='SAME')(cnn))
-        cnn = nn.relu(nn.Conv(features=64, kernel_size=(3,), strides=(2,), padding='SAME')(cnn))
-        # cnn: (..., num_rays//8, 64)
+        # (..., num_rays * stack_dim) → (..., stack_dim, num_rays)
+        lidar_frames = lidar_flat.reshape((*batch_shape, self.stack_dim, self.num_rays))
 
-        # Transponi per ottenere sequenza di frame: (..., stack_dim, spatial*64//stack_dim)
-        # Prima flat poi ridividi per frame per l'attention
-        cnn_flat = cnn.reshape((*batch_shape, -1))  # (..., spatial*64) dove spatial = ceil(num_rays/8)
-        cnn_normed = nn.LayerNorm()(cnn_flat)
-
-        # Proietta CNN features in S frame separati per l'attention
-        # Ogni frame ottiene un vettore di dim FRAME_FEAT
         FRAME_FEAT = 64
-        cnn_proj = nn.relu(
-            nn.Dense(self.stack_dim * FRAME_FEAT,
-                     kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(cnn_normed)
-        )
-        # (..., stack_dim, FRAME_FEAT)
-        frame_seq = cnn_proj.reshape((*batch_shape, self.stack_dim, FRAME_FEAT))
+        cnn_encoder = LidarFrameCNN(frame_feat=FRAME_FEAT)  # istanza unica → pesi condivisi
 
-        # ── Frame-Stack Self-Attention ────────────────────────────────────────
-        # Confronta i 3 frame temporali: cattura moto, accelerazione, pattern ciclici
-        attn_out = FrameStackAttention()(frame_seq)         # (..., stack_dim, FRAME_FEAT)
+        # Applica la stessa CNN ai 3 frame → 3 token da 64-dim
+        frame_feats = [cnn_encoder(lidar_frames[..., i, :]) for i in range(self.stack_dim)]
+
+        # (..., stack_dim=3, FRAME_FEAT=64)
+        frame_seq = jnp.stack(frame_feats, axis=-2)
+        frame_seq = nn.LayerNorm()(frame_seq)
+
+        # ── Spatio-Temporal Self-Attention ────────────────────────────────────
+        # Sequenza temporale di 3 token da 64-dim: ogni token è la rappresentazione
+        # compressa di un singolo frame LiDAR. L'attention impara differenze
+        # inter-frame (flusso ottico LiDAR, velocità apparente degli ostacoli).
+        attn_out  = FrameStackAttention()(frame_seq)                        # (..., 3, 64)
         attn_flat = attn_out.reshape((*batch_shape, self.stack_dim * FRAME_FEAT))  # (..., 192)
 
         # ── Global state MLP ──────────────────────────────────────────────────
