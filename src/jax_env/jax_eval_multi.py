@@ -559,8 +559,11 @@ def main():
 
     last_mtime = os.path.getmtime(ckpt) if os.path.exists(ckpt) else 0
 
-    def build_fast_reset(scen_idx):
-        bound_reset = functools.partial(reset_env, scenario_idx=scen_idx)
+    MAX_EVAL_GOAL_DIST = 9.0   # corrisponde all'ultimo stage del curriculum
+
+    def build_fast_reset(scen_idx, max_goal_dist=MAX_EVAL_GOAL_DIST):
+        bound_reset = functools.partial(reset_env, scenario_idx=scen_idx,
+                                        max_goal_dist=max_goal_dist)
         rs, ss = make_stacked_env(bound_reset, step_env, stack_dim=3, ghost_prob=0.0)
         return jax.jit(rs), jax.jit(ss)
 
