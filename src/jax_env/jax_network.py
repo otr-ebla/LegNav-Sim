@@ -1,27 +1,6 @@
 """
 jax_network.py — Actor-Critic Neural Network for PPO (CNN + Frame-Stack Attention)
 
-CHANGES vs GRU version:
-  - GRU completamente rimosso. La rete è ora STATELESS: __call__ prende solo `x`
-    e restituisce (actor_mean, actor_logstd, value). Nessun `hidden` carry.
-  - Memoria contestuale sostituita da 1-layer Multi-Head Self-Attention sul
-    frame stack LiDAR: shape (batch, stack_dim=3, cnn_features).
-    L'attention è O(stack_dim²) = O(9) — costo trascurabile. Il modulo è
-    completamente parallelizzabile su GPU, nessuna dipendenza sequenziale.
-  - Il PPO loss diventa un forward pass piatto su (T*N, OBS_SIZE) senza scan.
-    Questo sblocca il throughput massimo: 10-20x più veloce del GRU+scan.
-  - initialize_carry() rimosso (non più necessario). Tutti i call sites in
-    jax_train.py e jax_ppo.py devono essere aggiornati (vedere commenti).
-  - Tutti gli helper di squashing/scaling sono invariati.
-
-DESIGN RATIONALE — perché Attention invece di GRU:
-  GRU richiede lax.scan sequenziale nel PPO loss (ogni step dipende dal
-  precedente) → il training non può parallelizzare il time axis.
-  Self-Attention su un frame stack fisso (3 frame) è O(3²) = O(9),
-  completamente parallelizzabile, e cattura le stesse dipendenze temporali
-  tra frame consecutivi che il GRU userebbe per navigare corridoi.
-  Il frame stack è già disponibile nell'osservazione — non serve nessuna
-  modifica all'environment o al rollout collector.
 """
 
 import jax
@@ -41,8 +20,8 @@ ATTN_HEAD_DIM   = 16   # dim per testa → QKV dim = ATTN_HEADS * ATTN_HEAD_DIM 
 
 class LidarFrameCNN(nn.Module):
     """
-    CNN condivisa applicata su un singolo frame LiDAR (num_rays,).
-    Viene istanziata UNA VOLTA e chiamata 3 volte → weight sharing reale.
+    Shared CNN applied on a single LiDAR frame (num_rays,).
+    It is instantiated ONCE and called 3 times → real weight sharing.
 
     Input:  (..., num_rays)
     Output: (..., FRAME_FEAT=64)
