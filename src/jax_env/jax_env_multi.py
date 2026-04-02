@@ -480,17 +480,21 @@ def step_env(key, state, action, ghost_robot: bool = True):
     # yield_penalty = -0.4 * urgency * target_v  # /10 from -4.0
 
     # — 6c. Dense shaping ─────────────────────────────────────────────────
+    # — 6c. Dense shaping ─────────────────────────────────────────────────
     progress         = prev_dist - new_dist
     social_progress  = _PROGRESS_COEF * progress
     step_pen         = _STEP_PEN
     
-    # Harsh absolute penalty for jittering (prevents micro-oscillations)
-    smooth_pen       = -_SMOOTH_WEIGHT * jnp.abs(target_w - state.w)
+    # Harsh quadratic penalty for jittering to violently punish zero-crossing
+    smooth_pen       = -0.5 * (target_w - state.w)**2
     # Quadratic penalty on rotation magnitude (encourages driving straight)
     rot_pen          = -_ROT_WEIGHT * (target_w ** 2)
+    # Destroy the local minimum of spinning in place when blocked
+    spin_in_place_pen = jnp.where(target_v < 0.1, -0.5 * (target_w ** 2), 0.0)
     
     # Minimal baseline + smoothness
-    dense_reward     = social_progress + step_pen + smooth_pen + rot_pen + comfort_pen
+    dense_reward     = social_progress + step_pen + smooth_pen + rot_pen + spin_in_place_pen + comfort_pen
+    
 
     # — 6d. Terminal cascades ─────────────────────────────────────────────
     reward = dense_reward
