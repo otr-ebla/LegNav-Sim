@@ -151,9 +151,9 @@ class EndToEndActorCritic(nn.Module):
         frame_seq = nn.LayerNorm()(frame_seq)
 
         # ── Spatio-Temporal Self-Attention ────────────────────────────────────
-        # Sequenza temporale di 3 token da 64-dim: ogni token è la rappresentazione
-        # compressa di un singolo frame LiDAR. L'attention impara differenze
-        # inter-frame (flusso ottico LiDAR, velocità apparente degli ostacoli).
+        # Timeline of 3 64-dim tokens: each token is the compressed
+        # representation of a single LiDAR frame. Attention learns inter-frame differences
+        # (LiDAR optical flow, apparent obstacle velocity).
         attn_out  = FrameStackAttention()(frame_seq)                        # (..., 3, 64)
         attn_flat = attn_out.reshape((*batch_shape, self.stack_dim * FRAME_FEAT))  # (..., 192)
 
@@ -174,7 +174,7 @@ class EndToEndActorCritic(nn.Module):
             self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
         )(shared)
 
-        logstd_param     = self.param('log_std', constant(-1.0), (self.action_dim,))
+        logstd_param     = self.param('log_std', constant(-1.0), (self.action_dim,)) # state independent learnable log std
         actor_logstd_raw = jnp.broadcast_to(logstd_param, actor_mean.shape)
         actor_logstd     = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (
             jnp.tanh(actor_logstd_raw) + 1.0
