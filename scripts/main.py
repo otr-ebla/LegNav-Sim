@@ -3,7 +3,7 @@ import random
 
 def main():
     env = Simple2DEnv(max_steps = 1000, 
-                      num_rays=108,
+                      num_rays=216,
                       num_people=20)
     obs = env.reset()
     print("Environment reset. Initial obs:", obs)

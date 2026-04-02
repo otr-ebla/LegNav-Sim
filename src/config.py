@@ -13,7 +13,7 @@ class SimConfig:
     HSFM_DT = 0.01
     ROOM_SIDE_LENGTH = 10.0  # meters
     ROOM_SIZE = (ROOM_SIDE_LENGTH, ROOM_SIDE_LENGTH)  # meters
-    MAX_STEPS = 600
+    MAX_STEPS = 400
     HUMANS_RADIUS = 0.6  # meters
     PEOPLE_RADIUS = 0.6
     HUMANS_VELOCITY = 1.0 # m/s
@@ -27,7 +27,7 @@ class SimConfig:
 
 
 class LidarConfig:
-    NUM_RAYS = 108
+    NUM_RAYS = 216          # 360° full-circle LiDAR (108 front + 108 rear)
     MAX_DISTANCE = SimConfig.ROOM_SIDE_LENGTH * np.sqrt(2)  # meters
     MIN_DIST = 0.12  # meters
-    FOV = np.pi
+    FOV = 2 * np.pi          # 360° full-circle FOV

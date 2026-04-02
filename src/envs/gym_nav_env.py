@@ -6,7 +6,7 @@ import math
 from .fast_nav_env import Simple2DEnv
 from src.config import RobotConfig, LidarConfig, SimConfig 
 
-NUM_RAYS = LidarConfig.NUM_RAYS # Assicurati che in config sia 108
+NUM_RAYS = LidarConfig.NUM_RAYS  # 216 rays, 360° full-circle LiDAR
 STACK_DIM = RobotConfig.LIDAR_STACK_DIM
 MAX_STEPS = SimConfig.MAX_STEPS
 NUM_OBSTACLES = 12
@@ -35,15 +35,15 @@ class GymNavEnv(gym.Env):
         self.render_mode = render_mode
         self.real_lidar_specs = real_lidar_specs
         
-        # Fissiamo il numero di raggi a quello definito (108)
+        # Lock ray count to config value (216)
         self.num_rays = num_rays 
 
         self.stack_dim = stack_dim
         self.max_steps = max_steps
 
-        # Inizializzazione Ambiente Fisico
+        # Initialize physical environment
         self.env = Simple2DEnv(
-            num_rays=self.num_rays, # Passiamo il numero coerente
+            num_rays=self.num_rays,
             max_steps=max_steps,
             num_people=num_people,
             robot_radius=RobotConfig.RADIUS,
@@ -59,7 +59,7 @@ class GymNavEnv(gym.Env):
             real_lidar_specs=real_lidar_specs,
         )
         
-        # Observation Space (Aggiornato a 108)
+        # Observation Space (216 rays, 360° FOV)
         self.observation_space = spaces.Dict({
             "lidar": spaces.Box(low=0.0, high=1.0, shape=(self.num_rays,), dtype=np.float32),
             "pose": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32), 

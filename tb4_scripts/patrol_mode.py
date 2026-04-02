@@ -24,7 +24,7 @@ NORMALIZATION_FILE = "./25MSAC_jack_vecnormalize.pkl"
 # Parametri Ambiente
 MAX_LIN_VEL = 0.46
 MAX_ANG_VEL = 2.0
-NUM_RAYS_MODEL = 108
+NUM_RAYS_MODEL = 216
 STACK_SIZE = 3
 MAX_LIDAR_DIST = 12.0  
 ROOM_DIAGONAL = math.sqrt(12.0**2 + 12.0**2) 
