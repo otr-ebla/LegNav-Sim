@@ -144,15 +144,22 @@ def _build_ppo_shac():
         return bundle.get("params", bundle)
 
     def infer(params, obs, max_v):
-        # Heuristic based on the shape of Dense_0
-        is_old_arch = ("Dense_0" in params and params["Dense_0"]["kernel"].shape == (18, 128))
-        
+        # Detect pre-216-ray checkpoints (global_in was 18 = pose 9 + state 9)
+        is_legacy = ("Dense_0" in params and params["Dense_0"]["kernel"].shape[0] == 18)
+        if is_legacy:
+            raise RuntimeError(
+                "Checkpoint was trained with old 108-ray / state_vec=9 architecture. "
+                "Re-train with the new 216-ray / 360° FOV / state_vec=5 config."
+            )
+
+        # Heuristic: old-style CNN (no attention) vs new EndToEndActorCritic
+        is_old_arch = ("Dense_0" in params and params["Dense_0"]["kernel"].shape == (14, 128))
+
         if is_old_arch:
-            # Pass the parameters to the old architecture
             mean, _, _ = net_old.apply({"params": params}, obs[None])
             return scale_action_to_env(jnp.squeeze(mean, 0), float(max_v))
-        
-        # New stateless architecture
+
+        # New frame-stack attention architecture
         mean, _, _ = net_new.apply({"params": params}, obs[None])
         return scale_action_to_env(jnp.squeeze(mean, 0), float(max_v))
 
@@ -269,7 +276,7 @@ def _build_tqc():
 # ── Default checkpoint paths ───────────────────────────────────────────────────
 
 _DEFAULT_CKPT = {
-    "ppo":  "checkpoints/ppo_classic_best.msgpack",#"checkpoints/ppo_model_best.msgpack",
+    "ppo":  "checkpoints/ppo_attn_final.msgpack",#"checkpoints/ppo_model_best.msgpack",
     "shac": "checkpoints/shac_best.msgpack",
     "sac":  "checkpoints_sac/sac_best.msgpack",
     "tqc":  "checkpoints_tqc/tqc_best.msgpack",
