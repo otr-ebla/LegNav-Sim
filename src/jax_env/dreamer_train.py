@@ -133,11 +133,17 @@ def scan_rssm(wm_params: dict, obs_seq: jnp.ndarray,
 # without a norm clip. 100.0 is the standard DreamerV3 clip threshold.
 # ---------------------------------------------------------------------------
 
-MAX_GRAD_NORM = 100.0
+# V3: Adaptive Gradient Clipping (AGC) and LaProp
+def make_optimizer(lr):
+    return optax.chain(
+        optax.zero_nans(),
+        optax.adaptive_grad_clip(0.3),
+        optax.laprop(lr, b1=0.9, b2=0.99, eps=1e-20)
+    )
 
-opt_wm     = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR_WM,    eps=1e-8))
-opt_actor  = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR_ACTOR, eps=1e-5))
-opt_critic = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR_CRITIC, eps=1e-5))
+opt_wm     = make_optimizer(LR_WM)
+opt_actor  = make_optimizer(LR_ACTOR)
+opt_critic = make_optimizer(LR_CRITIC)
 
 # ---------------------------------------------------------------------------
 # Monolithic JIT training step
@@ -146,7 +152,7 @@ opt_critic = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR
 # ---------------------------------------------------------------------------
 
 @jax.jit
-def train_step(rng_key, buffer_state, params, opt_states, step_count):
+def train_step(rng_key, buffer_state, params, opt_states, step_count, ema_s, slow_critic_params):
     k_sample, k_actor, k_wm = jax.random.split(rng_key, 3)
 
     obs_seq, act_seq, rew_seq, done_seq = sample_sequences(
@@ -211,19 +217,19 @@ def train_step(rng_key, buffer_state, params, opt_states, step_count):
         lambda_returns = compute_lambda_returns(
             rewards[:-1], values[:-1], continues[:-1], bootstrap, GAMMA, LAMBDA_)
 
-        # FIX 2: normalise advantages to zero-mean / unit-std per batch.
-        # Raw advantages track reward magnitude; without normalisation a large
-        # step_pen or sparse goal bonus dominates and destabilises the gradient.
-        adv_raw    = lambda_returns - values[:-1]
-        advantages = jax.lax.stop_gradient(
-            (adv_raw - jnp.mean(adv_raw)) / (jnp.std(adv_raw) + 1e-8))
+        adv_raw = lambda_returns - values[:-1]
+        
+        # V3 Percentile Return Normalization with EMA tracking
+        batch_s = jnp.percentile(lambda_returns, 95) - jnp.percentile(lambda_returns, 5)
+        new_ema_s = 0.99 * ema_s + 0.01 * batch_s
+        advantages = jax.lax.stop_gradient(adv_raw / jnp.maximum(1.0, new_ema_s))
 
         actor_loss   = -jnp.mean(traj['log_prob'][:-1] * advantages)
         # BUG B FIX: single negation — maximise entropy = minimise mean(log_prob).
         entropy_loss = -ENTROPY_COEF * jnp.mean(traj['log_prob'][:-1])
-        return actor_loss + entropy_loss, (traj, lambda_returns)
+        return actor_loss + entropy_loss, (traj, lambda_returns, new_ema_s)
 
-    (act_loss, (traj, lambda_returns)), act_grads = jax.value_and_grad(
+    (act_loss, (traj, lambda_returns, new_ema_s)), act_grads = jax.value_and_grad(
         actor_loss_fn, has_aux=True)(params['actor'])
 
     # FIX 1: zero actor grads during WM warmup
@@ -231,14 +237,27 @@ def train_step(rng_key, buffer_state, params, opt_states, step_count):
     act_updates, new_act_opt = opt_actor.update(act_grads, opt_states['actor'])
     new_act_params = optax.apply_updates(params['actor'], act_updates)
 
-    # ---- C. Critic ----
     def critic_loss_fn(critic_params):
         target = jax.lax.stop_gradient(lambda_returns)
         values_logits = critic.apply(
             {'params': critic_params},
             jax.lax.stop_gradient(traj['h'][:-1]),
             jax.lax.stop_gradient(traj['z'][:-1]))
-        return jnp.mean(two_hot_loss(values_logits, target))
+            
+        # V3 Critic EMA Regularizer
+        slow_logits = critic.apply(
+            {'params': jax.lax.stop_gradient(slow_critic_params)},
+            jax.lax.stop_gradient(traj['h'][:-1]),
+            jax.lax.stop_gradient(traj['z'][:-1]))
+        
+        from dreamer_rssm import symexp
+        bin_centers = jnp.linspace(-20.0, 20.0, slow_logits.shape[-1])
+        slow_values = jnp.sum(jax.nn.softmax(slow_logits, axis=-1) * bin_centers, axis=-1)
+        slow_target = jax.lax.stop_gradient(symexp(slow_values))
+        
+        loss_crit = jnp.mean(two_hot_loss(values_logits, target))
+        reg_crit  = jnp.mean(two_hot_loss(values_logits, slow_target))
+        return loss_crit + reg_crit
 
     critic_loss, crit_grads = jax.value_and_grad(critic_loss_fn)(params['critic'])
 
@@ -246,6 +265,12 @@ def train_step(rng_key, buffer_state, params, opt_states, step_count):
     crit_grads = jax.tree_util.tree_map(lambda g: g * wm_warm_mask, crit_grads)
     crit_updates, new_crit_opt = opt_critic.update(crit_grads, opt_states['critic'])
     new_crit_params = optax.apply_updates(params['critic'], crit_updates)
+    
+    # Update slow critic parameters with 0.98 EMA decay
+    new_slow_critic = jax.tree_util.tree_map(
+        lambda slow, fast: 0.98 * slow + 0.02 * fast,
+        slow_critic_params, new_crit_params
+    )
 
     new_params     = {'wm': new_wm_params, 'actor': new_act_params, 'critic': new_crit_params}
     new_opt_states = {'wm': new_wm_opt,    'actor': new_act_opt,    'critic': new_crit_opt}
@@ -259,7 +284,7 @@ def train_step(rng_key, buffer_state, params, opt_states, step_count):
         'critic_loss': critic_loss,
         'wm_warming':  1.0 - wm_warm_mask,   # 1.0 during warmup, 0.0 after
     }
-    return new_params, new_opt_states, metrics
+    return new_params, new_opt_states, metrics, new_ema_s, new_slow_critic
 
 # ---------------------------------------------------------------------------
 # Inference step
@@ -297,12 +322,12 @@ def act_step(rng_key, wm_params, actor_params, obs,
 def train_loop_chunk(rng_key, buffer_state, params, opt_states,
                      env_obs, env_state, current_h, current_z, current_action,
                      cur_return, ema_return, ema_success,
-                     step_count,
+                     step_count, ema_s, slow_critic_params,
                      chunk_size=50):
 
     def single_step(carry, _):
         (b_state, p, opt, h, z, a, obs, e_state,
-         key, c_ret, e_ret, e_succ, s_count) = carry
+         key, c_ret, e_ret, e_succ, s_count, cur_ema_s, cur_slow_crit) = carry
 
         key, act_k, step_k, train_k = jax.random.split(key, 4)
 
@@ -316,7 +341,8 @@ def train_loop_chunk(rng_key, buffer_state, params, opt_states,
             s_keys, e_state, env_acts, 3.0, -1)
 
         new_b_state = add_batch(b_state, obs, raw_acts, rews, dones)
-        new_p, new_opt, metrics = train_step(train_k, new_b_state, p, opt, s_count)
+        new_p, new_opt, metrics, new_ema_s, new_slow_crit = train_step(
+            train_k, new_b_state, p, opt, s_count, cur_ema_s, cur_slow_crit)
 
         alive   = (~dones).astype(jnp.float32)[:, None]
         next_h *= alive
@@ -335,14 +361,14 @@ def train_loop_chunk(rng_key, buffer_state, params, opt_states,
 
         next_carry = (new_b_state, new_p, new_opt, next_h, next_z, raw_acts,
                       n_obs, n_e_state, key, c_ret, e_ret, e_succ,
-                      s_count + 1)
+                      s_count + 1, new_ema_s, new_slow_crit)
         return next_carry, metrics
 
     init_carry = (buffer_state, params, opt_states,
                   current_h, current_z, current_action,
                   env_obs, env_state, rng_key,
                   cur_return, ema_return, ema_success,
-                  step_count)
+                  step_count, ema_s, slow_critic_params)
 
     final_carry, metrics_history = jax.lax.scan(
         single_step, init_carry, None, length=chunk_size)
@@ -408,6 +434,9 @@ if __name__ == "__main__":
 
     # FIX 1: step counter as JAX int32 scalar, threaded through lax.scan carry
     step_count = jnp.int32(0)
+    
+    ema_s = jnp.array(1.0, dtype=jnp.float32)
+    slow_critic_params = jax.tree_util.tree_map(lambda x: x, params['critic'])
 
     # 4. Prefill
     print("Compiling and executing fast pre-fill on GPU...")
@@ -449,18 +478,18 @@ if __name__ == "__main__":
             continue
 
         final_carry, metrics_history = train_loop_chunk(
-            rng, buffer_state, params, opt_states,
-            env_obs, env_state, current_h, current_z, current_action,
-            cur_return, ema_return, ema_success,
-            step_count,
-            chunk_size=CHUNK_SIZE,
-        )
+                rng, buffer_state, params, opt_states,
+                env_obs, env_state, current_h, current_z, current_action,
+                cur_return, ema_return, ema_success,
+                step_count, ema_s, slow_critic_params,
+                chunk_size=CHUNK_SIZE,
+            )
 
-        (buffer_state, params, opt_states,
-         current_h, current_z, current_action,
-         env_obs, env_state, rng,
-         cur_return, ema_return, ema_success,
-         step_count) = final_carry
+            (buffer_state, params, opt_states,
+             current_h, current_z, current_action,
+             env_obs, env_state, rng,
+             cur_return, ema_return, ema_success,
+             step_count, ema_s, slow_critic_params) = final_carry
 
         if step % 100 == 0:
             avg_wm     = float(jnp.mean(metrics_history['wm_loss']))

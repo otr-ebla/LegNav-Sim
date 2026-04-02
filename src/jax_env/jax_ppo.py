@@ -119,7 +119,7 @@ GHOST_PROB_STAGES = [
 # Stage 0-1: solo scenario 0 (robot impara a navigare senza struttura)
 # Stage 2+:  mix crescente — il robot inizia a vedere scenari strutturati
 # Stage:                  0     1     2     3     4     5     6
-SCENARIO_RANDOM_PROB = [0.0,  0.0,  0.2,  0.4,  0.6,  0.8,  1.0]
+SCENARIO_RANDOM_PROB = [0.0,  0.0,  0.4,  0.6,  0.8,  1.0,  1.0]
 # Probabilità 0.0 → scenario_idx=0 fisso
 # Probabilità 1.0 → scenario_idx=-1 (tutti i 7 scenari in modo uniforme)
 

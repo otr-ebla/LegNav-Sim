@@ -181,14 +181,14 @@ class RSSM(nn.Module):
         # Block-diagonal GRU — 8x fewer recurrent parameters than nn.GRUCell(512)
         self.cell      = BlockDiagonalGRU(num_blocks=GRU_NUM_BLOCKS, block_size=GRU_BLOCK_SIZE)
         self.step_dense = nn.Dense(DETERMINISTIC_SIZE)
-        self.step_norm  = nn.LayerNorm()
+        self.step_norm  = nn.RMSNorm()
 
         self.prior_dense1 = nn.Dense(DETERMINISTIC_SIZE)
-        self.prior_norm1  = nn.LayerNorm()
+        self.prior_norm1  = nn.RMSNorm()
         self.prior_dense2 = nn.Dense(LATENT_SIZE)
 
         self.post_dense1  = nn.Dense(DETERMINISTIC_SIZE)
-        self.post_norm1   = nn.LayerNorm()
+        self.post_norm1   = nn.RMSNorm()
         self.post_dense2  = nn.Dense(LATENT_SIZE)
 
         self.sampler_train = CategoricalStraightThrough(sample=True)
@@ -283,4 +283,4 @@ class DreamerEncoder(nn.Module):
         global_feat = nn.swish(nn.Dense(128)(global_in))
 
         fused = jnp.concatenate([cnn_feat, global_feat], axis=-1)
-        return nn.swish(nn.LayerNorm()(nn.Dense(DETERMINISTIC_SIZE)(fused)))
+        return nn.swish(nn.RMSNorm()(nn.Dense(DETERMINISTIC_SIZE)(fused)))

@@ -16,8 +16,8 @@ class ObservationDecoder(nn.Module):
     @nn.compact
     def __call__(self, h_t: jnp.ndarray, z_t: jnp.ndarray) -> jnp.ndarray:
         x = jnp.concatenate([h_t, z_t], axis=-1)
-        x = nn.swish(nn.LayerNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
-        x = nn.swish(nn.LayerNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
+        x = nn.swish(nn.RMSNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
+        x = nn.swish(nn.RMSNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
         return nn.Dense(self.obs_dim)(x)
 
 
@@ -27,17 +27,18 @@ class RewardDecoder(nn.Module):
     @nn.compact
     def __call__(self, h_t: jnp.ndarray, z_t: jnp.ndarray) -> jnp.ndarray:
         x = jnp.concatenate([h_t, z_t], axis=-1)
-        x = nn.swish(nn.LayerNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
-        x = nn.swish(nn.LayerNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
-        return nn.Dense(self.num_bins)(x)
+        x = nn.swish(nn.RMSNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
+        x = nn.swish(nn.RMSNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
+        # V3 zero-initialization to prevent early reward hallucination
+        return nn.Dense(self.num_bins, kernel_init=jax.nn.initializers.zeros)(x)
 
 
 class ContinueDecoder(nn.Module):
     @nn.compact
     def __call__(self, h_t: jnp.ndarray, z_t: jnp.ndarray) -> jnp.ndarray:
         x = jnp.concatenate([h_t, z_t], axis=-1)
-        x = nn.swish(nn.LayerNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
-        x = nn.swish(nn.LayerNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
+        x = nn.swish(nn.RMSNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
+        x = nn.swish(nn.RMSNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
         return jnp.squeeze(nn.Dense(1)(x), axis=-1)
 
 def two_hot_encode(target: jnp.ndarray, min_val: float = -20.0, max_val: float = 20.0, num_bins: int = 255) -> jnp.ndarray:
@@ -115,7 +116,7 @@ def world_model_loss(
     obs_pred, reward_pred, continue_logits,
     prior_logits, posterior_logits,
 ):
-    obs_loss    = jnp.mean((obs_pred - obs_target) ** 2)
+    obs_loss    = 0.5 * jnp.mean((obs_pred - symlog(obs_target)) ** 2)
     reward_loss = jnp.mean(two_hot_loss(reward_pred, reward_target))
 
     continue_target = 1.0 - done_target.astype(jnp.float32)
