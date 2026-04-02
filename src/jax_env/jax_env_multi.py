@@ -53,7 +53,7 @@ _STEP_PEN      =  -0.025   # Drastically increased. Standing still is no longer 
 
 # Smoothness & Rotation penalties (Lowered to unblock exploration)
 _SMOOTH_WEIGHT =   0.08    # Reduced to stop paralyzing the agent's steering
-_ROT_WEIGHT    =   0.06    # Reduced to allow necessary initial exploration
+_ROT_WEIGHT    =   0.1    # Reduced to allow necessary initial exploration
 
 _COMFORT_DIST  = 1.2   # m — personal space boundary
 _COMFORT_COEF  = 0.015 # base penalty at d=0 (before speed scaling) — /10 from 0.15
