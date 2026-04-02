@@ -3,8 +3,8 @@ jax_env.py — Core 2D Navigation Environment
 ============================================
 Previous fixes: A (LiDAR anchor), B (passive_col), C (resample cap),
                 D (no nested JIT), E (person spawn clearance).
-Obs layout (single frame): pose(3) + state_vec(9) + lidar(NUM_RAYS) = 228
-Stacked × 3: 9 + 9 + 648 = 666
+Obs layout (single frame): pose(3) + state_vec(5) + lidar(NUM_RAYS) = 224
+Stacked × 3: 9 + 5 + 648 = 662
 """
 
 import math
@@ -33,7 +33,6 @@ SENSOR_NOISE = True
 DT             = RobotConfig.DT
 MAX_STEPS      = SimConfig.MAX_STEPS
 NUM_RAYS       = LidarConfig.NUM_RAYS
-REAR_RAYS      = 4
 NUM_PEOPLE     = 18
 NUM_OBS_CIR    = 7
 NUM_OBS_BOX    = 7
@@ -52,9 +51,9 @@ PROGRESS_COEF  = 1.0
 MAX_RESAMPLE_ITERS = 200
 DEFAULT_MIN_GOAL_DIST = 3.0
 
-STATE_VEC_SIZE  = 9   # v, w, max_v_norm, goal_dist, goal_align, rear_prox×4
+STATE_VEC_SIZE  = 5   # v, w, max_v_norm, goal_dist, goal_align
 _MAX_GOAL_DIST  = math.sqrt(ROOM_W**2 + ROOM_H**2)
-SINGLE_OBS_SIZE = 3 + STATE_VEC_SIZE + NUM_RAYS   # 228
+SINGLE_OBS_SIZE = 3 + STATE_VEC_SIZE + NUM_RAYS   # 224
 
 # ── Human idle / stop-and-go behaviour ─────────────────────────────────────────────
 # Each step an active human has P_HUMAN_STOP probability of starting a stop.
@@ -125,7 +124,7 @@ def get_obs(state: EnvState, key: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray
       USE_LEGS=False → N_people + N_obs_circles     (cylinder model)
     compute_lidar handles variable circle counts via vmap, so this is fine.
 
-    OBS_SIZE = 666 — the output vector layout is identical.
+    OBS_SIZE = 662 — the output vector layout is identical.
     """
     # ── Build human geometry for LiDAR ───────────────────────────────────────
     # USE_LEGS is a Python bool → resolved at trace time, no conditional overhead
@@ -160,19 +159,8 @@ def get_obs(state: EnvState, key: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray
         sp_mask = jnp.zeros(raw_lidar.shape, dtype=bool)
     # ──────────────────────────────────────────────────────────────────────────
 
-    # Rear sweep — 4 rays, FOV=0.75π
-    _REAR_FOV = float(jnp.pi * 0.75)
-    rear_raw = compute_lidar(
-        state.x, state.y, state.theta + jnp.pi,
-        all_circles, state.obs_boxes,
-        REAR_RAYS, _REAR_FOV, MAX_LIDAR_DIST, ROOM_W, ROOM_H
-    )
-
     inv_lidar = jnp.clip(
         (MAX_LIDAR_DIST - noisy_lidar) / (MAX_LIDAR_DIST - ROBOT_RADIUS), 0.0, 1.0
-    )
-    rear_prox_vec = jnp.clip(
-        (MAX_LIDAR_DIST - rear_raw) / (MAX_LIDAR_DIST - ROBOT_RADIUS), 0.0, 1.0
     )
 
     dx    = state.goal_x - state.x
@@ -193,16 +181,15 @@ def get_obs(state: EnvState, key: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray
         s_theta,
     ])
 
-    state_vec_scalars = jnp.array([
+    state_vec = jnp.array([
         state.v / jnp.maximum(state.max_v, 1e-3),
         state.w,
         (state.max_v - 0.2) / 1.8,
         goal_dist / _MAX_GOAL_DIST,
         goal_align / jnp.pi,
-    ])
-    state_vec = jnp.concatenate([state_vec_scalars, rear_prox_vec])  # (9,)
+    ])  # (5,)
 
-    return jnp.concatenate([pose_vec, state_vec, inv_lidar]), sp_mask  # 3+9+216 = 228
+    return jnp.concatenate([pose_vec, state_vec, inv_lidar]), sp_mask  # 3+5+216 = 224
 
 
 # ── Reset ─────────────────────────────────────────────────────────────────────

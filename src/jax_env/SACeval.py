@@ -41,7 +41,7 @@ from jax_env_multi import reset_env, step_env
 from jax_wrappers import make_stacked_env
 from jax_legs import LEG_RADIUS, HIP_WIDTH, SHOE_LENGTH, SHOE_WIDTH
 
-OBS_SIZE = 666
+OBS_SIZE = 662
 ACTION_DIM = 2
 
 # ── SAC Split Architecture ────────────────────────────────────────────────────
@@ -53,7 +53,7 @@ class ObsEncoder(nn.Module):
     @nn.compact
     def __call__(self, x):
         pose_size  = 3 * self.stack_dim
-        state_size = 9
+        state_size = 5
         
         pose_stack = x[..., :pose_size]
         state_vec  = x[..., pose_size : pose_size + state_size]

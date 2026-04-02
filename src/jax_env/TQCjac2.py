@@ -43,7 +43,7 @@ from jax_env_multi import reset_env, step_env
 from jax_wrappers import make_stacked_env, make_autoreset_env
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
-OBS_SIZE       = 666
+OBS_SIZE       = 662
 ACTION_DIM     = 2
 N_ENVS         = 2048
 BUFFER_CAP     = 500_000
@@ -126,7 +126,7 @@ class ObsEncoder(nn.Module):
     @nn.compact
     def __call__(self, x):
         pose_size = 3 * self.stack_dim
-        state_size = 9                    
+        state_size = 5
         pose_stack = x[..., :pose_size]
         state_vec  = x[..., pose_size : pose_size + state_size]
         lidar_flat = x[..., pose_size + state_size:]

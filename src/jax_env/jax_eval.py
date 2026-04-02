@@ -18,7 +18,7 @@ PATCH — Leg simulation rendering + CLI flags:
     one large circle. The body centre guide ring is drawn faintly so the
     visual collision boundary is still clear.
 
-OBS_SIZE is 666 (216 rays × 3 stack + 9 pose + 9 state).
+OBS_SIZE is 662 (216 rays × 3 stack + 9 pose + 5 state).
 """
 
 import argparse
@@ -59,7 +59,7 @@ from jax_legs import get_leg_positions, LEG_RADIUS, HIP_WIDTH, SHOE_LENGTH, SHOE
 from jax_wrappers import make_stacked_env
 from jax_network import EndToEndActorCritic, scale_action_to_env
 
-OBS_SIZE = 666
+OBS_SIZE = 662
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 SIM_SIZE   = 800

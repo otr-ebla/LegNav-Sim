@@ -29,7 +29,7 @@ MODEL_PATH = "checkpoints/ppo_model_best.msgpack"
 MAX_LIN_VEL = 0.46     # Max linear speed requested
 STACK_DIM = 3          # Network trained with 3 frames
 POSE_SIZE = 3
-STATE_VEC_SIZE = 9
+STATE_VEC_SIZE = 5
 
 # --- PATROL PARAMETERS (Real World Coordinates) ---
 WAYPOINT_A = (4.0, 0.0)   # Example: 4 meters straight ahead
@@ -70,7 +70,7 @@ class PatrolNodeJAX(Node):
         self.get_logger().info(f"🧠 Loading JAX PPO model from: {MODEL_PATH}")
         
         # Initialize network architecture
-        # OBS_SIZE is 666: (3 * 3) + 9 + (216 * 3)
+        # OBS_SIZE is 662: (3 * 3) + 5 + (216 * 3)
         self.obs_size = (POSE_SIZE * STACK_DIM) + STATE_VEC_SIZE + (NUM_RAYS * STACK_DIM)
         self.network = EndToEndActorCritic(action_dim=2, stack_dim=STACK_DIM, num_rays=NUM_RAYS)
         
@@ -210,7 +210,7 @@ class PatrolNodeJAX(Node):
             lidar_stack_flat
         ]).astype(np.float32)
         
-        return jnp.array(obs_flat[None, :]) # Shape (1, 666)
+        return jnp.array(obs_flat[None, :]) # Shape (1, 662)
 
     def control_loop(self):
         # Wait for sensors

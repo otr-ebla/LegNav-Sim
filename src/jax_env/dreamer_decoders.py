@@ -11,7 +11,7 @@ from dreamer_rssm import DETERMINISTIC_SIZE, symlog, apply_unimix
 
 
 class ObservationDecoder(nn.Module):
-    obs_dim: int = 666
+    obs_dim: int = 662
 
     @nn.compact
     def __call__(self, h_t: jnp.ndarray, z_t: jnp.ndarray) -> jnp.ndarray:

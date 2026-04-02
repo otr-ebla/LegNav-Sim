@@ -13,7 +13,7 @@ import numpy as np
 LOG_STD_MIN = -4.0
 LOG_STD_MAX =  0.0
 
-_STATE_VEC_SIZE = 9
+_STATE_VEC_SIZE = 5
 ATTN_HEADS      = 4    # numero di teste attention sul frame stack
 ATTN_HEAD_DIM   = 16   # dim per testa → QKV dim = ATTN_HEADS * ATTN_HEAD_DIM = 64
 
@@ -105,7 +105,7 @@ class EndToEndActorCritic(nn.Module):
         Nessun hidden state — compatibile con forward pass piatto su (T*N, D).
         """
         pose_size  = 3 * self.stack_dim    # 9
-        state_size = _STATE_VEC_SIZE       # 9
+        state_size = _STATE_VEC_SIZE       # 5
 
         pose_stack = x[..., :pose_size]
         state_vec  = x[..., pose_size : pose_size + state_size]
@@ -137,10 +137,10 @@ class EndToEndActorCritic(nn.Module):
         attn_flat = attn_out.reshape((*batch_shape, self.stack_dim * FRAME_FEAT))  # (..., 192)
 
         # ── Global state MLP ──────────────────────────────────────────────────
-        global_in = jnp.concatenate([pose_stack, state_vec], axis=-1)  # (..., 18)
+        global_in = jnp.concatenate([pose_stack, state_vec], axis=-1)  # (..., 14)
 
         # ── Fused trunk ───────────────────────────────────────────────────────
-        fused = jnp.concatenate([attn_flat, global_in], axis=-1)       # (..., 210)
+        fused = jnp.concatenate([attn_flat, global_in], axis=-1)       # (..., 206)
         shared = nn.relu(
             nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(fused)
         )

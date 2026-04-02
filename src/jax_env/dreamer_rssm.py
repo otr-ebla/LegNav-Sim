@@ -265,7 +265,7 @@ class DreamerEncoder(nn.Module):
     @nn.compact
     def __call__(self, obs: jnp.ndarray) -> jnp.ndarray:
         pose_size  = 3 * self.stack_dim
-        state_size = 9
+        state_size = 5
 
         pose_stack = obs[..., :pose_size]
         state_vec  = obs[..., pose_size : pose_size + state_size]
