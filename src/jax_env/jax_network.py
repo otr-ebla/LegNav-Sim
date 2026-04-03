@@ -15,7 +15,7 @@ LOG_STD_MAX =  0.0
 
 _STATE_VEC_SIZE = 5
 ATTN_HEADS      = 4    # numero di teste attention sul frame stack
-ATTN_HEAD_DIM   = 16   # dim per testa → QKV dim = ATTN_HEADS * ATTN_HEAD_DIM = 64
+ATTN_HEAD_DIM   = 16   # dim per head → QKV dim = ATTN_HEADS * ATTN_HEAD_DIM = 64
 
 
 class LidarFrameCNN(nn.Module):
@@ -45,20 +45,20 @@ class LidarFrameCNN(nn.Module):
 
 class FrameStackAttention(nn.Module):
     """
-    1-layer Multi-Head Self-Attention sul frame stack LiDAR.
+    1-layer Multi-Head Self-Attention over the LiDAR frame stack.
 
-    Input:  (batch, stack_dim, feat_dim)   — sequenza di frame CNN
-    Output: (batch, stack_dim * feat_dim)  — rappresentazione contestuale flat
+    Input:  (batch, stack_dim, feat_dim)   — sequence of CNN frame tokens
+    Output: (batch, stack_dim * feat_dim)  — flat contextual representation
 
-    Ogni frame può "attendere" agli altri frame della sequenza, permettendo
-    alla rete di confrontare frame consecutivi (es. detectare moto umano).
+    Each frame can attend to the others in the sequence, letting the network
+    compare consecutive frames (e.g. detect human motion / LiDAR optical flow).
     """
     num_heads: int = ATTN_HEADS
     head_dim:  int = ATTN_HEAD_DIM
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        # x: (..., S, D) dove S = stack_dim, D = feat_dim per frame
+        # x: (..., S, D) where S = stack_dim, D = feat_dim per frame
         S, D = x.shape[-2], x.shape[-1]
         qkv_dim = self.num_heads * self.head_dim
 
@@ -66,7 +66,7 @@ class FrameStackAttention(nn.Module):
         K = nn.Dense(qkv_dim, use_bias=False)(x)
         V = nn.Dense(qkv_dim, use_bias=False)(x)
 
-        # Reshape per multi-head: (..., S, H, head_dim)
+        # Reshape for multi-head: (..., S, H, head_dim)
         batch_shape = x.shape[:-2]
         def split_heads(t):
             return t.reshape((*batch_shape, S, self.num_heads, self.head_dim))
@@ -82,7 +82,7 @@ class FrameStackAttention(nn.Module):
         weights = jax.nn.softmax(scores, axis=-1)
         out    = jnp.einsum('...hqk,...hkd->...hqd', weights, V)      # (..., H, S, head_dim)
 
-        # Riassembla: (..., S, qkv_dim)
+        # Reassemble: (..., S, qkv_dim)
         out = jnp.moveaxis(out, -3, -2).reshape((*batch_shape, S, qkv_dim))
 
         # Projection finale + residual + LayerNorm
@@ -145,8 +145,8 @@ class EndToEndActorCritic(nn.Module):
         x: jnp.ndarray,    # (..., OBS_SIZE)
     ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """
-        STATELESS: prende solo l'osservazione, restituisce (mean, logstd, value).
-        Nessun hidden state — compatibile con forward pass piatto su (T*N, D).
+        STATELESS: takes only the observation, returns (mean, logstd, value).
+        No hidden state — compatible with flat forward pass over (T*N, D).
         """
         pose_size  = 3 * self.stack_dim    # 9
         state_size = _STATE_VEC_SIZE       # 5
@@ -155,18 +155,18 @@ class EndToEndActorCritic(nn.Module):
         state_vec  = x[..., pose_size : pose_size + state_size]
         lidar_flat = x[..., pose_size + state_size:]
 
-        # ── CNN shared per-frame → sequenza di token temporali ───────────────
-        # LidarFrameCNN è istanziata UNA VOLTA: tutte e 3 le call condividono
-        # gli stessi parametri → weight sharing reale (non simulato con nomi).
+        # ── Per-frame CNN → sequence of temporal tokens ───────────────────────
+        # LidarFrameCNN is instantiated ONCE: all 3 calls share the same
+        # parameters → real weight sharing (not simulated via name tricks).
         batch_shape = lidar_flat.shape[:-1]
 
         # (..., num_rays * stack_dim) → (..., stack_dim, num_rays)
         lidar_frames = lidar_flat.reshape((*batch_shape, self.stack_dim, self.num_rays))
 
         FRAME_FEAT = 64
-        cnn_encoder = LidarFrameCNN(frame_feat=FRAME_FEAT)  # istanza unica → pesi condivisi
+        cnn_encoder = LidarFrameCNN(frame_feat=FRAME_FEAT)  # single instance → shared weights
 
-        # Applica la stessa CNN ai 3 frame → 3 token da 64-dim
+        # Apply the same CNN to each of the 3 frames → 3 tokens of 64-dim
         frame_feats = [cnn_encoder(lidar_frames[..., i, :]) for i in range(self.stack_dim)]
 
         # (..., stack_dim=3, FRAME_FEAT=64)
@@ -212,7 +212,7 @@ class EndToEndActorCritic(nn.Module):
         return actor_mean, actor_logstd, jnp.squeeze(value, axis=-1)
 
 
-# ── Action squashing helpers (invariati) ─────────────────────────────────────
+# ── Action squashing helpers ──────────────────────────────────────────────────
 
 def _squash_log_jacobian(raw_actions: jnp.ndarray, max_v: float = 1.0) -> jnp.ndarray:
     v_squash = jax.nn.sigmoid(raw_actions[..., 0])
