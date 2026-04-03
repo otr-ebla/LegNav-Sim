@@ -43,11 +43,11 @@ class StackedEnvState:
 
 
 def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3,
-                     num_rays: int = NUM_RAYS, ghost_prob: float = 1.0):
+                     num_rays: int = NUM_RAYS):
 
-    def reset_stacked(key, max_goal_dist: float = 3.0, **kwargs):
+    def reset_stacked(key, max_goal_dist: float = 3.0, ghost_prob: float = 1.0, scenario_idx: int = -1, **kwargs):
         # Passes any extra dynamic args (like scenario_idx) gracefully down to the environment
-        base_obs, base_state = base_reset_fn(key, max_goal_dist, ghost_prob=ghost_prob, **kwargs)
+        base_obs, base_state = base_reset_fn(key, max_goal_dist=max_goal_dist, scenario_idx=scenario_idx, ghost_prob=ghost_prob, **kwargs)
         pose      = base_obs[0:POSE_SIZE]
         state_vec = base_obs[POSE_SIZE : POSE_SIZE + STATE_VEC_SIZE]
         lidar     = base_obs[POSE_SIZE + STATE_VEC_SIZE:]
@@ -91,12 +91,12 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3,
 
 
 def make_autoreset_env(reset_fn, step_fn):
-    def step_autoreset(key, state, action, max_goal_dist, scenario_idx):
+    def step_autoreset(key, state, action, max_goal_dist, scenario_idx, ghost_prob):
         step_key, reset_key = jax.random.split(key)
         obs, next_state, reward, done, info = step_fn(step_key, state, action)
         
         # Passes the active scenario strictly into the auto-reset dynamically
-        reset_obs, reset_state = reset_fn(reset_key, max_goal_dist=max_goal_dist, scenario_idx=scenario_idx)
+        reset_obs, reset_state = reset_fn(reset_key, max_goal_dist=max_goal_dist, scenario_idx=scenario_idx, ghost_prob=ghost_prob)
 
         def _select(reset_leaf, next_leaf):
             d = jnp.asarray(done)

@@ -3,29 +3,26 @@ jax_ppo.py — Single-GPU PPO Training (GPU 0) — STATELESS / MAX SPEED
 
 CHANGES vs GRU version:
 
-  GRU RIMOSSO — PPO PIATTO:
-    - hidden rimosso da train_state, collect_rollouts, ppo_loss_fn.
-    - ppo_loss_fn ora fa un singolo forward pass su (T*N, OBS_SIZE) invece
-      di un lax.scan sequenziale su T step. Questo è il cambiamento critico
-      per la velocità: il loss è ora completamente parallelizzabile su GPU.
-    - hiddens_seq e dones_seq rimossi da run_ppo_updates / ppo_update_epoch.
-    - collect_rollouts non restituisce più hidden o last_hidden.
-
-  BUGFIX — hidden mismatch permutazione:
-    (rimosso con il GRU — il bug non esiste più)
+  REMOVED GRU — FLAT PPO:
+    - hidden removed from train_state, collect_rollouts, ppo_loss_fn.
+    - ppo_loss_fn now does a single forward pass on (T*N, OBS_SIZE) instead
+      of a sequential lax.scan over T steps. This is critical for speed:
+      the loss is now fully parallelizable on the GPU.
+    - hiddens_seq and dones_seq removed from run_ppo_updates / ppo_update_epoch.
+    - collect_rollouts no longer returns hidden or last_hidden.
 
   BUGFIX — entropy coefficient:
-    ENTROPY_COEF alzato da 0.02 a 0.05 per contrastare il collasso prematuro
-    della policy. Con il loss piatto il gradiente entropico è ora corretto.
+    ENTROPY_COEF raised from 0.02 to 0.05 to counter premature policy collapse.
+    With the flat loss, the entropy gradient is now correct.
 
   MINIBATCH GEOMETRY:
-    Con loss piatto il minibatch è su (T*N) sample indipendenti.
-    N_MINIBATCHES = 8 → MINI_BATCH_SIZE = T*N/8 = 8192 sample per minibatch.
-    Batch grande + forward parallelo = massima occupazione GPU.
+    With flat loss, the minibatch is over (T*N) independent samples.
+    N_MINIBATCHES = 8 -> MINI_BATCH_SIZE = T*N/8 = 8192 samples per minibatch.
+    Large batch + parallel forward = maximum GPU occupancy.
 
-  INVARIATI:
-    - Curriculum, ghost-prob, reward normalisation, GAE, checkpointing.
-    - Tutti gli iperparametri non menzionati sopra.
+  UNCHANGED:
+    - Curriculum, ghost-prob, reward normalization, GAE, checkpointing.
+    - All hyperparameters not mentioned above.
 """
 
 import os
@@ -442,9 +439,10 @@ if __name__ == "__main__":
         rng, rollout_rng, update_rng = jax.random.split(rng, 3)
 
         # collect_rollouts stateless: non restituisce più hidden
+        # collect_rollouts stateless: no hidden return
         rollout_history, env_state, env_obs, last_val = collect_rollouts(
             rollout_rng, train_state[0], network.apply, vmap_step,
-            env_state, env_obs, cur_max_dist, cur_scenario
+            env_state, env_obs, cur_max_dist, cur_scenario, cur_ghost
         )
 
         raw_rewards = rollout_history["rewards"]
@@ -488,9 +486,9 @@ if __name__ == "__main__":
         new_stage    = _curriculum_stage(highest_rolling_suc)
         new_ghost    = curriculum_ghost_prob(highest_rolling_suc)
 
-        # Scenario per-update: campionato Python-side in base alla probabilità dello stage corrente.
-        # SCENARIO_RANDOM_PROB[stage] = prob di usare -1 (random tra tutti i 7 scenari).
-        # Prob complementare → scenario 0 fisso (random statico, più semplice).
+        # Per-update scenario: Python-side sample based on the current stage probability.
+        # SCENARIO_RANDOM_PROB[stage] = probability of using -1 (random among all 7 scenarios).
+        # Complementary probability → fixed scenario 0 (static random, simpler).
         _scen_rand_prob = SCENARIO_RANDOM_PROB[new_stage]
         new_scenario = -1 if (_random.random() < _scen_rand_prob) else 0
 

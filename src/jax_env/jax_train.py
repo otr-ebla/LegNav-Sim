@@ -48,23 +48,21 @@ _VMAP_STEP_CACHE: dict = {}
 
 
 def init_env_state(rng_key, max_goal_dist: float = 3.0, ghost_prob: float = 1.0, scenario_idx: int = -1):
-    ghost_robot = (ghost_prob >= 0.5)
-
     reset_stacked, step_stacked = make_stacked_env(
-        reset_env, step_env, stack_dim=3, ghost_prob=ghost_prob
+        reset_env, step_env, stack_dim=3
     )
 
-    cache_key = ghost_robot
+    cache_key = "default"
     if cache_key not in _VMAP_STEP_CACHE:
         _VMAP_STEP_CACHE.clear()
         step_auto = make_autoreset_env(reset_stacked, step_stacked)
         _VMAP_STEP_CACHE[cache_key] = jax.jit(
-            jax.vmap(step_auto, in_axes=(0, 0, 0, None, None))
+            jax.vmap(step_auto, in_axes=(0, 0, 0, None, None, None))
         )
     vmap_step = _VMAP_STEP_CACHE[cache_key]
 
     def _reset_with_dist(key):
-        return reset_stacked(key, max_goal_dist=max_goal_dist, scenario_idx=scenario_idx)
+        return reset_stacked(key, max_goal_dist=max_goal_dist, scenario_idx=scenario_idx, ghost_prob=ghost_prob)
     vmap_reset = jax.jit(jax.vmap(_reset_with_dist))
 
     reset_keys = jax.random.split(rng_key, NUM_ENVS)
@@ -107,6 +105,7 @@ def collect_rollouts(
     env_obs,
     max_goal_dist,
     scenario_idx,
+    ghost_prob,
 ):
     """
     Collect ROLLOUT_STEPS steps across NUM_ENVS environments.
@@ -131,7 +130,7 @@ def collect_rollouts(
 
         step_keys = jax.random.split(step_rng, NUM_ENVS)
         next_obs, next_state, rewards, dones, infos = vmap_step(
-            step_keys, current_state, env_actions, max_goal_dist, scenario_idx
+            step_keys, current_state, env_actions, max_goal_dist, scenario_idx, ghost_prob
         )
 
         transition = {
