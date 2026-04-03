@@ -9,7 +9,8 @@ PEOPLE_RADIUS = 0.4   # FIX: was 0.2 — must match jax_env.py (PEOPLE_RADIUS=0.
                       # With 0.2, PERSON_ROBOT_CLEAR=0.7m but body_thresh=0.6m -> margin <0.1m
                       # -> immediate collisions at first step guaranteed
 GOAL_RADIUS = 0.3
-NUM_PEOPLE = 12
+N_BASE_PEOPLE = 12   # people count for all scenarios except static_groups
+NUM_PEOPLE    = 24   # total slots; static_groups fills all, others pad with dummies
 NUM_OBS_CIR = 6
 NUM_OBS_BOX = 6
 
@@ -69,8 +70,16 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float, scenario_idx: int 
 
     def pack_human(px, py, th, g1x, g1y, g2x, g2y):
         return jnp.stack([
-            px, py, jnp.zeros_like(px), jnp.zeros_like(px), th, 
+            px, py, jnp.zeros_like(px), jnp.zeros_like(px), th,
             jnp.zeros_like(px), g1x, g1y, g2x, g2y, jnp.zeros_like(px)
+        ], axis=-1)
+
+    def _make_dummies(n):
+        dummy_x = jnp.full((n,), -999.0)
+        return jnp.stack([
+            dummy_x, dummy_x, jnp.zeros(n), jnp.zeros(n),
+            jnp.zeros(n), jnp.zeros(n), dummy_x, dummy_x,
+            dummy_x, dummy_x, jnp.full((n,), -1.0)
         ], axis=-1)
 
     # --- 0: RANDOM STATIC ---
@@ -147,7 +156,8 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float, scenario_idx: int 
             g1y = jax.random.uniform(pk_g1y, minval=1.0, maxval=ROOM_H-1.0)
             return jnp.array([px, py, 0.0, 0.0, 0.0, 0.0, g1x, g1y, g1x, g1y, 0.0])
             
-        people = jax.vmap(init_person)(jax.random.split(k_people_keys, NUM_PEOPLE))
+        people_base = jax.vmap(init_person)(jax.random.split(k_people_keys, N_BASE_PEOPLE))
+        people = jnp.concatenate([people_base, _make_dummies(NUM_PEOPLE - N_BASE_PEOPLE)], axis=0)
         return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
 
     # --- 1: PARALLEL TRAFFIC (CORRIDOR) ---
@@ -214,8 +224,8 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float, scenario_idx: int 
         obs_circles = jnp.zeros((NUM_OBS_CIR, 3))
         obs_boxes = jnp.zeros((NUM_OBS_BOX, 4))
 
-        py = jax.random.uniform(k4, (NUM_PEOPLE,), minval=1.5, maxval=ROOM_H - 1.5)
-        left_mask = jnp.arange(NUM_PEOPLE) % 2 == 0
+        py = jax.random.uniform(k4, (N_BASE_PEOPLE,), minval=1.5, maxval=ROOM_H - 1.5)
+        left_mask = jnp.arange(N_BASE_PEOPLE) % 2 == 0
         px = jnp.where(left_mask, 0.6, ROOM_W - 0.6)
         wall_near = jnp.where(left_mask, 0.6, ROOM_W - 0.6)
         wall_far  = jnp.where(left_mask, ROOM_W - 0.6, 0.6)
@@ -224,7 +234,8 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float, scenario_idx: int 
         g2x = wall_near; g2y = py
         angles = jnp.where(left_mask, 0.0, jnp.pi)
 
-        people = pack_human(px, py, angles, g1x, g1y, g2x, g2y)
+        people_base = pack_human(px, py, angles, g1x, g1y, g2x, g2y)
+        people = jnp.concatenate([people_base, _make_dummies(NUM_PEOPLE - N_BASE_PEOPLE)], axis=0)
         return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
 
     # --- 3: CIRCULAR CROSSING ---
@@ -237,15 +248,16 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float, scenario_idx: int 
         obs_boxes = jnp.zeros((NUM_OBS_BOX, 4))
         
         cx, cy, radius = ROOM_W / 2.0, ROOM_H / 2.0, jnp.minimum(ROOM_W, ROOM_H) / 2.0 - 1.5
-        spawn_angles = jnp.linspace(0, 2*jnp.pi, NUM_PEOPLE, endpoint=False) + jax.random.uniform(k2, (NUM_PEOPLE,), minval=-0.2, maxval=0.2)
+        spawn_angles = jnp.linspace(0, 2*jnp.pi, N_BASE_PEOPLE, endpoint=False) + jax.random.uniform(k2, (N_BASE_PEOPLE,), minval=-0.2, maxval=0.2)
         px = cx + radius * jnp.cos(spawn_angles)
         py = cy + radius * jnp.sin(spawn_angles)
-        
+
         g1x = cx + radius * jnp.cos(spawn_angles + jnp.pi)
         g1y = cy + radius * jnp.sin(spawn_angles + jnp.pi)
         g2x, g2y = px, py
-        
-        people = pack_human(px, py, spawn_angles + jnp.pi, g1x, g1y, g2x, g2y)
+
+        people_base = pack_human(px, py, spawn_angles + jnp.pi, g1x, g1y, g2x, g2y)
+        people = jnp.concatenate([people_base, _make_dummies(NUM_PEOPLE - N_BASE_PEOPLE)], axis=0)
         return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
 
     # --- 4: BOTTLENECK ---
@@ -309,22 +321,23 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float, scenario_idx: int 
         rx, ry, rtheta = ends_x[start_idx], ends_y[start_idx], ends_th[start_idx]
         gx, gy = ends_x[goal_idx],  ends_y[goal_idx]
         
-        sides = jax.random.randint(k4, (NUM_PEOPLE,), 0, 2)
-        vx = jax.random.uniform(k5, (NUM_PEOPLE,), minval=cw - gap/2 + 0.5, maxval=cw + gap/2 - 0.5)
-        vy = jax.random.uniform(k6, (NUM_PEOPLE,), minval=1.0, maxval=ROOM_H - 1.0)
-        hx = jax.random.uniform(k5, (NUM_PEOPLE,), minval=1.0, maxval=ROOM_W - 1.0)
-        hy = jax.random.uniform(k6, (NUM_PEOPLE,), minval=ch - gap/2 + 0.5, maxval=ch + gap/2 - 0.5)
-        
+        sides = jax.random.randint(k4, (N_BASE_PEOPLE,), 0, 2)
+        vx = jax.random.uniform(k5, (N_BASE_PEOPLE,), minval=cw - gap/2 + 0.5, maxval=cw + gap/2 - 0.5)
+        vy = jax.random.uniform(k6, (N_BASE_PEOPLE,), minval=1.0, maxval=ROOM_H - 1.0)
+        hx = jax.random.uniform(k5, (N_BASE_PEOPLE,), minval=1.0, maxval=ROOM_W - 1.0)
+        hy = jax.random.uniform(k6, (N_BASE_PEOPLE,), minval=ch - gap/2 + 0.5, maxval=ch + gap/2 - 0.5)
+
         px = jnp.where(sides == 0, vx, hx)
         py = jnp.where(sides == 0, vy, hy)
-        
+
         g1x = jnp.where(sides == 0, px, 1.0)
         g1y = jnp.where(sides == 0, ROOM_H - 1.0, py)
         g2x = jnp.where(sides == 0, px, ROOM_W - 1.0)
         g2y = jnp.where(sides == 0, 1.0, py)
-        
+
         angles = jnp.where(sides == 0, jnp.pi/2, 0.0)
-        people = pack_human(px, py, angles, g1x, g1y, g2x, g2y)
+        people_base = pack_human(px, py, angles, g1x, g1y, g2x, g2y)
+        people = jnp.concatenate([people_base, _make_dummies(NUM_PEOPLE - N_BASE_PEOPLE)], axis=0)
         return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
 
     # --- 6: STATIC GROUPS ---

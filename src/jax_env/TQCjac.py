@@ -116,74 +116,41 @@ def init_env_state(rng_key, min_goal_dist: float = 3.0):
     env_obs, env_state = vmap_reset(reset_keys)
     return env_obs, env_state, vmap_step
 
-# ── Shared obs encoder ────────────────────────────────────────────────────────
-class ObsEncoder(nn.Module):
-    stack_dim: int = 3
-    num_rays:  int = 216
-    dtype: jnp.dtype = NET_DTYPE
-    
-    @nn.compact
-    def __call__(self, x):
-        pose_size = 3 * self.stack_dim
-        state_size = 5
-        pose_stack = x[..., :pose_size]
-        state_vec  = x[..., pose_size : pose_size + state_size]
-        lidar_flat = x[..., pose_size + state_size:]
-        batch_shape = lidar_flat.shape[:-1]
-        
-        # Cast inputs to network dtype
-        lidar_cnn = lidar_flat.reshape((*batch_shape, self.num_rays, self.stack_dim)).astype(self.dtype)
-        cnn = nn.relu(nn.Conv(features=32, kernel_size=(7,), strides=(2,), padding='SAME', dtype=self.dtype)(lidar_cnn))
-        cnn = nn.relu(nn.Conv(features=64, kernel_size=(5,), strides=(2,), padding='SAME', dtype=self.dtype)(cnn))
-        cnn = nn.relu(nn.Conv(features=64, kernel_size=(3,), strides=(2,), padding='SAME', dtype=self.dtype)(cnn))
-        cnn_feat = nn.LayerNorm(dtype=self.dtype)(cnn.reshape((*batch_shape, -1)))
-        
-        global_in = jnp.concatenate([pose_stack, state_vec], axis=-1).astype(self.dtype)
-        global_feat = nn.relu(nn.Dense(128, dtype=self.dtype)(global_in))
-        global_feat = nn.relu(nn.Dense(64, dtype=self.dtype)(global_feat))
-        
-        fused = jnp.concatenate([cnn_feat, global_feat], axis=-1)
-        shared = nn.relu(nn.Dense(256, dtype=self.dtype)(fused))
-        return nn.relu(nn.Dense(128, dtype=self.dtype)(shared))   
+# Use the same SharedEncoder as PPO and SAC for fair algorithm comparison.
+from jax_network import SharedEncoder
 
 # ── Actor ─────────────────────────────────────────────────────────────────────
 class TQCActorNetwork(nn.Module):
     action_dim:  int   = ACTION_DIM
     LOG_STD_MIN: float = -5.0
     LOG_STD_MAX: float =  2.0
-    dtype: jnp.dtype = NET_DTYPE
-    
+
     @nn.compact
     def __call__(self, obs):
-        feat = ObsEncoder(dtype=self.dtype)(obs)
-        mean = nn.Dense(self.action_dim, dtype=self.dtype)(feat)
-        log_std = nn.Dense(self.action_dim, dtype=self.dtype)(feat)
-        # Always cast outputs back to float32 for physics and loss stability
+        feat = SharedEncoder()(obs)
+        mean    = nn.Dense(self.action_dim)(feat)
+        log_std = nn.Dense(self.action_dim)(feat)
         return mean.astype(jnp.float32), jnp.clip(log_std.astype(jnp.float32), self.LOG_STD_MIN, self.LOG_STD_MAX)
 
 # ── Quantile Critics ──────────────────────────────────────────────────────────
 class QuantileCriticNetwork(nn.Module):
     n_atoms:    int = N_ATOMS
     action_dim: int = ACTION_DIM
-    dtype: jnp.dtype = NET_DTYPE
-    
+
     @nn.compact
     def __call__(self, obs, action):
-        feat = ObsEncoder(dtype=self.dtype)(obs)
-        x = nn.relu(nn.Dense(256, dtype=self.dtype)(jnp.concatenate([feat, action.astype(self.dtype)], axis=-1)))
-        x = nn.relu(nn.Dense(128, dtype=self.dtype)(x))
-        # Always cast output atoms back to float32 for stable Huber loss
-        return nn.Dense(self.n_atoms, dtype=self.dtype)(x).astype(jnp.float32)
+        feat = SharedEncoder()(obs)
+        x = nn.relu(nn.Dense(256)(jnp.concatenate([feat, action], axis=-1)))
+        x = nn.relu(nn.Dense(128)(x))
+        return nn.Dense(self.n_atoms)(x).astype(jnp.float32)
 
 class TQCCriticEnsemble(nn.Module):
-    n_critics:  int = N_CRITICS
-    n_atoms:    int = N_ATOMS
-    action_dim: int = ACTION_DIM
-    dtype: jnp.dtype = NET_DTYPE
-    
+    n_critics: int = N_CRITICS
+    n_atoms:   int = N_ATOMS
+
     @nn.compact
     def __call__(self, obs, action):
-        all_atoms = [QuantileCriticNetwork(self.n_atoms, self.action_dim, dtype=self.dtype, name=f'critic_{i}')(obs, action) for i in range(self.n_critics)]
+        all_atoms = [QuantileCriticNetwork(self.n_atoms, self.action_dim, name=f'critic_{i}')(obs, action) for i in range(self.n_critics)]
         return jnp.stack(all_atoms, axis=1)
 
 _TAUS = (2.0 * jnp.arange(1, N_ATOMS + 1) - 1.0) / (2.0 * N_ATOMS)

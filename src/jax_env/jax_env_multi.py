@@ -55,21 +55,20 @@ _STEP_PEN      =  -0.025   # Drastically increased. Standing still is no longer 
 
 # Smoothness & Rotation penalties (Lowered to unblock exploration)
 _SMOOTH_WEIGHT =   0.08    # Reduced to stop paralyzing the agent's steering
-_ROT_WEIGHT    =   0.1    # Reduced to allow necessary initial exploration
+_ROT_WEIGHT    =   0.03   # Low: allow steering around humans, only penalizes extreme spinning
 
 _COMFORT_DIST  = 1.2   # m — personal space boundary
 _COMFORT_COEF  = 0.015 # base penalty at d=0 (before speed scaling) — /10 from 0.15
 
-_YIELD_DIST    = 2.0   # m — distance to start yielding
-_YIELD_COEF    = 0.7   # max penalty when target_v is full and human is at 0 distance — /10 from 4.0
-_FREE_SPEED_COEF = 0.12 # bonus for moving at max speed when no humans are around — /10 from 0.8
+_YIELD_DIST    = 1.8   # m — distance to start yielding (wider detection zone)
+_YIELD_COEF    = 3.0   # must dominate progress_coef (2.0) so braking near humans is always preferred
 
 
 # -------------------
 
 
 N_SUBSTEPS = int(DT / HSFM_DT)
-NUM_PEOPLE = 12
+NUM_PEOPLE = 24
 
 # Position used to hide the robot from HSFM when ghost_robot=True.
 # Far outside the room so social forces from the robot on humans are zero.
@@ -318,7 +317,16 @@ def step_env(key, state, action, ghost_robot: bool = True):
 
     # Only freeze active (non-dummy) humans; never freeze respawned ones
     active_mask_stop = (new_people[:, 10] >= 0.0) & ~needs_respawn
-    freeze           = is_stopped_h & active_mask_stop
+
+    # Detect static_groups scenario: g1 == g2 for all humans (no waypoints to walk toward).
+    # In this case force ALL active humans frozen so the robot learns to avoid static people.
+    g1x_sg = state.people[:, 6]
+    g1y_sg = state.people[:, 7]
+    g2x_sg = state.people[:, 8]
+    g2y_sg = state.people[:, 9]
+    is_static_groups = jnp.all((g1x_sg == g2x_sg) & (g1y_sg == g2y_sg))
+
+    freeze = (is_stopped_h | is_static_groups) & active_mask_stop
 
     # Clamp px=0,1 vx=2, vy=3, omega=5 for stopped humans
     frozen_people = state.people.at[:, 2:4].set(0.0).at[:, 5].set(0.0)
@@ -381,7 +389,9 @@ def step_env(key, state, action, ghost_robot: bool = True):
     # ── 5. Collision Detection ───────────────────────────────────────────────────
 
     heading_dot  = dx_p * jnp.cos(new_theta) + dy_p * jnp.sin(new_theta)
-    in_fwd_fov   = heading_dot > 0.0       # human is ahead of the robot
+    heading_angle = jnp.arctan2(dy_p, dx_p)
+    rel_angle = (heading_angle - new_theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
+    in_fwd_fov   = jnp.abs(rel_angle) < (jnp.pi / 2.0)   # human within ±90° forward cone
     in_prox      = dists_p_active < 1.5    # within 1.5 m
     robot_moving = target_v >= 0.1         # robot is moving
 
@@ -472,28 +482,27 @@ def step_env(key, state, action, ghost_robot: bool = True):
 
 
     # — --- 6b. NEW: Yield Penalty Dynamical Brake Gradient
-
-    yield_weight = jnp.maximum(0.0, 1.0 - dists_p_active/_YIELD_DIST) # consider only humans within the yield distance
+    yield_linear = jnp.maximum(0.0, 1.0 - dists_p_active/_YIELD_DIST)
+    yield_weight = yield_linear ** 2  # quadratic: gentle at edge, steep when close
     yield_weight = yield_weight * in_fwd_fov.astype(jnp.float32)  # only consider humans in front
     yield_pressure = jnp.max(yield_weight) # focus on the most critical human for yielding
     yield_pen = -_YIELD_COEF * target_v * yield_pressure  # stronger penalty for moving fast when close to a human in front
-    free_speed_bonus = _FREE_SPEED_COEF * target_v * (1.0 - yield_pressure) # reward for moving when no humans are close in front
 
     
     # — 6c. Dense shaping ─────────────────────────────────────────────────
     progress         = prev_dist - new_dist
-    social_progress  = _PROGRESS_COEF * progress
+    progress_reward  = _PROGRESS_COEF * progress
     step_pen         = _STEP_PEN
-    
+
     # Harsh quadratic penalty for jittering to violently punish zero-crossing
     smooth_pen       = -0.5 * (target_w - state.w)**2
     # Quadratic penalty on rotation magnitude (encourages driving straight)
     rot_pen          = -_ROT_WEIGHT * (target_w ** 2)
     # Destroy the local minimum of spinning in place when blocked
     spin_in_place_pen = jnp.where(target_v < 0.1, -0.5 * (target_w ** 2), 0.0)
-    
+
     # Minimal baseline + smoothness
-    dense_reward     = social_progress + step_pen + smooth_pen + rot_pen + spin_in_place_pen + yield_pen + free_speed_bonus #+ comfort_pen 
+    dense_reward     = progress_reward + step_pen + smooth_pen + rot_pen + spin_in_place_pen + yield_pen
     
 
     # — 6d. Terminal cascades ─────────────────────────────────────────────
@@ -531,12 +540,13 @@ def step_env(key, state, action, ghost_robot: bool = True):
         "sp_mask":       sp_mask,
         "timeout":       timeout,
         "instant_col":   instant_col,
-        "rew_yield":     jnp.array(0.0),
-        "rew_prog":      social_progress,
+        # Per-step reward components for eval panel
+        "rew_progress":  progress_reward,
         "rew_step":      jnp.array(step_pen),
         "rew_smooth":    smooth_pen,
-        "rew_rot":       rot_pen,
-        "rew_comf":      comfort_pen,
-        "rew_yield":     yield_pen + free_speed_bonus,
+        "rew_speed":     jnp.array(0.0),  # removed: was redundant with progress
+        "rew_heading":   jnp.array(0.0),  # not in multi env
+        "rew_comfort":   jnp.array(0.0),  # commented out above
+        "rew_yield":     yield_pen,
     }
     return obs, new_state, reward, done, info

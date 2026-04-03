@@ -78,7 +78,7 @@ LR_END         = 1e-5
 LR_MIN         = 1e-5
 WARMUP_UPDATES = 5
 
-TOTAL_UPDATES  = 1000
+TOTAL_UPDATES  = 600
 
 # ── Minibatch geometry ────────────────────────────────────────────────────────
 # Loss piatto su (T*N) sample. Shuffle su tutto il batch poi split in minibatch.
@@ -272,7 +272,7 @@ def ppo_loss_fn(
     mean, logstd, values = network.apply({"params": params}, obs_mb)
 
     log_prob    = squash_corrected_log_prob(actions_mb, mean, logstd, max_v_mb)
-    ratio       = jnp.exp(jnp.clip(log_prob - old_log_probs, -5.0, 5.0))
+    ratio       = jnp.exp(log_prob - old_log_probs)
     policy_loss = -jnp.mean(jnp.minimum(
         ratio * advantages_mb,
         jnp.clip(ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS) * advantages_mb,
@@ -497,14 +497,9 @@ if __name__ == "__main__":
         if new_max_dist > cur_max_dist or new_ghost > cur_ghost or new_stage != cur_stage:
             cur_max_dist = new_max_dist
             cur_stage    = new_stage
-
-            if new_ghost > cur_ghost:
-                cur_ghost = new_ghost
-                vmap_step = rebuild_vmap_step(cur_ghost)
-                print(f"  -> Ghost closure rebuilt: ghost_prob={cur_ghost:.1f}")
-            else:
-                print(f"  -> Curriculum advanced: stage={cur_stage}, dist={cur_max_dist:.1f}m, "
-                      f"scen_rand_prob={_scen_rand_prob:.0%}")
+            cur_ghost    = new_ghost
+            print(f"  -> Curriculum advanced: stage={cur_stage}, dist={cur_max_dist:.1f}m, "
+                  f"ghost_prob={cur_ghost:.1f}, scen_rand_prob={_scen_rand_prob:.0%}")
 
         cur_scenario = new_scenario
 

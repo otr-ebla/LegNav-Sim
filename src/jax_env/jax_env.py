@@ -532,9 +532,9 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray, **kwargs):
 
     # Yield penalty is absolute (not normalised by max_v):
     # moving at 2 m/s costs ~5x more than at 0.4 m/s — strong deterrent at any speed
-    yield_penalty = -7.5 * urgency * target_v
+    yield_penalty = -0.5 * urgency * target_v  # Reduced from -7.5 to prevent paralysis
     # Yield bonus: full value while urgency is present, no time-decay
-    yield_bonus   =  0.5 * urgency
+    yield_bonus   =  0.1 * urgency
 
     yield_reward = jnp.where(
         is_yield_situation,
@@ -571,8 +571,16 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray, **kwargs):
         "goal_reached":  goal_reached,
         "collision":     collision,
         "passive_col":   passive_col,
-        "active_col":    active_col,    # <-- Added this line
+        "active_col":    active_col,
         "closest_human": closest_human,
         "sp_mask":       sp_mask,
+        # Per-step reward components (raw, before terminal overrides)
+        "rew_progress":  progress,
+        "rew_step":      jnp.array(step_pen, dtype=jnp.float32),
+        "rew_smooth":    smooth,
+        "rew_speed":     speed_bon_yield,
+        "rew_heading":   heading_bon,
+        "rew_comfort":   comfort_pen,
+        "rew_yield":     yield_reward,
     }
     return obs, new_state, reward, done, info

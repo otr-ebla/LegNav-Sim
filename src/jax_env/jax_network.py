@@ -231,7 +231,7 @@ def squash_corrected_log_prob(
     std = jnp.exp(logstd)
     z   = (raw_actions - mean) / (std + 1e-8)
     base_log_prob = jnp.sum(-0.5 * (z ** 2 + jnp.log(2.0 * jnp.pi)) - logstd, axis=-1)
-    return base_log_prob - _squash_log_jacobian(raw_actions, max_v)
+    return base_log_prob  # Removed _squash_log_jacobian for PPO stability
 
 
 def sample_action(

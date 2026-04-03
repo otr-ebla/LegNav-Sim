@@ -280,6 +280,8 @@ WINDOW_W   = SIM_SIZE + PANEL_W
 WINDOW_H   = SIM_SIZE
 SCALE      = SIM_SIZE / max(ROOM_W, ROOM_H)
 FPS_TARGET = 10
+FPS_SPEEDS = [10, 20, 30]
+FPS_IDX    = 0
 
 C_BG        = (28,  28,  34); C_FLOOR    = (44,  44,  52); C_GRID     = (56,  56,  66)
 C_WALL      = (190, 190, 205); C_ROBOT    = (60,  140, 255); C_ROBOT_H  = (170, 210, 255)
@@ -433,7 +435,7 @@ def draw_scene(surface, state, raw_lidar, foot_state_np, show_lidar, show_arrows
 
 def draw_panel(surface, fonts, algo, ep, step, ep_ret, max_v, v, w,
                goal_dist, goal_align, ch, stats, banner, banner_t,
-               scen_idx, eval_mode, use_legs, raw_lidar, sp_mask):
+               scen_idx, eval_mode, use_legs, raw_lidar, sp_mask, rew_acc, show_radar=True):
     pygame.draw.rect(surface, C_PANEL, (SIM_SIZE, 0, PANEL_W, WINDOW_H))
     pygame.draw.line(surface, C_WALL,  (SIM_SIZE, 0), (SIM_SIZE, WINDOW_H), 2)
     y = 10; lh = 19; x0 = SIM_SIZE + 10
@@ -460,6 +462,21 @@ def draw_panel(surface, fonts, algo, ep, step, ep_ret, max_v, v, w,
     txt(f"Align {math.degrees(goal_align):>+5.1f}°")
     txt(f"Human {ch:>5.2f} m"); sep()
     txt(f"Ep ret {ep_ret:>+7.2f}", C_GOAL, "mid"); sep()
+
+    # ── Reward breakdown (cumulative per episode) ─────────────────────────────
+    txt("── Reward components ─", C_DIM, "small"); y += 1
+    _REW_LABELS = [
+        ("progress", "rew_progress"),
+        ("step_pen", "rew_step"),
+        ("smooth  ", "rew_smooth"),
+        ("yield   ", "rew_yield"),
+    ]
+    for label, key in _REW_LABELS:
+        val = rew_acc.get(key, 0.0)
+        col = C_SUCCESS if val > 0.005 else (C_COLLIDE if val < -0.005 else C_DIM)
+        txt(f"  {label} {val:>+7.2f}", col, "small")
+    sep()
+
     txt("── Last 50 episodes ─", C_DIM, "small"); y += 2
     txt(f"  Success  {stats['suc']:>5.1f}%",  C_SUCCESS)
     txt(f"  Collision{stats['col']:>5.1f}%",  C_COLLIDE)
@@ -476,19 +493,17 @@ def draw_panel(surface, fonts, algo, ep, step, ep_ret, max_v, v, w,
             "passive_col": ("🚶 PASSIVE COL",   (200,100,100)),
             "timeout"    : ("⏱  TIMEOUT",       C_TIMEOUT),
             "skipped"    : ("⏭  SKIPPED",       C_DIM),
-        }.get(banner, ("", C_TEXT))
+        }.get(banner, (banner, C_TEXT))  # use banner text as-is if not in dict
         if label:
             surf = fonts["big"].render(label, True, col)
-            radar_r   = 130
-            radar_top = WINDOW_H - radar_r * 2 - 20
-            bx = SIM_SIZE + PANEL_W // 2 - surf.get_width() // 2
-            by = radar_top - surf.get_height() - 20
+            # Top-left corner
+            bx, by = 20, 20
             bg = pygame.Surface((surf.get_width()+24, surf.get_height()+12))
             bg.fill((20,20,26)); bg.set_alpha(220)
             surface.blit(bg, (bx-12, by-6)); surface.blit(surf, (bx, by))
 
     # LiDAR radar chart
-    if raw_lidar is not None:
+    if raw_lidar is not None and show_radar:
         radar_r  = 130
         radar_cx = SIM_SIZE + PANEL_W // 2
         radar_cy = WINDOW_H - radar_r - 20
@@ -567,8 +582,11 @@ def main():
     rng, reset_rng = jax.random.split(rng)
     obs, stacked_state = fast_reset(reset_rng)
 
+    _REW_KEYS = ["rew_progress","rew_step","rew_smooth","rew_yield"]
     ep=0; ep_steps=0; ep_reward=0.0; ep_hist=[]
-    paused=False; show_lidar=True; show_arrows=True; show_body=args.ghost_body
+    rew_acc = {k: 0.0 for k in _REW_KEYS}
+    paused=False; show_lidar=True; show_arrows=True; show_body=args.ghost_body; show_radar=True
+    fps_idx=0; fps_speeds=[10, 20, 30]; current_fps=fps_speeds[fps_idx]
     banner=""; banner_t=0
 
     def get_stats():
@@ -590,6 +608,8 @@ def main():
                 if k == pygame.K_l:    show_lidar  = not show_lidar
                 if k == pygame.K_h:    show_arrows = not show_arrows
                 if k == pygame.K_b:    show_body   = not show_body
+                if k == pygame.K_p:    show_radar  = not show_radar
+                if k == pygame.K_s:    fps_idx = (fps_idx + 1) % len(fps_speeds); current_fps = fps_speeds[fps_idx]; banner = f"FPS: {current_fps}"; banner_t = 15
                 if pygame.K_0 <= k <= pygame.K_6:
                     evaluation_mode  = "fixed"
                     current_scenario = k - pygame.K_0
@@ -636,6 +656,8 @@ def main():
         rng, step_rng = jax.random.split(rng)
         obs, stacked_state, reward, done, info = fast_step(step_rng, stacked_state, env_action)
         ep_reward += float(reward); ep_steps += 1
+        for k in _REW_KEYS:
+            rew_acc[k] += float(info.get(k, 0.0))
 
         cpu_state = jax.device_get(stacked_state.env_state)
         raw_lidar = MAX_LIDAR_DIST - jax.device_get(stacked_state.lidar_stack)[-1] * \
@@ -655,10 +677,10 @@ def main():
         draw_panel(screen, fonts, algo, ep, ep_steps, ep_reward,
                    float(cpu_state.max_v), float(cpu_state.v), float(cpu_state.w),
                    gdist, galign, ch, get_stats(), banner, banner_t,
-                   current_scenario, evaluation_mode, use_legs, raw_lidar, sp_mask)
+                   current_scenario, evaluation_mode, use_legs, raw_lidar, sp_mask, rew_acc, show_radar)
 
         if banner_t > 0: banner_t -= 1
-        pygame.display.flip(); clock.tick(FPS_TARGET)
+        pygame.display.flip(); clock.tick(current_fps)
 
         if done:
             goal = bool(info["goal_reached"]); col = bool(info["collision"])
@@ -674,6 +696,7 @@ def main():
                 fast_reset, fast_step = build_fast_reset(current_scenario)
 
             ep+=1; ep_reward=0.0; ep_steps=0
+            rew_acc = {k: 0.0 for k in _REW_KEYS}
 
             if ep >= 300:
                 s = get_stats()
