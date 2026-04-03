@@ -563,9 +563,9 @@ def main():
     def build_fast_reset(scen_idx, max_goal_dist=MAX_EVAL_GOAL_DIST):
         # Lambda invece di functools.partial: make_stacked_env passa max_goal_dist
         # come argomento posizionale, quindi non deve essere già nel partial.
-        bound_reset = lambda key, mgd, **kw: reset_env(key, mgd, scenario_idx=scen_idx, **kw)
-        rs, ss = make_stacked_env(bound_reset, step_env, stack_dim=3, ghost_prob=0.0)
-        jit_rs = jax.jit(lambda key: rs(key, max_goal_dist))
+        bound_reset = lambda key, max_goal_dist=3.0, scenario_idx=-1, **kw: reset_env(key, max_goal_dist, scenario_idx=scen_idx, **kw)
+        rs, ss = make_stacked_env(bound_reset, step_env, stack_dim=3)
+        jit_rs = jax.jit(lambda key: rs(key, max_goal_dist, ghost_prob=0.0))
         jit_ss = jax.jit(ss)
         return jit_rs, jit_ss
 

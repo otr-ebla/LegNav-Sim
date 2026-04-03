@@ -202,7 +202,9 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float, scenario_idx: int 
         g1x = jnp.concatenate([g1x_walls, g1x_random])
         g1y = jnp.full((N_PRL,), 1.0)
         
-        people_prl = pack_human(px, py, jnp.full((N_PRL,), -jnp.pi/2), g1x, g1y, g1x, g1y)
+        g2x = g1x
+        g2y = jnp.full((N_PRL,), ROOM_H - 0.2)
+        people_prl = pack_human(px, py, jnp.full((N_PRL,), -jnp.pi/2), g1x, g1y, g2x, g2y)
         
         n_pad = NUM_PEOPLE - N_PRL
         dummy_x = jnp.full((n_pad,), -999.0)
