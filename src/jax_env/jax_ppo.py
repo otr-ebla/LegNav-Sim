@@ -64,10 +64,7 @@ GAMMA          = 0.99
 GAE_LAMBDA     = 0.95
 CLIP_EPS       = 0.2
 VF_COEF        = 0.25
-ENTROPY_COEF   = 0.015   # valore stage 0 — usato solo per il print iniziale
-# Decay per stage: esplorazione calibrata su ogni livello del curriculum
-# Stage:                 0      1      2      3      4      5      6
-ENTROPY_COEF_BY_STAGE = [0.015, 0.012, 0.008, 0.005, 0.003, 0.002, 0.001]
+ENTROPY_COEF   = 0.015   # initial value (suc=0) — continuously interpolated by curriculum
 MAX_GRAD_NORM  = 0.5
 PPO_EPOCHS     = 6
 LR_START       = 2.5e-4
@@ -78,7 +75,7 @@ WARMUP_UPDATES = 5
 TOTAL_UPDATES  = 600
 
 # ── Minibatch geometry ────────────────────────────────────────────────────────
-# Loss piatto su (T*N) sample. Shuffle su tutto il batch poi split in minibatch.
+# Flat loss over (T*N) samples. Shuffle full batch then split into minibatches.
 BATCH_SIZE      = NUM_ENVS * ROLLOUT_STEPS          # 65_536
 N_MINIBATCHES   = 8
 assert BATCH_SIZE % N_MINIBATCHES == 0
@@ -90,35 +87,22 @@ _TOTAL_OPT_STEPS      = TOTAL_UPDATES  * _OPT_STEPS_PER_UPDATE
 
 network = EndToEndActorCritic(action_dim=2)
 
-# ── Curriculum ────────────────────────────────────────────────────────────────
-CURRICULUM_STAGES = [
-    (25.0, 1.5),
-    (38.0, 2.5),
-    (50.0, 4.0),
-    (60.0, 5.0),
-    (70.0, 6.5),
-    (80.0, 8.0),
-    (101., 9.0),
-]
+# ── Continuous Curriculum ─────────────────────────────────────────────────────
+# Instead of discrete jumps causing domain shock, we continuously interpolate
+# environment parameters based on the highest rolling success rate.
+_SUC_ANCHORS  = np.array([0.0, 25.0, 38.0, 50.0, 60.0, 70.0, 82.0, 95.0, 100.0])
+_DIST_ANCHORS = np.array([1.5,  1.5,  2.5,  4.0,  5.0,  6.5,  8.0,  9.0,   9.0])
+_GHOST_ANCHORS= np.array([0.0,  0.0,  0.0,  0.0,  0.15, 0.3,  0.6,  0.9,   1.0])
+_ENT_ANCHORS  = np.array([0.015,0.015,0.012,0.008,0.005,0.003,0.002,0.001, 0.001])
+# Progressively unlock scenarios [0: Random, 1: Parallel, 2: Perp, 3: Circle, 4: Bottleneck, 5: Intersect, 6: Static]
+_SCEN_ANCHORS = np.array([0,    0,    1,    2,    4,    5,    6,    6,     6])
 
-GHOST_PROB_STAGES = [
-    # ghost_prob basso → robot visibile agli umani → umani lo evitano → più facile
-    # ghost_prob alto  → robot invisibile agli umani → umani non collaborano → più difficile
-    # Il curriculum aumenta la difficoltà man mano che il robot migliora.
-    # Stage:           suc <  threshold  → ghost_prob
-    (50.0, 0.0),   # stage 0-2: robot sempre visibile (umani cedono il passo)
-    (70.0, 0.3),   # stage 3:   robot visibile 70% degli episodi
-    (82.0, 0.6),   # stage 4-5: mix bilanciato
-    (101., 1.0),   # stage 6:   robot sempre invisibile (comportamento naturale umani)
-]
-
-# Probabilità di usare scenario random (-1) vs scenario 0 fisso, per stage.
-# Stage 0-1: solo scenario 0 (robot impara a navigare senza struttura)
-# Stage 2+:  mix crescente — il robot inizia a vedere scenari strutturati
-# Stage:                  0     1     2     3     4     5     6
-SCENARIO_RANDOM_PROB = [0.0,  0.0,  0.4,  0.6,  0.8,  1.0,  1.0]
-# Probabilità 0.0 → scenario_idx=0 fisso
-# Probabilità 1.0 → scenario_idx=-1 (tutti i 7 scenari in modo uniforme)
+def get_continuous_curriculum(suc_pct: float):
+    dist  = float(np.interp(suc_pct, _SUC_ANCHORS, _DIST_ANCHORS))
+    ghost = float(np.interp(suc_pct, _SUC_ANCHORS, _GHOST_ANCHORS))
+    ent   = float(np.interp(suc_pct, _SUC_ANCHORS, _ENT_ANCHORS))
+    max_s = int(np.interp(suc_pct, _SUC_ANCHORS, _SCEN_ANCHORS))
+    return dist, ghost, ent, max_s
 
 from flax import struct
 
@@ -157,25 +141,6 @@ def normalize_batch_rewards(rewards, dones, running_ret, rms_state, gamma):
     normalized_rewards = rewards / jnp.sqrt(new_rms_state.var + 1e-8)
     normalized_rewards = jnp.clip(normalized_rewards, -10.0, 10.0)
     return normalized_rewards, running_ret, new_rms_state
-
-
-def curriculum_ghost_prob(suc_pct: float) -> float:
-    for threshold, prob in GHOST_PROB_STAGES:
-        if suc_pct < threshold:
-            return prob
-    return GHOST_PROB_STAGES[-1][1]
-
-def curriculum_max_goal_dist(suc_pct: float) -> float:
-    for threshold, dist in CURRICULUM_STAGES:
-        if suc_pct < threshold:
-            return dist
-    return CURRICULUM_STAGES[-1][1]
-
-def _curriculum_stage(suc_pct: float) -> int:
-    for i, (threshold, _) in enumerate(CURRICULUM_STAGES):
-        if suc_pct < threshold:
-            return i
-    return len(CURRICULUM_STAGES) - 1
 
 
 _warmup_schedule = optax.linear_schedule(
@@ -260,11 +225,11 @@ def ppo_loss_fn(
     returns_mb,     # (MB,)
     old_log_probs,  # (MB,)
     max_v_mb,       # (MB,)
-    entropy_coef,   # () — scalare JAX, varia per stage curriculum
+    entropy_coef,   # () — JAX scalar, varies continuously with curriculum
 ):
     """
-    Forward pass parallelo su MB = MINI_BATCH_SIZE sample.
-    Nessun lax.scan: tutto vectorizzato in un colpo solo sulla GPU.
+    Parallel forward pass over MB = MINI_BATCH_SIZE samples.
+    No lax.scan: fully vectorized in a single GPU kernel.
     """
     mean, logstd, values = network.apply({"params": params}, obs_mb)
 
@@ -285,16 +250,16 @@ def ppo_loss_fn(
     return total_loss, (policy_loss, value_loss, entropy, kl_div, clip_frac)
 
 
-# ── Minibatch update — shuffle su (T*N), split in N_MINIBATCHES chunk ─────────
+# ── Minibatch update — shuffle over (T*N), split into N_MINIBATCHES chunks ────
 
 @jax.jit
 def ppo_update_epoch(carry, perm):
     """
-    perm: (BATCH_SIZE,) — permutazione su tutti i T*N sample.
+    perm: (BATCH_SIZE,) — permutation over all T*N samples.
     """
     params, opt_state, obs_flat, actions_flat, adv_flat, ret_flat, old_lp_flat, max_v_flat, entropy_coef = carry
 
-    # Applica permutazione
+    # Apply permutation
     obs_p     = obs_flat[perm]
     actions_p = actions_flat[perm]
     adv_p     = adv_flat[perm]
@@ -332,8 +297,8 @@ def ppo_update_epoch(carry, perm):
 def run_ppo_updates(train_state, obs_seq, actions_seq, adv_seq, ret_seq,
                     old_lp_seq, max_v_seq, rng_key, entropy_coef):
     """
-    obs_seq: (T, N, OBS_SIZE) — reshapato a (T*N, OBS_SIZE) per il loss piatto.
-    entropy_coef: scalare JAX con il valore dello stage corrente.
+    obs_seq: (T, N, OBS_SIZE) — reshaped to (T*N, OBS_SIZE) for flat loss.
+    entropy_coef: JAX scalar with the current curriculum entropy value.
     """
     params, opt_state = train_state
 
@@ -349,7 +314,7 @@ def run_ppo_updates(train_state, obs_seq, actions_seq, adv_seq, ret_seq,
     adv_flat = (adv_flat - adv_flat.mean()) / (adv_flat.std() + 1e-8)
     ret_flat = ret_seq.reshape(TN)
 
-    # Una permutazione per epoca su tutti i T*N sample
+    # One permutation per epoch over all T*N samples
     perms = jax.vmap(lambda k: jax.random.permutation(k, TN))(
         jax.random.split(rng_key, PPO_EPOCHS)
     )
@@ -389,7 +354,7 @@ if __name__ == "__main__":
     print(f"  Envs        : {NUM_ENVS}  x  steps {ROLLOUT_STEPS}  =  {BATCH_SIZE:,} batch")
     print(f"  Minibatches : {N_MINIBATCHES} x {MINI_BATCH_SIZE} sample  (flat T*N)")
     print(f"  VF_COEF={VF_COEF}  ENTROPY_COEF={ENTROPY_COEF}")
-    print(f"  Curriculum stages: {CURRICULUM_STAGES}\n")
+    print(f"  Continuous curriculum anchors: suc={list(_SUC_ANCHORS)}\n")
 
     rng = jax.random.PRNGKey(42)
     rng, init_rng, env_rng = jax.random.split(rng, 3)
@@ -405,15 +370,13 @@ if __name__ == "__main__":
     final_ckpt_path = "checkpoints/ppo_attn_final.msgpack"
 
     # Curriculum state
-    cur_max_dist = curriculum_max_goal_dist(0.0)
-    cur_stage    = _curriculum_stage(0.0)
-    cur_ghost    = curriculum_ghost_prob(0.0)
+    cur_max_dist, cur_ghost, cur_ent, cur_max_scen = get_continuous_curriculum(0.0)
     rolling_suc  = 0.0
     highest_rolling_suc = 0.0
     cur_scenario = 0
 
-    print(f"Curriculum: starting stage {cur_stage}, max_goal_dist={cur_max_dist:.1f} m, "
-          f"ghost_prob={cur_ghost:.1f}, scenario={cur_scenario}")
+    print(f"Curriculum: max_goal_dist={cur_max_dist:.1f} m, "
+          f"ghost_prob={cur_ghost:.1f}, max_scenario={cur_max_scen}")
 
     print("Initialising environments...")
     env_obs, env_state, vmap_step = init_env_state(env_rng, ghost_prob=cur_ghost)
@@ -427,7 +390,7 @@ if __name__ == "__main__":
 
     hdr = (f"{'Upd':>5} | {'EpRet':>7} | {'Suc%':>5} {'Obs%':>5} {'Acol%':>5} {'Pcol%':>5} {'Tmo%':>5} |"
            f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} {'KL':>6} {'ClpF':>5} | {'FPS':>7} {'#Ep':>6} {'LR':>8} | "
-           f"{'Stage':>5} {'MaxDist':>7} {'Ghost':>6} {'Ent':>7} {'Scen%':>5} {'Time':>8}")
+           f"{'MaxDist':>7} {'Ghost':>6} {'Ent':>7} {'ScenMax':>7} {'Time':>8}")
     print(hdr)
     print("─" * len(hdr))
 
@@ -438,7 +401,7 @@ if __name__ == "__main__":
 
         rng, rollout_rng, update_rng = jax.random.split(rng, 3)
 
-        # collect_rollouts stateless: non restituisce più hidden
+        # collect_rollouts stateless: no hidden return
         # collect_rollouts stateless: no hidden return
         rollout_history, env_state, env_obs, last_val = collect_rollouts(
             rollout_rng, train_state[0], network.apply, vmap_step,
@@ -482,31 +445,24 @@ if __name__ == "__main__":
             rolling_suc = 0.9 * rolling_suc + 0.1 * suc_pct
             highest_rolling_suc = max(highest_rolling_suc, rolling_suc)
 
-        new_max_dist = curriculum_max_goal_dist(highest_rolling_suc)
-        new_stage    = _curriculum_stage(highest_rolling_suc)
-        new_ghost    = curriculum_ghost_prob(highest_rolling_suc)
+        new_max_dist, new_ghost, new_ent, new_max_scen = get_continuous_curriculum(highest_rolling_suc)
 
-        # Per-update scenario: Python-side sample based on the current stage probability.
-        # SCENARIO_RANDOM_PROB[stage] = probability of using -1 (random among all 7 scenarios).
-        # Complementary probability → fixed scenario 0 (static random, simpler).
-        _scen_rand_prob = SCENARIO_RANDOM_PROB[new_stage]
-        new_scenario = -1 if (_random.random() < _scen_rand_prob) else 0
+        # Progressively sample from the unlocked scenarios to avoid layout shock
+        new_scenario = _random.randint(0, new_max_scen)
 
-        if new_max_dist > cur_max_dist or new_ghost > cur_ghost or new_stage != cur_stage:
+        if new_max_dist > cur_max_dist or new_ghost > cur_ghost or new_max_scen > cur_max_scen:
             cur_max_dist = new_max_dist
-            cur_stage    = new_stage
             cur_ghost    = new_ghost
-            print(f"  -> Curriculum advanced: stage={cur_stage}, dist={cur_max_dist:.1f}m, "
-                  f"ghost_prob={cur_ghost:.1f}, scen_rand_prob={_scen_rand_prob:.0%}")
+            cur_max_scen = new_max_scen
+            print(f"  -> Curriculum smoothly advanced: dist={cur_max_dist:.1f}m, "
+                  f"ghost_prob={cur_ghost:.2f}, unlocked_scenarios=0-{cur_max_scen}")
 
         cur_scenario = new_scenario
-
-        # Entropy coefficient dallo stage corrente
-        entropy_coef = jnp.array(ENTROPY_COEF_BY_STAGE[cur_stage])
+        entropy_coef = jnp.array(new_ent)
 
         advantages, returns = compute_gae(rewards, values, dones, last_val)
 
-        # PPO update senza hidden
+        # PPO update — stateless (no hidden state)
         train_state, mean_loss, aux = run_ppo_updates(
             train_state,
             obs_seq,
@@ -526,7 +482,6 @@ if __name__ == "__main__":
             lr_now       = float(scheduler(update * _OPT_STEPS_PER_UPDATE))
             ent_coef_now = float(entropy_coef)
             elapsedtime  = (time.time() - t_start) / 60.0
-            scen_prob    = SCENARIO_RANDOM_PROB[cur_stage]
             print(
                 f"{update:>5d} | {mean_ret:>7.1f} | "
                 f"{suc_pct:>4.1f}% {obs_pct:>4.1f}% {acol_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% | "
@@ -534,8 +489,8 @@ if __name__ == "__main__":
                 f"{float(v_loss):>6.2f} {float(entropy):>6.2f} "
                 f"{float(kl_div):>6.4f} {float(clip_frac):>4.2f} | "
                 f"{fps:>7,.0f} {n_ep:>6d} {lr_now:.2e} | "
-                f"{cur_stage:>5d} {cur_max_dist:>6.1f}m {cur_ghost:>5.1f}g "
-                f"{ent_coef_now:>6.4f}e {scen_prob:>4.0%}s {elapsedtime:>5.1f}min"
+                f"{cur_max_dist:>6.1f}m {cur_ghost:>5.2f}g "
+                f"{ent_coef_now:>6.4f}e scen<=={cur_max_scen} {elapsedtime:>5.1f}min"
             )
 
         if suc_pct > best_suc and n_ep > 0:

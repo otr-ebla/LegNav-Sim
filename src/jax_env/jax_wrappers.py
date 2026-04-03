@@ -18,9 +18,9 @@ FIXES vs previous version:
                       at construction time by sampling a Python bool.
     The sampled bool is baked into the closure — JAX never sees a traced bool.
 
-    For curriculum decay: rebuild make_stacked_env at each stage change in
-    jax_ppo.py with the new ghost_prob, same as rebuilding for max_goal_dist.
-    make_autoreset_env is ghost_agnostic (behaviour is locked in step_fn).
+    For curriculum updates: rebuild make_stacked_env whenever ghost_prob changes
+    (driven by get_continuous_curriculum in jax_ppo.py), same as rebuilding
+    for max_goal_dist. make_autoreset_env is ghost-agnostic (behaviour is locked in step_fn).
 
 Obs layout: [pose_stack(3*stack_dim=9) | state_vec(5) | lidar_stack(num_rays*stack_dim=648)]
 Total: 9 + 5 + 648 = 662

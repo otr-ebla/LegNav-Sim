@@ -2,14 +2,14 @@
 jax_train.py — Rollout Collection (Stateless — no GRU)
 
 CHANGES vs GRU version:
-  - `hidden` completamente rimosso da collect_rollouts e da tutti i carry.
-  - network.apply ora chiamato come apply_fn({"params": params}, obs) — nessun
-    secondo argomento hidden.
-  - Il rollout buffer NON contiene più 'hiddens' — il PPO loss è ora un forward
-    pass piatto su (T*N, D), nessun scan nel loss.
-  - last_val calcolato con forward pass diretto (nessun hidden da passare).
-  - init_env_state non restituisce più hidden.
-  - Tutto il resto (curriculum, vmap_step, ghost_prob) è invariato.
+  - `hidden` fully removed from collect_rollouts and all carries.
+  - network.apply now called as apply_fn({"params": params}, obs) — no
+    second hidden argument.
+  - Rollout buffer no longer contains 'hiddens' — PPO loss is now a flat
+    forward pass over (T*N, D), no scan inside the loss.
+  - last_val computed with a direct forward pass (no hidden to pass).
+  - init_env_state no longer returns hidden.
+  - Everything else (curriculum, vmap_step, ghost_prob) unchanged.
 """
 
 import os
@@ -109,7 +109,7 @@ def collect_rollouts(
 ):
     """
     Collect ROLLOUT_STEPS steps across NUM_ENVS environments.
-    STATELESS: nessun hidden carry. Network è puro feedforward (+ attention sul frame stack).
+    STATELESS: no hidden carry. Network is pure feedforward (+ frame-stack attention).
 
     Returns:
       rollout_history  — dict of (ROLLOUT_STEPS, NUM_ENVS, ...) tensors
