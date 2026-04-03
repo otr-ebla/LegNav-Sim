@@ -494,8 +494,9 @@ def step_env(key, state, action, ghost_robot: bool = True):
     progress_reward  = _PROGRESS_COEF * progress
     step_pen         = _STEP_PEN
 
-    # Harsh quadratic penalty for jittering to violently punish zero-crossing
-    smooth_pen       = -0.5 * (target_w - state.w)**2
+    # FIX Bug#4: _SMOOTH_WEIGHT era definito (0.08) ma non usato.
+    # Il coeff fisso -0.5 era 6× troppo alto → robot spaventato di girare → stagnazione.
+    smooth_pen       = -_SMOOTH_WEIGHT * (target_w - state.w)**2
     # Quadratic penalty on rotation magnitude (encourages driving straight)
     rot_pen          = -_ROT_WEIGHT * (target_w ** 2)
     # Destroy the local minimum of spinning in place when blocked

@@ -82,7 +82,9 @@ def rebuild_vmap_step(ghost_prob: float):
     _VMAP_STEP_CACHE.clear()
     step_auto = make_autoreset_env(reset_stacked, step_stacked)
     _VMAP_STEP_CACHE[cache_key] = jax.jit(
-        jax.vmap(step_auto, in_axes=(0, 0, 0, None, None))
+        # FIX Bug#3: in_axes aveva 5 voci, step_autoreset ne vuole 6
+        # (key, state, action, max_goal_dist, scenario_idx, ghost_prob)
+        jax.vmap(step_auto, in_axes=(0, 0, 0, None, None, None))
     )
     return _VMAP_STEP_CACHE[cache_key]
 

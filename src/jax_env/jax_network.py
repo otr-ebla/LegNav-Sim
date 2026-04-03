@@ -215,10 +215,13 @@ class EndToEndActorCritic(nn.Module):
 # ── Action squashing helpers ──────────────────────────────────────────────────
 
 def _squash_log_jacobian(raw_actions: jnp.ndarray, max_v: float = 1.0) -> jnp.ndarray:
-    v_squash = jax.nn.sigmoid(raw_actions[..., 0])
-    w_squash = jnp.tanh(raw_actions[..., 1])
-    log_dv = jnp.log(v_squash * (1.0 - v_squash) * max_v + 1e-6)
-    log_dw = jnp.log(1.0 - w_squash ** 2 + 1e-6)
+    # Jacobian corretto per v = tanh(a)*0.5+0.5, w = tanh(b)
+    # dv/da = 0.5*(1 - tanh²(a)) = 0.5*sech²(a)
+    # log|dv/da * max_v| = log(0.5*max_v) + log(1 - tanh²(a))
+    t_v = jnp.tanh(raw_actions[..., 0])
+    t_w = jnp.tanh(raw_actions[..., 1])
+    log_dv = jnp.log(0.5 * max_v + 1e-6) + jnp.log(1.0 - t_v ** 2 + 1e-6)
+    log_dw = jnp.log(1.0 - t_w ** 2 + 1e-6)
     return log_dv + log_dw
 
 
@@ -245,13 +248,17 @@ def sample_action(
 
 
 def scale_action_to_env(raw_action: jnp.ndarray, max_v: float) -> jnp.ndarray:
-    v = jax.nn.sigmoid(raw_action[..., 0]) * max_v
+    # FIX Bug#1: sigmoid ∈ (0,1) → mai raggiunge max_v.
+    # tanh rescalato ∈ (-1,1) → (0,1) via *0.5+0.5, asintoticamente tende a 1.
+    # In alternativa, clamp diretto: jnp.clip(raw_action[...,0], 0.0, 1.0)*max_v
+    v = (jnp.tanh(raw_action[..., 0]) * 0.5 + 0.5) * max_v
     w = jnp.tanh(raw_action[..., 1])
     return jnp.stack([v, w], axis=-1)
 
 
 def scale_actions_batched(raw_actions: jnp.ndarray, max_v: jnp.ndarray) -> jnp.ndarray:
-    v = jax.nn.sigmoid(raw_actions[:, 0]) * max_v
+    # FIX Bug#1: stesso fix applicato alla versione batched.
+    v = (jnp.tanh(raw_actions[:, 0]) * 0.5 + 0.5) * max_v
     w = jnp.tanh(raw_actions[:, 1])
     return jnp.stack([v, w], axis=-1)
 

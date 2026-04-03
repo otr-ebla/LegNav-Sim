@@ -132,12 +132,12 @@ class RunningMeanStd:
 
 @jax.jit
 def normalize_batch_rewards(rewards, dones, running_ret, rms_state, gamma):
-    def _step(ret, t):
-        r, d = t
-        ret = r + gamma * ret * (1.0 - d)
-        return ret, ret
-    running_ret, returns = jax.lax.scan(_step, running_ret, (rewards, dones))
-    new_rms_state = rms_state.update(returns.flatten())
+    # FIX Bug#2: prima si stimava la varianza dei return cumulativi (scala ~1/(1-γ)≈100)
+    # e poi si dividevano i reward istantanei per quella std → reward sottoscalati di ~10x,
+    # segnale quasi piatto, policy stagnante.
+    # Fix: si normalizzano i reward istantanei con la running std dei reward istantanei.
+    # running_ret viene mantenuto per compatibilità firma ma non usato.
+    new_rms_state = rms_state.update(rewards.flatten())
     normalized_rewards = rewards / jnp.sqrt(new_rms_state.var + 1e-8)
     normalized_rewards = jnp.clip(normalized_rewards, -10.0, 10.0)
     return normalized_rewards, running_ret, new_rms_state
