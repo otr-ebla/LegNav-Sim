@@ -72,7 +72,7 @@ LR_END         = 1e-5
 LR_MIN         = 1e-5
 WARMUP_UPDATES = 5
 
-TOTAL_UPDATES  = 600
+TOTAL_UPDATES  = 1600
 
 # ── Minibatch geometry ────────────────────────────────────────────────────────
 # Flat loss over (T*N) samples. Shuffle full batch then split into minibatches.
