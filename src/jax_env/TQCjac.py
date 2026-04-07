@@ -108,13 +108,20 @@ jax.config.update("jax_default_device", target_gpu)
 # ── Environment ───────────────────────────────────────────────────────────────
 reset_stacked, step_stacked = make_stacked_env(reset_env, step_env, stack_dim=3)
 
+# vmap_step is created ONCE at module level — never recreated on curriculum advance
+# so train_chunk (static_argnums=(8,)) is never recompiled mid-training.
+_step_auto = make_autoreset_env(reset_stacked, step_stacked)
+vmap_step  = jax.jit(jax.vmap(_step_auto, in_axes=(0, 0, 0, None, None, None)))
+
+@jax.jit
+def _vmap_reset(reset_keys, min_goal_dist, ghost_prob, scenario_idx):
+    def _single(key):
+        return reset_stacked(key, max_goal_dist=min_goal_dist, ghost_prob=ghost_prob, scenario_idx=scenario_idx)
+    return jax.vmap(_single)(reset_keys)
+
 def init_env_state(rng_key, min_goal_dist: float = 1.5, ghost_prob: float = 0.0, scenario_idx: int = -1):
-    step_auto = make_autoreset_env(reset_stacked, step_stacked)
-    vmap_step = jax.jit(jax.vmap(step_auto, in_axes=(0, 0, 0, None, None, None)))
-    def _reset_with_dist(key): return reset_stacked(key, max_goal_dist=min_goal_dist, ghost_prob=ghost_prob, scenario_idx=scenario_idx)
-    vmap_reset = jax.jit(jax.vmap(_reset_with_dist))
     reset_keys = jax.random.split(rng_key, N_ENVS)
-    env_obs, env_state = vmap_reset(reset_keys)
+    env_obs, env_state = _vmap_reset(reset_keys, min_goal_dist, ghost_prob, scenario_idx)
     return env_obs, env_state, vmap_step
 
 # Use the same SharedEncoder as PPO and SAC for fair algorithm comparison.
@@ -161,7 +168,8 @@ actor_net  = TQCActorNetwork()
 critic_net = TQCCriticEnsemble()
 actor_opt  = optax.adam(LR, eps=1e-5)
 critic_opt = optax.adam(LR, eps=1e-5)
-alpha_opt  = optax.adam(LR, eps=1e-5)
+ALPHA_LR   = LR / G_UPDATES  # 3e-4 / 20 = 1.5e-5 — compensates for 1000 updates/chunk
+alpha_opt  = optax.adam(ALPHA_LR, eps=1e-5)
 
 # ── Action Squashing ──────────────────────────────────────────────────────────
 def _tanh_log_prob_correction(tanh_u, max_v):
@@ -464,7 +472,9 @@ if __name__ == "__main__":
                 cur_min_dist = new_min_dist
                 cur_stage    = new_stage
                 rng, reinit_rng = jax.random.split(rng)
-                env_obs, env_state, vmap_step = init_env_state(reinit_rng, min_goal_dist=cur_min_dist)
+                # Only reset env obs/state — vmap_step is module-level, never recreated
+                reset_keys = jax.random.split(reinit_rng, N_ENVS)
+                env_obs, env_state = _vmap_reset(reset_keys, cur_min_dist, 0.0, -1)
                 replay_buf = buf_flush(replay_buf)  # Previene il distribution shift
 
         if suc_pct > best_suc:
