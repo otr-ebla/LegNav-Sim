@@ -72,9 +72,8 @@ LIDAR_MAX_RANGE = 10.0   # metres — set to your env's actual max sensor range
 # ── Actor-encoder gradient coupling ───────────────────────────────────────────
 # Scale factor applied to actor gradients flowing back into LidarCNN.
 # 0.0 = full stop_gradient (old behaviour, critic-only encoder)
-# 0.1 = soft coupling — actor can shape perception without destabilising critic
-# 1.0 = full coupling (aggressive, not recommended without careful LR tuning)
-ACTOR_ENC_GRAD_SCALE = 0.1
+# 0.0 = full stop_gradient (standard off-policy practice for stable critic)
+ACTOR_ENC_GRAD_SCALE = 0.0
 
 CKPT_DIR  = "checkpoints_sac"
 CKPT_PATH = f"{CKPT_DIR}/sac_best.msgpack"
@@ -376,6 +375,10 @@ def collect_step(sep, ahp, env_state, env_obs, rng_key, vmap_step, max_goal_dist
     new_obs, new_state, reward, done, info = vmap_step(
         step_keys, env_state, env_action, max_goal_dist, scenario_idx
     )
+
+    # Scale reward down to keep Q-values within reasonable bounds for entropy tuning
+    reward = reward * 0.01
+
     return new_obs, new_state, env_obs, env_action, reward, done, info, max_v
 
 
@@ -549,6 +552,13 @@ if __name__ == "__main__":
     best_suc    = 49.5
     best_ret    = -1e9
 
+    # Initialize curriculum state for fair comparison with PPO
+    from jax_ppo import get_continuous_curriculum
+    cur_max_dist, _, _, cur_max_scen = get_continuous_curriculum(0.0)
+    rolling_suc = 0.0
+    highest_rolling_suc = 0.0
+    cur_scenario = 0
+
     # ── Warmup: fill buffer with random actions ───────────────────────────────
     print("Warming up buffer with random actions...")
     for _ in range((WARMUP_STEPS // N_ENVS) + 1):
@@ -560,7 +570,7 @@ if __name__ == "__main__":
         env_action = jnp.stack([rand_v, rand_w], axis=-1)
         step_keys  = jax.random.split(k_step, N_ENVS)
         new_obs, env_state, reward, done, info = jax.jit(vmap_step)(
-            step_keys, env_state, env_action, 3.0, -1
+            step_keys, env_state, env_action, cur_max_dist, cur_scenario
         )
         terminal   = done & ~info["timeout"].astype(jnp.bool_)
         replay_buf = buf_add(replay_buf, obs_before, env_action, reward,
@@ -597,7 +607,7 @@ if __name__ == "__main__":
             q1p, q1os, q2p, q2os, tq1p, tq2p,
             la, alo, vmap_step,
             replay_buf, env_state, env_obs, train_rng,
-            3.0, -1
+            cur_max_dist, cur_scenario
         )
         (sep, eos, tsep, ahp, ahos,
          q1p, q1os, q2p, q2os, tq1p, tq2p,
@@ -616,6 +626,19 @@ if __name__ == "__main__":
             col_pct  = float((ep_col  * ep_msk).sum() / n_ep) * 100.0
             pcol_pct = float((ep_pcol * ep_msk).sum() / n_ep) * 100.0
             tmo_pct  = float((ep_tmo  * ep_msk).sum() / n_ep) * 100.0
+
+            # Advance continuous curriculum
+            rolling_suc = 0.9 * rolling_suc + 0.1 * suc_pct
+            highest_rolling_suc = 0.99 * highest_rolling_suc + 0.01 * rolling_suc
+
+            new_max_dist, _, _, new_max_scen = get_continuous_curriculum(highest_rolling_suc)
+
+            if new_max_dist > cur_max_dist or new_max_scen > cur_max_scen:
+                cur_max_dist = min(cur_max_dist + 0.2, new_max_dist)
+                cur_max_scen = new_max_scen
+
+            cur_scenario = jax.random.randint(jax.random.PRNGKey(int(time.time())), (), 0, cur_max_scen + 1)
+            cur_scenario = int(cur_scenario)
         else:
             mean_ret = suc_pct = col_pct = pcol_pct = tmo_pct = 0.0
 
