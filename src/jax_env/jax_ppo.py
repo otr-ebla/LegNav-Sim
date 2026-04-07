@@ -72,7 +72,7 @@ LR_END         = 1e-5
 LR_MIN         = 1e-5
 WARMUP_UPDATES = 5
 
-TOTAL_UPDATES  = 1600
+TOTAL_UPDATES  = 800
 
 # ── Minibatch geometry ────────────────────────────────────────────────────────
 # Flat loss over (T*N) samples. Shuffle full batch then split into minibatches.
@@ -93,7 +93,10 @@ network = EndToEndActorCritic(action_dim=2)
 _SUC_ANCHORS  = np.array([0.0, 25.0, 38.0, 50.0, 60.0, 70.0, 82.0, 95.0, 100.0])
 _DIST_ANCHORS = np.array([1.5,  1.5,  2.5,  4.0,  5.0,  6.5,  8.0,  9.0,   9.0])
 _GHOST_ANCHORS= np.array([0.0,  0.0,  0.0,  0.0,  0.15, 0.3,  0.6,  0.9,   1.0])
-_ENT_ANCHORS  = np.array([0.015,0.015,0.012,0.008,0.005,0.003,0.002,0.001, 0.001])
+_ENT_ANCHORS  = np.array([
+    0.02, 0.02, 0.018, 0.015, 0.012,
+    0.01, 0.008, 0.006, 0.005
+])
 # Progressively unlock scenarios [0: Random, 1: Parallel, 2: Perp, 3: Circle, 4: Bottleneck, 5: Intersect, 6: Static]
 _SCEN_ANCHORS = np.array([0,    0,    1,    2,    4,    5,    6,    6,     6])
 
@@ -443,7 +446,7 @@ if __name__ == "__main__":
         # Curriculum
         if n_ep > 0:
             rolling_suc = 0.9 * rolling_suc + 0.1 * suc_pct
-            highest_rolling_suc = max(highest_rolling_suc, rolling_suc)
+            highest_rolling_suc = 0.99 * highest_rolling_suc + 0.01 * rolling_suc
 
         new_max_dist, new_ghost, new_ent, new_max_scen = get_continuous_curriculum(highest_rolling_suc)
 
@@ -451,7 +454,8 @@ if __name__ == "__main__":
         new_scenario = _random.randint(0, new_max_scen)
 
         if new_max_dist > cur_max_dist or new_ghost > cur_ghost or new_max_scen > cur_max_scen:
-            cur_max_dist = new_max_dist
+            max_step = 0.2  # metri per update — impedisce shock da salto di distanza
+            cur_max_dist = min(cur_max_dist + max_step, new_max_dist)
             cur_ghost    = new_ghost
             cur_max_scen = new_max_scen
             print(f"  -> Curriculum smoothly advanced: dist={cur_max_dist:.1f}m, "
