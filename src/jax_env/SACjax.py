@@ -40,7 +40,7 @@ OBS_SIZE       = 662        # 9 (pose) + 5 (state_vec) + 648 (lidar)
 ACTION_DIM     = 2
 N_ENVS         = 256        # FIX 1: reduced from 2048; large N_ENVS drowns the buffer
                              #        faster than G updates can replay — overwrite before reuse.
-BUFFER_CAP     = 2_000_000  # 2M — with N_ENVS=256: ~7800 steps to fill → plenty of mixing
+BUFFER_CAP     = 500_000    # 500K — fits in VRAM (1.32 GB obs float16); ~1950 steps to fill with N_ENVS=256
 BATCH_SIZE     = 512        # FIX 1: kept proportional to N_ENVS; smaller is fine for SAC
 G_UPDATES      = 20         # FIX 1: gradient updates per collect step (replay ratio = G/1 ≫ 1)
                              #        SAC's sample efficiency comes from here — not from more envs.
@@ -99,15 +99,15 @@ jax.config.update("jax_default_device", target_gpu)
 # ── Environment ───────────────────────────────────────────────────────────────
 reset_stacked, step_stacked = make_stacked_env(reset_env, step_env, stack_dim=3)
 
-def init_env_state(rng_key, max_goal_dist: float = 3.0, scenario_idx: int = -1):
+def init_env_state(rng_key, max_goal_dist: float = 1.5, ghost_prob: float = 0.0, scenario_idx: int = -1):
     """Build vmapped step/reset, initialise all envs. Returns (obs, state, vmap_step).
     vmap_step is NOT jit-wrapped — the outer train_chunk JIT fuses it.
     """
     step_auto = make_autoreset_env(reset_stacked, step_stacked)
-    vmap_step = jax.vmap(step_auto, in_axes=(0, 0, 0, None, None))
+    vmap_step = jax.vmap(step_auto, in_axes=(0, 0, 0, None, None, None))
 
     def _reset(key):
-        return reset_stacked(key, max_goal_dist=max_goal_dist, scenario_idx=scenario_idx)
+        return reset_stacked(key, max_goal_dist=max_goal_dist, scenario_idx=scenario_idx, ghost_prob=ghost_prob)
     vmap_reset = jax.jit(jax.vmap(_reset))
 
     env_obs, env_state = vmap_reset(jax.random.split(rng_key, N_ENVS))
@@ -196,7 +196,7 @@ def extract_max_v(obs):
 
 # ── Replay buffer (on-GPU circular) ───────────────────────────────────────────
 # VRAM budget: obs/next_obs stored as float16 to halve memory.
-#   2M * 662 * 2B * 2 arrays = 5.30 GB (vs 10.59 GB with float32).
+#   500K * 662 * 2B * 2 arrays = 1.32 GB (vs 2.65 GB with float32).
 # buf_sample casts back to float32 before returning — encoder sees full precision.
 # Field 'terminal' = done & ~timeout — only true environmental endings stored.
 def make_buffer(capacity):
@@ -364,7 +364,7 @@ def sac_update(sep, eos, tsep, ahp, ahos, q1p, q1os, q2p, q2os,
 
 # ── Collection step ───────────────────────────────────────────────────────────
 @functools.partial(jax.jit, static_argnums=(5,))
-def collect_step(sep, ahp, env_state, env_obs, rng_key, vmap_step, max_goal_dist, scenario_idx):
+def collect_step(sep, ahp, env_state, env_obs, rng_key, vmap_step, max_goal_dist, scenario_idx, ghost_prob):
     """Compute max_v ONCE, sample action via shared encoder + actor head, step env."""
     max_v = extract_max_v(env_obs)
     k_act, k_step = jax.random.split(rng_key)
@@ -373,7 +373,7 @@ def collect_step(sep, ahp, env_state, env_obs, rng_key, vmap_step, max_goal_dist
     env_action, _ = sample_action_sac_batched(k_act, mean, log_std, max_v)
     step_keys = jax.random.split(k_step, N_ENVS)
     new_obs, new_state, reward, done, info = vmap_step(
-        step_keys, env_state, env_action, max_goal_dist, scenario_idx
+        step_keys, env_state, env_action, max_goal_dist, scenario_idx, ghost_prob
     )
 
     # Scale reward down to keep Q-values within reasonable bounds for entropy tuning
@@ -383,68 +383,70 @@ def collect_step(sep, ahp, env_state, env_obs, rng_key, vmap_step, max_goal_dist
 
 
 # ── Fused GPU train chunk ─────────────────────────────────────────────────────
+# Two-phase design to keep the large buffer OUT of the gradient-update scan carry:
+#   Phase 1 (collect scan, 50 iters): buffer in carry, no gradient computation.
+#   Phase 2 (update scan, G*50 iters): buffer is a closed-over constant — carry
+#            contains only model params + optimizer states (~tens of MB, not GB).
+# This lets XLA treat the 500K buffer as an immutable constant during backprop,
+# avoiding 1000 implicit copies of ~1.3 GB that the mixed-scan design forced.
 @functools.partial(jax.jit, static_argnums=(13,))
 def train_chunk(sep, eos, tsep, ahp, ahos,
                 q1p, q1os, q2p, q2os, tq1p, tq2p,
                 la, alo, vmap_step,
                 buf, es, eo, key,
-                max_goal_dist, scenario_idx):
+                max_goal_dist, scenario_idx, ghost_prob):
 
-    def _loop_body(carry, _):
-        (sep, eos, tsep, ahp, ahos,
-         q1p, q1os, q2p, q2os, tq1p, tq2p,
-         la, alo, buf, es, eo, key) = carry
-        key, k_col, k_upd_base = jax.random.split(key, 3)
-
+    # ── Phase 1: collect LOG_EVERY env steps, write to buffer ─────────────────
+    def _collect_body(carry, _):
+        es_, eo_, buf_, key_ = carry
+        key_, k_col = jax.random.split(key_)
         new_eo, new_es, obs_b, env_a, rew, done, info, max_v_cur = collect_step(
-            sep, ahp, es, eo, k_col, vmap_step, max_goal_dist, scenario_idx
+            sep, ahp, es_, eo_, k_col, vmap_step, max_goal_dist, scenario_idx, ghost_prob
         )
-
         terminal = done & ~info["timeout"]
-        new_buf = buf_add(buf, obs_b, env_a, rew, new_eo,
+        new_buf = buf_add(buf_, obs_b, env_a, rew, new_eo,
                           terminal.astype(jnp.float32), max_v_cur)
-
-        def _update_step(update_carry, upd_idx):
-            (sep_, eos_, tsep_, ahp_, ahos_,
-             q1p_, q1os_, q2p_, q2os_, tq1p_, tq2p_, la_, alo_) = update_carry
-            k_samp = jax.random.fold_in(k_upd_base, upd_idx * 2)
-            k_upd  = jax.random.fold_in(k_upd_base, upd_idx * 2 + 1)
-            b_obs, b_act, b_rew, b_next, b_terminal, b_max_v = buf_sample(
-                new_buf, k_samp, BATCH_SIZE
-            )
-            b_max_v_next = extract_max_v(b_next)
-            (new_sep_, new_eos_, new_tsep_, new_ahp_, new_ahos_,
-             new_q1p_, new_q1os_, new_q2p_, new_q2os_,
-             new_tq1p_, new_tq2p_, new_la_, new_alo_, metrics_) = sac_update(
-                sep_, eos_, tsep_, ahp_, ahos_,
-                q1p_, q1os_, q2p_, q2os_, tq1p_, tq2p_, la_, alo_,
-                b_obs, b_act, b_rew, b_next, b_terminal, b_max_v, b_max_v_next, k_upd
-            )
-            return (new_sep_, new_eos_, new_tsep_, new_ahp_, new_ahos_,
-                    new_q1p_, new_q1os_, new_q2p_, new_q2os_,
-                    new_tq1p_, new_tq2p_, new_la_, new_alo_), metrics_
-
-        update_carry_init = (sep, eos, tsep, ahp, ahos,
-                             q1p, q1os, q2p, q2os, tq1p, tq2p, la, alo)
-        (new_sep, new_eos, new_tsep, new_ahp, new_ahos,
-         new_q1p, new_q1os, new_q2p, new_q2os,
-         new_tq1p, new_tq2p, new_la, new_alo), all_update_metrics = jax.lax.scan(
-            _update_step, update_carry_init, jnp.arange(G_UPDATES)
-        )
-        metrics = jax.tree_util.tree_map(lambda x: x[-1], all_update_metrics)
-
         step_data = (rew, done, info["goal_reached"], info["collision"], info["passive_col"])
-        new_carry = (new_sep, new_eos, new_tsep, new_ahp, new_ahos,
-                     new_q1p, new_q1os, new_q2p, new_q2os, new_tq1p, new_tq2p,
-                     new_la, new_alo, new_buf, new_es, new_eo, key)
-        return new_carry, (step_data, metrics)
+        return (new_es, new_eo, new_buf, key_), step_data
 
-    carry = (sep, eos, tsep, ahp, ahos,
-             q1p, q1os, q2p, q2os, tq1p, tq2p,
-             la, alo, buf, es, eo, key)
-    new_carry, (all_step_data, all_metrics) = jax.lax.scan(
-        _loop_body, carry, None, length=LOG_EVERY
+    (new_es, new_eo, new_buf, key), all_step_data = jax.lax.scan(
+        _collect_body, (es, eo, buf, key), None, length=LOG_EVERY
     )
+
+    # ── Phase 2: G_UPDATES * LOG_EVERY gradient steps, buffer as constant ─────
+    # new_buf is captured by closure — XLA sees it as an immutable operand,
+    # so the scan carry only carries params + opt states (no buffer copies).
+    def _update_step(update_carry, upd_idx):
+        (sep_, eos_, tsep_, ahp_, ahos_,
+         q1p_, q1os_, q2p_, q2os_, tq1p_, tq2p_, la_, alo_, key_) = update_carry
+        k_samp = jax.random.fold_in(key_, upd_idx * 2)
+        k_upd  = jax.random.fold_in(key_, upd_idx * 2 + 1)
+        b_obs, b_act, b_rew, b_next, b_terminal, b_max_v = buf_sample(
+            new_buf, k_samp, BATCH_SIZE
+        )
+        b_max_v_next = extract_max_v(b_next)
+        (new_sep_, new_eos_, new_tsep_, new_ahp_, new_ahos_,
+         new_q1p_, new_q1os_, new_q2p_, new_q2os_,
+         new_tq1p_, new_tq2p_, new_la_, new_alo_, metrics_) = sac_update(
+            sep_, eos_, tsep_, ahp_, ahos_,
+            q1p_, q1os_, q2p_, q2os_, tq1p_, tq2p_, la_, alo_,
+            b_obs, b_act, b_rew, b_next, b_terminal, b_max_v, b_max_v_next, k_upd
+        )
+        return (new_sep_, new_eos_, new_tsep_, new_ahp_, new_ahos_,
+                new_q1p_, new_q1os_, new_q2p_, new_q2os_,
+                new_tq1p_, new_tq2p_, new_la_, new_alo_, key_), metrics_
+
+    update_carry_init = (sep, eos, tsep, ahp, ahos,
+                         q1p, q1os, q2p, q2os, tq1p, tq2p, la, alo, key)
+    (new_sep, new_eos, new_tsep, new_ahp, new_ahos,
+     new_q1p, new_q1os, new_q2p, new_q2os,
+     new_tq1p, new_tq2p, new_la, new_alo, key), all_metrics = jax.lax.scan(
+        _update_step, update_carry_init, jnp.arange(G_UPDATES * LOG_EVERY)
+    )
+
+    new_carry = (new_sep, new_eos, new_tsep, new_ahp, new_ahos,
+                 new_q1p, new_q1os, new_q2p, new_q2os, new_tq1p, new_tq2p,
+                 new_la, new_alo, new_buf, new_es, new_eo, key)
     return new_carry, all_step_data, all_metrics
 
 
@@ -542,8 +544,15 @@ if __name__ == "__main__":
     la   = jnp.array(0.0, dtype=jnp.float32)  # log(1.0) = 0.0 → alpha = 1.0
     alo  = alpha_opt.init(la)
 
+    # Initialize curriculum state for fair comparison with PPO
+    from jax_ppo import get_continuous_curriculum
+    cur_max_dist, cur_ghost, _, cur_max_scen = get_continuous_curriculum(0.0)
+    rolling_suc = 0.0
+    highest_rolling_suc = 0.0
+    cur_scenario = 0
+
     print("Initialising environments...")
-    env_obs, env_state, vmap_step = init_env_state(k_env)
+    env_obs, env_state, vmap_step = init_env_state(k_env, max_goal_dist=cur_max_dist, ghost_prob=cur_ghost)
     print(f"Ready. obs shape: {env_obs.shape}\n")
 
     replay_buf  = make_buffer(BUFFER_CAP)
@@ -551,13 +560,6 @@ if __name__ == "__main__":
     n_updates   = 0
     best_suc    = 49.5
     best_ret    = -1e9
-
-    # Initialize curriculum state for fair comparison with PPO
-    from jax_ppo import get_continuous_curriculum
-    cur_max_dist, _, _, cur_max_scen = get_continuous_curriculum(0.0)
-    rolling_suc = 0.0
-    highest_rolling_suc = 0.0
-    cur_scenario = 0
 
     # ── Warmup: fill buffer with random actions ───────────────────────────────
     print("Warming up buffer with random actions...")
@@ -570,7 +572,7 @@ if __name__ == "__main__":
         env_action = jnp.stack([rand_v, rand_w], axis=-1)
         step_keys  = jax.random.split(k_step, N_ENVS)
         new_obs, env_state, reward, done, info = jax.jit(vmap_step)(
-            step_keys, env_state, env_action, cur_max_dist, cur_scenario
+            step_keys, env_state, env_action, cur_max_dist, cur_scenario, cur_ghost
         )
         terminal   = done & ~info["timeout"].astype(jnp.bool_)
         replay_buf = buf_add(replay_buf, obs_before, env_action, reward,
@@ -607,7 +609,7 @@ if __name__ == "__main__":
             q1p, q1os, q2p, q2os, tq1p, tq2p,
             la, alo, vmap_step,
             replay_buf, env_state, env_obs, train_rng,
-            cur_max_dist, cur_scenario
+            cur_max_dist, cur_scenario, cur_ghost
         )
         (sep, eos, tsep, ahp, ahos,
          q1p, q1os, q2p, q2os, tq1p, tq2p,
@@ -631,10 +633,11 @@ if __name__ == "__main__":
             rolling_suc = 0.9 * rolling_suc + 0.1 * suc_pct
             highest_rolling_suc = 0.99 * highest_rolling_suc + 0.01 * rolling_suc
 
-            new_max_dist, _, _, new_max_scen = get_continuous_curriculum(highest_rolling_suc)
+            new_max_dist, new_ghost, _, new_max_scen = get_continuous_curriculum(highest_rolling_suc)
 
             if new_max_dist > cur_max_dist or new_max_scen > cur_max_scen:
                 cur_max_dist = min(cur_max_dist + 0.2, new_max_dist)
+                cur_ghost    = new_ghost
                 cur_max_scen = new_max_scen
 
             cur_scenario = jax.random.randint(jax.random.PRNGKey(int(time.time())), (), 0, cur_max_scen + 1)
