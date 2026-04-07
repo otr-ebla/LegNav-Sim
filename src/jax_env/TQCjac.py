@@ -53,7 +53,9 @@ WARMUP_STEPS   = 10_000
 GAMMA          = 0.99
 TAU            = 0.00025    # Allineato a SAC (0.005 / G_UPDATES per stabilità EMA)
 LR             = 3e-4
-TARGET_ENTROPY = -float(ACTION_DIM)   
+TARGET_ENTROPY = 0.0   # Empirical: tanh-squashed 2D actions settle at log_pi ≈ 0.1–0.2;
+                       # -float(ACTION_DIM)=-2.0 would require log_pi=2.0 (unbounded Gaussian)
+                       # and causes slow but inevitable alpha collapse in TQC.
 TOTAL_UPDATES  = 200_000
 LOG_EVERY      = 50         # Allineato a SAC
 SAVE_EVERY     = 5000
@@ -135,6 +137,7 @@ class TQCActorNetwork(nn.Module):
 
     @nn.compact
     def __call__(self, obs):
+        obs  = obs.astype(NET_DTYPE)          # Run encoder + heads in NET_DTYPE (bfloat16 or float32)
         feat = SharedEncoder()(obs)
         mean    = nn.Dense(self.action_dim)(feat)
         log_std = nn.Dense(self.action_dim)(feat)
@@ -147,10 +150,12 @@ class QuantileCriticNetwork(nn.Module):
 
     @nn.compact
     def __call__(self, obs, action):
+        obs    = obs.astype(NET_DTYPE)        # Encoder + MLP in NET_DTYPE
+        action = action.astype(NET_DTYPE)
         feat = SharedEncoder()(obs)
         x = nn.relu(nn.Dense(256)(jnp.concatenate([feat, action], axis=-1)))
         x = nn.relu(nn.Dense(128)(x))
-        return nn.Dense(self.n_atoms)(x).astype(jnp.float32)
+        return nn.Dense(self.n_atoms)(x).astype(jnp.float32)  # Huber loss stays float32
 
 class TQCCriticEnsemble(nn.Module):
     n_critics:  int = N_CRITICS
@@ -393,14 +398,25 @@ if __name__ == "__main__":
         env_obs = new_obs
         total_steps += N_ENVS
 
+    # ── JIT compilation (outside loop so t_start excludes compile time) ─────────
     print("Warmup done. JIT compiling train chunk (this may take up to a minute)...")
+    _c, _sd, _m = train_chunk(
+        ap, aos, cp, cos, tp, la, laos,
+        replay_buf, vmap_step, cur_min_dist, -1, 0.0, env_state, env_obs, rng
+    )
+    jax.block_until_ready(_c)   # Wait for GPU to finish compilation + first run
+    ap, aos, cp, cos, tp, la, laos, replay_buf, env_state, env_obs, rng = _c
+    n_updates   += LOG_EVERY
+    total_steps += N_ENVS * LOG_EVERY
+    print("Compilation done.")
+
     hdr = (f"{'Upd':>7} | {'Steps':>10} | {'EpRet':>7} | "
            f"{'Suc%':>5} {'ACo%':>5} {'PCo%':>5} {'Tmo%':>5} | "
            f"{'CritL':>7} {'ActL':>7} {'Alpha':>6} {'LogPi':>6} {'Qmean':>7} | {'FPS':>7} | "
            f"{'Time':>8} | {'Stage':>5} {'MinDist':>7}")
     print(hdr); print("─" * len(hdr))
 
-    t_start = time.time()
+    t_start = time.time()   # ← starts AFTER JIT compilation, measures only real training time
 
     # ── Training log (CSV) ───────────────────────────────────────────────────
     _LOG_PATH = "checkpoints_tqc/tqc_training_log.csv"
