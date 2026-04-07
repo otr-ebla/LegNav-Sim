@@ -108,10 +108,10 @@ jax.config.update("jax_default_device", target_gpu)
 # ── Environment ───────────────────────────────────────────────────────────────
 reset_stacked, step_stacked = make_stacked_env(reset_env, step_env, stack_dim=3)
 
-def init_env_state(rng_key, min_goal_dist: float = 3.0):
-    step_auto = make_autoreset_env(reset_stacked, step_stacked, min_goal_dist=min_goal_dist)
-    vmap_step = jax.jit(jax.vmap(step_auto, in_axes=(0, 0, 0)))
-    def _reset_with_dist(key): return reset_stacked(key, min_goal_dist=min_goal_dist)
+def init_env_state(rng_key, min_goal_dist: float = 1.5, ghost_prob: float = 0.0, scenario_idx: int = -1):
+    step_auto = make_autoreset_env(reset_stacked, step_stacked)
+    vmap_step = jax.jit(jax.vmap(step_auto, in_axes=(0, 0, 0, None, None, None)))
+    def _reset_with_dist(key): return reset_stacked(key, max_goal_dist=min_goal_dist, ghost_prob=ghost_prob, scenario_idx=scenario_idx)
     vmap_reset = jax.jit(jax.vmap(_reset_with_dist))
     reset_keys = jax.random.split(rng_key, N_ENVS)
     env_obs, env_state = vmap_reset(reset_keys)
@@ -280,21 +280,22 @@ def tqc_update(ap, aos, cp, cos, tp, la, laos, obs, action, reward, next_obs, do
 
 # ── Fused GPU Collection & Update Loop ────────────────────────────────────────
 @functools.partial(jax.jit, static_argnums=(4,))
-def collect_step(actor_params, env_state, env_obs, rng_key, vmap_step):
+def collect_step(actor_params, env_state, env_obs, rng_key, vmap_step, min_goal_dist, scenario_idx, ghost_prob):
     mean, log_std = actor_net.apply({"params": actor_params}, env_obs)
     env_action, _ = jax.vmap(sample_action)(jax.random.split(rng_key, N_ENVS), mean, log_std, extract_max_v(env_obs))
-    new_obs, new_state, reward, done, info = vmap_step(jax.random.split(jax.random.split(rng_key)[1], N_ENVS), env_state, env_action)
+    step_keys = jax.random.split(jax.random.fold_in(rng_key, 99), N_ENVS)
+    new_obs, new_state, reward, done, info = vmap_step(step_keys, env_state, env_action, min_goal_dist, scenario_idx, ghost_prob)
     return new_obs, new_state, env_obs, env_action, reward, done, info
 
 @functools.partial(jax.jit, static_argnums=(8,))
-def train_chunk(ap, aos, cp, cos, tp, la, laos, buf, vmap_step, es, eo, key):
+def train_chunk(ap, aos, cp, cos, tp, la, laos, buf, vmap_step, min_goal_dist, scenario_idx, ghost_prob, es, eo, key):
     """Executes LOG_EVERY env steps (collect phase) then G_UPDATES * LOG_EVERY gradient steps (update phase)."""
 
     # -- Phase 1: Collect LOG_EVERY steps into buffer --
     def _collect_body(carry, _):
         es_, eo_, buf_, key_ = carry
         key_, k_col = jax.random.split(key_)
-        new_eo, new_es, obs_b, env_a, rew, done, info = collect_step(ap, es_, eo_, k_col, vmap_step)
+        new_eo, new_es, obs_b, env_a, rew, done, info = collect_step(ap, es_, eo_, k_col, vmap_step, min_goal_dist, scenario_idx, ghost_prob)
         terminal = done & ~info["timeout"]
         new_buf = buf_add(buf_, obs_b, env_a, rew, new_eo, terminal.astype(jnp.float32))
         step_data = (rew, done, info["goal_reached"], info["collision"], info["passive_col"])
@@ -379,7 +380,7 @@ if __name__ == "__main__":
     print("Warming up buffer (filling with random actions)...")
     for _ in range((WARMUP_STEPS // N_ENVS) + 1):
         rng, c_rng = jax.random.split(rng)
-        new_obs, env_state, obs_before, env_action, reward, done, info = collect_step(ap, env_state, env_obs, c_rng, vmap_step)
+        new_obs, env_state, obs_before, env_action, reward, done, info = collect_step(ap, env_state, env_obs, c_rng, vmap_step, cur_min_dist, -1, 0.0)
         replay_buf = buf_add(replay_buf, obs_before, env_action, reward, new_obs, done.astype(jnp.float32))
         env_obs = new_obs
         total_steps += N_ENVS
@@ -407,8 +408,8 @@ if __name__ == "__main__":
         
         # ── 1. Execute Fused GPU Chunk ──
         new_carry, all_step_data, all_metrics = train_chunk(
-            ap, aos, cp, cos, tp, la, laos, 
-            replay_buf, vmap_step, env_state, env_obs, rng
+            ap, aos, cp, cos, tp, la, laos,
+            replay_buf, vmap_step, cur_min_dist, -1, 0.0, env_state, env_obs, rng
         )
         
         ap, aos, cp, cos, tp, la, laos, replay_buf, env_state, env_obs, rng = new_carry
