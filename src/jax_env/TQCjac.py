@@ -146,8 +146,9 @@ class QuantileCriticNetwork(nn.Module):
         return nn.Dense(self.n_atoms)(x).astype(jnp.float32)
 
 class TQCCriticEnsemble(nn.Module):
-    n_critics: int = N_CRITICS
-    n_atoms:   int = N_ATOMS
+    n_critics:  int = N_CRITICS
+    n_atoms:    int = N_ATOMS
+    action_dim: int = ACTION_DIM
 
     @nn.compact
     def __call__(self, obs, action):
