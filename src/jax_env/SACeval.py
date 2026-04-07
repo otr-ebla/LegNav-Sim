@@ -304,10 +304,14 @@ def main():
     except FileNotFoundError: 
         print(f"⚠️  No checkpoint found at {ckpt} — running random policy.")
 
-    def build_fast_reset(scen_idx):
-        bound_reset = functools.partial(reset_env, scenario_idx=scen_idx)
-        reset_stacked, step_stacked = make_stacked_env(bound_reset, step_env, stack_dim=3, ghost_robot=False)
-        return jax.jit(reset_stacked), jax.jit(step_stacked)
+    MAX_EVAL_GOAL_DIST = 9.0
+
+    def build_fast_reset(scen_idx, max_goal_dist=MAX_EVAL_GOAL_DIST):
+        bound_reset = lambda key, max_goal_dist=3.0, scenario_idx=-1, **kw: reset_env(key, max_goal_dist, scenario_idx=scen_idx, **kw)
+        reset_stacked, step_stacked = make_stacked_env(bound_reset, step_env, stack_dim=3)
+        jit_rs = jax.jit(lambda key: reset_stacked(key, max_goal_dist, ghost_prob=0.0))
+        jit_ss = jax.jit(step_stacked)
+        return jit_rs, jit_ss
 
     evaluation_mode = "random"
     current_scenario = random.randint(0, 6)

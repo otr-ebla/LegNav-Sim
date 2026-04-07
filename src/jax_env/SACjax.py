@@ -157,11 +157,17 @@ critic_q2   = CriticBranch()
 
 
 # ── Optimisers ────────────────────────────────────────────────────────────────
-enc_opt        = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
-head_actor_opt = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
-head_q1_opt    = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
-head_q2_opt    = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
-alpha_opt      = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
+# Alpha gets G_UPDATES × LOG_EVERY = 1000 gradient updates per chunk, while
+# network params get the same 1000 updates but are large tensors with gradient
+# clipping. For a scalar like log_alpha, Adam normalises every step to ≈ LR,
+# so effective per-chunk Δla ≈ 1000 × LR = 0.3 → alpha collapses in 10 chunks.
+# Fix: scale alpha LR by 1/G_UPDATES so per-env-step rate matches standard SAC.
+ALPHA_LR = LR / G_UPDATES   # 3e-4 / 20 = 1.5e-5 → Δla ≈ 0.015 per chunk
+enc_opt        = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR,       eps=1e-5))
+head_actor_opt = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR,       eps=1e-5))
+head_q1_opt    = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR,       eps=1e-5))
+head_q2_opt    = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR,       eps=1e-5))
+alpha_opt      = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(ALPHA_LR, eps=1e-5))
 
 # ── Action squashing + exact log-prob ─────────────────────────────────────────
 
@@ -376,9 +382,7 @@ def collect_step(sep, ahp, env_state, env_obs, rng_key, vmap_step, max_goal_dist
         step_keys, env_state, env_action, max_goal_dist, scenario_idx, ghost_prob
     )
 
-    # Scale reward down to keep Q-values within reasonable bounds for entropy tuning
-    reward = reward * 0.01
-
+    # Let auto-alpha adapt to the natural Q-scale. Aggressive reward scaling destroys the actor's objective.
     return new_obs, new_state, env_obs, env_action, reward, done, info, max_v
 
 
@@ -539,8 +543,8 @@ if __name__ == "__main__":
     ahos = head_actor_opt.init(ahp)
     q1os = head_q1_opt.init(q1p)
     q2os = head_q2_opt.init(q2p)
-    # Alpha init: after /10 env scaling, rewards are O(10), Q-values O(100).
-    # alpha=1.0 gives entropy term ~1.0*log_pi ~ -2.0, i.e. ~2% of Q — sane ratio.
+    # Alpha init: raw Q-values are O(10-100). auto-alpha tunes itself via ALPHA_LR.
+    # Start at 1.0 so early entropy term is non-negligible vs Q, then decays correctly.
     la   = jnp.array(0.0, dtype=jnp.float32)  # log(1.0) = 0.0 → alpha = 1.0
     alo  = alpha_opt.init(la)
 

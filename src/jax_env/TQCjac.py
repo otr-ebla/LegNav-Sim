@@ -45,16 +45,17 @@ from jax_wrappers import make_stacked_env, make_autoreset_env
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 OBS_SIZE       = 662
 ACTION_DIM     = 2
-N_ENVS         = 2048
+N_ENVS         = 256        # Allineato a SAC
 BUFFER_CAP     = 500_000
-BATCH_SIZE     = 1024
+BATCH_SIZE     = 512        # Allineato a SAC
+G_UPDATES      = 20         # UTD ratio, allineato a SAC
 WARMUP_STEPS   = 10_000
 GAMMA          = 0.99
-TAU            = 0.005
+TAU            = 0.00025    # Allineato a SAC (0.005 / G_UPDATES per stabilità EMA)
 LR             = 3e-4
 TARGET_ENTROPY = -float(ACTION_DIM)   
 TOTAL_UPDATES  = 200_000
-LOG_EVERY      = 500
+LOG_EVERY      = 50         # Allineato a SAC
 SAVE_EVERY     = 5000
 
 # TQC-specific (Optimized for execution speed)
@@ -211,6 +212,19 @@ def buf_add(buf, obs, action, reward, next_obs, done):
         "size": jnp.minimum(jnp.int32(buf["size"] + N), jnp.int32(cap)),
     }
 
+@jax.jit
+def buf_flush(buf):
+    """Resets buffer size and ptr to 0 to prevent distribution shift during curriculum jumps."""
+    return {
+        "obs":      buf["obs"],
+        "action":   buf["action"],
+        "reward":   buf["reward"],
+        "next_obs": buf["next_obs"],
+        "done":     buf["done"],
+        "ptr":      jnp.int32(0),
+        "size":     jnp.int32(0),
+    }
+
 @jax.jit(static_argnames=["batch_size"])
 def buf_sample(buf, rng_key, batch_size: int):
     capacity = buf["obs"].shape[0]
@@ -273,27 +287,38 @@ def collect_step(actor_params, env_state, env_obs, rng_key, vmap_step):
 
 @functools.partial(jax.jit, static_argnums=(8,))
 def train_chunk(ap, aos, cp, cos, tp, la, laos, buf, vmap_step, es, eo, key):
-    """Executes LOG_EVERY steps of collection, buffer insertion, and gradient updates natively on GPU."""
-    def _loop_body(carry, _):
-        ap, aos, cp, cos, tp, la, laos, buf, es, eo, key = carry
-        key, k_col, k_samp, k_upd = jax.random.split(key, 4)
-        
-        new_eo, new_es, obs_b, env_a, rew, done, info = collect_step(ap, es, eo, k_col, vmap_step)
-        
-        # Calculate true terminal state (ignore timeouts for Bellman backup)
+    """Executes LOG_EVERY env steps (collect phase) then G_UPDATES * LOG_EVERY gradient steps (update phase)."""
+
+    # -- Phase 1: Collect LOG_EVERY steps into buffer --
+    def _collect_body(carry, _):
+        es_, eo_, buf_, key_ = carry
+        key_, k_col = jax.random.split(key_)
+        new_eo, new_es, obs_b, env_a, rew, done, info = collect_step(ap, es_, eo_, k_col, vmap_step)
         terminal = done & ~info["timeout"]
-        
-        new_buf = buf_add(buf, obs_b, env_a, rew, new_eo, terminal.astype(jnp.float32))
-        b_obs, b_act, b_rew, b_next, b_done = buf_sample(new_buf, k_samp, BATCH_SIZE)
-        
-        new_ap, new_aos, new_cp, new_cos, new_tp, new_la, new_laos, metrics = \
-            tqc_update(ap, aos, cp, cos, tp, la, laos, b_obs, b_act, b_rew, b_next, b_done, k_upd)
-                       
+        new_buf = buf_add(buf_, obs_b, env_a, rew, new_eo, terminal.astype(jnp.float32))
         step_data = (rew, done, info["goal_reached"], info["collision"], info["passive_col"])
-        return (new_ap, new_aos, new_cp, new_cos, new_tp, new_la, new_laos, new_buf, new_es, new_eo, key), (step_data, metrics)
-        
-    carry = (ap, aos, cp, cos, tp, la, laos, buf, es, eo, key)
-    new_carry, (all_step_data, all_metrics) = jax.lax.scan(_loop_body, carry, None, length=LOG_EVERY)
+        return (new_es, new_eo, new_buf, key_), step_data
+
+    (new_es, new_eo, new_buf, key), all_step_data = jax.lax.scan(
+        _collect_body, (es, eo, buf, key), None, length=LOG_EVERY
+    )
+
+    # -- Phase 2: G_UPDATES * LOG_EVERY gradient updates --
+    def _update_step(update_carry, upd_idx):
+        ap_, aos_, cp_, cos_, tp_, la_, laos_, key_ = update_carry
+        k_samp = jax.random.fold_in(key_, upd_idx * 2)
+        k_upd  = jax.random.fold_in(key_, upd_idx * 2 + 1)
+        b_obs, b_act, b_rew, b_next, b_done = buf_sample(new_buf, k_samp, BATCH_SIZE)
+        new_ap_, new_aos_, new_cp_, new_cos_, new_tp_, new_la_, new_laos_, metrics_ = \
+            tqc_update(ap_, aos_, cp_, cos_, tp_, la_, laos_, b_obs, b_act, b_rew, b_next, b_done, k_upd)
+        return (new_ap_, new_aos_, new_cp_, new_cos_, new_tp_, new_la_, new_laos_, key_), metrics_
+
+    update_carry_init = (ap, aos, cp, cos, tp, la, laos, key)
+    (new_ap, new_aos, new_cp, new_cos, new_tp, new_la, new_laos, key), all_metrics = jax.lax.scan(
+        _update_step, update_carry_init, jnp.arange(G_UPDATES * LOG_EVERY)
+    )
+
+    new_carry = (new_ap, new_aos, new_cp, new_cos, new_tp, new_la, new_laos, new_buf, new_es, new_eo, key)
     return new_carry, all_step_data, all_metrics
 
 @jax.jit
@@ -335,7 +360,7 @@ if __name__ == "__main__":
     tp = jax.tree_util.tree_map(jnp.array, cp)
     aos  = actor_opt.init(ap)
     cos = critic_opt.init(cp)
-    la        = jnp.array(jnp.log(0.1), dtype=jnp.float32)
+    la   = jnp.array(0.0, dtype=jnp.float32)  # Allineato a SAC: log(1.0) = 0.0 → alpha = 1.0
     laos  = alpha_opt.init(la)
 
     cur_min_dist = curriculum_min_goal_dist(0.0)
@@ -433,10 +458,12 @@ if __name__ == "__main__":
             new_stage    = _curriculum_stage(rolling_suc)
             
             if new_min_dist > cur_min_dist:
+                print(f"*** Curriculum advance: stage {new_stage}, min_dist={new_min_dist:.1f}. Flushing buffer. ***")
                 cur_min_dist = new_min_dist
                 cur_stage    = new_stage
                 rng, reinit_rng = jax.random.split(rng)
                 env_obs, env_state, vmap_step = init_env_state(reinit_rng, min_goal_dist=cur_min_dist)
+                replay_buf = buf_flush(replay_buf)  # Previene il distribution shift
 
         if suc_pct > best_suc:
             best_suc = suc_pct
