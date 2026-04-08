@@ -138,8 +138,15 @@ class TQCCriticEnsemble(nn.Module):
 
     @nn.compact
     def __call__(self, feat, action):
-        all_atoms = [QuantileCriticBranch(self.n_atoms, name=f'critic_{i}')(feat, action) for i in range(self.n_critics)]
-        return jnp.stack(all_atoms, axis=1)
+        vmap_critic = nn.vmap(
+            QuantileCriticBranch,
+            variable_axes={'params': 0},
+            split_rngs={'params': True},
+            in_axes=None,
+            out_axes=1,
+            axis_size=self.n_critics
+        )
+        return vmap_critic(n_atoms=self.n_atoms, name='critic')(feat, action)
 
 _TAUS = (2.0 * jnp.arange(1, N_ATOMS + 1) - 1.0) / (2.0 * N_ATOMS)
 
@@ -204,9 +211,8 @@ def buf_add(buf, obs, action, reward, next_obs, done):
 
 @jax.jit(static_argnames=["batch_size"])
 def buf_sample(buf, rng_key, batch_size: int):
-    capacity = buf["obs"].shape[0]
-    idxs = jnp.where(jax.random.randint(rng_key, (batch_size,), 0, capacity) < buf["size"],
-                     jax.random.randint(rng_key, (batch_size,), 0, capacity), jnp.int32(0))
+    max_idx = jnp.maximum(1, buf["size"])
+    idxs = jax.random.randint(rng_key, (batch_size,), 0, max_idx)
     return (buf["obs"][idxs].astype(jnp.float32), buf["action"][idxs], buf["reward"][idxs], buf["next_obs"][idxs].astype(jnp.float32), buf["done"][idxs])
 
 @jax.jit
@@ -280,7 +286,7 @@ def collect_step(sep, ap, env_state, env_obs, rng_key, vmap_step, min_goal_dist,
     new_obs, new_state, reward, done, info = vmap_step(step_keys, env_state, env_action, min_goal_dist, scenario_idx, ghost_prob)
     return new_obs, new_state, env_obs, env_action, reward, done, info
 
-@functools.partial(jax.jit, static_argnums=(11,))
+@functools.partial(jax.jit, static_argnums=(11,), donate_argnums=(10, 15, 16))
 def train_chunk(ap, aos, cp, cos, tp, sep, eos, tsep, la, laos, buf, vmap_step, min_goal_dist, scenario_idx, ghost_prob, es, eo, key):
     def _collect_body(carry, _):
         es_, eo_, buf_, key_ = carry
