@@ -35,7 +35,7 @@ BATCH_SIZE     = 512
 G_UPDATES      = 10
 WARMUP_STEPS   = 10_000
 GAMMA          = 0.99
-TAU            = 0.00025
+TAU            = 0.005
 LR             = 3e-4
 MAX_GRAD_NORM  = 10.0
 TARGET_ENTROPY = -2.0
@@ -50,7 +50,7 @@ N_TOP_ATOMS_DROP = 3
 N_TARGET_ATOMS   = N_CRITICS * N_ATOMS - N_TOP_ATOMS_DROP
 HUBER_KAPPA      = 1.0
 
-MAX_V_OBS_IDX = 13
+MAX_V_OBS_IDX = 11  # stacked obs: pose_stack(9) + state_vec[v_norm, w, max_v_norm, ...] → idx 9+2=11
 LOG_STD_EPS   = 1e-6
 
 CKPT_DIR  = "checkpoints_tqc"
@@ -115,7 +115,7 @@ scale_gradient.defvjp(_scale_gradient_fwd, _scale_gradient_bwd)
 class TQCActorHead(nn.Module):
     action_dim:  int   = ACTION_DIM
     LOG_STD_MIN: float = -5.0
-    LOG_STD_MAX: float =  2.0
+    LOG_STD_MAX: float =  0.5
 
     @nn.compact
     def __call__(self, feat):
@@ -157,8 +157,8 @@ critic_net = TQCCriticEnsemble()
 enc_opt    = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
 actor_opt  = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
 critic_opt = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
-ALPHA_LR   = LR
-alpha_opt  = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(ALPHA_LR, eps=1e-5))
+ALPHA_LR   = 1e-4
+alpha_opt  = optax.adam(ALPHA_LR, eps=1e-5)
 
 def _tanh_log_prob_correction(tanh_u, max_v):
     corr_v = jnp.log(max_v * 0.5 + LOG_STD_EPS) + jnp.log(1.0 - tanh_u[..., 0] ** 2 + LOG_STD_EPS)
@@ -174,15 +174,22 @@ def sample_action(rng_key, mean, log_std, max_v):
     return env_action, lp_gauss + _tanh_log_prob_correction(tanh_u, max_v)
 
 @jax.jit
-def extract_max_v(obs): return obs[..., MAX_V_OBS_IDX] * 2.0
+def extract_max_v(obs):
+    # state_vec[2] = (max_v - 0.2) / 1.8  →  inverse: * 1.8 + 0.2
+    # Clamp to [0.2, 2.0] matching env range for safety
+    return jnp.clip(obs[..., MAX_V_OBS_IDX] * 1.8 + 0.2, 0.2, 2.0)
 
 def quantile_huber_loss(atoms, targets, taus, kappa=HUBER_KAPPA):
-    u = targets[:, None, :] - atoms[:, :, None]
+    # atoms:   (B, N_ATOMS)    — online quantile predictions
+    # targets: (B, N_TARGET)   — truncated target atoms
+    # taus:    (N_ATOMS,)
+    u = targets[:, None, :] - atoms[:, :, None]   # (B, N_ATOMS, N_TARGET)
     abs_u = jnp.abs(u)
     huber = jnp.where(abs_u <= kappa, 0.5 * u ** 2, kappa * (abs_u - 0.5 * kappa))
     indicator = (u < 0.0).astype(jnp.float32)
     rho = jnp.abs(taus[None, :, None] - indicator) * huber / kappa
-    return jnp.mean(jnp.mean(rho, axis=2))
+    # Sum over target atoms, mean over quantile atoms, mean over batch
+    return jnp.mean(jnp.mean(jnp.sum(rho, axis=2), axis=1))
 
 def make_buffer(capacity):
     return {
@@ -229,7 +236,7 @@ def critic_loss_fn(cp, tp, ap, sep, tsep, log_alpha, obs, action, reward, next_o
     mean_n, lgs_n = actor_head.apply({"params": ap}, feat_next_actor)
     next_act, next_lp = jax.vmap(sample_action)(jax.random.split(rng_key, obs.shape[0]), mean_n, lgs_n, extract_max_v(next_obs))
 
-    target_atoms = critic_net.apply({"params": tp}, feat_next_critic, next_act)
+    target_atoms = critic_net.apply({"params": tp}, feat_next_critic, next_act.astype(NET_DTYPE))
     target_kept = jnp.sort(target_atoms.reshape(obs.shape[0], N_CRITICS * N_ATOMS), axis=1)[:, :N_TARGET_ATOMS]
     backup = jax.lax.stop_gradient(reward[:, None] + GAMMA * (1.0 - done[:, None]) * (target_kept - alpha * next_lp[:, None]))
 
@@ -240,7 +247,7 @@ def critic_loss_fn(cp, tp, ap, sep, tsep, log_alpha, obs, action, reward, next_o
     for i in range(N_CRITICS):
         total_loss += quantile_huber_loss(online_atoms[:, i, :], backup, _TAUS)
         q_sum += jnp.mean(online_atoms[:, i, :])
-    return total_loss, q_sum / N_CRITICS
+    return total_loss / N_CRITICS, q_sum / N_CRITICS
 
 @jax.jit
 def actor_loss_fn(ap, cp, sep, log_alpha, obs, rng_key):
