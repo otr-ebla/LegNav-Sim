@@ -1,0 +1,255 @@
+\documentclass[tikz, border=10pt]{standalone}
+\usepackage{tikz}
+\usepackage{amsmath}
+\usepackage{xcolor}
+
+\usetikzlibrary{
+  positioning,
+  shapes.geometric,
+  shapes.multipart,
+  arrows.meta,
+  fit,
+  backgrounds,
+  calc,
+  decorations.pathreplacing
+}
+
+%% Color palette
+\definecolor{clrInput}{HTML}{D6E4F7}
+\definecolor{clrCNN}{HTML}{FDE8C8}
+\definecolor{clrAttn}{HTML}{D8F5D8}
+\definecolor{clrTrunk}{HTML}{EAD6F7}
+\definecolor{clrActor}{HTML}{FAD4D4}
+\definecolor{clrCritic}{HTML}{D4EEF7}
+\definecolor{clrBorder}{HTML}{444444}
+\definecolor{clrArrow}{HTML}{333333}
+\definecolor{clrShared}{HTML}{FFEECC}
+
+\tikzset{
+  base/.style={
+    draw=clrBorder, thick,
+    minimum width=2.6cm,
+    minimum height=0.55cm,
+    font=\small,
+    align=center,
+    rounded corners=2pt
+  },
+  inputbox/.style={base, fill=clrInput},
+  cnnbox/.style={base, fill=clrCNN},
+  attnbox/.style={base, fill=clrAttn},
+  trunkbox/.style={base, fill=clrTrunk},
+  actorbox/.style={base, fill=clrActor},
+  criticbox/.style={base, fill=clrCritic},
+  sharedbox/.style={base, fill=clrShared, minimum width=5.6cm},
+  outputbox/.style={base, fill=white, dashed, draw=clrBorder},
+  arrow/.style={-{Stealth[length=4pt]}, thick, color=clrArrow},
+  groupbrace/.style={decorate, decoration={brace, amplitude=4pt}, thick, color=gray!70},
+  grouplabel/.style={font=\footnotesize\itshape, color=gray!70},
+  dimtag/.style={font=\scriptsize\color{gray!70}, inner sep=1pt}
+}
+
+\begin{document}
+\begin{tikzpicture}[node distance=0.38cm]
+
+%% ================================================================
+%%  COLUMN POSITIONS
+%% ================================================================
+%  Frame columns at x = -3.3, 0, 3.3
+%  Global state column at x = 7.0
+
+\newcommand{\colA}{-3.3cm}
+\newcommand{\colB}{0cm}
+\newcommand{\colC}{3.3cm}
+\newcommand{\colG}{7.2cm}   % global state
+
+%% ================================================================
+%%  INPUT LAYER
+%% ================================================================
+
+% LiDAR frames
+\node[inputbox, minimum width=2.2cm] (f1) at (\colA, 0)
+  {LiDAR Frame 1\\[-2pt]{\scriptsize(216 rays)}};
+
+\node[inputbox, minimum width=2.2cm] (f2) at (\colB, 0)
+  {LiDAR Frame 2\\[-2pt]{\scriptsize(216 rays)}};
+
+\node[inputbox, minimum width=2.2cm] (f3) at (\colC, 0)
+  {LiDAR Frame 3\\[-2pt]{\scriptsize(216 rays)}};
+
+% Global state
+\node[inputbox, minimum width=2.4cm] (gs) at (\colG, 0)
+  {Pose + State\\[-2pt]{\scriptsize(14 dims)}};
+
+% Brace over frames
+\draw[groupbrace]
+  ([yshift=3pt, xshift=-1.2cm]f1.north west) --
+  ([yshift=3pt, xshift= 1.2cm]f3.north east)
+  node[midway, above=4pt, grouplabel] {LiDAR frame stack ($\times$3, 648 dims)};
+
+%% ================================================================
+%%  CNN (shared weights)
+%% ================================================================
+
+\node[cnnbox, minimum width=2.2cm, below=0.55cm of f1] (cnn1)
+  {Conv1D $\times$3 + FC\\[-2pt]{\scriptsize 7-5-3 kernels, strides 2}};
+
+\node[cnnbox, minimum width=2.2cm, below=0.55cm of f2] (cnn2)
+  {Conv1D $\times$3 + FC\\[-2pt]{\scriptsize 7-5-3 kernels, strides 2}};
+
+\node[cnnbox, minimum width=2.2cm, below=0.55cm of f3] (cnn3)
+  {Conv1D $\times$3 + FC\\[-2pt]{\scriptsize 7-5-3 kernels, strides 2}};
+
+% Shared-weight annotation
+\draw[draw=orange!70!black, thick, dashed, rounded corners=4pt]
+  ([xshift=-1.2cm, yshift=4pt]cnn1.north west) rectangle
+  ([xshift= 1.2cm, yshift=-4pt]cnn3.south east);
+\node[font=\scriptsize\itshape, text=orange!70!black]
+  at ([xshift=0.8cm, yshift=-12pt]cnn3.south east)
+  {shared weights};
+
+% Arrows frame -> CNN
+\foreach \s/\t in {f1/cnn1, f2/cnn2, f3/cnn3}{
+  \draw[arrow] (\s) -- (\t);
+}
+
+% CNN output dim tags
+\foreach \n in {cnn1, cnn2, cnn3}{
+  \node[dimtag, right=1pt of \n.east, xshift=2pt]
+    {\scriptsize 64};
+}
+
+%% ================================================================
+%%  FRAME-STACK ATTENTION
+%% ================================================================
+
+\node[attnbox,
+      minimum width=6.0cm,
+      minimum height=0.85cm,
+      below=0.95cm of cnn2] (attn)
+  {Multi-Head Self-Attention\\[-2pt]
+   {\scriptsize 4 heads $\times$ 16 dims/head $\;|\;$ residual + LayerNorm}};
+
+% Arrows CNN -> Attn
+\draw[arrow] (cnn1.south) -- (cnn1.south |- attn.north);
+\draw[arrow] (cnn2.south) -- (cnn2.south |- attn.north);
+\draw[arrow] (cnn3.south) -- (cnn3.south |- attn.north);
+
+% Seq shape label
+\node[dimtag, right=6pt of attn.east]
+  {\scriptsize$(3 \times 64)$};
+
+%% ================================================================
+%%  FLATTEN + CONCAT
+%% ================================================================
+
+\node[sharedbox,
+      below=0.80cm of attn,
+      minimum height=0.6cm] (concat)
+  {Flatten \& Concatenate with Global State\\[-2pt]
+   {\scriptsize $3 \times 64 = 192$ dims $\;\oplus\;$ 14 dims $= 206$ dims}};
+
+% Arrow attn -> concat
+\draw[arrow] (attn.south) -- (concat.north -| attn.south);
+
+% Arrow global state -> concat
+\draw[arrow] (gs.south) |- ([yshift=6pt]concat.east)
+  -- (concat.east);
+
+%% ================================================================
+%%  SHARED TRUNK
+%% ================================================================
+
+\node[trunkbox, minimum width=5.6cm, below=0.38cm of concat] (d256)
+  {Dense(256) + ReLU};
+
+\node[trunkbox, minimum width=5.6cm, below=0.38cm of d256] (d128)
+  {Dense(128) + ReLU};
+
+\draw[arrow] (concat.south) -- (d256.north);
+\draw[arrow] (d256.south)   -- (d128.north);
+
+\node[dimtag, right=4pt of d256.east] {\scriptsize 256};
+\node[dimtag, right=4pt of d128.east] {\scriptsize 128};
+
+% Trunk brace
+\draw[groupbrace, rotate=180]
+  ([xshift=2pt, yshift=-3pt]d256.south east) --
+  ([xshift=2pt, yshift=3pt]d256.north east)
+  node[midway, right=8pt, grouplabel, rotate=180] {};
+
+%% ================================================================
+%%  ACTOR / CRITIC SPLIT
+%% ================================================================
+
+% Actor head
+\node[actorbox,
+      minimum width=2.6cm,
+      below right=0.75cm and -2.2cm of d128] (actor_l)
+  {Dense(2)};
+
+\node[outputbox, minimum width=2.6cm, below=0.38cm of actor_l] (actor_out)
+  {$\boldsymbol{\mu}, \log\boldsymbol{\sigma}$\\[-2pt]
+   {\scriptsize action mean \& log-std (2 dims each)}};
+
+% Critic head
+\node[criticbox,
+      minimum width=2.6cm,
+      below left=0.75cm and -2.2cm of d128] (crit_d64)
+  {Dense(64) + ReLU};
+
+\node[criticbox, minimum width=2.6cm, below=0.38cm of crit_d64] (crit_d1)
+  {Dense(1)};
+
+\node[outputbox, minimum width=2.6cm, below=0.38cm of crit_d1] (crit_out)
+  {$V(s)$\\[-2pt]{\scriptsize state value (scalar)}};
+
+% Arrows trunk -> heads
+\draw[arrow] (d128.south) -|  (actor_l.north);
+\draw[arrow] (d128.south) -|  (crit_d64.north);
+
+\draw[arrow] (actor_l.south)  -- (actor_out.north);
+\draw[arrow] (crit_d64.south) -- (crit_d1.north);
+\draw[arrow] (crit_d1.south)  -- (crit_out.north);
+
+\node[dimtag, right=4pt of crit_d64.east] {\scriptsize 64};
+\node[dimtag, right=4pt of crit_d1.east]  {\scriptsize 1};
+
+%% ================================================================
+%%  SECTION LABELS (left margin)
+%% ================================================================
+
+\begin{scope}[every node/.style={
+    font=\footnotesize\bfseries,
+    text=white,
+    fill=gray!60,
+    rounded corners=2pt,
+    inner sep=3pt,
+    minimum width=1.55cm,
+    align=center
+  }]
+  \node[anchor=east] at ([xshift=-0.6cm]f1.west |- f1.center)
+    {Input};
+  \node[anchor=east] at ([xshift=-0.6cm]cnn1.west |- cnn1.center)
+    {CNN};
+  \node[anchor=east] at ([xshift=-0.6cm]cnn1.west |- attn.center)
+    {Attention};
+  \node[anchor=east] at ([xshift=-0.6cm]cnn1.west |- concat.center)
+    {Fusion};
+  \node[anchor=east] at ([xshift=-0.6cm]cnn1.west |- d128.center)
+    {Trunk};
+  \node[anchor=east] at ([xshift=-0.6cm]cnn1.west |- actor_l.center)
+    {Heads};
+\end{scope}
+
+%% ================================================================
+%%  HEAD LABELS
+%% ================================================================
+
+\node[font=\small\bfseries, text=clrActor!80!black,
+      above=2pt of actor_l] {Actor};
+
+\node[font=\small\bfseries, text=clrCritic!80!black,
+      above=2pt of crit_d64] {Critic};
+
+\end{tikzpicture}
+\end{document}
