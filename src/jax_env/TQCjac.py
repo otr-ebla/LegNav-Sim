@@ -123,7 +123,7 @@ def _vmap_reset(reset_keys, min_goal_dist, ghost_prob, scenario_idx):
 
 def init_env_state(rng_key, min_goal_dist: float = 1.5, ghost_prob: float = 0.0, scenario_idx: int = -1):
     reset_keys = jax.random.split(rng_key, N_ENVS)
-    env_obs, env_state = _vmap_reset(reset_keys, min_goal_dist, ghost_prob, scenario_idx)
+    env_obs, env_state = _vmap_reset(reset_keys, jnp.float32(min_goal_dist), jnp.float32(ghost_prob), jnp.int32(scenario_idx))
     return env_obs, env_state, vmap_step
 
 # Use the same SharedEncoder as PPO and SAC for fair algorithm comparison.
@@ -490,7 +490,7 @@ if __name__ == "__main__":
                 rng, reinit_rng = jax.random.split(rng)
                 # Only reset env obs/state — vmap_step is module-level, never recreated
                 reset_keys = jax.random.split(reinit_rng, N_ENVS)
-                env_obs, env_state = _vmap_reset(reset_keys, cur_min_dist, 0.0, -1)
+                env_obs, env_state = _vmap_reset(reset_keys, jnp.float32(cur_min_dist), jnp.float32(0.0), jnp.int32(-1))
                 replay_buf = buf_flush(replay_buf)  # Previene il distribution shift
 
         if suc_pct > best_suc:
