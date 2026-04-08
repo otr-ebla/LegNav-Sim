@@ -393,7 +393,7 @@ if __name__ == "__main__":
     print("Warming up buffer (filling with random actions)...")
     for _ in range((WARMUP_STEPS // N_ENVS) + 1):
         rng, c_rng = jax.random.split(rng)
-        new_obs, env_state, obs_before, env_action, reward, done, info = collect_step(ap, env_state, env_obs, c_rng, vmap_step, cur_min_dist, -1, 0.0)
+        new_obs, env_state, obs_before, env_action, reward, done, info = collect_step(ap, env_state, env_obs, c_rng, vmap_step, jnp.float32(cur_min_dist), jnp.int32(-1), jnp.float32(0.0))
         replay_buf = buf_add(replay_buf, obs_before, env_action, reward, new_obs, done.astype(jnp.float32))
         env_obs = new_obs
         total_steps += N_ENVS
@@ -402,7 +402,7 @@ if __name__ == "__main__":
     print("Warmup done. JIT compiling train chunk (this may take up to a minute)...")
     _c, _sd, _m = train_chunk(
         ap, aos, cp, cos, tp, la, laos,
-        replay_buf, vmap_step, cur_min_dist, -1, 0.0, env_state, env_obs, rng
+        replay_buf, vmap_step, jnp.float32(cur_min_dist), jnp.int32(-1), jnp.float32(0.0), env_state, env_obs, rng
     )
     jax.block_until_ready(_c)   # Wait for GPU to finish compilation + first run
     ap, aos, cp, cos, tp, la, laos, replay_buf, env_state, env_obs, rng = _c
@@ -433,7 +433,7 @@ if __name__ == "__main__":
         # ── 1. Execute Fused GPU Chunk ──
         new_carry, all_step_data, all_metrics = train_chunk(
             ap, aos, cp, cos, tp, la, laos,
-            replay_buf, vmap_step, cur_min_dist, -1, 0.0, env_state, env_obs, rng
+            replay_buf, vmap_step, jnp.float32(cur_min_dist), jnp.int32(-1), jnp.float32(0.0), env_state, env_obs, rng
         )
         
         ap, aos, cp, cos, tp, la, laos, replay_buf, env_state, env_obs, rng = new_carry
