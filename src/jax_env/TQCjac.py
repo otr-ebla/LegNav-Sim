@@ -186,10 +186,10 @@ def quantile_huber_loss(atoms, targets, taus, kappa=HUBER_KAPPA):
 
 def make_buffer(capacity):
     return {
-        "obs": jnp.zeros((capacity, OBS_SIZE), jnp.float16),
+        "obs": jnp.zeros((capacity, OBS_SIZE), jnp.float32),
         "action": jnp.zeros((capacity, ACTION_DIM), jnp.float32),
         "reward": jnp.zeros((capacity,), jnp.float32),
-        "next_obs": jnp.zeros((capacity, OBS_SIZE), jnp.float16),
+        "next_obs": jnp.zeros((capacity, OBS_SIZE), jnp.float32),
         "done": jnp.zeros((capacity,), jnp.float32),
         "ptr": jnp.int32(0), "size": jnp.int32(0),
     }
@@ -199,10 +199,10 @@ def buf_add(buf, obs, action, reward, next_obs, done):
     cap = buf["obs"].shape[0]; N = obs.shape[0]
     idxs = (buf["ptr"] + jnp.arange(N)) % cap
     return {
-        "obs": buf["obs"].at[idxs].set(obs.astype(jnp.float16)),
+        "obs": buf["obs"].at[idxs].set(obs.astype(jnp.float32)),
         "action": buf["action"].at[idxs].set(action),
         "reward": buf["reward"].at[idxs].set(reward),
-        "next_obs": buf["next_obs"].at[idxs].set(next_obs.astype(jnp.float16)),
+        "next_obs": buf["next_obs"].at[idxs].set(next_obs.astype(jnp.float32)),
         "done": buf["done"].at[idxs].set(done),
         "ptr": jnp.int32((buf["ptr"] + N) % cap),
         "size": jnp.minimum(jnp.int32(buf["size"] + N), jnp.int32(cap)),
@@ -213,7 +213,7 @@ def buf_add(buf, obs, action, reward, next_obs, done):
 def buf_sample(buf, rng_key, batch_size: int):
     max_idx = jnp.maximum(1, buf["size"])
     idxs = jax.random.randint(rng_key, (batch_size,), 0, max_idx)
-    return (buf["obs"][idxs].astype(jnp.float32), buf["action"][idxs], buf["reward"][idxs], buf["next_obs"][idxs].astype(jnp.float32), buf["done"][idxs])
+    return (buf["obs"][idxs], buf["action"][idxs], buf["reward"][idxs], buf["next_obs"][idxs], buf["done"][idxs])
 
 @jax.jit
 def soft_update(target, online):
@@ -223,11 +223,13 @@ def soft_update(target, online):
 def critic_loss_fn(cp, tp, ap, sep, tsep, log_alpha, obs, action, reward, next_obs, done, rng_key):
     alpha = jnp.exp(log_alpha)
 
-    feat_next = jax.lax.stop_gradient(shared_enc.apply({"params": tsep}, next_obs.astype(NET_DTYPE)))
-    mean_n, lgs_n = actor_head.apply({"params": ap}, feat_next)
+    feat_next_critic = jax.lax.stop_gradient(shared_enc.apply({"params": tsep}, next_obs.astype(NET_DTYPE)))
+    feat_next_actor = jax.lax.stop_gradient(shared_enc.apply({"params": sep}, next_obs.astype(NET_DTYPE)))
+
+    mean_n, lgs_n = actor_head.apply({"params": ap}, feat_next_actor)
     next_act, next_lp = jax.vmap(sample_action)(jax.random.split(rng_key, obs.shape[0]), mean_n, lgs_n, extract_max_v(next_obs))
 
-    target_atoms = critic_net.apply({"params": tp}, feat_next, next_act)
+    target_atoms = critic_net.apply({"params": tp}, feat_next_critic, next_act)
     target_kept = jnp.sort(target_atoms.reshape(obs.shape[0], N_CRITICS * N_ATOMS), axis=1)[:, :N_TARGET_ATOMS]
     backup = jax.lax.stop_gradient(reward[:, None] + GAMMA * (1.0 - done[:, None]) * (target_kept - alpha * next_lp[:, None]))
 
@@ -271,7 +273,7 @@ def tqc_update(ap, aos, cp, cos, tp, sep, eos, tsep, la, laos, obs, action, rewa
     e_upd, new_eos = enc_opt.update(combined_enc_grads, eos, sep)
     new_sep = optax.apply_updates(sep, e_upd)
 
-    al_loss, al_grad = jax.value_and_grad(lambda a, lp: -a * (lp + TARGET_ENTROPY))(la, jax.lax.stop_gradient(log_pi_mean))
+    al_loss, al_grad = jax.value_and_grad(lambda a, lp: -jnp.exp(a) * (lp + TARGET_ENTROPY))(la, jax.lax.stop_gradient(log_pi_mean))
     al_upd, new_laos = alpha_opt.update(al_grad, laos)
 
     metrics = {"critic_loss": c_loss, "actor_loss": a_loss, "alpha": jnp.exp(optax.apply_updates(la, al_upd)), "log_pi": log_pi_mean, "q_mean": q_mean}
