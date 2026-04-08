@@ -208,10 +208,10 @@ def quantile_huber_loss(atoms, targets, taus, kappa=HUBER_KAPPA):
 # ── Replay buffer ─────────────────────────────────────────────────────────────
 def make_buffer(capacity):
     return {
-        "obs": jnp.zeros((capacity, OBS_SIZE), jnp.float32),
+        "obs": jnp.zeros((capacity, OBS_SIZE), jnp.float16),
         "action": jnp.zeros((capacity, ACTION_DIM), jnp.float32),
         "reward": jnp.zeros((capacity,), jnp.float32),
-        "next_obs": jnp.zeros((capacity, OBS_SIZE), jnp.float32),
+        "next_obs": jnp.zeros((capacity, OBS_SIZE), jnp.float16),
         "done": jnp.zeros((capacity,), jnp.float32),
         "ptr": jnp.int32(0), "size": jnp.int32(0),
     }
@@ -221,34 +221,22 @@ def buf_add(buf, obs, action, reward, next_obs, done):
     cap = buf["obs"].shape[0]; N = obs.shape[0]
     idxs = (buf["ptr"] + jnp.arange(N)) % cap
     return {
-        "obs": buf["obs"].at[idxs].set(obs),
+        "obs": buf["obs"].at[idxs].set(obs.astype(jnp.float16)),
         "action": buf["action"].at[idxs].set(action),
         "reward": buf["reward"].at[idxs].set(reward),
-        "next_obs": buf["next_obs"].at[idxs].set(next_obs),
+        "next_obs": buf["next_obs"].at[idxs].set(next_obs.astype(jnp.float16)),
         "done": buf["done"].at[idxs].set(done),
         "ptr": jnp.int32((buf["ptr"] + N) % cap),
         "size": jnp.minimum(jnp.int32(buf["size"] + N), jnp.int32(cap)),
     }
 
-@jax.jit
-def buf_flush(buf):
-    """Resets buffer size and ptr to 0 to prevent distribution shift during curriculum jumps."""
-    return {
-        "obs":      buf["obs"],
-        "action":   buf["action"],
-        "reward":   buf["reward"],
-        "next_obs": buf["next_obs"],
-        "done":     buf["done"],
-        "ptr":      jnp.int32(0),
-        "size":     jnp.int32(0),
-    }
 
 @jax.jit(static_argnames=["batch_size"])
 def buf_sample(buf, rng_key, batch_size: int):
     capacity = buf["obs"].shape[0]
     idxs = jnp.where(jax.random.randint(rng_key, (batch_size,), 0, capacity) < buf["size"],
                      jax.random.randint(rng_key, (batch_size,), 0, capacity), jnp.int32(0))
-    return (buf["obs"][idxs], buf["action"][idxs], buf["reward"][idxs], buf["next_obs"][idxs], buf["done"][idxs])
+    return (buf["obs"][idxs].astype(jnp.float32), buf["action"][idxs], buf["reward"][idxs], buf["next_obs"][idxs].astype(jnp.float32), buf["done"][idxs])
 
 # ── Core TQC Update ───────────────────────────────────────────────────────────
 @jax.jit
@@ -536,7 +524,8 @@ if __name__ == "__main__":
                 # Only reset env obs/state — vmap_step is module-level, never recreated
                 reset_keys = jax.random.split(reinit_rng, N_ENVS)
                 env_obs, env_state = _vmap_reset(reset_keys, jnp.float32(cur_min_dist), jnp.float32(0.0), jnp.int32(-1))
-                replay_buf = buf_flush(replay_buf)  # Previene il distribution shift
+                # Update pointers directly in the dictionary without triggering an XLA graph copy
+                replay_buf = {**replay_buf, "ptr": jnp.int32(0), "size": jnp.int32(0)}
 
         if suc_pct > best_suc:
             best_suc = suc_pct
