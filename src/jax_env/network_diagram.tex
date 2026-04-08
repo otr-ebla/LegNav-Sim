@@ -1,12 +1,10 @@
-\documentclass[tikz, border=10pt]{standalone}
+\documentclass[tikz, border=8pt]{standalone}
 \usepackage{tikz}
 \usepackage{amsmath}
 \usepackage{xcolor}
 
 \usetikzlibrary{
   positioning,
-  shapes.geometric,
-  shapes.multipart,
   arrows.meta,
   fit,
   backgrounds,
@@ -14,242 +12,225 @@
   decorations.pathreplacing
 }
 
-%% Color palette
+%% ── Colour palette ───────────────────────────────────────────────
 \definecolor{clrInput}{HTML}{D6E4F7}
 \definecolor{clrCNN}{HTML}{FDE8C8}
 \definecolor{clrAttn}{HTML}{D8F5D8}
 \definecolor{clrTrunk}{HTML}{EAD6F7}
+\definecolor{clrFuse}{HTML}{FFF5CC}
 \definecolor{clrActor}{HTML}{FAD4D4}
 \definecolor{clrCritic}{HTML}{D4EEF7}
 \definecolor{clrBorder}{HTML}{444444}
 \definecolor{clrArrow}{HTML}{333333}
-\definecolor{clrShared}{HTML}{FFEECC}
 
 \tikzset{
-  base/.style={
-    draw=clrBorder, thick,
-    minimum width=2.6cm,
-    minimum height=0.55cm,
-    font=\small,
+  %% generic block
+  blk/.style={
+    draw=clrBorder, line width=0.6pt,
+    rounded corners=2.5pt,
+    font=\footnotesize,
     align=center,
-    rounded corners=2pt
+    inner sep=4pt
   },
-  inputbox/.style={base, fill=clrInput},
-  cnnbox/.style={base, fill=clrCNN},
-  attnbox/.style={base, fill=clrAttn},
-  trunkbox/.style={base, fill=clrTrunk},
-  actorbox/.style={base, fill=clrActor},
-  criticbox/.style={base, fill=clrCritic},
-  sharedbox/.style={base, fill=clrShared, minimum width=5.6cm},
-  outputbox/.style={base, fill=white, dashed, draw=clrBorder},
-  arrow/.style={-{Stealth[length=4pt]}, thick, color=clrArrow},
-  groupbrace/.style={decorate, decoration={brace, amplitude=4pt}, thick, color=gray!70},
-  grouplabel/.style={font=\footnotesize\itshape, color=gray!70},
-  dimtag/.style={font=\scriptsize\color{gray!70}, inner sep=1pt}
+  %% typed blocks
+  iblk/.style ={blk, fill=clrInput},
+  cblk/.style ={blk, fill=clrCNN},
+  ablk/.style ={blk, fill=clrAttn},
+  fblk/.style ={blk, fill=clrFuse},
+  tblk/.style ={blk, fill=clrTrunk},
+  actblk/.style={blk, fill=clrActor},
+  criblk/.style={blk, fill=clrCritic},
+  outblk/.style={blk, fill=white, draw=clrBorder, dashed, line width=0.5pt},
+  %% arrows
+  arr/.style={-{Stealth[length=3.5pt, width=2.5pt]},
+              line width=0.7pt, color=clrArrow},
+  %% dim tags
+  dim/.style={font=\scriptsize, color=gray!65}
 }
 
 \begin{document}
-\begin{tikzpicture}[node distance=0.38cm]
+\begin{tikzpicture}
 
 %% ================================================================
-%%  COLUMN POSITIONS
+%%  X-POSITIONS  (centre of each stage, in cm)
 %% ================================================================
-%  Frame columns at x = -3.3, 0, 3.3
-%  Global state column at x = 7.0
-
-\newcommand{\colA}{-3.3cm}
-\newcommand{\colB}{0cm}
-\newcommand{\colC}{3.3cm}
-\newcommand{\colG}{7.2cm}   % global state
-
-%% ================================================================
-%%  INPUT LAYER
-%% ================================================================
-
-% LiDAR frames
-\node[inputbox, minimum width=2.2cm] (f1) at (\colA, 0)
-  {LiDAR Frame 1\\[-2pt]{\scriptsize(216 rays)}};
-
-\node[inputbox, minimum width=2.2cm] (f2) at (\colB, 0)
-  {LiDAR Frame 2\\[-2pt]{\scriptsize(216 rays)}};
-
-\node[inputbox, minimum width=2.2cm] (f3) at (\colC, 0)
-  {LiDAR Frame 3\\[-2pt]{\scriptsize(216 rays)}};
-
-% Global state
-\node[inputbox, minimum width=2.4cm] (gs) at (\colG, 0)
-  {Pose + State\\[-2pt]{\scriptsize(14 dims)}};
-
-% Brace over frames
-\draw[groupbrace]
-  ([yshift=3pt, xshift=-1.2cm]f1.north west) --
-  ([yshift=3pt, xshift= 1.2cm]f3.north east)
-  node[midway, above=4pt, grouplabel] {LiDAR frame stack ($\times$3, 648 dims)};
+%%  0.0 : input frames
+%%  3.6 : CNN
+%%  7.3 : attention
+%% 10.5 : fusion / concat
+%% 13.1 : Dense-256
+%% 15.3 : Dense-128
+%% 17.6 : actor head
+%% 17.6 : critic head  (same x, different y)
+%%
+%%  Y-POSITIONS for the three parallel frame rows:
+%%   +1.40 / 0.00 / -1.40  (before attention)
+%%   0.00                   (after attention)
 
 %% ================================================================
-%%  CNN (shared weights)
+%%  STAGE 1 — Input
 %% ================================================================
+\node[iblk, minimum width=2.0cm, minimum height=0.70cm]
+  (f1) at (0, 1.40) {Frame 1\\{\scriptsize 216 rays}};
 
-\node[cnnbox, minimum width=2.2cm, below=0.55cm of f1] (cnn1)
-  {Conv1D $\times$3 + FC\\[-2pt]{\scriptsize 7-5-3 kernels, strides 2}};
+\node[iblk, minimum width=2.0cm, minimum height=0.70cm]
+  (f2) at (0, 0.00) {Frame 2\\{\scriptsize 216 rays}};
 
-\node[cnnbox, minimum width=2.2cm, below=0.55cm of f2] (cnn2)
-  {Conv1D $\times$3 + FC\\[-2pt]{\scriptsize 7-5-3 kernels, strides 2}};
+\node[iblk, minimum width=2.0cm, minimum height=0.70cm]
+  (f3) at (0,-1.40) {Frame 3\\{\scriptsize 216 rays}};
 
-\node[cnnbox, minimum width=2.2cm, below=0.55cm of f3] (cnn3)
-  {Conv1D $\times$3 + FC\\[-2pt]{\scriptsize 7-5-3 kernels, strides 2}};
+%% left brace labelling the 3-frame LiDAR stack
+\draw[decorate,
+      decoration={brace, amplitude=5pt},
+      line width=0.6pt, color=gray!55]
+  ([xshift=-1.15cm, yshift= 3pt]f1.north west) --
+  ([xshift=-1.15cm, yshift=-3pt]f3.south west)
+  node[midway, left=7pt,
+       font=\scriptsize\itshape, color=gray!55, align=right]
+    {LiDAR\\stack\\$\times$3};
 
-% Shared-weight annotation
-\draw[draw=orange!70!black, thick, dashed, rounded corners=4pt]
-  ([xshift=-1.2cm, yshift=4pt]cnn1.north west) rectangle
-  ([xshift= 1.2cm, yshift=-4pt]cnn3.south east);
-\node[font=\scriptsize\itshape, text=orange!70!black]
-  at ([xshift=0.8cm, yshift=-12pt]cnn3.south east)
+%% global state (will feed into fusion at x=10.5)
+\node[iblk, minimum width=2.0cm, minimum height=0.70cm]
+  (gs) at (10.5,-2.65) {Pose + State\\{\scriptsize 14 dims}};
+
+%% ================================================================
+%%  STAGE 2 — Shared-weight CNN
+%% ================================================================
+\node[cblk, minimum width=2.7cm, minimum height=0.72cm]
+  (cnn1) at (3.6, 1.40)
+  {Conv1D$\times$3 + Dense\\[-1pt]{\scriptsize k\,=\,7-5-3, str.\,2\;$\to$\,64}};
+
+\node[cblk, minimum width=2.7cm, minimum height=0.72cm]
+  (cnn2) at (3.6, 0.00)
+  {Conv1D$\times$3 + Dense\\[-1pt]{\scriptsize k\,=\,7-5-3, str.\,2\;$\to$\,64}};
+
+\node[cblk, minimum width=2.7cm, minimum height=0.72cm]
+  (cnn3) at (3.6,-1.40)
+  {Conv1D$\times$3 + Dense\\[-1pt]{\scriptsize k\,=\,7-5-3, str.\,2\;$\to$\,64}};
+
+%% dashed box: shared weights
+\begin{scope}[on background layer]
+  \node[draw=orange!65!black, dashed, line width=0.7pt,
+        fill=orange!6, rounded corners=4pt,
+        fit=(cnn1)(cnn2)(cnn3), inner sep=6pt] (cnn_group) {};
+\end{scope}
+\node[font=\scriptsize\itshape, text=orange!65!black,
+      below=2pt of cnn_group.south east, anchor=north east]
   {shared weights};
 
-% Arrows frame -> CNN
-\foreach \s/\t in {f1/cnn1, f2/cnn2, f3/cnn3}{
-  \draw[arrow] (\s) -- (\t);
-}
-
-% CNN output dim tags
-\foreach \n in {cnn1, cnn2, cnn3}{
-  \node[dimtag, right=1pt of \n.east, xshift=2pt]
-    {\scriptsize 64};
-}
+%% arrows  input → CNN
+\draw[arr] (f1.east) -- (cnn1.west);
+\draw[arr] (f2.east) -- (cnn2.west);
+\draw[arr] (f3.east) -- (cnn3.west);
 
 %% ================================================================
-%%  FRAME-STACK ATTENTION
+%%  STAGE 3 — Frame-stack attention
 %% ================================================================
+\node[ablk, minimum width=2.10cm, minimum height=4.40cm]
+  (attn) at (7.3, 0)
+  {Multi-Head\\Self-Attention\\[4pt]
+   {\scriptsize 4 heads\,$\times$\,16\,d/h}\\[1pt]
+   {\scriptsize residual\,+\,LN}\\[4pt]
+   {\scriptsize $(3\!\times\!64)\!\to\!(3\!\times\!64)$}};
 
-\node[attnbox,
-      minimum width=6.0cm,
-      minimum height=0.85cm,
-      below=0.95cm of cnn2] (attn)
-  {Multi-Head Self-Attention\\[-2pt]
-   {\scriptsize 4 heads $\times$ 16 dims/head $\;|\;$ residual + LayerNorm}};
-
-% Arrows CNN -> Attn
-\draw[arrow] (cnn1.south) -- (cnn1.south |- attn.north);
-\draw[arrow] (cnn2.south) -- (cnn2.south |- attn.north);
-\draw[arrow] (cnn3.south) -- (cnn3.south |- attn.north);
-
-% Seq shape label
-\node[dimtag, right=6pt of attn.east]
-  {\scriptsize$(3 \times 64)$};
+%% arrows  CNN → attention (horizontal entry at corresponding y)
+\draw[arr] (cnn1.east) -- (cnn1.east -| attn.west);
+\draw[arr] (cnn2.east) -- (attn.west);
+\draw[arr] (cnn3.east) -- (cnn3.east -| attn.west);
 
 %% ================================================================
-%%  FLATTEN + CONCAT
+%%  STAGE 4 — Fusion (flatten + concat)
 %% ================================================================
+\node[fblk, minimum width=2.10cm, minimum height=1.20cm]
+  (concat) at (10.5, 0)
+  {Flatten\\$\oplus$\;Concat\\[-1pt]{\scriptsize $192\!+\!14\!=\!206$\,d}};
 
-\node[sharedbox,
-      below=0.80cm of attn,
-      minimum height=0.6cm] (concat)
-  {Flatten \& Concatenate with Global State\\[-2pt]
-   {\scriptsize $3 \times 64 = 192$ dims $\;\oplus\;$ 14 dims $= 206$ dims}};
+%% arrows  attention → concat
+\draw[arr] (attn.east) -- (concat.west);
 
-% Arrow attn -> concat
-\draw[arrow] (attn.south) -- (concat.north -| attn.south);
+%% global state → concat  (short vertical arrow)
+\draw[arr] (gs.north) -- (concat.south);
 
-% Arrow global state -> concat
-\draw[arrow] (gs.south) |- ([yshift=6pt]concat.east)
-  -- (concat.east);
-
-%% ================================================================
-%%  SHARED TRUNK
-%% ================================================================
-
-\node[trunkbox, minimum width=5.6cm, below=0.38cm of concat] (d256)
-  {Dense(256) + ReLU};
-
-\node[trunkbox, minimum width=5.6cm, below=0.38cm of d256] (d128)
-  {Dense(128) + ReLU};
-
-\draw[arrow] (concat.south) -- (d256.north);
-\draw[arrow] (d256.south)   -- (d128.north);
-
-\node[dimtag, right=4pt of d256.east] {\scriptsize 256};
-\node[dimtag, right=4pt of d128.east] {\scriptsize 128};
-
-% Trunk brace
-\draw[groupbrace, rotate=180]
-  ([xshift=2pt, yshift=-3pt]d256.south east) --
-  ([xshift=2pt, yshift=3pt]d256.north east)
-  node[midway, right=8pt, grouplabel, rotate=180] {};
+%% label on the vertical arrow
+\node[dim, right=3pt] at ($(gs.north)!0.52!(concat.south) + (0.05,0)$)
+  {global input};
 
 %% ================================================================
-%%  ACTOR / CRITIC SPLIT
+%%  STAGE 5 — Shared trunk
+%% ================================================================
+\node[tblk, minimum width=2.00cm, minimum height=0.65cm]
+  (d256) at (13.1, 0) {Dense(256)\\[-1pt]{\scriptsize ReLU}};
+
+\node[tblk, minimum width=2.00cm, minimum height=0.65cm]
+  (d128) at (15.3, 0) {Dense(128)\\[-1pt]{\scriptsize ReLU}};
+
+\draw[arr] (concat.east) -- (d256.west);
+\draw[arr] (d256.east)   -- (d128.west);
+
+\node[dim, above=2pt of d256] {256};
+\node[dim, above=2pt of d128] {128};
+
+%% ================================================================
+%%  STAGE 6 — Actor / Critic heads
 %% ================================================================
 
-% Actor head
-\node[actorbox,
-      minimum width=2.6cm,
-      below right=0.75cm and -2.2cm of d128] (actor_l)
+%% — Actor —
+\node[actblk, minimum width=2.50cm, minimum height=0.62cm]
+  (actor) at (17.6, 1.05)
   {Dense(2)};
 
-\node[outputbox, minimum width=2.6cm, below=0.38cm of actor_l] (actor_out)
-  {$\boldsymbol{\mu}, \log\boldsymbol{\sigma}$\\[-2pt]
-   {\scriptsize action mean \& log-std (2 dims each)}};
+\node[outblk, minimum width=2.80cm, minimum height=0.62cm,
+      right=0.40cm of actor]
+  (actor_out)
+  {$\boldsymbol{\mu},\,\log\boldsymbol{\sigma}$\\[-1pt]
+   {\scriptsize action\;(2\,dims\;each)}};
 
-% Critic head
-\node[criticbox,
-      minimum width=2.6cm,
-      below left=0.75cm and -2.2cm of d128] (crit_d64)
-  {Dense(64) + ReLU};
+\draw[arr] (d128.east) -| (actor.west);
+\draw[arr] (actor.east)  -- (actor_out.west);
 
-\node[criticbox, minimum width=2.6cm, below=0.38cm of crit_d64] (crit_d1)
-  {Dense(1)};
+%% actor label
+\node[font=\scriptsize\bfseries, text=clrActor!70!black,
+      above=2pt of actor] {Actor};
 
-\node[outputbox, minimum width=2.6cm, below=0.38cm of crit_d1] (crit_out)
-  {$V(s)$\\[-2pt]{\scriptsize state value (scalar)}};
+%% — Critic —
+\node[criblk, minimum width=2.50cm, minimum height=0.62cm]
+  (crit1) at (17.6,-0.55)
+  {Dense(64)\;+\;ReLU};
 
-% Arrows trunk -> heads
-\draw[arrow] (d128.south) -|  (actor_l.north);
-\draw[arrow] (d128.south) -|  (crit_d64.north);
+\node[criblk, minimum width=2.50cm, minimum height=0.62cm,
+      below=0.28cm of crit1]
+  (crit2) {Dense(1)};
 
-\draw[arrow] (actor_l.south)  -- (actor_out.north);
-\draw[arrow] (crit_d64.south) -- (crit_d1.north);
-\draw[arrow] (crit_d1.south)  -- (crit_out.north);
+\node[outblk, minimum width=2.80cm, minimum height=0.62cm,
+      right=0.40cm of crit2]
+  (crit_out)
+  {$V(s)$\\[-1pt]{\scriptsize state value\;(scalar)}};
 
-\node[dimtag, right=4pt of crit_d64.east] {\scriptsize 64};
-\node[dimtag, right=4pt of crit_d1.east]  {\scriptsize 1};
+\draw[arr] (d128.east) -| (crit1.west);
+\draw[arr] (crit1.south) -- (crit2.north);
+\draw[arr] (crit2.east)  -- (crit_out.west);
+
+%% critic label
+\node[font=\scriptsize\bfseries, text=clrCritic!70!black,
+      above=2pt of crit1] {Critic};
 
 %% ================================================================
-%%  SECTION LABELS (left margin)
+%%  STAGE LABELS (bottom strip)
 %% ================================================================
+\def\labely{-3.40}
 
 \begin{scope}[every node/.style={
-    font=\footnotesize\bfseries,
-    text=white,
-    fill=gray!60,
-    rounded corners=2pt,
-    inner sep=3pt,
-    minimum width=1.55cm,
-    align=center
+    font=\scriptsize\bfseries, text=white,
+    fill=gray!52, rounded corners=2pt,
+    inner sep=3pt, align=center
   }]
-  \node[anchor=east] at ([xshift=-0.6cm]f1.west |- f1.center)
-    {Input};
-  \node[anchor=east] at ([xshift=-0.6cm]cnn1.west |- cnn1.center)
-    {CNN};
-  \node[anchor=east] at ([xshift=-0.6cm]cnn1.west |- attn.center)
-    {Attention};
-  \node[anchor=east] at ([xshift=-0.6cm]cnn1.west |- concat.center)
-    {Fusion};
-  \node[anchor=east] at ([xshift=-0.6cm]cnn1.west |- d128.center)
-    {Trunk};
-  \node[anchor=east] at ([xshift=-0.6cm]cnn1.west |- actor_l.center)
-    {Heads};
+  \node[minimum width=2.0cm]  at (0,    \labely) {Input};
+  \node[minimum width=2.7cm]  at (3.6,  \labely) {CNN (shared)};
+  \node[minimum width=2.1cm]  at (7.3,  \labely) {Attention};
+  \node[minimum width=2.1cm]  at (10.5, \labely) {Fusion};
+  \node[minimum width=4.50cm] at (14.2, \labely) {Shared Trunk};
+  \node[minimum width=2.5cm]  at (17.6, \labely) {Heads};
 \end{scope}
-
-%% ================================================================
-%%  HEAD LABELS
-%% ================================================================
-
-\node[font=\small\bfseries, text=clrActor!80!black,
-      above=2pt of actor_l] {Actor};
-
-\node[font=\small\bfseries, text=clrCritic!80!black,
-      above=2pt of crit_d64] {Critic};
 
 \end{tikzpicture}
 \end{document}

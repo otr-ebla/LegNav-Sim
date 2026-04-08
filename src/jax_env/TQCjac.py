@@ -29,10 +29,10 @@ from jax_wrappers import make_stacked_env, make_autoreset_env
 
 OBS_SIZE       = 662
 ACTION_DIM     = 2
-N_ENVS         = 2048
+N_ENVS         = 256
 BUFFER_CAP     = 500_000
 BATCH_SIZE     = 512
-G_UPDATES      = 20
+G_UPDATES      = 10
 WARMUP_STEPS   = 10_000
 GAMMA          = 0.99
 TAU            = 0.00025
@@ -41,7 +41,7 @@ MAX_GRAD_NORM  = 10.0
 TARGET_ENTROPY = -2.0
 ACTOR_ENC_GRAD_SCALE = 0.1
 TOTAL_UPDATES  = 200_000
-LOG_EVERY      = 50
+LOG_EVERY      = 10
 SAVE_EVERY     = 5000
 
 N_CRITICS        = 5
@@ -157,7 +157,7 @@ critic_net = TQCCriticEnsemble()
 enc_opt    = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
 actor_opt  = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
 critic_opt = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
-ALPHA_LR   = LR / G_UPDATES
+ALPHA_LR   = LR
 alpha_opt  = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(ALPHA_LR, eps=1e-5))
 
 def _tanh_log_prob_correction(tanh_u, max_v):
@@ -294,7 +294,7 @@ def train_chunk(ap, aos, cp, cos, tp, sep, eos, tsep, la, laos, buf, vmap_step, 
         es_, eo_, buf_, key_ = carry
         key_, k_col = jax.random.split(key_)
         new_eo, new_es, obs_b, env_a, rew, done, info = collect_step(sep, ap, es_, eo_, k_col, vmap_step, min_goal_dist, scenario_idx, ghost_prob)
-        terminal = done & ~info["timeout"]
+        terminal = done
         new_buf = buf_add(buf_, obs_b, env_a, rew, new_eo, terminal.astype(jnp.float32))
         step_data = (rew, done, info["goal_reached"], info["collision"], info["passive_col"])
         return (new_es, new_eo, new_buf, key_), step_data
@@ -482,13 +482,12 @@ if __name__ == "__main__":
             new_stage    = _curriculum_stage(rolling_suc)
 
             if new_min_dist > cur_min_dist:
-                print(f"*** Curriculum advance: stage {new_stage}, min_dist={new_min_dist:.1f}. Flushing buffer. ***")
+                print(f"*** Curriculum advance: stage {new_stage}, min_dist={new_min_dist:.1f}. Keeping buffer intact. ***")
                 cur_min_dist = new_min_dist
                 cur_stage    = new_stage
                 rng, reinit_rng = jax.random.split(rng)
                 reset_keys = jax.random.split(reinit_rng, N_ENVS)
                 env_obs, env_state = _vmap_reset(reset_keys, jnp.float32(cur_min_dist), jnp.float32(0.0), jnp.int32(-1))
-                replay_buf = {**replay_buf, "ptr": jnp.int32(0), "size": jnp.int32(0)}
 
         if suc_pct > best_suc:
             best_suc = suc_pct
