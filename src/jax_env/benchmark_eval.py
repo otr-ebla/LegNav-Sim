@@ -127,7 +127,7 @@ STACK_DIM  = 3
 
 @jax.jit
 def dynamic_reset_stacked(key, min_dist, scen_idx, target_max_v):
-    base_obs, base_state = reset_env(key, min_dist, scen_idx)
+    base_obs, base_state = reset_env(key, min_dist, scen_idx, 0.0)  # ghost_prob=0.0: pedestrians always avoid the robot (matches jax_eval_multi)
     pose      = base_obs[0:POSE_SIZE]
     state_vec = base_obs[POSE_SIZE : POSE_SIZE + _SVS]
     lidar     = base_obs[POSE_SIZE + _SVS:]
@@ -172,7 +172,7 @@ YIELD_FOV  = 1.57
 def _rollout_body(net_apply_fn, squash_fn, params, scen_idx, target_max_v, rng_key):
     reset_keys = jax.random.split(rng_key, N_ENVS)
     obs, state = jax.vmap(dynamic_reset_stacked, in_axes=(0, None, None, None))(
-        reset_keys, 3.0, scen_idx, target_max_v
+        reset_keys, 9.0, scen_idx, target_max_v  # max_goal_dist=9.0 matches jax_eval_multi
     )
 
     init_dist = jnp.sqrt(
