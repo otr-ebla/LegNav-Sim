@@ -326,7 +326,7 @@ def load_tqc(path):
 
 
 _CKPT_PATHS = {
-    "PPO": "checkpoints/ppo_model_best.msgpack",
+    "PPO": "checkpoints/ppo_attn_best.msgpack",
     "SAC": "checkpoints_sac/sac_best.msgpack",
     "TQC": "checkpoints_tqc/tqc_best.msgpack",
 }
@@ -551,21 +551,25 @@ def main():
     print()
 
     # Sequential evaluation loop
-    results      = []
+    all_frames   = []
     scatter_data = {}
+    total_cells  = N_SCENARIOS * N_SPEEDS
 
-    print("Executing evaluation grid...")
+    print(f"Executing evaluation grid ({N_SCENARIOS} scenarios x {N_SPEEDS} speeds = {total_cells} cells, {N_ENVS} envs each)...")
     for p_name, params in policies.items():
         eval_fn  = _EVAL_FN[p_name]
         t_policy = time.time()
         sd_list, sv_list = [], []
+        cell_idx = 0
 
         for si in range(N_SCENARIOS):
+            t_scen = time.time()
             for vi, v_max in enumerate(MAX_V_TESTS):
                 rng, cell_rng = jax.random.split(rng)
                 cell = jax.device_get(jax.block_until_ready(
                     eval_fn(params, jnp.int32(si), jnp.float32(v_max), cell_rng)
                 ))
+                cell_idx += 1
 
                 sd = cell["step_dists"].ravel()
                 sv = cell["step_vs"].ravel()
@@ -573,26 +577,34 @@ def main():
                 sd_list.append(sd[ok])
                 sv_list.append(sv[ok])
 
-                for i in range(N_ENVS):
-                    results.append({
-                        "Policy":        p_name,
-                        "Scenario":      si,
-                        "Max_V":         v_max,
-                        "Success":       cell["success"][i],
-                        "Active Col":    cell["act_col"][i],
-                        "Passive Col":   cell["pass_col"][i],
-                        "Timeout":       cell["timeout"][i],
-                        "SPL":           cell["spl"][i],
-                        "Jerk":          cell["jerk"][i],
-                        "Min Dist":      cell["min_dist"][i],
-                        "Time to Goal":  cell["time"][i],
-                        "Yield Score":   cell["yield_score"][i],
-                    })
+                # Vectorized DataFrame construction (no per-env Python loop)
+                n = len(cell["success"])
+                cell_df = pd.DataFrame({
+                    "Policy":        p_name,
+                    "Scenario":      si,
+                    "Max_V":         v_max,
+                    "Success":       cell["success"],
+                    "Active Col":    cell["act_col"],
+                    "Passive Col":   cell["pass_col"],
+                    "Timeout":       cell["timeout"],
+                    "SPL":           cell["spl"],
+                    "Jerk":          cell["jerk"],
+                    "Min Dist":      cell["min_dist"],
+                    "Time to Goal":  cell["time"],
+                    "Yield Score":   cell["yield_score"],
+                })
+                all_frames.append(cell_df)
+
+            suc_pct = np.mean([f["Success"].mean() for f in all_frames[-N_SPEEDS:]]) * 100
+            print(f"    {p_name} | {SCEN_NAMES[si]:<11s} "
+                  f"({cell_idx:>2d}/{total_cells}) "
+                  f"suc={suc_pct:5.1f}%  "
+                  f"{time.time() - t_scen:.1f}s")
 
         scatter_data[p_name] = (np.concatenate(sd_list), np.concatenate(sv_list))
-        print(f"  {p_name} done in {time.time() - t_policy:.1f}s")
+        print(f"  {p_name} total: {time.time() - t_policy:.1f}s\n")
 
-    df = pd.DataFrame(results)
+    df = pd.concat(all_frames, ignore_index=True)
     df.to_csv("evaluation_raw_data.csv", index=False)
     print("Saved evaluation_raw_data.csv\n")
 
