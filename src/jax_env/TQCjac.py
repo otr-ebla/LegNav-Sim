@@ -29,10 +29,10 @@ from jax_wrappers import make_stacked_env, make_autoreset_env
 
 OBS_SIZE       = 662
 ACTION_DIM     = 2
-N_ENVS         = 256
+N_ENVS         = 2048
 BUFFER_CAP     = 500_000
 BATCH_SIZE     = 512
-G_UPDATES      = 10
+G_UPDATES      = 20
 WARMUP_STEPS   = 10_000
 GAMMA          = 0.99
 TAU            = 0.005
@@ -40,8 +40,8 @@ LR             = 3e-4
 MAX_GRAD_NORM  = 10.0
 TARGET_ENTROPY = -2.0
 ACTOR_ENC_GRAD_SCALE = 0.1
-TOTAL_UPDATES  = 200_000
-LOG_EVERY      = 10
+TOTAL_UPDATES  = 100_000
+LOG_EVERY      = 50
 SAVE_EVERY     = 5000
 
 N_CRITICS        = 5
@@ -58,23 +58,7 @@ CKPT_PATH = f"{CKPT_DIR}/tqc_best.msgpack"
 
 NET_DTYPE = jnp.bfloat16 if args.bfloat16 else jnp.float32
 
-CURRICULUM_STAGES = [
-    (20.0, 1.5),
-    (35.0, 3.0),
-    (50.0, 5.5),
-    (65.0, 7.0),
-    (101., 8.0),
-]
-
-def curriculum_min_goal_dist(suc_pct: float) -> float:
-    for threshold, dist in CURRICULUM_STAGES:
-        if suc_pct < threshold: return dist
-    return CURRICULUM_STAGES[-1][1]
-
-def _curriculum_stage(suc_pct: float) -> int:
-    for i, (threshold, _) in enumerate(CURRICULUM_STAGES):
-        if suc_pct < threshold: return i
-    return len(CURRICULUM_STAGES) - 1
+from jax_ppo import get_continuous_curriculum
 
 def _check_gpu():
     try: devs = jax.devices("cuda")
@@ -301,7 +285,7 @@ def train_chunk(ap, aos, cp, cos, tp, sep, eos, tsep, la, laos, buf, vmap_step, 
         es_, eo_, buf_, key_ = carry
         key_, k_col = jax.random.split(key_)
         new_eo, new_es, obs_b, env_a, rew, done, info = collect_step(sep, ap, es_, eo_, k_col, vmap_step, min_goal_dist, scenario_idx, ghost_prob)
-        terminal = done
+        terminal = done & ~info["timeout"]
         new_buf = buf_add(buf_, obs_b, env_a, rew, new_eo, terminal.astype(jnp.float32))
         step_data = (rew, done, info["goal_reached"], info["collision"], info["passive_col"])
         return (new_es, new_eo, new_buf, key_), step_data
@@ -387,33 +371,41 @@ if __name__ == "__main__":
     la   = jnp.array(0.0, dtype=jnp.float32)
     laos = alpha_opt.init(la)
 
-    cur_min_dist = curriculum_min_goal_dist(0.0)
-    cur_stage    = _curriculum_stage(0.0)
+    cur_max_dist, cur_ghost, _, cur_max_scen = get_continuous_curriculum(0.0)
     rolling_suc  = 0.0
+    highest_rolling_suc = 0.0
+    cur_scenario = 0
 
-    print(f"Curriculum: starting stage {cur_stage}, min_goal_dist={cur_min_dist:.1f} m")
+    print(f"Curriculum: max_dist={cur_max_dist:.1f} ghost={cur_ghost:.2f} max_scen={cur_max_scen}")
     print(f"Initialising environments on GPU {args.gpu}...")
     rng, env_rng = jax.random.split(rng)
-    env_obs, env_state, vmap_step = init_env_state(env_rng, min_goal_dist=cur_min_dist)
+    env_obs, env_state, vmap_step = init_env_state(env_rng, min_goal_dist=cur_max_dist, ghost_prob=cur_ghost)
     replay_buf  = make_buffer(BUFFER_CAP)
     total_steps, n_updates = 0, 0
     best_suc = 44.0
 
-    print("Warming up buffer (filling with random actions)...")
+    print("Warming up buffer with random actions...")
+    rng, k_warmup = jax.random.split(rng)
     for _ in range((WARMUP_STEPS // N_ENVS) + 1):
-        rng, c_rng = jax.random.split(rng)
-        new_obs, env_state, obs_before, env_action, reward, done, info = collect_step(
-            sep, ap, env_state, env_obs, c_rng, vmap_step,
-            jnp.float32(cur_min_dist), jnp.int32(-1), jnp.float32(0.0)
+        k_warmup, k_act, k_step = jax.random.split(k_warmup, 3)
+        obs_before = env_obs
+        max_v      = extract_max_v(env_obs)
+        rand_v     = jax.random.uniform(k_act, (N_ENVS,)) * max_v
+        rand_w     = jax.random.uniform(k_act, (N_ENVS,), minval=-1.0, maxval=1.0)
+        env_action = jnp.stack([rand_v, rand_w], axis=-1)
+        step_keys  = jax.random.split(k_step, N_ENVS)
+        new_obs, env_state, reward, done, info = jax.jit(vmap_step)(
+            step_keys, env_state, env_action, cur_max_dist, cur_scenario, cur_ghost
         )
-        replay_buf = buf_add(replay_buf, obs_before, env_action, reward, new_obs, done.astype(jnp.float32))
+        terminal   = done & ~info["timeout"]
+        replay_buf = buf_add(replay_buf, obs_before, env_action, reward, new_obs, terminal.astype(jnp.float32))
         env_obs = new_obs
         total_steps += N_ENVS
 
     print("Warmup done. JIT compiling train chunk (this may take up to a minute)...")
     _c, _sd, _m = train_chunk(
         ap, aos, cp, cos, tp, sep, eos, tsep, la, laos,
-        replay_buf, vmap_step, jnp.float32(cur_min_dist), jnp.int32(-1), jnp.float32(0.0), env_state, env_obs, rng
+        replay_buf, vmap_step, jnp.float32(cur_max_dist), jnp.int32(cur_scenario), jnp.float32(cur_ghost), env_state, env_obs, rng
     )
     jax.block_until_ready(_c)
     ap, aos, cp, cos, tp, sep, eos, tsep, la, laos, replay_buf, env_state, env_obs, rng = _c
@@ -424,7 +416,7 @@ if __name__ == "__main__":
     hdr = (f"{'Upd':>7} | {'Steps':>10} | {'EpRet':>7} | "
            f"{'Suc%':>5} {'ACo%':>5} {'PCo%':>5} {'Tmo%':>5} | "
            f"{'CritL':>7} {'ActL':>7} {'Alpha':>6} {'LogPi':>6} {'Qmean':>7} | {'FPS':>7} | "
-           f"{'Time':>8} | {'Stage':>5} {'MinDist':>7}")
+           f"{'Time':>8} | {'Dist':>5} {'Ghost':>5} {'Scen':>4}")
     print(hdr); print("─" * len(hdr))
 
     t_start = time.time()
@@ -442,7 +434,7 @@ if __name__ == "__main__":
 
         new_carry, all_step_data, all_metrics = train_chunk(
             ap, aos, cp, cos, tp, sep, eos, tsep, la, laos,
-            replay_buf, vmap_step, jnp.float32(cur_min_dist), jnp.int32(-1), jnp.float32(0.0), env_state, env_obs, rng
+            replay_buf, vmap_step, jnp.float32(cur_max_dist), jnp.int32(cur_scenario), jnp.float32(cur_ghost), env_state, env_obs, rng
         )
 
         ap, aos, cp, cos, tp, sep, eos, tsep, la, laos, replay_buf, env_state, env_obs, rng = new_carry
@@ -477,7 +469,7 @@ if __name__ == "__main__":
         print(f"{n_updates:>7d} | {total_steps:>10,} | {mean_ret:>7.1f} | "
               f"{suc_pct:>4.1f}% {col_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% | "
               f"{m_crit:>7.4f} {m_act:>7.4f} {m_alph:>6.4f} {m_lpi:>6.3f} {m_qm:>7.3f} | "
-              f"{fps:>7,.0f} | {time_str:>8} | {cur_stage:>5d} {cur_min_dist:>5.1f}m")
+              f"{fps:>7,.0f} | {time_str:>8} | {cur_max_dist:>4.1f}m {cur_ghost:>4.2f} {cur_scenario:>4d}")
         _log_writer.writerow([total_steps, round(mean_ret, 4),
                                round(suc_pct, 4), round(col_pct, 4),
                                round(pcol_pct, 4), round(tmo_pct, 4), n_ep])
@@ -485,16 +477,16 @@ if __name__ == "__main__":
 
         if n_ep > 0:
             rolling_suc = 0.9 * rolling_suc + 0.1 * suc_pct
-            new_min_dist = curriculum_min_goal_dist(rolling_suc)
-            new_stage    = _curriculum_stage(rolling_suc)
+            highest_rolling_suc = 0.99 * highest_rolling_suc + 0.01 * rolling_suc
 
-            if new_min_dist > cur_min_dist:
-                print(f"*** Curriculum advance: stage {new_stage}, min_dist={new_min_dist:.1f}. Keeping buffer intact. ***")
-                cur_min_dist = new_min_dist
-                cur_stage    = new_stage
-                rng, reinit_rng = jax.random.split(rng)
-                reset_keys = jax.random.split(reinit_rng, N_ENVS)
-                env_obs, env_state = _vmap_reset(reset_keys, jnp.float32(cur_min_dist), jnp.float32(0.0), jnp.int32(-1))
+            new_max_dist, new_ghost, _, new_max_scen = get_continuous_curriculum(highest_rolling_suc)
+
+            if new_max_dist > cur_max_dist or new_max_scen > cur_max_scen:
+                cur_max_dist = min(cur_max_dist + 0.2, new_max_dist)
+                cur_ghost    = new_ghost
+                cur_max_scen = new_max_scen
+
+            cur_scenario = int(jax.random.randint(jax.random.PRNGKey(int(time.time())), (), 0, cur_max_scen + 1))
 
         if suc_pct > best_suc:
             best_suc = suc_pct
