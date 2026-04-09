@@ -209,14 +209,19 @@ def _build_sac():
 
 # ── TQC ────────────────────────────────────────────────────────────────────────
 # Uses SharedEncoder + TQCActorHead (Dense mean/log_std head).
-# Checkpoint keys: "enc_params", "actor_head_params".
+# Checkpoint keys: "enc_params", "actor_params".
 
 class _TQCActorHead(nn.Module):
+    action_dim:  int   = ACTION_DIM
+    LOG_STD_MIN: float = -5.0
+    LOG_STD_MAX: float =  0.5
+
     @nn.compact
     def __call__(self, feat):
-        mean    = nn.Dense(ACTION_DIM)(feat)
-        log_std = nn.Dense(ACTION_DIM)(feat)
-        return mean, jnp.clip(log_std, -5.0, 2.0)
+        mean    = nn.Dense(self.action_dim)(feat)
+        log_std = nn.Dense(self.action_dim)(feat)
+        return mean.astype(jnp.float32), jnp.clip(log_std.astype(jnp.float32),
+                                                   self.LOG_STD_MIN, self.LOG_STD_MAX)
 
 def _build_tqc():
     from jax_network import SharedEncoder
@@ -233,7 +238,7 @@ def _build_tqc():
         with open(path, "rb") as f:
             raw = f.read()
         b = flax.serialization.msgpack_restore(raw)
-        return b["enc_params"], b["actor_head_params"]
+        return b["enc_params"], b["actor_params"]
 
     def infer(params, obs, max_v):
         enc_p, head_p = params
