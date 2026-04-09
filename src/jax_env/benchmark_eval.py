@@ -120,22 +120,27 @@ def _squash_action(mean, max_v):
 
 
 # ── Environment Wrappers ────────────────────────────────────────────────────
+from jax_env import STATE_VEC_SIZE as _SVS
+
+POSE_SIZE  = 3
+STACK_DIM  = 3
+
 @jax.jit
 def dynamic_reset_stacked(key, min_dist, scen_idx, target_max_v):
     base_obs, base_state = reset_env(key, min_dist, scen_idx)
-    pose      = base_obs[0:3]
-    state_vec = base_obs[3:12]
-    lidar     = base_obs[12:]
+    pose      = base_obs[0:POSE_SIZE]
+    state_vec = base_obs[POSE_SIZE : POSE_SIZE + _SVS]
+    lidar     = base_obs[POSE_SIZE + _SVS:]
 
     base_state = base_state.replace(max_v=target_max_v)
+    # state_vec layout: [v, w, max_v_norm, goal_dist, goal_align]
     new_state_vec = jnp.array([
         0.0, 0.0, (target_max_v - 0.2) / 1.8,
         state_vec[3], state_vec[4],
-        state_vec[5], state_vec[6], state_vec[7], state_vec[8],
     ])
 
-    lidar_stack = jnp.tile(lidar[None, :], (3, 1))
-    pose_stack  = jnp.tile(pose[None, :],  (3, 1))
+    lidar_stack = jnp.tile(lidar[None, :], (STACK_DIM, 1))
+    pose_stack  = jnp.tile(pose[None, :],  (STACK_DIM, 1))
     stacked_state = StackedEnvState(
         env_state=base_state, lidar_stack=lidar_stack, pose_stack=pose_stack
     )
@@ -146,9 +151,9 @@ def dynamic_reset_stacked(key, min_dist, scen_idx, target_max_v):
 @jax.jit
 def step_stacked_headless(key, state: StackedEnvState, action):
     base_obs, new_base_state, reward, done, info = step_env(key, state.env_state, action)
-    new_pose      = base_obs[0:3]
-    new_state_vec = base_obs[3:12]
-    new_lidar     = base_obs[12:]
+    new_pose      = base_obs[0:POSE_SIZE]
+    new_state_vec = base_obs[POSE_SIZE : POSE_SIZE + _SVS]
+    new_lidar     = base_obs[POSE_SIZE + _SVS:]
 
     new_lidar_stack = jnp.concatenate([state.lidar_stack[1:], new_lidar[None]], axis=0)
     new_pose_stack  = jnp.concatenate([state.pose_stack[1:],  new_pose[None]],  axis=0)
@@ -536,11 +541,12 @@ def main():
 
     rng = jax.random.PRNGKey(42)
 
-    # Warm-up: compile kernels
+    # Warm-up: compile kernels (pass jnp arrays so one compilation covers all cells)
     print("\nCompiling evaluation kernels (~30s each)...")
     for p_name, params in policies.items():
         rng, k_warmup = jax.random.split(rng)
-        jax.block_until_ready(_EVAL_FN[p_name](params, 0, 1.0, k_warmup))
+        jax.block_until_ready(_EVAL_FN[p_name](
+            params, jnp.int32(0), jnp.float32(1.0), k_warmup))
         print(f"  {p_name} kernel compiled.")
     print()
 
@@ -558,7 +564,7 @@ def main():
             for vi, v_max in enumerate(MAX_V_TESTS):
                 rng, cell_rng = jax.random.split(rng)
                 cell = jax.device_get(jax.block_until_ready(
-                    eval_fn(params, si, float(v_max), cell_rng)
+                    eval_fn(params, jnp.int32(si), jnp.float32(v_max), cell_rng)
                 ))
 
                 sd = cell["step_dists"].ravel()
