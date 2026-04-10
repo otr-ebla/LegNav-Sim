@@ -1,16 +1,15 @@
 import os
 import csv
-import argparse
 
-parser = argparse.ArgumentParser(description="JAX TQC Training")
-parser.add_argument("--gpu", type=str, default="1", choices=["0", "1"], help="Target GPU ID (0 or 1)")
-parser.add_argument("--bfloat16", action="store_true", help="Enable bfloat16 mixed precision for neural networks")
-args, _ = parser.parse_known_args()
+# Use setdefault so an orchestrator script (or the user's shell) can pre-set
+# these before importing this module without being overwritten.
+os.environ.setdefault("JAX_PLATFORMS",               "cuda")
+os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
+os.environ.setdefault("TF_GPU_ALLOCATOR",            "cuda_malloc_async")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES",        "0")
 
-os.environ["JAX_PLATFORMS"]               = "cuda"
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
-os.environ["TF_GPU_ALLOCATOR"]            = "cuda_malloc_async"
-os.environ["CUDA_VISIBLE_DEVICES"]        = args.gpu
+# Set TQC_BFLOAT16=1 in the environment to enable bfloat16 mixed precision.
+_USE_BFLOAT16 = os.environ.get("TQC_BFLOAT16", "0") == "1"
 
 import time
 import warnings
@@ -40,7 +39,7 @@ LR             = 3e-4
 MAX_GRAD_NORM  = 10.0
 TARGET_ENTROPY = -2.0
 ACTOR_ENC_GRAD_SCALE = 0.1
-TOTAL_UPDATES  = 100_000
+DEFAULT_TOTAL_ENV_STEPS = 20_000_000   # default budget; override via train(total_env_steps=...)
 LOG_EVERY      = 50
 SAVE_EVERY     = 5000
 
@@ -56,7 +55,7 @@ LOG_STD_EPS   = 1e-6
 CKPT_DIR  = "checkpoints_tqc"
 CKPT_PATH = f"{CKPT_DIR}/tqc_best.msgpack"
 
-NET_DTYPE = jnp.bfloat16 if args.bfloat16 else jnp.float32
+NET_DTYPE = jnp.bfloat16 if _USE_BFLOAT16 else jnp.float32
 
 from jax_ppo import get_continuous_curriculum
 
@@ -64,9 +63,9 @@ def _check_gpu():
     try: devs = jax.devices("cuda")
     except RuntimeError: devs = []
     if not devs:
-        raise RuntimeError(f"No CUDA devices found for GPU {args.gpu}.")
+        raise RuntimeError("No CUDA devices found for TQC training.")
     target_device = devs[0]
-    print(f"TQC pinned to: {target_device}  (physical GPU {args.gpu})")
+    print(f"TQC pinned to: {target_device}  (CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES','')})")
     return target_device
 
 target_gpu = _check_gpu()
@@ -346,11 +345,17 @@ def save_checkpoint(sep, tsep, ap, cp, tp, eos, aos, cos, la, laos, step):
     with open(CKPT_PATH, "wb") as f: f.write(flax.serialization.to_bytes(bundle))
     print(f"  TQC checkpoint -> {CKPT_PATH}  (step {step})")
 
-if __name__ == "__main__":
-    precision_str = "bfloat16" if args.bfloat16 else "float32"
-    print(f"TQC Training — GPU {args.gpu} (CUDA_VISIBLE_DEVICES={args.gpu}) | Precision: {precision_str}")
+def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
+    """Run TQC training for a fixed env-step budget.
+
+    Loop exits when `total_steps >= total_env_steps`. Each chunk advances
+    `total_steps` by `N_ENVS * LOG_EVERY` env steps.
+    """
+    precision_str = "bfloat16" if _USE_BFLOAT16 else "float32"
+    print(f"TQC Training — CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES','')} | Precision: {precision_str}")
     print(f"  N_ENVS={N_ENVS}  BUFFER={BUFFER_CAP:,}  BATCH={BATCH_SIZE}")
     print(f"  N_CRITICS={N_CRITICS}  N_ATOMS={N_ATOMS}  N_TOP_DROP={N_TOP_ATOMS_DROP}  N_TARGET_ATOMS={N_TARGET_ATOMS}")
+    print(f"  Budget: {int(total_env_steps):,} env steps")
 
     rng = jax.random.PRNGKey(7)
     rng, k_se, ka, kc = jax.random.split(rng, 4)
@@ -377,7 +382,7 @@ if __name__ == "__main__":
     cur_scenario = 0
 
     print(f"Curriculum: max_dist={cur_max_dist:.1f} ghost={cur_ghost:.2f} max_scen={cur_max_scen}")
-    print(f"Initialising environments on GPU {args.gpu}...")
+    print(f"Initialising environments...")
     rng, env_rng = jax.random.split(rng)
     env_obs, env_state, vmap_step = init_env_state(env_rng, min_goal_dist=cur_max_dist, ghost_prob=cur_ghost)
     replay_buf  = make_buffer(BUFFER_CAP)
@@ -429,7 +434,7 @@ if __name__ == "__main__":
                            "pcol_pct", "tmo_pct", "n_ep"])
     _log_file.flush()
 
-    while n_updates < TOTAL_UPDATES:
+    while total_steps < total_env_steps:
         t0 = time.time()
 
         new_carry, all_step_data, all_metrics = train_chunk(
@@ -495,3 +500,7 @@ if __name__ == "__main__":
     print(f"\nTQC done! {(time.time() - t_start)/3600:.2f}h | Best success: {best_suc:.1f}%")
     _log_file.close()
     print(f"Training log saved -> {_LOG_PATH}")
+
+
+if __name__ == "__main__":
+    train()

@@ -27,15 +27,12 @@ CHANGES vs GRU version:
 
 import os
 import csv
-import argparse
 
-parser = argparse.ArgumentParser(description="JAX PPO Training")
-parser.add_argument("--gpu", type=str, default="0", choices=["0", "1"])
-args, _ = parser.parse_known_args()
-
-os.environ["CUDA_VISIBLE_DEVICES"]           = args.gpu
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.88"
-os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
+# Use setdefault so an orchestrator script (or the user's shell) can pre-set
+# these before importing this module without being overwritten.
+os.environ.setdefault("CUDA_VISIBLE_DEVICES",           "0")
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.88")
+os.environ.setdefault("TF_GPU_ALLOCATOR",               "cuda_malloc_async")
 
 import time
 import warnings
@@ -72,7 +69,7 @@ LR_END         = 1e-5
 LR_MIN         = 1e-5
 WARMUP_UPDATES = 5
 
-TOTAL_UPDATES  = 800
+DEFAULT_TOTAL_ENV_STEPS = 20_000_000     # default budget; override via train(total_env_steps=...)
 
 # ── Minibatch geometry ────────────────────────────────────────────────────────
 # Flat loss over (T*N) samples. Shuffle full batch then split into minibatches.
@@ -83,7 +80,6 @@ MINI_BATCH_SIZE = BATCH_SIZE // N_MINIBATCHES       # 8_192
 
 _OPT_STEPS_PER_UPDATE = PPO_EPOCHS * N_MINIBATCHES
 _WARMUP_OPT_STEPS     = WARMUP_UPDATES * _OPT_STEPS_PER_UPDATE
-_TOTAL_OPT_STEPS      = TOTAL_UPDATES  * _OPT_STEPS_PER_UPDATE
 
 network = EndToEndActorCritic(action_dim=2)
 
@@ -146,22 +142,13 @@ def normalize_batch_rewards(rewards, dones, running_ret, rms_state, gamma):
     return normalized_rewards, running_ret, new_rms_state
 
 
-_warmup_schedule = optax.linear_schedule(
-    init_value=LR_MIN, end_value=LR_START, transition_steps=_WARMUP_OPT_STEPS,
-)
-_decay_schedule = optax.linear_schedule(
-    init_value=LR_START, end_value=LR_END,
-    transition_steps=_TOTAL_OPT_STEPS - _WARMUP_OPT_STEPS,
-)
-scheduler = optax.join_schedules(
-    schedules=[_warmup_schedule, _decay_schedule],
-    boundaries=[_WARMUP_OPT_STEPS],
-)
-
-optimizer = optax.chain(
-    optax.clip_by_global_norm(MAX_GRAD_NORM),
-    optax.adam(learning_rate=scheduler, eps=1e-5),
-)
+# `scheduler` and `optimizer` are (re)built inside `train()` once the actual
+# total env-step budget is known, since the LR schedule's decay length depends
+# on the number of optimizer steps. They are exposed at module scope so that
+# the @jax.jit'd `ppo_update_epoch` (which references `optimizer` as a free
+# variable) sees the rebuilt instance at trace time.
+scheduler = None
+optimizer = None
 
 
 # ── Episode-outcome helpers (invariati) ───────────────────────────────────────
@@ -352,10 +339,40 @@ def load_checkpoint(dummy_params, dummy_opt_state,
 
 LOG_EVERY = 1
 
-if __name__ == "__main__":
-    print(f"PPO Training — GPU {args.gpu}  [Stateless / Flat Loss / Frame-Stack Attention]")
+
+def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
+    """Run PPO training for a fixed env-step budget.
+
+    The LR schedule and the loop length are derived from `total_env_steps`.
+    The module-level `optimizer` and `scheduler` globals are rebuilt here so
+    that the @jax.jit-compiled `ppo_update_epoch` (which references
+    `optimizer` as a free variable) traces against the freshly built one.
+    """
+    global optimizer, scheduler
+
+    total_updates   = max(1, int(total_env_steps) // BATCH_SIZE)
+    total_opt_steps = total_updates * _OPT_STEPS_PER_UPDATE
+
+    warmup_sched = optax.linear_schedule(
+        init_value=LR_MIN, end_value=LR_START, transition_steps=_WARMUP_OPT_STEPS,
+    )
+    decay_sched = optax.linear_schedule(
+        init_value=LR_START, end_value=LR_END,
+        transition_steps=max(1, total_opt_steps - _WARMUP_OPT_STEPS),
+    )
+    scheduler = optax.join_schedules(
+        schedules=[warmup_sched, decay_sched],
+        boundaries=[_WARMUP_OPT_STEPS],
+    )
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(MAX_GRAD_NORM),
+        optax.adam(learning_rate=scheduler, eps=1e-5),
+    )
+
+    print(f"PPO Training  [Stateless / Flat Loss / Frame-Stack Attention]")
     print(f"  Envs        : {NUM_ENVS}  x  steps {ROLLOUT_STEPS}  =  {BATCH_SIZE:,} batch")
     print(f"  Minibatches : {N_MINIBATCHES} x {MINI_BATCH_SIZE} sample  (flat T*N)")
+    print(f"  Budget      : {total_env_steps:,} env steps  →  {total_updates} updates")
     print(f"  VF_COEF={VF_COEF}  ENTROPY_COEF={ENTROPY_COEF}")
     print(f"  Continuous curriculum anchors: suc={list(_SUC_ANCHORS)}\n")
 
@@ -392,6 +409,7 @@ if __name__ == "__main__":
     best_suc = 55.0  # NEVER TOUCH THIS LINE
 
     _LOG_PATH = "checkpoints/ppo_training_log.csv"
+    os.makedirs("checkpoints", exist_ok=True)
     _log_file = open(_LOG_PATH, "w", newline="")
     _log_writer = csv.writer(_log_file)
     _log_writer.writerow(["step", "mean_ep_reward", "suc_pct", "acol_pct", "pcol_pct", "tmo_pct"])
@@ -404,117 +422,120 @@ if __name__ == "__main__":
 
     t_start = time.time()
 
-    for update in range(TOTAL_UPDATES):
-        t0 = time.time()
+    try:
+        for update in range(total_updates):
+            t0 = time.time()
 
-        rng, rollout_rng, update_rng = jax.random.split(rng, 3)
+            rng, rollout_rng, update_rng = jax.random.split(rng, 3)
 
-        # collect_rollouts stateless: no hidden return
-        # collect_rollouts stateless: no hidden return
-        rollout_history, env_state, env_obs, last_val = collect_rollouts(
-            rollout_rng, train_state[0], network.apply, vmap_step,
-            env_state, env_obs, cur_max_dist, cur_scenario, cur_ghost
-        )
-
-        raw_rewards = rollout_history["rewards"]
-        values      = rollout_history["values"]
-        dones       = rollout_history["dones"]
-
-        rewards, running_ret, rms_state = normalize_batch_rewards(
-            raw_rewards, dones, running_ret, rms_state, GAMMA
-        )
-
-        obs_seq   = rollout_history["obs"]
-        acts_seq  = rollout_history["actions"]
-        lp_seq    = rollout_history["log_probs"]
-        max_v_seq = rollout_history["max_v"]
-        goal_reached = rollout_history["goal_reached"]
-        collision    = rollout_history["collision"]
-        passive_col  = rollout_history["passive_col"]
-        active_col   = rollout_history["active_col"]
-
-        ep_rets, ep_suc, ep_obs, ep_acol, ep_pcol, ep_tmo, ep_msk = collect_episode_outcomes(
-            raw_rewards, dones, goal_reached, collision, passive_col, active_col
-        )
-
-        n_ep = int(ep_msk.sum())
-        if n_ep > 0:
-            mean_ret = float((ep_rets * ep_msk).sum() / n_ep)
-            suc_pct  = float((ep_suc  * ep_msk).sum() / n_ep) * 100.0
-            obs_pct  = float((ep_obs  * ep_msk).sum() / n_ep) * 100.0
-            acol_pct = float((ep_acol * ep_msk).sum() / n_ep) * 100.0
-            pcol_pct = float((ep_pcol * ep_msk).sum() / n_ep) * 100.0
-            tmo_pct  = float((ep_tmo  * ep_msk).sum() / n_ep) * 100.0
-        else:
-            mean_ret, suc_pct, obs_pct, acol_pct, pcol_pct, tmo_pct = 0., 0., 0., 0., 0., 0.
-
-        # Curriculum
-        if n_ep > 0:
-            rolling_suc = 0.9 * rolling_suc + 0.1 * suc_pct
-            highest_rolling_suc = 0.99 * highest_rolling_suc + 0.01 * rolling_suc
-
-        new_max_dist, new_ghost, new_ent, new_max_scen = get_continuous_curriculum(highest_rolling_suc)
-
-        # Progressively sample from the unlocked scenarios to avoid layout shock
-        new_scenario = _random.randint(0, new_max_scen)
-
-        if new_max_dist > cur_max_dist or new_ghost > cur_ghost or new_max_scen > cur_max_scen:
-            max_step = 0.2  # metri per update — impedisce shock da salto di distanza
-            cur_max_dist = min(cur_max_dist + max_step, new_max_dist)
-            cur_ghost    = new_ghost
-            cur_max_scen = new_max_scen
-            print(f"  -> Curriculum smoothly advanced: dist={cur_max_dist:.1f}m, "
-                  f"ghost_prob={cur_ghost:.2f}, unlocked_scenarios=0-{cur_max_scen}")
-
-        cur_scenario = new_scenario
-        entropy_coef = jnp.array(new_ent)
-
-        advantages, returns = compute_gae(rewards, values, dones, last_val)
-
-        # PPO update — stateless (no hidden state)
-        train_state, mean_loss, aux = run_ppo_updates(
-            train_state,
-            obs_seq,
-            acts_seq,
-            advantages,
-            returns,
-            lp_seq,
-            max_v_seq,
-            update_rng,
-            entropy_coef,
-        )
-
-        fps = BATCH_SIZE / (time.time() - t0)
-
-        if update % 5 == 0:
-            p_loss, v_loss, entropy, kl_div, clip_frac = aux
-            lr_now       = float(scheduler(update * _OPT_STEPS_PER_UPDATE))
-            ent_coef_now = float(entropy_coef)
-            elapsedtime  = (time.time() - t_start) / 60.0
-            print(
-                f"{update:>5d} | {mean_ret:>7.1f} | "
-                f"{suc_pct:>4.1f}% {obs_pct:>4.1f}% {acol_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% | "
-                f"{float(mean_loss):>7.2f} {float(p_loss):>6.2f} "
-                f"{float(v_loss):>6.2f} {float(entropy):>6.2f} "
-                f"{float(kl_div):>6.4f} {float(clip_frac):>4.2f} | "
-                f"{fps:>7,.0f} {n_ep:>6d} {lr_now:.2e} | "
-                f"{cur_max_dist:>6.1f}m {cur_ghost:>5.2f}g "
-                f"{ent_coef_now:>6.4f}e scen<=={cur_max_scen} {elapsedtime:>5.1f}min"
+            rollout_history, env_state, env_obs, last_val = collect_rollouts(
+                rollout_rng, train_state[0], network.apply, vmap_step,
+                env_state, env_obs, cur_max_dist, cur_scenario, cur_ghost
             )
 
-        if n_ep > 0:
-            _log_writer.writerow([update * BATCH_SIZE, round(mean_ret, 4),
-                                   round(suc_pct, 2), round(acol_pct, 2),
-                                   round(pcol_pct, 2), round(tmo_pct, 2)])
-            _log_file.flush()
+            raw_rewards = rollout_history["rewards"]
+            values      = rollout_history["values"]
+            dones       = rollout_history["dones"]
 
-        if suc_pct > best_suc and n_ep > 0:
-            best_suc = suc_pct
-            save_checkpoint(train_state[0], train_state[1], ckpt_path)
+            rewards, running_ret, rms_state = normalize_batch_rewards(
+                raw_rewards, dones, running_ret, rms_state, GAMMA
+            )
 
-    _log_file.close()
+            obs_seq   = rollout_history["obs"]
+            acts_seq  = rollout_history["actions"]
+            lp_seq    = rollout_history["log_probs"]
+            max_v_seq = rollout_history["max_v"]
+            goal_reached = rollout_history["goal_reached"]
+            collision    = rollout_history["collision"]
+            passive_col  = rollout_history["passive_col"]
+            active_col   = rollout_history["active_col"]
+
+            ep_rets, ep_suc, ep_obs, ep_acol, ep_pcol, ep_tmo, ep_msk = collect_episode_outcomes(
+                raw_rewards, dones, goal_reached, collision, passive_col, active_col
+            )
+
+            n_ep = int(ep_msk.sum())
+            if n_ep > 0:
+                mean_ret = float((ep_rets * ep_msk).sum() / n_ep)
+                suc_pct  = float((ep_suc  * ep_msk).sum() / n_ep) * 100.0
+                obs_pct  = float((ep_obs  * ep_msk).sum() / n_ep) * 100.0
+                acol_pct = float((ep_acol * ep_msk).sum() / n_ep) * 100.0
+                pcol_pct = float((ep_pcol * ep_msk).sum() / n_ep) * 100.0
+                tmo_pct  = float((ep_tmo  * ep_msk).sum() / n_ep) * 100.0
+            else:
+                mean_ret, suc_pct, obs_pct, acol_pct, pcol_pct, tmo_pct = 0., 0., 0., 0., 0., 0.
+
+            # Curriculum
+            if n_ep > 0:
+                rolling_suc = 0.9 * rolling_suc + 0.1 * suc_pct
+                highest_rolling_suc = 0.99 * highest_rolling_suc + 0.01 * rolling_suc
+
+            new_max_dist, new_ghost, new_ent, new_max_scen = get_continuous_curriculum(highest_rolling_suc)
+
+            # Progressively sample from the unlocked scenarios to avoid layout shock
+            new_scenario = _random.randint(0, new_max_scen)
+
+            if new_max_dist > cur_max_dist or new_ghost > cur_ghost or new_max_scen > cur_max_scen:
+                max_step = 0.2  # metri per update — impedisce shock da salto di distanza
+                cur_max_dist = min(cur_max_dist + max_step, new_max_dist)
+                cur_ghost    = new_ghost
+                cur_max_scen = new_max_scen
+                print(f"  -> Curriculum smoothly advanced: dist={cur_max_dist:.1f}m, "
+                      f"ghost_prob={cur_ghost:.2f}, unlocked_scenarios=0-{cur_max_scen}")
+
+            cur_scenario = new_scenario
+            entropy_coef = jnp.array(new_ent)
+
+            advantages, returns = compute_gae(rewards, values, dones, last_val)
+
+            train_state, mean_loss, aux = run_ppo_updates(
+                train_state,
+                obs_seq,
+                acts_seq,
+                advantages,
+                returns,
+                lp_seq,
+                max_v_seq,
+                update_rng,
+                entropy_coef,
+            )
+
+            fps = BATCH_SIZE / (time.time() - t0)
+
+            if update % 5 == 0:
+                p_loss, v_loss, entropy, kl_div, clip_frac = aux
+                lr_now       = float(scheduler(update * _OPT_STEPS_PER_UPDATE))
+                ent_coef_now = float(entropy_coef)
+                elapsedtime  = (time.time() - t_start) / 60.0
+                print(
+                    f"{update:>5d} | {mean_ret:>7.1f} | "
+                    f"{suc_pct:>4.1f}% {obs_pct:>4.1f}% {acol_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% | "
+                    f"{float(mean_loss):>7.2f} {float(p_loss):>6.2f} "
+                    f"{float(v_loss):>6.2f} {float(entropy):>6.2f} "
+                    f"{float(kl_div):>6.4f} {float(clip_frac):>4.2f} | "
+                    f"{fps:>7,.0f} {n_ep:>6d} {lr_now:.2e} | "
+                    f"{cur_max_dist:>6.1f}m {cur_ghost:>5.2f}g "
+                    f"{ent_coef_now:>6.4f}e scen<=={cur_max_scen} {elapsedtime:>5.1f}min"
+                )
+
+            if n_ep > 0:
+                _log_writer.writerow([update * BATCH_SIZE, round(mean_ret, 4),
+                                       round(suc_pct, 2), round(acol_pct, 2),
+                                       round(pcol_pct, 2), round(tmo_pct, 2)])
+                _log_file.flush()
+
+            if suc_pct > best_suc and n_ep > 0:
+                best_suc = suc_pct
+                save_checkpoint(train_state[0], train_state[1], ckpt_path)
+    finally:
+        _log_file.close()
+
     print(f"Training log saved -> {_LOG_PATH}")
 
     elapsed = time.time() - t_start
     print(f"\nDone! {elapsed/3600:.2f}h | Best success: {best_suc:.1f}%")
     save_checkpoint(train_state[0], train_state[1], final_ckpt_path)
+
+
+if __name__ == "__main__":
+    train()

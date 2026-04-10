@@ -16,9 +16,12 @@ Architecture:
 
 import os
 import csv
-os.environ["JAX_PLATFORMS"]               = "cuda"
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
-os.environ["TF_GPU_ALLOCATOR"]            = "cuda_malloc_async"
+
+# Use setdefault so an orchestrator script (or the user's shell) can pre-set
+# these before importing this module without being overwritten.
+os.environ.setdefault("JAX_PLATFORMS",               "cuda")
+os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
+os.environ.setdefault("TF_GPU_ALLOCATOR",            "cuda_malloc_async")
 
 import time
 import functools
@@ -54,7 +57,7 @@ LR             = 3e-4
 TARGET_ENTROPY = -2.0       # FIX 2: correct value is -|A| = -dim(action_space) = -2.0
                              #        -1.0 was LESS exploratory (demanded less entropy),
                              #        causing premature alpha decay and policy collapse.
-TOTAL_UPDATES  = 200_000
+DEFAULT_TOTAL_ENV_STEPS = 20_000_000   # default budget; override via train(total_env_steps=...)
 LOG_EVERY      = 50         # chunks; each chunk = N_ENVS*LOG_EVERY env steps collected
 SAVE_EVERY     = 5000
 MAX_GRAD_NORM  = 10.0
@@ -509,12 +512,18 @@ def save_checkpoint(sep, tsep, ahp, q1p, q2p, tq1p, tq2p,
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
 
+def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
+    """Run SAC training for a fixed env-step budget.
+
+    Loop exits when `total_steps >= total_env_steps`. Each chunk advances
+    `total_steps` by `N_ENVS * LOG_EVERY` env steps.
+    """
     print("SAC Training  (shared LidarCNN + decoupled Q1/Q2 branches)")
     print(f"  N_ENVS={N_ENVS}  BUFFER={BUFFER_CAP:,}  BATCH={BATCH_SIZE}  G_UPDATES={G_UPDATES}")
     print(f"  gamma={GAMMA}  tau={TAU}  lr={LR}  H*={TARGET_ENTROPY}")
-    print(f"  LOG_EVERY={LOG_EVERY}  transitions/chunk={N_ENVS*LOG_EVERY:,}  grad_updates/chunk={LOG_EVERY*G_UPDATES}\n")
+    print(f"  LOG_EVERY={LOG_EVERY}  transitions/chunk={N_ENVS*LOG_EVERY:,}  grad_updates/chunk={LOG_EVERY*G_UPDATES}")
+    print(f"  Budget: {int(total_env_steps):,} env steps\n")
 
     master_key = jax.random.PRNGKey(7)
     master_key, k_init, k_env, k_warmup = jax.random.split(master_key, 4)
@@ -605,7 +614,7 @@ if __name__ == "__main__":
     # Print every 10th chunk
     PRINT_EVERY_CHUNKS = 10
 
-    while n_updates < TOTAL_UPDATES:
+    while total_steps < total_env_steps:
         t0 = time.time()
 
         new_carry, all_step_data, all_metrics = train_chunk(
@@ -686,3 +695,7 @@ if __name__ == "__main__":
     print(f"\nSAC done! {elapsed/3600:.2f}h | Best success: {best_suc:.1f}%  Best reward: {best_ret:.1f}")
     _log_file.close()
     print(f"Training log saved -> {_LOG_PATH}")
+
+
+if __name__ == "__main__":
+    train()
