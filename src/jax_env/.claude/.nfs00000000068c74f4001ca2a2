@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pdflatex -interaction=nonstopmode network_diagram.tex)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('TQCjac.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('TQCjac.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('/home/alberto_vaglio/indoor-rl-nav/src/jax_env/TQCjac.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(find /home/alberto_vaglio/indoor-rl-nav/src/jax_env/checkpoints* -name \"*.msgpack\" -type f)",
+      "Bash(ls /home/alberto_vaglio/indoor-rl-nav/src/jax_env/checkpoints/*.csv)"
+    ]
+  }
+}
