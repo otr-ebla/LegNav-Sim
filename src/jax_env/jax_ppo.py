@@ -391,6 +391,11 @@ if __name__ == "__main__":
 
     best_suc = 55.0  # NEVER TOUCH THIS LINE
 
+    _LOG_PATH = "checkpoints/ppo_training_log.csv"
+    _log_file = open(_LOG_PATH, "w", newline="")
+    _log_writer = csv.writer(_log_file)
+    _log_writer.writerow(["step", "mean_ep_reward", "suc_pct", "acol_pct", "pcol_pct", "tmo_pct"])
+
     hdr = (f"{'Upd':>5} | {'EpRet':>7} | {'Suc%':>5} {'Obs%':>5} {'Acol%':>5} {'Pcol%':>5} {'Tmo%':>5} |"
            f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} {'KL':>6} {'ClpF':>5} | {'FPS':>7} {'#Ep':>6} {'LR':>8} | "
            f"{'MaxDist':>7} {'Ghost':>6} {'Ent':>7} {'ScenMax':>7} {'Time':>8}")
@@ -497,9 +502,18 @@ if __name__ == "__main__":
                 f"{ent_coef_now:>6.4f}e scen<=={cur_max_scen} {elapsedtime:>5.1f}min"
             )
 
+        if n_ep > 0:
+            _log_writer.writerow([update * BATCH_SIZE, round(mean_ret, 4),
+                                   round(suc_pct, 2), round(acol_pct, 2),
+                                   round(pcol_pct, 2), round(tmo_pct, 2)])
+            _log_file.flush()
+
         if suc_pct > best_suc and n_ep > 0:
             best_suc = suc_pct
             save_checkpoint(train_state[0], train_state[1], ckpt_path)
+
+    _log_file.close()
+    print(f"Training log saved -> {_LOG_PATH}")
 
     elapsed = time.time() - t_start
     print(f"\nDone! {elapsed/3600:.2f}h | Best success: {best_suc:.1f}%")
