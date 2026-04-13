@@ -1,28 +1,5 @@
 """
-jax_ppo.py — Single-GPU PPO Training (GPU 0) — STATELESS / MAX SPEED
-
-CHANGES vs GRU version:
-
-  REMOVED GRU — FLAT PPO:
-    - hidden removed from train_state, collect_rollouts, ppo_loss_fn.
-    - ppo_loss_fn now does a single forward pass on (T*N, OBS_SIZE) instead
-      of a sequential lax.scan over T steps. This is critical for speed:
-      the loss is now fully parallelizable on the GPU.
-    - hiddens_seq and dones_seq removed from run_ppo_updates / ppo_update_epoch.
-    - collect_rollouts no longer returns hidden or last_hidden.
-
-  BUGFIX — entropy coefficient:
-    ENTROPY_COEF raised from 0.02 to 0.05 to counter premature policy collapse.
-    With the flat loss, the entropy gradient is now correct.
-
-  MINIBATCH GEOMETRY:
-    With flat loss, the minibatch is over (T*N) independent samples.
-    N_MINIBATCHES = 8 -> MINI_BATCH_SIZE = T*N/8 = 8192 samples per minibatch.
-    Large batch + parallel forward = maximum GPU occupancy.
-
-  UNCHANGED:
-    - Curriculum, ghost-prob, reward normalization, GAE, checkpointing.
-    - All hyperparameters not mentioned above.
+jax_ppo.py
 """
 
 import os
@@ -68,7 +45,7 @@ LR_END         = 1e-5
 LR_MIN         = 1e-5
 WARMUP_UPDATES = 5
 
-DEFAULT_TOTAL_ENV_STEPS = 20_000_000     # default budget; override via train(total_env_steps=...)
+DEFAULT_TOTAL_ENV_STEPS = 40_000_000     # default budget; override via train(total_env_steps=...)
 
 # ── Minibatch geometry ────────────────────────────────────────────────────────
 # Flat loss over (T*N) samples. Shuffle full batch then split into minibatches.
@@ -475,18 +452,23 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
 
             new_max_dist, new_ghost, new_ent, new_max_scen = get_continuous_curriculum(highest_rolling_suc)
 
-            advanced = False
+            # Salva la rappresentazione arrotondata per bloccare lo spam dei float
+            old_print_dist = round(cur_max_dist, 1)
+            old_print_ghost = round(cur_ghost, 2)
+            old_print_scen = cur_max_scen
+
             if new_max_dist > cur_max_dist:
                 # smooth-step distance (0.2 m / update) — impedisce shock da salto di distanza
                 cur_max_dist = min(cur_max_dist + 0.2, new_max_dist)
-                advanced = True
             if new_ghost > cur_ghost:
                 cur_ghost = new_ghost
-                advanced = True
             if new_max_scen > cur_max_scen:
                 cur_max_scen = new_max_scen
-                advanced = True
-            if advanced:
+
+            # Emetti il log solo se il delta è sufficientemente grande da cambiare l'output visibile
+            if (round(cur_max_dist, 1) > old_print_dist or 
+                round(cur_ghost, 2) > old_print_ghost or 
+                cur_max_scen > old_print_scen):
                 print(f"  -> Curriculum advanced: dist={cur_max_dist:.1f}m, "
                       f"ghost_prob={cur_ghost:.2f}, unlocked_scenarios=0-{cur_max_scen}")
 

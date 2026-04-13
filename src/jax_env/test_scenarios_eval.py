@@ -181,7 +181,7 @@ def run_interactive():
     def advance_waypoint():
         """Advance to next robot waypoint. Returns True if there are more waypoints."""
         nonlocal obs, stacked_state, wp_idx, wp_segment_reward, wp_segment_steps
-        nonlocal rng
+        nonlocal ep_reward, ep_steps, rew_acc, rng
         wp_results.append((wp_idx, wp_segment_reward, wp_segment_steps, "reached"))
         wp_idx += 1
         if wp_idx >= len(waypoints):
@@ -218,8 +218,12 @@ def run_interactive():
             new_pose_stack.flatten(), state_vec, new_lidar_stack.flatten()
         ])
 
+        # Reset per-segment counters — new episode starts from here
         wp_segment_reward = 0.0
-        wp_segment_steps = 0
+        wp_segment_steps  = 0
+        ep_reward = 0.0
+        ep_steps  = 0
+        rew_acc   = {k: 0.0 for k in _REW_KEYS}
         return True
 
     scen_name = TEST_SCENARIO_NAMES[current_scenario]
@@ -389,10 +393,16 @@ def run_headless():
             rng, reset_rng = jax.random.split(rng)
             obs, stacked_state = fast_reset(reset_rng)
             wp_idx = 0
-            ep_reward = 0.0; ep_steps = 0
+            ep_reward = 0.0; ep_steps = 0   # reset at start of every segment
             episode_done = False
 
             while not episode_done:
+                # Each iteration of this while-loop is one waypoint segment.
+                # ep_steps / ep_reward reset to zero here, exactly as if a
+                # new episode had started.
+                ep_reward = 0.0
+                ep_steps  = 0
+
                 for step in range(MAX_STEPS):
                     env_action = infer_fn(params, obs, stacked_state.env_state.max_v)
                     rng, step_rng = jax.random.split(rng)
@@ -434,7 +444,7 @@ def run_headless():
                                 state_vec,
                                 stacked_state.lidar_stack.flatten()
                             ])
-                            break  # break inner for-loop, continue outer while
+                            break  # break inner for-loop; while resets counters
                         elif goal:
                             # All waypoints reached
                             total_wp_completed += 1
@@ -450,12 +460,12 @@ def run_headless():
                             episode_done = True
                             break
                 else:
-                    # MAX_STEPS exhausted without done
+                    # MAX_STEPS exhausted without done — timeout for this segment
                     timeouts += 1
                     episode_done = True
 
             total_reward += ep_reward
-            total_steps += ep_steps
+            total_steps  += ep_steps
 
         avg_reward = total_reward / n_episodes
         avg_steps = total_steps / n_episodes

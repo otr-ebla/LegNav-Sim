@@ -1,15 +1,5 @@
 """
-jax_train.py — Rollout Collection (Stateless — no GRU)
-
-CHANGES vs GRU version:
-  - `hidden` fully removed from collect_rollouts and all carries.
-  - network.apply now called as apply_fn({"params": params}, obs) — no
-    second hidden argument.
-  - Rollout buffer no longer contains 'hiddens' — PPO loss is now a flat
-    forward pass over (T*N, D), no scan inside the loss.
-  - last_val computed with a direct forward pass (no hidden to pass).
-  - init_env_state no longer returns hidden.
-  - Everything else (curriculum, vmap_step, ghost_prob) unchanged.
+jax_train.py 
 """
 
 import os
