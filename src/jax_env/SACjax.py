@@ -41,22 +41,19 @@ from jax_wrappers import make_stacked_env, make_autoreset_env
 # ── Constants ─────────────────────────────────────────────────────────────────
 OBS_SIZE       = 662        # 9 (pose) + 5 (state_vec) + 648 (lidar)
 ACTION_DIM     = 2
-N_ENVS         = 256        # FIX 1: reduced from 2048; large N_ENVS drowns the buffer
-                             #        faster than G updates can replay — overwrite before reuse.
-BUFFER_CAP     = 500_000    # 500K — fits in VRAM (1.32 GB obs float16); ~1950 steps to fill with N_ENVS=256
-BATCH_SIZE     = 512        # FIX 1: kept proportional to N_ENVS; smaller is fine for SAC
-G_UPDATES      = 20         # FIX 1: gradient updates per collect step (replay ratio = G/1 ≫ 1)
-                             #        SAC's sample efficiency comes from here — not from more envs.
+N_ENVS         = 2048       # Match TQC: high parallelism keeps replay-ratio (samples drawn /
+                            # samples collected) sane at G_UPDATES=20.
+BUFFER_CAP     = 500_000    # 500K — fits in VRAM (1.32 GB obs float16)
+BATCH_SIZE     = 512
+G_UPDATES      = 20         # Gradient updates per collect step
 WARMUP_STEPS   = 10_000
 GAMMA          = 0.99
-TAU            = 0.005 / G_UPDATES   # Compensate for G_UPDATES EMA applications per env step.
-                             # Without this, effective tau per env step = 1-(1-0.005)^20 ≈ 0.095,
-                             # turning the "slow anchor" target into a fast-moving target.
-                             # TAU=0.00025 restores the intended per-env-step drift.
+TAU            = 0.005      # Standard SAC target-EMA rate (per gradient update). The previous
+                            # "TAU/G_UPDATES" rescaling was incorrect: SAC's tau is defined per
+                            # gradient step, not per env step, and dividing it makes the target
+                            # net 20x too slow — the critic never gets a stable bootstrap.
 LR             = 3e-4
-TARGET_ENTROPY = -2.0       # FIX 2: correct value is -|A| = -dim(action_space) = -2.0
-                             #        -1.0 was LESS exploratory (demanded less entropy),
-                             #        causing premature alpha decay and policy collapse.
+TARGET_ENTROPY = -2.0       # -|A| — standard auto-alpha target.
 DEFAULT_TOTAL_ENV_STEPS = 20_000_000   # default budget; override via train(total_env_steps=...)
 LOG_EVERY      = 50         # chunks; each chunk = N_ENVS*LOG_EVERY env steps collected
 SAVE_EVERY     = 5000
@@ -133,7 +130,9 @@ class SACActorHead(nn.Module):
     """Policy head: 128-dim shared feat → (mean, log_std)."""
     action_dim:  int   = ACTION_DIM
     LOG_STD_MIN: float = -5.0
-    LOG_STD_MAX: float =  2.0
+    LOG_STD_MAX: float =  0.5   # Match TQC. Was 2.0, which let std reach e^2 ≈ 7.4 in
+                                # raw action space → policy was effectively pure noise
+                                # for thousands of updates and could not commit.
 
     @nn.compact
     def __call__(self, feat: jnp.ndarray):
@@ -160,12 +159,12 @@ critic_q2   = CriticBranch()
 
 
 # ── Optimisers ────────────────────────────────────────────────────────────────
-# Alpha gets G_UPDATES × LOG_EVERY = 1000 gradient updates per chunk, while
-# network params get the same 1000 updates but are large tensors with gradient
-# clipping. For a scalar like log_alpha, Adam normalises every step to ≈ LR,
-# so effective per-chunk Δla ≈ 1000 × LR = 0.3 → alpha collapses in 10 chunks.
-# Fix: scale alpha LR by 1/G_UPDATES so per-env-step rate matches standard SAC.
-ALPHA_LR = LR / G_UPDATES   # 3e-4 / 20 = 1.5e-5 → Δla ≈ 0.015 per chunk
+# Standard Adam learning rates. The previous "ALPHA_LR = LR / G_UPDATES" was
+# wrong: auto-α is *supposed* to track entropy mismatch, and Adam's per-step
+# update is bounded by the learning rate, not the per-chunk drift. Throttling
+# α by 20× simply prevents the policy from ever committing to actions when
+# the initial random policy is too entropic for the target.
+ALPHA_LR = 1e-4   # match TQCjac.py
 enc_opt        = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR,       eps=1e-5))
 head_actor_opt = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR,       eps=1e-5))
 head_q1_opt    = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR,       eps=1e-5))
@@ -642,19 +641,24 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
             pcol_pct = float((ep_pcol * ep_msk).sum() / n_ep) * 100.0
             tmo_pct  = float((ep_tmo  * ep_msk).sum() / n_ep) * 100.0
 
-            # Advance continuous curriculum
-            rolling_suc = 0.9 * rolling_suc + 0.1 * suc_pct
-            highest_rolling_suc = 0.99 * highest_rolling_suc + 0.01 * rolling_suc
+            # ── Monotonic curriculum ──────────────────────────────────────
+            # Once a level is passed it can never be unlearned: both the
+            # tracking signal (`highest_rolling_suc`) and the per-dimension
+            # curriculum state are strictly non-decreasing.
+            rolling_suc         = 0.9 * rolling_suc + 0.1 * suc_pct
+            highest_rolling_suc = max(highest_rolling_suc, rolling_suc)
 
             new_max_dist, new_ghost, _, new_max_scen = get_continuous_curriculum(highest_rolling_suc)
 
-            if new_max_dist > cur_max_dist or new_max_scen > cur_max_scen:
+            if new_max_dist > cur_max_dist:
                 cur_max_dist = min(cur_max_dist + 0.2, new_max_dist)
-                cur_ghost    = new_ghost
+            if new_ghost > cur_ghost:
+                cur_ghost = new_ghost
+            if new_max_scen > cur_max_scen:
                 cur_max_scen = new_max_scen
 
-            cur_scenario = jax.random.randint(jax.random.PRNGKey(int(time.time())), (), 0, cur_max_scen + 1)
-            cur_scenario = int(cur_scenario)
+            # Train on the hardest unlocked scenario (monotonic difficulty).
+            cur_scenario = int(cur_max_scen)
         else:
             mean_ret = suc_pct = col_pct = pcol_pct = tmo_pct = 0.0
 

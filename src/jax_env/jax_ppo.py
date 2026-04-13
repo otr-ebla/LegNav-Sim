@@ -36,7 +36,6 @@ os.environ.setdefault("TF_GPU_ALLOCATOR",               "cuda_malloc_async")
 
 import time
 import warnings
-import random as _random
 import jax
 import jax.numpy as jnp
 import functools
@@ -465,25 +464,35 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
             else:
                 mean_ret, suc_pct, obs_pct, acol_pct, pcol_pct, tmo_pct = 0., 0., 0., 0., 0., 0.
 
-            # Curriculum
+            # ── Monotonic curriculum ──────────────────────────────────────
+            # Once a level is passed it can never be unlearned: both the
+            # tracking signal (`highest_rolling_suc`) and the per-dimension
+            # curriculum state (`cur_max_dist`, `cur_ghost`, `cur_max_scen`)
+            # are strictly non-decreasing.
             if n_ep > 0:
-                rolling_suc = 0.9 * rolling_suc + 0.1 * suc_pct
-                highest_rolling_suc = 0.99 * highest_rolling_suc + 0.01 * rolling_suc
+                rolling_suc         = 0.9 * rolling_suc + 0.1 * suc_pct
+                highest_rolling_suc = max(highest_rolling_suc, rolling_suc)
 
             new_max_dist, new_ghost, new_ent, new_max_scen = get_continuous_curriculum(highest_rolling_suc)
 
-            # Progressively sample from the unlocked scenarios to avoid layout shock
-            new_scenario = _random.randint(0, new_max_scen)
-
-            if new_max_dist > cur_max_dist or new_ghost > cur_ghost or new_max_scen > cur_max_scen:
-                max_step = 0.2  # metri per update — impedisce shock da salto di distanza
-                cur_max_dist = min(cur_max_dist + max_step, new_max_dist)
-                cur_ghost    = new_ghost
+            advanced = False
+            if new_max_dist > cur_max_dist:
+                # smooth-step distance (0.2 m / update) — impedisce shock da salto di distanza
+                cur_max_dist = min(cur_max_dist + 0.2, new_max_dist)
+                advanced = True
+            if new_ghost > cur_ghost:
+                cur_ghost = new_ghost
+                advanced = True
+            if new_max_scen > cur_max_scen:
                 cur_max_scen = new_max_scen
-                print(f"  -> Curriculum smoothly advanced: dist={cur_max_dist:.1f}m, "
+                advanced = True
+            if advanced:
+                print(f"  -> Curriculum advanced: dist={cur_max_dist:.1f}m, "
                       f"ghost_prob={cur_ghost:.2f}, unlocked_scenarios=0-{cur_max_scen}")
 
-            cur_scenario = new_scenario
+            # Train on the hardest unlocked scenario — this is monotonically
+            # non-decreasing because cur_max_scen is.
+            cur_scenario = cur_max_scen
             entropy_coef = jnp.array(new_ent)
 
             advantages, returns = compute_gae(rewards, values, dones, last_val)

@@ -481,17 +481,24 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
         _log_file.flush()
 
         if n_ep > 0:
-            rolling_suc = 0.9 * rolling_suc + 0.1 * suc_pct
-            highest_rolling_suc = 0.99 * highest_rolling_suc + 0.01 * rolling_suc
+            # ── Monotonic curriculum ──────────────────────────────────────
+            # Once a level is passed it can never be unlearned: both the
+            # tracking signal (`highest_rolling_suc`) and the per-dimension
+            # curriculum state are strictly non-decreasing.
+            rolling_suc         = 0.9 * rolling_suc + 0.1 * suc_pct
+            highest_rolling_suc = max(highest_rolling_suc, rolling_suc)
 
             new_max_dist, new_ghost, _, new_max_scen = get_continuous_curriculum(highest_rolling_suc)
 
-            if new_max_dist > cur_max_dist or new_max_scen > cur_max_scen:
+            if new_max_dist > cur_max_dist:
                 cur_max_dist = min(cur_max_dist + 0.2, new_max_dist)
-                cur_ghost    = new_ghost
+            if new_ghost > cur_ghost:
+                cur_ghost = new_ghost
+            if new_max_scen > cur_max_scen:
                 cur_max_scen = new_max_scen
 
-            cur_scenario = int(jax.random.randint(jax.random.PRNGKey(int(time.time())), (), 0, cur_max_scen + 1))
+            # Train on the hardest unlocked scenario (monotonic difficulty).
+            cur_scenario = int(cur_max_scen)
 
         if suc_pct > best_suc:
             best_suc = suc_pct

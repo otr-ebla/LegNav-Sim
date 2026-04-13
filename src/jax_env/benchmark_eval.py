@@ -518,6 +518,327 @@ def _plot_proximity_speed(scatter_data):
     plt.close(fig)
 
 
+# ── Test Scenario Configuration ──────────────────────────────────────────────
+from jax_scenarios import TEST_ROBOT_WAYPOINTS, TEST_SCENARIO_NAMES
+
+N_TEST_ENVS   = 512
+TEST_SCEN_IDS = sorted(TEST_SCENARIO_NAMES.keys())   # [7, 8, 9, 10, 11, 12]
+N_TEST_SCENS  = len(TEST_SCEN_IDS)
+
+
+# ── Per-waypoint Segment Rollout ──────────────────────────────────────────────
+#
+# Runs MAX_STEPS steps from a provided (obs, state) without calling reset.
+# Saves the stacked state at the moment the goal is first reached (pre-done,
+# i.e. before step_env internally resets the env) so the outer Python loop can
+# set a new goal and continue from the arrival position.
+
+def _segment_core(net_apply_fn, squash_fn, params,
+                  init_obs, init_state, rng_key, step_offset):
+    human_r = LEG_RADIUS if jax_env.USE_LEGS else PEOPLE_RADIUS
+
+    init_dist = jnp.sqrt(
+        (init_state.env_state.goal_x - init_state.env_state.x) ** 2 +
+        (init_state.env_state.goal_y - init_state.env_state.y) ** 2
+    )
+
+    carry = (
+        init_state, init_obs,
+        jnp.zeros(N_TEST_ENVS),           # path_len
+        jnp.full(N_TEST_ENVS, 100.0),     # min_human_dist
+        jnp.zeros(N_TEST_ENVS),           # v_p
+        jnp.zeros(N_TEST_ENVS),           # w_p
+        jnp.zeros(N_TEST_ENVS),           # av_p
+        jnp.zeros(N_TEST_ENVS),           # aw_p
+        jnp.ones(N_TEST_ENVS,  dtype=jnp.bool_),   # active
+        jnp.zeros(N_TEST_ENVS, dtype=jnp.bool_),   # gr_flag (goal reached ever)
+        init_state,                        # gr_state (pre-done state at first goal)
+        init_obs,                          # gr_obs
+    )
+
+    def _step(carry, step_idx):
+        (state, obs, pl, mhd, v_p, w_p, av_p, aw_p,
+         active, gr_flag, gr_state, gr_obs) = carry
+
+        k_step = jax.random.fold_in(rng_key, step_offset + step_idx)
+
+        raw_out = net_apply_fn({"params": params}, obs)
+        mean    = raw_out[0]
+        action  = jax.vmap(squash_fn)(mean, state.env_state.max_v)
+
+        step_keys = jax.random.split(k_step, N_TEST_ENVS)
+        next_obs, next_state, _, done, info = jax.vmap(step_stacked_headless)(
+            step_keys, state, action
+        )
+
+        v  = next_state.env_state.v
+        w  = next_state.env_state.w
+        av = (v - v_p) / DT
+        aw = (w - w_p) / DT
+
+        pl  = pl  + jnp.where(active, v * DT, 0.0)
+        ch  = info["closest_human"] - ROBOT_RADIUS - human_r
+        mhd = jnp.where(active, jnp.minimum(mhd, ch), mhd)
+
+        g  = info["goal_reached"] & active
+        c  = info["collision"]    & active
+        pc = info["passive_col"]  & active
+
+        # On the first step where goal is reached, save the PRE-step state/obs.
+        # (next_state is already reset by step_env; we need the arrival state.)
+        first_goal = g & ~gr_flag
+
+        def _sel(new_a, old_a):
+            if new_a.ndim == 1:
+                return jnp.where(first_goal, new_a, old_a)
+            return jnp.where(
+                first_goal.reshape([-1] + [1] * (new_a.ndim - 1)), new_a, old_a
+            )
+
+        new_gr_state = jax.tree_util.tree_map(_sel, state, gr_state)
+        new_gr_obs   = _sel(obs, gr_obs)
+        new_gr_flag  = gr_flag | g
+
+        next_active = active & ~done
+        step_data   = (active, g, c, pc, v, ch)
+        return (
+            next_state, next_obs, pl, mhd, v, av, w, aw,
+            next_active, new_gr_flag, new_gr_state, new_gr_obs
+        ), step_data
+
+    final_carry, step_data = jax.lax.scan(
+        _step, carry, jnp.arange(MAX_STEPS, dtype=jnp.uint32)
+    )
+    (_, _, final_pl, final_mhd, _, _, _, _,
+     _, final_gr_flag, final_gr_state, final_gr_obs) = final_carry
+    active_mask, goals, cols, pcols, step_vs, step_dists = step_data
+
+    ep_goal = goals.any(axis=0)
+    ep_col  = cols.any(axis=0)
+    ep_pcol = pcols.any(axis=0)
+
+    act_col  = ep_col  & ~ep_pcol & ~ep_goal
+    pass_col = ep_pcol & ~ep_goal
+    tmo      = ~ep_goal & ~ep_col & ~ep_pcol
+
+    spl = ep_goal * (init_dist / jnp.maximum(final_pl, init_dist))
+
+    metrics = {
+        "goal_reached": ep_goal,
+        "act_col":      act_col.astype(jnp.float32),
+        "pass_col":     pass_col.astype(jnp.float32),
+        "timeout":      tmo.astype(jnp.float32),
+        "spl":          spl,
+        "min_dist":     final_mhd,
+    }
+    return metrics, final_gr_state, final_gr_obs, final_gr_flag
+
+
+@jax.jit
+def segment_ppo(params, init_obs, init_state, rng_key, step_offset):
+    return _segment_core(_ppo_net.apply, _squash_action, params,
+                         init_obs, init_state, rng_key, step_offset)
+
+@jax.jit
+def segment_sac(params, init_obs, init_state, rng_key, step_offset):
+    return _segment_core(_sac_apply, _squash_action, params,
+                         init_obs, init_state, rng_key, step_offset)
+
+@jax.jit
+def segment_tqc(params, init_obs, init_state, rng_key, step_offset):
+    return _segment_core(_tqc_apply, _squash_action, params,
+                         init_obs, init_state, rng_key, step_offset)
+
+_SEG_FN = {"PPO": segment_ppo, "SAC": segment_sac, "TQC": segment_tqc}
+
+
+def run_test_scenarios(policies, rng):
+    """
+    Evaluates all policies on test scenarios 7-12.
+
+    Multi-waypoint scenarios (7, 9, 12) chain waypoint segments sequentially:
+      - each segment runs from the robot's arrival position at the previous waypoint
+      - a full-scenario SUCCESS requires reaching the *last* waypoint without any
+        prior collision or timeout
+      - collision/timeout in any segment permanently marks that env as failed
+
+    Single-waypoint scenarios (8, 10, 11) are identical to standard rollouts but
+    use the smaller N_TEST_ENVS budget.
+    """
+    all_frames  = []
+    total_cells = N_TEST_SCENS * N_SPEEDS
+
+    for p_name, params in policies.items():
+        seg_fn   = _SEG_FN[p_name]
+        t_policy = time.time()
+        cell_idx = 0
+
+        for scen_id in TEST_SCEN_IDS:
+            waypoints = TEST_ROBOT_WAYPOINTS[scen_id]
+            n_wp      = len(waypoints)
+            t_scen    = time.time()
+
+            for v_max in MAX_V_TESTS:
+                rng, cell_rng = jax.random.split(rng)
+                reset_keys = jax.random.split(cell_rng, N_TEST_ENVS)
+
+                # Reset — scenario's first goal is already waypoints[0]
+                obs, state = jax.vmap(
+                    dynamic_reset_stacked, in_axes=(0, None, None, None)
+                )(reset_keys, 9.0, jnp.int32(scen_id), jnp.float32(v_max))
+
+                still_alive  = np.ones(N_TEST_ENVS,  dtype=bool)
+                overall_col  = np.zeros(N_TEST_ENVS, dtype=bool)
+                overall_pcol = np.zeros(N_TEST_ENVS, dtype=bool)
+                last_metrics = None
+
+                for wp_idx in range(n_wp):
+                    is_last  = (wp_idx == n_wp - 1)
+                    step_off = jnp.int32(wp_idx * MAX_STEPS)
+
+                    metrics, gr_state, gr_obs, gr_flag = jax.block_until_ready(
+                        seg_fn(params, obs, state, cell_rng, step_off)
+                    )
+                    last_metrics = metrics
+
+                    m_col  = np.array(metrics["act_col"]).astype(bool)
+                    m_pcol = np.array(metrics["pass_col"]).astype(bool)
+                    m_goal = np.array(metrics["goal_reached"])
+
+                    overall_col  |= m_col  & still_alive
+                    overall_pcol |= m_pcol & still_alive
+
+                    if not is_last:
+                        # Advance goal to next waypoint in the saved pre-done state
+                        next_gx, next_gy = waypoints[wp_idx + 1]
+                        new_env_state = gr_state.env_state.replace(
+                            goal_x=jnp.where(gr_flag, next_gx,
+                                             gr_state.env_state.goal_x),
+                            goal_y=jnp.where(gr_flag, next_gy,
+                                             gr_state.env_state.goal_y),
+                            max_v=jnp.full(N_TEST_ENVS, v_max),
+                        )
+                        state = gr_state.replace(env_state=new_env_state)
+                        obs   = gr_obs
+                        # Only envs that reached this waypoint continue
+                        still_alive = still_alive & m_goal
+
+                # Success = alive after all segments AND reached final waypoint
+                final_success = still_alive & np.array(last_metrics["goal_reached"])
+                tmo = ~final_success & ~overall_col & ~overall_pcol
+
+                cell_idx += 1
+                cell_df = pd.DataFrame({
+                    "Policy":        p_name,
+                    "Scenario":      scen_id,
+                    "Scenario_Name": TEST_SCENARIO_NAMES[scen_id],
+                    "Max_V":         v_max,
+                    "N_Waypoints":   n_wp,
+                    "Success":       final_success.astype(float),
+                    "Active Col":    overall_col.astype(float),
+                    "Passive Col":   overall_pcol.astype(float),
+                    "Timeout":       tmo.astype(float),
+                    "SPL":           np.array(last_metrics["spl"]),
+                    "Min Dist":      np.array(last_metrics["min_dist"]),
+                })
+                all_frames.append(cell_df)
+
+            suc_pct = np.mean(
+                [f["Success"].mean() for f in all_frames[-N_SPEEDS:]]
+            ) * 100
+            print(f"    {p_name} | {TEST_SCENARIO_NAMES[scen_id]:<22s} "
+                  f"({cell_idx:>2d}/{total_cells}) "
+                  f"suc={suc_pct:5.1f}%  "
+                  f"{time.time() - t_scen:.1f}s")
+
+        print(f"  {p_name} test total: {time.time() - t_policy:.1f}s\n")
+
+    return pd.concat(all_frames, ignore_index=True)
+
+
+def _plot_test_dashboard(test_df):
+    """Compact dashboard for the 6 test scenarios."""
+    sns.set_theme(style="whitegrid", palette="muted")
+
+    fig, axes = plt.subplots(2, 3, figsize=(22, 12))
+    fig.suptitle("Test Scenario Evaluation Dashboard (Scenarios 7–12)",
+                 fontsize=18, weight="bold")
+
+    # ── (0,0) Success rate per scenario ─────────────────────────────────────
+    scen_suc = (test_df.groupby(["Scenario_Name", "Policy"])["Success"]
+                .mean().reset_index())
+    scen_suc["Success"] *= 100
+    ax = axes[0, 0]
+    sns.barplot(data=scen_suc, x="Scenario_Name", y="Success", hue="Policy", ax=ax)
+    ax.set_title("Success Rate by Test Scenario", fontsize=13)
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha="right", fontsize=8)
+    ax.set_ylim(0, 100)
+    ax.set_ylabel("Success Rate (%)")
+
+    # ── (0,1) Overall outcome breakdown ─────────────────────────────────────
+    rate_df = (test_df.groupby("Policy")[
+        ["Success", "Active Col", "Passive Col", "Timeout"]
+    ].mean().reset_index())
+    rate_melt = rate_df.melt(id_vars="Policy", var_name="Outcome", value_name="Rate")
+    rate_melt["Rate"] *= 100
+    ax = axes[0, 1]
+    sns.barplot(data=rate_melt, x="Outcome", y="Rate", hue="Policy", ax=ax)
+    ax.set_title("Overall Outcomes — Test Scenarios", fontsize=13)
+    ax.set_ylim(0, 100)
+    ax.set_ylabel("Rate (%)")
+
+    # ── (0,2) Success vs max speed ───────────────────────────────────────────
+    spd_suc = (test_df.groupby(["Max_V", "Policy"])["Success"]
+               .mean().reset_index())
+    spd_suc["Success"] *= 100
+    ax = axes[0, 2]
+    sns.lineplot(data=spd_suc, x="Max_V", y="Success", hue="Policy",
+                 marker="o", linewidth=3, markersize=8, ax=ax)
+    ax.set_title("Success Rate vs. Max Speed — Test Scenarios", fontsize=13)
+    ax.set_xticks(MAX_V_TESTS)
+    ax.set_ylim(0, 100)
+    ax.set_xlabel("Max Linear Speed (m/s)")
+    ax.set_ylabel("Success Rate (%)")
+
+    # ── (1,0) SPL (successful episodes only) ────────────────────────────────
+    suc_only = test_df[test_df["Success"] == 1.0]
+    ax = axes[1, 0]
+    if not suc_only.empty:
+        sns.boxplot(data=suc_only, x="Policy", y="SPL", hue="Policy",
+                    ax=ax, showfliers=False)
+    ax.set_title("SPL — Test Scenarios (successful eps)", fontsize=13)
+    ax.set_ylabel("SPL")
+
+    # ── (1,1) Safety margin vs speed ────────────────────────────────────────
+    ax = axes[1, 1]
+    sns.lineplot(data=test_df, x="Max_V", y="Min Dist", hue="Policy",
+                 marker="^", linewidth=3, markersize=8, ax=ax)
+    ax.set_title("Safety Margin vs. Max Speed — Test Scenarios", fontsize=13)
+    ax.axhline(0.0, color="red", linestyle="--", alpha=0.5, label="Collision")
+    ax.set_xticks(MAX_V_TESTS)
+    ax.set_xlabel("Max Linear Speed (m/s)")
+    ax.set_ylabel("Min Human Distance (m)")
+    ax.legend(fontsize=9)
+
+    # ── (1,2) Multi-waypoint full-path success ───────────────────────────────
+    multi_wp = test_df[test_df["N_Waypoints"] > 1]
+    ax = axes[1, 2]
+    if not multi_wp.empty:
+        mw_suc = (multi_wp.groupby(["Scenario_Name", "Policy"])["Success"]
+                  .mean().reset_index())
+        mw_suc["Success"] *= 100
+        sns.barplot(data=mw_suc, x="Scenario_Name", y="Success", hue="Policy", ax=ax)
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=20, ha="right", fontsize=9)
+    ax.set_title("Multi-Waypoint: Full-Path Success Rate", fontsize=13)
+    ax.set_ylim(0, 100)
+    ax.set_ylabel("Full-Path Success (%)")
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.savefig("Test_Scenario_Dashboard.png", dpi=300)
+    print("Saved 'Test_Scenario_Dashboard.png'")
+    plt.close(fig)
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
     gpu = jax.devices("cuda")[0] if jax.devices("cuda") else jax.devices()[0]
@@ -542,12 +863,27 @@ def main():
     rng = jax.random.PRNGKey(42)
 
     # Warm-up: compile kernels (pass jnp arrays so one compilation covers all cells)
-    print("\nCompiling evaluation kernels (~30s each)...")
+    print("\nCompiling training-scenario evaluation kernels (~30s each)...")
     for p_name, params in policies.items():
         rng, k_warmup = jax.random.split(rng)
         jax.block_until_ready(_EVAL_FN[p_name](
             params, jnp.int32(0), jnp.float32(1.0), k_warmup))
-        print(f"  {p_name} kernel compiled.")
+        print(f"  {p_name} rollout kernel compiled.")
+    print()
+
+    # Warm-up: compile segment kernels for test scenarios
+    print("Compiling test-scenario segment kernels (~60s each)...")
+    rng, k_wu_reset = jax.random.split(rng)
+    wu_reset_keys = jax.random.split(k_wu_reset, N_TEST_ENVS)
+    wu_obs, wu_state = jax.vmap(
+        dynamic_reset_stacked, in_axes=(0, None, None, None)
+    )(wu_reset_keys, 9.0, jnp.int32(7), jnp.float32(1.0))
+    for p_name, params in policies.items():
+        rng, k_seg = jax.random.split(rng)
+        jax.block_until_ready(
+            _SEG_FN[p_name](params, wu_obs, wu_state, k_seg, jnp.int32(0))
+        )
+        print(f"  {p_name} segment kernel compiled.")
     print()
 
     # Sequential evaluation loop
@@ -608,8 +944,23 @@ def main():
     df.to_csv("evaluation_raw_data.csv", index=False)
     print("Saved evaluation_raw_data.csv\n")
 
-    print("Generating dashboard...")
+    print("Generating training-scenario dashboard...")
     _plot_dashboard(df, scatter_data)
+
+    # ── Test scenario evaluation ───────────────────────────────────────────
+    print("\n" + "="*60)
+    print(f"Executing test scenario grid "
+          f"({N_TEST_SCENS} scenarios x {N_SPEEDS} speeds = "
+          f"{N_TEST_SCENS * N_SPEEDS} cells, {N_TEST_ENVS} envs each)...")
+    print("NOTE: multi-waypoint scenarios (7, 9, 12) chain segments —")
+    print("      success requires reaching the *last* waypoint.\n")
+
+    test_df = run_test_scenarios(policies, rng)
+    test_df.to_csv("test_evaluation_raw_data.csv", index=False)
+    print("Saved test_evaluation_raw_data.csv\n")
+
+    print("Generating test-scenario dashboard...")
+    _plot_test_dashboard(test_df)
 
 
 if __name__ == "__main__":
