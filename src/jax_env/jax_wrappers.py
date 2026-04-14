@@ -91,12 +91,15 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3,
 
 
 def make_autoreset_env(reset_fn, step_fn):
-    def step_autoreset(key, state, action, max_goal_dist, scenario_idx, ghost_prob):
+    def step_autoreset(key, state, action, max_goal_dist, scenario_idx, ghost_prob, max_scenario):
         step_key, reset_key = jax.random.split(key)
         obs, next_state, reward, done, info = step_fn(step_key, state, action)
-        
-        # Passes the active scenario strictly into the auto-reset dynamically
-        reset_obs, reset_state = reset_fn(reset_key, max_goal_dist=max_goal_dist, scenario_idx=scenario_idx, ghost_prob=ghost_prob)
+
+        # max_scenario flows via **kwargs through reset_stacked → reset_env → generate_scenario
+        # so the random draw on reset is capped to [0, max_scenario] (curriculum range).
+        reset_obs, reset_state = reset_fn(reset_key, max_goal_dist=max_goal_dist,
+                                          scenario_idx=scenario_idx, ghost_prob=ghost_prob,
+                                          max_scenario=max_scenario)
 
         def _select(reset_leaf, next_leaf):
             d = jnp.asarray(done)

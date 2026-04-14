@@ -51,22 +51,28 @@ def _batch_sample_safe_pos(key, clearance, obs_circles, obs_boxes, min_val, max_
     best_idx = jnp.argmax(is_safe_mask)
     return guesses_x[best_idx], guesses_y[best_idx]
 
-def generate_scenario(key: jnp.ndarray, max_goal_dist: float, scenario_idx: int = -1):
+def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
+                      scenario_idx: int = -1, max_scenario: int = 6):
     """
     Generate a scenario.
+
+    scenario_idx < 0  → random draw from [0, max_scenario] (uniform).
+    scenario_idx >= 0 → pin to that exact index (used for eval / test scenarios).
+    max_scenario      → upper bound for random training draws; set to cur_max_scen
+                        from the curriculum so the robot always sees *all* unlocked
+                        scenarios, not just the hardest one (fixes Scenario Amnesia).
     """
     # Minimum goal distance floor — goal never spawns inside the robot
     _MIN_GOAL_FLOOR = 0.8
 
     k_scen, k_branch = jax.random.split(key)
-    
-    # Sample a random scenario normally
-    sampled_idx = jax.random.randint(k_scen, (), 0, 7)
-    
-    # If the user requested a specific scenario, use it
+
+    # Sample uniformly from the full range of currently-unlocked scenarios.
+    # max_scenario is a JAX integer so randint can handle it dynamically.
+    sampled_idx = jax.random.randint(k_scen, (), 0, jnp.int32(max_scenario) + 1)
+
+    # If the caller pinned a specific scenario (>= 0), use it; else use the draw.
     idx = jnp.where(scenario_idx < 0, sampled_idx, jnp.int32(scenario_idx))
-    
-    # REMOVED the hardcoded curriculum logic here.
 
     def pack_human(px, py, th, g1x, g1y, g2x, g2y):
         return jnp.stack([

@@ -74,7 +74,8 @@ jax.config.update("jax_default_device", target_gpu)
 reset_stacked, step_stacked = make_stacked_env(reset_env, step_env, stack_dim=3)
 
 _step_auto = make_autoreset_env(reset_stacked, step_stacked)
-vmap_step  = jax.jit(jax.vmap(_step_auto, in_axes=(0, 0, 0, None, None, None)))
+# in_axes: (key, state, action, max_goal_dist, scenario_idx, ghost_prob, max_scenario)
+vmap_step  = jax.jit(jax.vmap(_step_auto, in_axes=(0, 0, 0, None, None, None, None)))
 
 @jax.jit
 def _vmap_reset(reset_keys, min_goal_dist, ghost_prob, scenario_idx):
@@ -270,20 +271,20 @@ def tqc_update(ap, aos, cp, cos, tp, sep, eos, tsep, la, laos, obs, action, rewa
     return new_ap, new_aos, new_cp, new_cos, soft_update(tp, new_cp), new_sep, new_eos, soft_update(tsep, new_sep), optax.apply_updates(la, al_upd), new_laos, metrics
 
 @functools.partial(jax.jit, static_argnums=(5,))
-def collect_step(sep, ap, env_state, env_obs, rng_key, vmap_step, min_goal_dist, scenario_idx, ghost_prob):
+def collect_step(sep, ap, env_state, env_obs, rng_key, vmap_step, min_goal_dist, scenario_idx, ghost_prob, max_scenario):
     feat = shared_enc.apply({"params": sep}, env_obs.astype(NET_DTYPE))
     mean, log_std = actor_head.apply({"params": ap}, feat)
     env_action, _ = jax.vmap(sample_action)(jax.random.split(rng_key, N_ENVS), mean, log_std, extract_max_v(env_obs))
     step_keys = jax.random.split(jax.random.fold_in(rng_key, 99), N_ENVS)
-    new_obs, new_state, reward, done, info = vmap_step(step_keys, env_state, env_action, min_goal_dist, scenario_idx, ghost_prob)
+    new_obs, new_state, reward, done, info = vmap_step(step_keys, env_state, env_action, min_goal_dist, scenario_idx, ghost_prob, max_scenario)
     return new_obs, new_state, env_obs, env_action, reward, done, info
 
 @functools.partial(jax.jit, static_argnums=(11,), donate_argnums=(10, 15, 16))
-def train_chunk(ap, aos, cp, cos, tp, sep, eos, tsep, la, laos, buf, vmap_step, min_goal_dist, scenario_idx, ghost_prob, es, eo, key):
+def train_chunk(ap, aos, cp, cos, tp, sep, eos, tsep, la, laos, buf, vmap_step, min_goal_dist, scenario_idx, ghost_prob, es, eo, key, max_scenario):
     def _collect_body(carry, _):
         es_, eo_, buf_, key_ = carry
         key_, k_col = jax.random.split(key_)
-        new_eo, new_es, obs_b, env_a, rew, done, info = collect_step(sep, ap, es_, eo_, k_col, vmap_step, min_goal_dist, scenario_idx, ghost_prob)
+        new_eo, new_es, obs_b, env_a, rew, done, info = collect_step(sep, ap, es_, eo_, k_col, vmap_step, min_goal_dist, scenario_idx, ghost_prob, max_scenario)
         terminal = done & ~info["timeout"]
         new_buf = buf_add(buf_, obs_b, env_a, rew, new_eo, terminal.astype(jnp.float32))
         step_data = (rew, done, info["goal_reached"], info["collision"], info["passive_col"])
@@ -400,7 +401,8 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
         env_action = jnp.stack([rand_v, rand_w], axis=-1)
         step_keys  = jax.random.split(k_step, N_ENVS)
         new_obs, env_state, reward, done, info = jax.jit(vmap_step)(
-            step_keys, env_state, env_action, cur_max_dist, cur_scenario, cur_ghost
+            step_keys, env_state, env_action, cur_max_dist, cur_scenario, cur_ghost,
+            jnp.int32(cur_max_scen)
         )
         terminal   = done & ~info["timeout"]
         replay_buf = buf_add(replay_buf, obs_before, env_action, reward, new_obs, terminal.astype(jnp.float32))
@@ -410,7 +412,8 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     print("Warmup done. JIT compiling train chunk (this may take up to a minute)...")
     _c, _sd, _m = train_chunk(
         ap, aos, cp, cos, tp, sep, eos, tsep, la, laos,
-        replay_buf, vmap_step, jnp.float32(cur_max_dist), jnp.int32(cur_scenario), jnp.float32(cur_ghost), env_state, env_obs, rng
+        replay_buf, vmap_step, jnp.float32(cur_max_dist), jnp.int32(cur_scenario), jnp.float32(cur_ghost),
+        env_state, env_obs, rng, jnp.int32(cur_max_scen)
     )
     jax.block_until_ready(_c)
     ap, aos, cp, cos, tp, sep, eos, tsep, la, laos, replay_buf, env_state, env_obs, rng = _c
@@ -439,7 +442,8 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
 
         new_carry, all_step_data, all_metrics = train_chunk(
             ap, aos, cp, cos, tp, sep, eos, tsep, la, laos,
-            replay_buf, vmap_step, jnp.float32(cur_max_dist), jnp.int32(cur_scenario), jnp.float32(cur_ghost), env_state, env_obs, rng
+            replay_buf, vmap_step, jnp.float32(cur_max_dist), jnp.int32(cur_scenario), jnp.float32(cur_ghost),
+            env_state, env_obs, rng, jnp.int32(cur_max_scen)
         )
 
         ap, aos, cp, cos, tp, sep, eos, tsep, la, laos, replay_buf, env_state, env_obs, rng = new_carry
@@ -474,7 +478,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
         print(f"{n_updates:>7d} | {total_steps:>10,} | {mean_ret:>7.1f} | "
               f"{suc_pct:>4.1f}% {col_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% | "
               f"{m_crit:>7.4f} {m_act:>7.4f} {m_alph:>6.4f} {m_lpi:>6.3f} {m_qm:>7.3f} | "
-              f"{fps:>7,.0f} | {time_str:>8} | {cur_max_dist:>4.1f}m {cur_ghost:>4.2f} {cur_scenario:>4d}")
+              f"{fps:>7,.0f} | {time_str:>8} | {cur_max_dist:>4.1f}m {cur_ghost:>4.2f} scen<={cur_max_scen}")
         _log_writer.writerow([total_steps, round(mean_ret, 4),
                                round(suc_pct, 4), round(col_pct, 4),
                                round(pcol_pct, 4), round(tmo_pct, 4), n_ep])
@@ -497,8 +501,8 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
             if new_max_scen > cur_max_scen:
                 cur_max_scen = new_max_scen
 
-            # Train on the hardest unlocked scenario (monotonic difficulty).
-            cur_scenario = int(cur_max_scen)
+            # Always sample scenario uniformly from [0, cur_max_scen] at each reset.
+            cur_scenario = -1
 
         if suc_pct > best_suc:
             best_suc = suc_pct

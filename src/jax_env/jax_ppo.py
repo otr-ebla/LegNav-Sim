@@ -62,15 +62,26 @@ network = EndToEndActorCritic(action_dim=2)
 # ── Continuous Curriculum ─────────────────────────────────────────────────────
 # Instead of discrete jumps causing domain shock, we continuously interpolate
 # environment parameters based on the highest rolling success rate.
-_SUC_ANCHORS  = np.array([0.0, 25.0, 38.0, 50.0, 60.0, 70.0, 82.0, 95.0, 100.0])
-_DIST_ANCHORS = np.array([1.5,  1.5,  2.5,  4.0,  5.0,  6.5,  8.0,  9.0,   9.0])
-_GHOST_ANCHORS= np.array([0.0,  0.0,  0.0,  0.0,  0.15, 0.3,  0.6,  0.9,   1.0])
-_ENT_ANCHORS  = np.array([
-    0.02, 0.02, 0.018, 0.015, 0.012,
-    0.01, 0.008, 0.006, 0.005
-])
-# Progressively unlock scenarios [0: Random, 1: Parallel, 2: Perp, 3: Circle, 4: Bottleneck, 5: Intersect, 6: Static]
-_SCEN_ANCHORS = np.array([0,    0,    1,    2,    4,    5,    6,    6,     6])
+#
+# Design principles (two fixes applied):
+#
+#  1. SOLVE AMNESIA: every reset now draws scenario_idx ~ Uniform[0, cur_max_scen]
+#     instead of always training on the hardest unlocked scenario. The training
+#     loop passes scenario_idx=-1 and max_scenario=cur_max_scen; generate_scenario
+#     does the random draw internally using jax.random.randint.
+#
+#  2. DECOUPLE DISTANCE FROM GEOMETRY: max_goal_dist is only meaningful for
+#     Stage 0 (Random) — geometry scenarios ignore it entirely. The new anchors
+#     bring max_goal_dist to 9 m at ~75 % success so the Critic is already
+#     calibrated for long paths *before* Stage 1 is unlocked at ~82 %.
+_SUC_ANCHORS  = np.array([0.0, 20.0, 35.0, 50.0, 65.0, 75.0, 82.0, 90.0, 100.0])
+_DIST_ANCHORS = np.array([1.5,  1.5,  3.0,  5.0,  7.5,  9.0,  9.0,  9.0,   9.0])
+_GHOST_ANCHORS= np.array([0.0,  0.0,  0.0,  0.0,  0.1,  0.3,  0.6,  0.9,   1.0])
+_ENT_ANCHORS  = np.array([0.02, 0.02, 0.018, 0.015, 0.012, 0.01, 0.008, 0.006, 0.005])
+# Scenarios unlock ONLY after max_goal_dist has reached 9 m (≥ 75 % success).
+# Stage 0 (Random) must be mastered with full 9 m goals before any geometry
+# scenario is introduced, so the Critic's value estimates are already calibrated.
+_SCEN_ANCHORS = np.array([0,    0,    0,    0,    0,    0,    1,    4,     6])
 
 def get_continuous_curriculum(suc_pct: float):
     dist  = float(np.interp(suc_pct, _SUC_ANCHORS, _DIST_ANCHORS))
@@ -406,7 +417,8 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
 
             rollout_history, env_state, env_obs, last_val = collect_rollouts(
                 rollout_rng, train_state[0], network.apply, vmap_step,
-                env_state, env_obs, cur_max_dist, cur_scenario, cur_ghost
+                env_state, env_obs, cur_max_dist, jnp.int32(-1), cur_ghost,
+                jnp.int32(cur_max_scen)   # max_scenario: upper bound for random draw
             )
 
             raw_rewards = rollout_history["rewards"]
@@ -472,9 +484,10 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
                 print(f"  -> Curriculum advanced: dist={cur_max_dist:.1f}m, "
                       f"ghost_prob={cur_ghost:.2f}, unlocked_scenarios=0-{cur_max_scen}")
 
-            # Train on the hardest unlocked scenario — this is monotonically
-            # non-decreasing because cur_max_scen is.
-            cur_scenario = cur_max_scen
+            # Always draw scenario_idx uniformly from [0, cur_max_scen] at each
+            # reset (done inside generate_scenario via jax.random.randint).
+            # Passing -1 here tells the env to use the random draw.
+            cur_scenario = -1
             entropy_coef = jnp.array(new_ent)
 
             advantages, returns = compute_gae(rewards, values, dones, last_val)

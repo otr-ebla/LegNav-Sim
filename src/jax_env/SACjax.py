@@ -104,7 +104,8 @@ def init_env_state(rng_key, max_goal_dist: float = 1.5, ghost_prob: float = 0.0,
     vmap_step is NOT jit-wrapped — the outer train_chunk JIT fuses it.
     """
     step_auto = make_autoreset_env(reset_stacked, step_stacked)
-    vmap_step = jax.vmap(step_auto, in_axes=(0, 0, 0, None, None, None))
+    # in_axes: (key, state, action, max_goal_dist, scenario_idx, ghost_prob, max_scenario)
+    vmap_step = jax.vmap(step_auto, in_axes=(0, 0, 0, None, None, None, None))
 
     def _reset(key):
         return reset_stacked(key, max_goal_dist=max_goal_dist, scenario_idx=scenario_idx, ghost_prob=ghost_prob)
@@ -372,7 +373,7 @@ def sac_update(sep, eos, tsep, ahp, ahos, q1p, q1os, q2p, q2os,
 
 # ── Collection step ───────────────────────────────────────────────────────────
 @functools.partial(jax.jit, static_argnums=(5,))
-def collect_step(sep, ahp, env_state, env_obs, rng_key, vmap_step, max_goal_dist, scenario_idx, ghost_prob):
+def collect_step(sep, ahp, env_state, env_obs, rng_key, vmap_step, max_goal_dist, scenario_idx, ghost_prob, max_scenario):
     """Compute max_v ONCE, sample action via shared encoder + actor head, step env."""
     max_v = extract_max_v(env_obs)
     k_act, k_step = jax.random.split(rng_key)
@@ -381,7 +382,7 @@ def collect_step(sep, ahp, env_state, env_obs, rng_key, vmap_step, max_goal_dist
     env_action, _ = sample_action_sac_batched(k_act, mean, log_std, max_v)
     step_keys = jax.random.split(k_step, N_ENVS)
     new_obs, new_state, reward, done, info = vmap_step(
-        step_keys, env_state, env_action, max_goal_dist, scenario_idx, ghost_prob
+        step_keys, env_state, env_action, max_goal_dist, scenario_idx, ghost_prob, max_scenario
     )
 
     # Let auto-alpha adapt to the natural Q-scale. Aggressive reward scaling destroys the actor's objective.
@@ -400,14 +401,15 @@ def train_chunk(sep, eos, tsep, ahp, ahos,
                 q1p, q1os, q2p, q2os, tq1p, tq2p,
                 la, alo, vmap_step,
                 buf, es, eo, key,
-                max_goal_dist, scenario_idx, ghost_prob):
+                max_goal_dist, scenario_idx, ghost_prob,
+                max_scenario):
 
     # ── Phase 1: collect LOG_EVERY env steps, write to buffer ─────────────────
     def _collect_body(carry, _):
         es_, eo_, buf_, key_ = carry
         key_, k_col = jax.random.split(key_)
         new_eo, new_es, obs_b, env_a, rew, done, info, max_v_cur = collect_step(
-            sep, ahp, es_, eo_, k_col, vmap_step, max_goal_dist, scenario_idx, ghost_prob
+            sep, ahp, es_, eo_, k_col, vmap_step, max_goal_dist, scenario_idx, ghost_prob, max_scenario
         )
         terminal = done & ~info["timeout"]
         new_buf = buf_add(buf_, obs_b, env_a, rew, new_eo,
@@ -584,7 +586,8 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
         env_action = jnp.stack([rand_v, rand_w], axis=-1)
         step_keys  = jax.random.split(k_step, N_ENVS)
         new_obs, env_state, reward, done, info = jax.jit(vmap_step)(
-            step_keys, env_state, env_action, cur_max_dist, cur_scenario, cur_ghost
+            step_keys, env_state, env_action, cur_max_dist, cur_scenario, cur_ghost,
+            jnp.int32(cur_max_scen)
         )
         terminal   = done & ~info["timeout"].astype(jnp.bool_)
         replay_buf = buf_add(replay_buf, obs_before, env_action, reward,
@@ -621,7 +624,8 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
             q1p, q1os, q2p, q2os, tq1p, tq2p,
             la, alo, vmap_step,
             replay_buf, env_state, env_obs, train_rng,
-            cur_max_dist, cur_scenario, cur_ghost
+            cur_max_dist, cur_scenario, cur_ghost,
+            jnp.int32(cur_max_scen)
         )
         (sep, eos, tsep, ahp, ahos,
          q1p, q1os, q2p, q2os, tq1p, tq2p,
@@ -657,8 +661,8 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
             if new_max_scen > cur_max_scen:
                 cur_max_scen = new_max_scen
 
-            # Train on the hardest unlocked scenario (monotonic difficulty).
-            cur_scenario = int(cur_max_scen)
+            # Always sample scenario uniformly from [0, cur_max_scen] at each reset.
+            cur_scenario = -1
         else:
             mean_ret = suc_pct = col_pct = pcol_pct = tmo_pct = 0.0
 

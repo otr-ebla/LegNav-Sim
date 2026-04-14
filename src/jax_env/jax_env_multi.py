@@ -102,11 +102,12 @@ def build_hsfm_obstacles(obs_boxes):
     return jnp.concatenate([room_edges[None, ...], box_edges], axis=0)
 
 
-def reset_env(key: jax.Array, max_goal_dist: float = 3.0, scenario_idx: int = -1, ghost_prob: float = 1.0):
+def reset_env(key: jax.Array, max_goal_dist: float = 3.0, scenario_idx: int = -1,
+              ghost_prob: float = 1.0, max_scenario: int = 6):
     k_main, k_legs, k_obs, k_ghost = jax.random.split(key, 4)
 
     rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people = \
-        generate_scenario(k_main, max_goal_dist, scenario_idx)
+        generate_scenario(k_main, max_goal_dist, scenario_idx, max_scenario)
     
     #max_v = 0.8
 
