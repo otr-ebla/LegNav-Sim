@@ -3,8 +3,10 @@ pretrain_navrep.py — Collect expert transitions and pretrain NavRep's V and M.
 
 Pipeline
 --------
-1. Collect millions of (lidar, next-lidar) transitions by rolling out the DWA
-   expert in the vectorised JAX environment (NUM_ENVS in parallel).
+1. Collect millions of (lidar, next-lidar) transitions by rolling out the
+   HumanPilot expert (JHSFM Social Force Model toward goal) in the vectorised
+   JAX environment (NUM_ENVS in parallel).  The robot moves like a pedestrian:
+   SFM goal force + obstacle repulsion from LiDAR → unicycle [v, w] command.
 2. Train Module V (VAE: 1D-CNN encoder + ConvTranspose decoder) on shuffled
    single-frame LiDAR scans with reconstruction + β·KL loss.
 3. Encode full per-env trajectories into z-sequences and train Module M
@@ -44,7 +46,7 @@ import flax.serialization
 
 from jax_train import init_env_state, NUM_ENVS
 from jax_env import NUM_RAYS as ENV_NUM_RAYS
-from comparison_policies.dwa_planner import DWA
+from comparison_policies.jhsfm_planner import HumanPilot
 from comparison_policies.navrep_network import (
     VAE, MWrapper, LidarEncoder, Z_DIM, NUM_RAYS, STACK_DIM,
 )
@@ -82,9 +84,9 @@ def _extract_latest_lidar(obs_chunk: jnp.ndarray) -> jnp.ndarray:
     )[..., -1, :]
 
 
-def _build_chunk_runner(vmap_step, dwa_act, max_goal_dist, ghost_prob, max_scen):
-    """JIT-compile one chunk of CHUNK_LEN env steps with the DWA expert."""
-    vmap_act = jax.vmap(dwa_act)
+def _build_chunk_runner(vmap_step, pilot_act, max_goal_dist, ghost_prob, max_scen):
+    """JIT-compile one chunk of CHUNK_LEN env steps with the HumanPilot expert."""
+    vmap_act = jax.vmap(pilot_act)
 
     @jax.jit
     def run_chunk(state, obs, rng):
@@ -106,9 +108,17 @@ def _build_chunk_runner(vmap_step, dwa_act, max_goal_dist, ghost_prob, max_scen)
 
 
 def collect_expert_lidar(total_frames: int, rng: jax.Array) -> np.ndarray:
-    """Roll out DWA and collect most-recent-frame LiDAR as (T_total, NUM_ENVS, 216)."""
+    """
+    Roll out HumanPilot (JHSFM) and collect most-recent-frame LiDAR
+    as an array of shape (T_total, NUM_ENVS, 216).
+
+    The robot moves toward its goal using the Social Force Model —
+    the same dynamics used for pedestrians in jax_humans.py —
+    producing naturalistic LiDAR trajectories for V/M pretraining.
+    """
     print(f"[collect] target {total_frames:,} frames "
-          f"({total_frames // NUM_ENVS} env-steps across {NUM_ENVS} envs)")
+          f"({total_frames // NUM_ENVS} env-steps across {NUM_ENVS} envs)\n"
+          f"         expert: HumanPilot (JHSFM — SFM toward goal)")
 
     n_chunks = max(1, (total_frames + NUM_ENVS * CHUNK_LEN - 1)
                    // (NUM_ENVS * CHUNK_LEN))
@@ -118,8 +128,8 @@ def collect_expert_lidar(total_frames: int, rng: jax.Array) -> np.ndarray:
         env_rng, max_goal_dist=9.0, ghost_prob=0.0
     )
 
-    dwa = DWA()
-    run_chunk = _build_chunk_runner(vmap_step, dwa.act,
+    pilot = HumanPilot(lidar_n_frames=1)
+    run_chunk = _build_chunk_runner(vmap_step, pilot.act,
                                     max_goal_dist=9.0,
                                     ghost_prob=0.0,
                                     max_scen=12)
@@ -320,6 +330,7 @@ def main():
     args = ap.parse_args()
 
     print(f"NavRep Pretraining  (V + M)")
+    print(f"  expert   : HumanPilot (JHSFM Social Force Model toward goal)")
     print(f"  frames   : {args.frames:,}")
     print(f"  V epochs : {args.v_epochs}")
     print(f"  M epochs : {args.m_epochs}")
