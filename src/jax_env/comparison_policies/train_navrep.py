@@ -1,24 +1,28 @@
 """
-train_navrep.py — Train a NavRep-style policy using the vectorised JAX environment.
+train_navrep.py — PPO-train NavRep's Controller (C) with V + M frozen.
 
-Architecture (NavRep E2E):
-  V: 1D CNN lidar encoder (32-dim latent, 3-frame input)
-  M: implicitly encoded via 3-frame stacked obs (no separate LSTM)
-  Policy: 2-layer MLP [64, 64]  — identical to NavRep's policy head
+Architecture (faithful NavRep):
+  V : LidarEncoder (VAE)     — loaded from pretraining, frozen
+  M : causal Transformer      — loaded from pretraining, frozen
+  C : 2-layer MLP [64, 64]   — trained here with PPO
 
-Training infrastructure mirrors ppo_mlp_baseline.py exactly:
-  - 512 vectorised JAX envs (GPU, all stepped in one kernel)
-  - PPO with GAE, reward normalisation, continuous curriculum
-  - Identical hyper-parameters to the other baselines for fair comparison
+Gradients are blocked inside the forward pass via `stop_gradient` on V and M
+outputs, so V and M parameters are not updated by the PPO optimiser (zero
+gradients → zero Adam updates starting from zero momentum).
+
+Pretraining step (must be run first):
+    python comparison_policies/pretrain_navrep.py
+    → checkpoints_navrep/navrep_vm.msgpack
 
 Saves:
-  checkpoints_navrep/navrep_best.msgpack
-  checkpoints_navrep/navrep_final.msgpack
-  checkpoints_navrep/navrep_training_log.csv
+    checkpoints_navrep/navrep_best.msgpack
+    checkpoints_navrep/navrep_final.msgpack
+    checkpoints_navrep/navrep_training_log.csv
 
 Usage:
     cd src/jax_env
-    python comparison_policies/train_navrep.py [--steps N]
+    python comparison_policies/train_navrep.py [--steps N] \\
+        [--vm-ckpt checkpoints_navrep/navrep_vm.msgpack]
 """
 
 import os
@@ -89,12 +93,25 @@ _WARMUP_OPT_STEPS     = WARMUP_UPDATES * _OPT_STEPS_PER_UPDATE
 CKPT_DIR   = os.path.join(_JAX_ENV_DIR, "checkpoints_navrep")
 CKPT_BEST  = os.path.join(CKPT_DIR, "navrep_best.msgpack")
 CKPT_FINAL = os.path.join(CKPT_DIR, "navrep_final.msgpack")
+VM_CKPT    = os.path.join(CKPT_DIR, "navrep_vm.msgpack")
 LOG_PATH   = os.path.join(CKPT_DIR, "navrep_training_log.csv")
 
-# Module-level network + optimizer (same pattern as ppo_mlp_baseline.py)
-network   = NavRepActorCritic(action_dim=2, lidar_z=32, hidden_dim=64)
+# Module-level network + optimizer
+network   = NavRepActorCritic(action_dim=2, hidden_dim=64)
 scheduler = None
 optimizer = None
+
+
+def _load_vm_into(params, vm_path=VM_CKPT):
+    """Overwrite params['encoder'] and params['M'] with the pretrained bundle."""
+    target = {"encoder": params["encoder"], "M": params["M"]}
+    with open(vm_path, "rb") as f:
+        raw = f.read()
+    loaded = flax.serialization.from_bytes(target, raw)
+    new_params = dict(params)
+    new_params["encoder"] = loaded["encoder"]
+    new_params["M"]       = loaded["M"]
+    return new_params
 
 
 # ── PPO loss (same logic as ppo_mlp_baseline.py, uses local `network`) ────────
@@ -200,9 +217,13 @@ def load_checkpoint(dummy_params, dummy_opt_state, filepath=CKPT_BEST):
 LOG_EVERY = 1
 
 
-def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
+def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS,
+          vm_ckpt_path: str = VM_CKPT):
     """
     NavRep PPO training with 512 vectorised JAX envs.
+
+    Loads V + M weights from `vm_ckpt_path` and trains only the controller (C)
+    — V and M are frozen via stop_gradient in the forward pass.
 
     Checkpoints:   checkpoints_navrep/navrep_best.msgpack
                    checkpoints_navrep/navrep_final.msgpack
@@ -233,8 +254,8 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
         optax.adam(learning_rate=scheduler, eps=1e-5),
     )
 
-    print("PPO Training  [NavRep: 1D-CNN(32) + MLP[64,64]]")
-    print(f"  Network     : 1D-CNN lidar encoder (Z=32) + state MLP → combined 64 → pi/vf [64,64]")
+    print("PPO Training  [NavRep: V(VAE) + M(Transformer) + C(MLP[64,64])]")
+    print(f"  V+M ckpt    : {vm_ckpt_path}")
     print(f"  Envs        : {NUM_ENVS}  x  steps {ROLLOUT_STEPS}  =  {BATCH_SIZE:,} batch")
     print(f"  Minibatches : {N_MINIBATCHES} x {MINI_BATCH_SIZE}  (flat T*N)")
     print(f"  Budget      : {total_env_steps:,} env steps  →  {total_updates} updates\n")
@@ -244,8 +265,22 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
 
     dummy_obs = jnp.zeros((1, OBS_SIZE))
     params    = network.init(init_rng, dummy_obs)["params"]
-    n_params  = sum(x.size for x in jax.tree_util.tree_leaves(params))
-    print(f"  Parameters  : {n_params:,}\n")
+
+    if not os.path.isfile(vm_ckpt_path):
+        raise FileNotFoundError(
+            f"V+M pretraining checkpoint not found at '{vm_ckpt_path}'. "
+            f"Run pretrain_navrep.py first."
+        )
+    params = _load_vm_into(params, vm_ckpt_path)
+    print(f"  V + M       : loaded from {vm_ckpt_path} (frozen via stop_gradient)")
+
+    n_total = sum(x.size for x in jax.tree_util.tree_leaves(params))
+    n_c = sum(
+        x.size
+        for k, sub in params.items() if k not in ("encoder", "M")
+        for x in jax.tree_util.tree_leaves(sub)
+    )
+    print(f"  Parameters  : total={n_total:,}  controller={n_c:,}\n")
 
     opt_state   = optimizer.init(params)
     train_state = (params, opt_state)
@@ -389,5 +424,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", type=int, default=DEFAULT_TOTAL_ENV_STEPS,
                         help="Total environment steps (default 100M)")
+    parser.add_argument("--vm-ckpt", type=str, default=VM_CKPT,
+                        help="Pretrained V+M checkpoint (navrep_vm.msgpack)")
     args = parser.parse_args()
-    train(args.steps)
+    train(args.steps, args.vm_ckpt)
