@@ -39,7 +39,7 @@ from jax_humans import (
     _wall_force,
     _circle_force,
     _box_force,
-    _MAX_SPEED,
+    MAX_SPEED,
     _EPS,
 )
 
@@ -65,7 +65,7 @@ class HumanPilot:
         
         wp_x, wp_y = state.goal_x, state.goal_y
         max_v = state.max_v
-        v_des = jnp.minimum(max_v, _MAX_SPEED)
+        v_des = jnp.minimum(max_v, MAX_SPEED)
 
         # ── 1) Goal force ─────────────────────────────────────────────────────
         gfx, gfy = _goal_force(px, py, vx, vy, wp_x, wp_y, v_des)
