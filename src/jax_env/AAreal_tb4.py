@@ -1,3 +1,10 @@
+'''
+AAreal_tb4.py
+ROS2 Node for Patrolling the real Turtlebot4 between two waypoints using a JAX-trained PPO model.
+
+'''
+
+
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node

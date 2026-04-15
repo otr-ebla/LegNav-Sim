@@ -45,7 +45,7 @@ LR_END         = 1e-5
 LR_MIN         = 1e-5
 WARMUP_UPDATES = 5
 
-DEFAULT_TOTAL_ENV_STEPS = 40_000_000     # default budget; override via train(total_env_steps=...)
+DEFAULT_TOTAL_ENV_STEPS = 50_000_000    # default budget; override via train(total_env_steps=...)
 
 # ── Minibatch geometry ────────────────────────────────────────────────────────
 # Flat loss over (T*N) samples. Shuffle full batch then split into minibatches.
@@ -59,29 +59,14 @@ _WARMUP_OPT_STEPS     = WARMUP_UPDATES * _OPT_STEPS_PER_UPDATE
 
 network = EndToEndActorCritic(action_dim=2)
 
-# ── Continuous Curriculum ─────────────────────────────────────────────────────
-# Instead of discrete jumps causing domain shock, we continuously interpolate
-# environment parameters based on the highest rolling success rate.
-#
-# Design principles (two fixes applied):
-#
-#  1. SOLVE AMNESIA: every reset now draws scenario_idx ~ Uniform[0, cur_max_scen]
-#     instead of always training on the hardest unlocked scenario. The training
-#     loop passes scenario_idx=-1 and max_scenario=cur_max_scen; generate_scenario
-#     does the random draw internally using jax.random.randint.
-#
-#  2. DECOUPLE DISTANCE FROM GEOMETRY: max_goal_dist is only meaningful for
-#     Stage 0 (Random) — geometry scenarios ignore it entirely. The new anchors
-#     bring max_goal_dist to 9 m at ~75 % success so the Critic is already
-#     calibrated for long paths *before* Stage 1 is unlocked at ~82 %.
-_SUC_ANCHORS  = np.array([0.0, 20.0, 35.0, 50.0, 65.0, 75.0, 82.0, 90.0, 100.0])
-_DIST_ANCHORS = np.array([1.5,  1.5,  3.0,  5.0,  7.5,  9.0,  9.0,  9.0,   9.0])
-_GHOST_ANCHORS= np.array([0.0,  0.0,  0.0,  0.0,  0.1,  0.3,  0.6,  0.9,   1.0])
+_SUC_ANCHORS  = np.array([0.0, 20.0, 35.0, 50.0, 60.0, 70.0, 82.0, 90.0, 100.0])
+_DIST_ANCHORS = np.array([1.5,  1.5,  2.5,  4.0,  6.0,  7.5,  9.0,  9.0,   9.0])
+_GHOST_ANCHORS= np.array([0.0,  0.0,  0.0,  0.0,  0.05, 0.15, 0.4,  0.7,   1.0])
 _ENT_ANCHORS  = np.array([0.02, 0.02, 0.018, 0.015, 0.012, 0.01, 0.008, 0.006, 0.005])
-# Scenarios unlock ONLY after max_goal_dist has reached 9 m (≥ 75 % success).
-# Stage 0 (Random) must be mastered with full 9 m goals before any geometry
-# scenario is introduced, so the Critic's value estimates are already calibrated.
-_SCEN_ANCHORS = np.array([0,    0,    0,    0,    0,    0,    1,    4,     6])
+# Scenarios unlock one at a time, all visible by 60% rolling success.
+# Ghost probability ramps slower to avoid passive-collision feedback loop.
+#   20%→Parallel  35%→Perpend  50%→Circular  60%→Bottleneck+Intersect  70%→ALL(Groups)
+_SCEN_ANCHORS = np.array([0,    1,    2,    3,    5,    6,    6,    6,     6])
 
 def get_continuous_curriculum(suc_pct: float):
     dist  = float(np.interp(suc_pct, _SUC_ANCHORS, _DIST_ANCHORS))
@@ -528,7 +513,9 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
                                        round(pcol_pct, 2), round(tmo_pct, 2)])
                 _log_file.flush()
 
-            if suc_pct > best_suc and n_ep > 0:
+            # Only save when curriculum is past the trivial phase (≥2 scenarios, goal ≥5m).
+            curriculum_mature = cur_max_scen >= 1 and cur_max_dist >= 5.0
+            if suc_pct > best_suc and n_ep > 0 and curriculum_mature:
                 best_suc = suc_pct
                 save_checkpoint(train_state[0], train_state[1], ckpt_path)
     finally:

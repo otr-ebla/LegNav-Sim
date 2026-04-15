@@ -36,7 +36,7 @@ HSFM_DT    = 0.01
 # Terminal rewards (all /10 from original to keep Q-values O(100) not O(1000)).
 # This ensures alpha*log_pi remains a meaningful fraction of the critic signal
 # so the entropy term actually shapes the policy during early training.
-_R_GOAL        =  20.0
+_R_GOAL        =  30.0
 _R_OBS_COL     =  -7.0
 _R_WALL_COL    =  -7.0
 _R_ACTIVE_COL  =  -50.0
@@ -51,7 +51,7 @@ _PROGRESS_COEF =  2.0
 
 # Step penalty — small constant cost per timestep, encourages efficiency.
 # Step penalty — small constant cost per timestep, encourages efficiency.
-_STEP_PEN      =  -0.025   # Drastically increased. Standing still is no longer a safe haven.
+_STEP_PEN      =  -0.075   # Drastically increased. Standing still is no longer a safe haven.
 
 # Smoothness & Rotation penalties (Lowered to unblock exploration)
 _SMOOTH_WEIGHT =   0.08    # Reduced to stop paralyzing the agent's steering
@@ -61,7 +61,7 @@ _COMFORT_DIST  = 1.2   # m — personal space boundary
 _COMFORT_COEF  = 0.015 # base penalty at d=0 (before speed scaling) — /10 from 0.15
 
 _YIELD_DIST    = 1.8   # m — distance to start yielding (wider detection zone)
-_YIELD_COEF    = 3.0   # must dominate progress_coef (2.0) so braking near humans is always preferred
+_YIELD_COEF    = 10   # must dominate progress_coef so braking near humans is always preferred
 
 
 # -------------------

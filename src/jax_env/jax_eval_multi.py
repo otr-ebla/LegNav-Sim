@@ -1,7 +1,7 @@
 """
 jax_eval_multi.py — Universal Interactive Evaluation
 =====================================================
-Loads any PPO / SHAC / SAC / TQC checkpoint via argparse.
+Loads any PPO / SHAC / SAC / TQC / MLP checkpoint via argparse.
 
 Usage:
   # PPO or SHAC (same EndToEndActorCritic architecture, same ckpt format)
@@ -13,6 +13,9 @@ Usage:
 
   # TQC (monolithic actor)
   python3 jax_eval_multi.py --algo tqc  --ckpt checkpoints_tqc/tqc_best.msgpack
+
+  # Vanilla MLP baseline (2×128 MLP, same PPO training loop)
+  python3 jax_eval_multi.py --algo mlp  --ckpt checkpoints_vanilla_ppo/ppo_mlp_best.msgpack
 
 Keys:
   0-6   Lock scenario    7   Random mode
@@ -40,8 +43,9 @@ import flax.serialization
 def _parse_args():
     p = argparse.ArgumentParser(description="Universal JAX Evaluation")
     p.add_argument("--algo",     default="ppo",
-                   choices=["ppo", "shac", "sac", "tqc"],
-                   help="Algorithm whose checkpoint to load.")
+                   choices=["ppo", "shac", "sac", "tqc", "mlp"],
+                   help="Algorithm whose checkpoint to load. "
+                        "'mlp' = Vanilla 2×128 MLP baseline (ppo_mlp_baseline.py).")
     p.add_argument("--ckpt",     default="",
                    help="Path to the checkpoint file (msgpack). "
                         "If empty, a sensible default for the chosen algo is used.")
@@ -253,26 +257,56 @@ def _build_tqc():
     return init_params, load, infer
 
 
+# ── MLP baseline ──────────────────────────────────────────────────────────────
+# Uses VanillaMLPActorCritic from comparison_policies/ppo_mlp_baseline.py.
+# Checkpoint format is identical to PPO (single {"params": ..., "opt_state": ...}
+# msgpack bundle), so the same load/infer helpers work.
+
+def _build_mlp():
+    from comparison_policies.vanilla_mlp_network import VanillaMLPActorCritic
+    from jax_network import scale_action_to_env
+
+    net = VanillaMLPActorCritic(action_dim=ACTION_DIM, hidden_dim=128)
+    rng = jax.random.PRNGKey(0)
+    init_params = net.init(rng, jnp.zeros((1, OBS_SIZE)))["params"]
+
+    def load(path):
+        with open(path, "rb") as f:
+            raw = f.read()
+        bundle = flax.serialization.msgpack_restore(raw)
+        # Accept both bare params dict and {params, opt_state} bundle
+        return bundle.get("params", bundle)
+
+    def infer(params, obs, max_v):
+        mean, _, _ = net.apply({"params": params}, obs[None])
+        return scale_action_to_env(jnp.squeeze(mean, 0), float(max_v))
+
+    return init_params, load, infer, 0
+
+
 # ── Default checkpoint paths ───────────────────────────────────────────────────
 
 _DEFAULT_CKPT = {
-    "ppo":  "checkpoints/ppo_attn_final.msgpack",#"checkpoints/ppo_model_best.msgpack",
+    "ppo":  "checkpoints/ppo_attn_final.msgpack",
     "shac": "checkpoints/shac_best.msgpack",
     "sac":  "checkpoints_sac/sac_best.msgpack",
     "tqc":  "checkpoints_tqc/tqc_best.msgpack",
+    "mlp":  "checkpoints_vanilla_ppo/ppo_mlp_best.msgpack",
 }
 
 # ── Policy factory ─────────────────────────────────────────────────────────────
 
 def build_policy(algo):
     if algo in ("ppo", "shac"):
-        return _build_ppo_shac()   # Restituisce 4 elementi
+        return _build_ppo_shac()    # 4 elementi
     elif algo == "sac":
-        return _build_sac() + (0,) # 3 + 1 = 4 elementi
+        return _build_sac() + (0,)  # 3 + 1 = 4 elementi
     elif algo == "tqc":
-        return _build_tqc() + (0,) # 3 + 1 = 4 elementi
+        return _build_tqc() + (0,)  # 3 + 1 = 4 elementi
+    elif algo == "mlp":
+        return _build_mlp()         # 4 elementi
     else:
-        raise ValueError(f"Unknown algo: {algo}")
+        raise ValueError(f"Unknown algo: {algo}. Valid: ppo, shac, sac, tqc, mlp")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -454,8 +488,14 @@ def draw_panel(surface, fonts, algo, ep, step, ep_ret, max_v, v, w,
         pygame.draw.line(surface, C_DIM, (x0, y+3), (x0+PANEL_W-20, y+3), 1); y += 10
 
     txt(f"─ {algo.upper()} EVAL ─", C_TEXT, "big"); y += 2; sep()
-    scen_name = {0:"Random",1:"Parallel",2:"Perpend",3:"Circular",
-                 4:"Bottleneck",5:"Intersect",6:"Groups"}.get(scen_idx, "?")
+    scen_name = {
+        0: "Random",       1: "Parallel",    2: "Perpend",
+        3: "Circular",     4: "Bottleneck",  5: "Intersect",
+        6: "Groups",
+        # ── test scenarios ──
+        7:  "S-Corridor",  8:  "Conv.Crowds", 9:  "Seq.Rooms",
+        10: "Zigzag CF",   11: "Furn.Maze",   12: "U-Turn",
+    }.get(scen_idx, "?")
     mode_text = "[RANDOM]" if eval_mode == "random" else "[FIXED]"
     leg_mode  = "LEGS" if use_legs else "CYLINDERS"
     txt(f"{mode_text} {leg_mode}", C_DIM, "small")

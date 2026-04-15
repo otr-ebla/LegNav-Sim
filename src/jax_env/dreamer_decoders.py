@@ -79,13 +79,7 @@ def compute_kl_loss(
     posterior_logits: jnp.ndarray,
     free_nats: float = 1.0,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    # apply_unimix returns log((1-alpha)*softmax(logits) + alpha*(1/K)).
-    # Using raw log_softmax here would produce unregularized log-probs: a
-    # near-zero category has log-prob near -inf, and the gradient of the KL
-    # sum w.r.t. that logit is unbounded — the exact NaN explosion Unimix
-    # was designed to prevent. The uniform floor (alpha=0.01) ensures every
-    # log-prob is bounded away from -inf, bounding the gradient magnitude and
-    # protecting the GRU weights that generated these logits.
+
     prior_log_probs     = apply_unimix(prior_logits)
     posterior_log_probs = apply_unimix(posterior_logits)
     # posterior_probs derived from the same regularized distribution so the

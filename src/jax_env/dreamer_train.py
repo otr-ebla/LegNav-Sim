@@ -49,9 +49,6 @@ GAMMA        = 0.99
 LAMBDA_      = 0.95           # renamed from LAMBDA to avoid shadowing Python builtin
 ENTROPY_COEF = 3e-4
 
-# FIX 1: actor/critic grads are zeroed below this step count.
-# At ~960 FPS x 64 envs, 3000 steps ≈ 10s wall time.
-# Watch WM loss: once it stabilises below ~0.4 you can lower this.
 WM_WARMUP_STEPS = 20_000
 
 OBS_DIM    = 662
@@ -126,15 +123,6 @@ def scan_rssm(wm_params: dict, obs_seq: jnp.ndarray,
 # Optimizers
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Optimizers — Adam chained with global-norm gradient clipping.
-# RL losses are non-stationary: a collision spike or sudden goal-reach can
-# produce a loss step that would permanently destroy world-model weights
-# without a norm clip. 100.0 is the standard DreamerV3 clip threshold.
-# ---------------------------------------------------------------------------
-
-# V3: Adaptive Gradient Clipping (AGC) and LaProp
-# V3: Adaptive Gradient Clipping (AGC) and LaProp
 def make_optimizer(lr):
     b1 = 0.9
     b2 = 0.99
@@ -152,11 +140,6 @@ opt_wm     = make_optimizer(LR_WM)
 opt_actor  = make_optimizer(LR_ACTOR)
 opt_critic = make_optimizer(LR_CRITIC)
 
-# ---------------------------------------------------------------------------
-# Monolithic JIT training step
-# FIX 1: step_count added as a JAX scalar so the warmup gate works inside
-#         lax.scan without recompilation (no Python conditional).
-# ---------------------------------------------------------------------------
 
 @jax.jit
 def train_step(rng_key, buffer_state, params, opt_states, step_count, ema_s, slow_critic_params):
@@ -183,9 +166,6 @@ def train_step(rng_key, buffer_state, params, opt_states, step_count, ema_s, slo
     wm_updates, new_wm_opt = opt_wm.update(wm_grads, opt_states['wm'], params['wm'])
     new_wm_params = optax.apply_updates(params['wm'], wm_updates)
 
-    # FIX 1: warmup mask — 0.0 during warmup, 1.0 after.
-    # Multiplying grads by 0.0 stops param updates while letting the Adam
-    # state warm up; no recompilation needed since step_count is a traced value.
     wm_warm_mask = (step_count >= WM_WARMUP_STEPS).astype(jnp.float32)
 
     # ---- B. Actor ----
@@ -320,10 +300,6 @@ def act_step(rng_key, wm_params, actor_params, obs,
 
     return action, h_t, z_t
 
-# ---------------------------------------------------------------------------
-# Chunked training loop (lax.scan over CHUNK_SIZE env steps)
-# FIX 1: step_count threaded through carry so train_step can apply warmup gate.
-# ---------------------------------------------------------------------------
 
 @partial(jax.jit, static_argnames=('chunk_size',))
 def train_loop_chunk(rng_key, buffer_state, params, opt_states,

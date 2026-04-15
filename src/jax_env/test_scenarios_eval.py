@@ -10,10 +10,11 @@ Usage:
   python3 test_scenarios_eval.py --algo sac  --ckpt checkpoints_sac/sac_best.msgpack
   python3 test_scenarios_eval.py --algo tqc  --ckpt checkpoints_tqc/tqc_best.msgpack
   python3 test_scenarios_eval.py --algo ppo  --ckpt checkpoints/ppo_attn_final.msgpack
+  python3 test_scenarios_eval.py --algo mlp  --ckpt checkpoints_vanilla_ppo/ppo_mlp_best.msgpack
 
 Keys:
   7-9, 0(=10), -(=11), =(=12)   Select test scenario
-  R     Reset episode
+  R     Reset episode    →   Skip to random test scenario
   N     Next waypoint (skip to next, for debugging)
   L     Toggle LiDAR     H   Toggle arrows
   B     Toggle body ring S   Cycle FPS
@@ -38,7 +39,7 @@ import flax.serialization
 def _parse_args():
     p = argparse.ArgumentParser(description="Test Scenario Evaluation")
     p.add_argument("--algo", default="sac",
-                   choices=["ppo", "shac", "sac", "tqc"])
+                   choices=["ppo", "shac", "sac", "tqc", "mlp"])
     p.add_argument("--ckpt", default="")
     p.add_argument("--legs",    dest="use_legs", action="store_true",  default=True)
     p.add_argument("--no-legs", dest="use_legs", action="store_false")
@@ -154,7 +155,7 @@ def run_interactive():
     rew_acc = {k: 0.0 for k in _REW_KEYS}
     paused = False; show_lidar = True; show_arrows = True
     show_body = args.ghost_body; show_radar = True
-    fps_idx = 0; fps_speeds = [10, 20, 30]; current_fps = fps_speeds[fps_idx]
+    fps_idx = 0; fps_speeds = [10, 20, 30, 60, 120]; current_fps = fps_speeds[fps_idx]
     banner = ""; banner_t = 0
 
     def get_stats():
@@ -187,12 +188,14 @@ def run_interactive():
         if wp_idx >= len(waypoints):
             return False  # all waypoints done
 
-        # Update goal in the env state to next waypoint
+        # Update goal in the env state to next waypoint.
+        # Reset time_step so the 400-step timeout budget is fresh for each segment.
         next_gx, next_gy = waypoints[wp_idx]
         env_state = stacked_state.env_state
         env_state = env_state.replace(
             goal_x=jnp.float32(next_gx),
             goal_y=jnp.float32(next_gy),
+            time_step=jnp.int32(0),
         )
         stacked_state = stacked_state.replace(env_state=env_state)
 
@@ -252,9 +255,19 @@ def run_interactive():
                 if k == pygame.K_s:
                     fps_idx = (fps_idx+1) % len(fps_speeds)
                     current_fps = fps_speeds[fps_idx]
+                    banner = f"FPS: {current_fps}"; banner_t = 15
                 if k == pygame.K_r:
                     reset_episode()
                     banner = "reset"; banner_t = 15
+                if k == pygame.K_RIGHT:
+                    # Skip → random test scenario (7-12), different from current
+                    _choices = [s for s in range(7, 13) if s != current_scenario]
+                    current_scenario = int(np.random.choice(_choices))
+                    waypoints = TEST_ROBOT_WAYPOINTS[current_scenario]
+                    scen_name = TEST_SCENARIO_NAMES[current_scenario]
+                    fast_reset, fast_step = build_fast_reset(current_scenario)
+                    reset_episode()
+                    banner = f"skip → {scen_name}"; banner_t = 25
                 if k == pygame.K_n:
                     # Debug: skip to next waypoint
                     if advance_waypoint():
@@ -354,6 +367,12 @@ def run_interactive():
                 ep_hist.append((ep_reward, 0.0, float(col and not pcol), float(tmo), float(pcol)))
 
             ep += 1
+            # After every episode (success or failure) jump to a random test scenario
+            _choices = [s for s in range(7, 13) if s != current_scenario]
+            current_scenario = int(np.random.choice(_choices))
+            waypoints = TEST_ROBOT_WAYPOINTS[current_scenario]
+            scen_name = TEST_SCENARIO_NAMES[current_scenario]
+            fast_reset, fast_step = build_fast_reset(current_scenario)
             reset_episode()
 
 
@@ -416,7 +435,8 @@ def run_headless():
                         col = bool(info["collision"])
 
                         if goal and wp_idx + 1 < len(waypoints):
-                            # Advance to next waypoint
+                            # Advance to next waypoint.
+                            # Reset time_step so the 400-step budget is fresh per segment.
                             wp_idx += 1
                             total_wp_completed += 1
                             next_gx, next_gy = waypoints[wp_idx]
@@ -424,6 +444,7 @@ def run_headless():
                             env_state = env_state.replace(
                                 goal_x=jnp.float32(next_gx),
                                 goal_y=jnp.float32(next_gy),
+                                time_step=jnp.int32(0),
                             )
                             stacked_state = stacked_state.replace(env_state=env_state)
                             # Recompute obs with new goal

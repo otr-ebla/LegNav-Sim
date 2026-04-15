@@ -24,7 +24,8 @@ def _verify_gpu():
         raise RuntimeError(
             f"No CUDA GPU found. All devices: {jax.devices()}."
         )
-    print(f"GPU verified: {cuda_devices}")
+    physical = os.environ.get("CUDA_VISIBLE_DEVICES", "all")
+    print(f"GPU verified: {cuda_devices}  (physical GPU(s): {physical})")
     return cuda_devices[0]
 
 GPU_DEVICE = _verify_gpu()

@@ -1,5 +1,16 @@
 import os
+import sys
 import csv
+
+# ── GPU selection — must happen BEFORE import jax ────────────────────────────
+# JAX reads CUDA_VISIBLE_DEVICES at import time, so we parse --gpu here
+# with a minimal parser rather than relying on argparse later.
+import argparse as _ap
+_pre = _ap.ArgumentParser(add_help=False)
+_pre.add_argument("--gpu", type=int, default=None)
+_pre_args, _ = _pre.parse_known_args()
+if _pre_args.gpu is not None:
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(_pre_args.gpu)
 
 # Use setdefault so an orchestrator script (or the user's shell) can pre-set
 # these before importing this module without being overwritten.
@@ -29,7 +40,7 @@ from jax_wrappers import make_stacked_env, make_autoreset_env
 OBS_SIZE       = 662
 ACTION_DIM     = 2
 N_ENVS         = 2048
-BUFFER_CAP     = 500_000
+BUFFER_CAP     = 1_000_000  # 1M — keeps a mix of easy/hard experiences longer
 BATCH_SIZE     = 512
 G_UPDATES      = 20
 WARMUP_STEPS   = 10_000
@@ -65,7 +76,8 @@ def _check_gpu():
     if not devs:
         raise RuntimeError("No CUDA devices found for TQC training.")
     target_device = devs[0]
-    print(f"TQC pinned to: {target_device}  (CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES','')})")
+    physical = os.environ.get("CUDA_VISIBLE_DEVICES", "all")
+    print(f"TQC pinned to: JAX device {target_device}  →  physical GPU {physical}")
     return target_device
 
 target_gpu = _check_gpu()
@@ -328,8 +340,10 @@ def collect_episode_outcomes(rewards, dones, goal_reached, collision, passive_co
     )
     return ep_rets.ravel(), ep_suc.ravel(), ep_col.ravel(), ep_pcol.ravel(), ep_tmo.ravel(), ep_msk.ravel()
 
-def save_checkpoint(sep, tsep, ap, cp, tp, eos, aos, cos, la, laos, step):
+def save_checkpoint(sep, tsep, ap, cp, tp, eos, aos, cos, la, laos, step,
+                    filepath=None):
     os.makedirs(CKPT_DIR, exist_ok=True)
+    path = filepath or CKPT_PATH
     bundle = {
         "enc_params":        jax.device_get(sep),
         "target_enc_params": jax.device_get(tsep),
@@ -343,8 +357,8 @@ def save_checkpoint(sep, tsep, ap, cp, tp, eos, aos, cos, la, laos, step):
         "alpha_opt_state":   jax.device_get(laos),
         "step":              int(step),
     }
-    with open(CKPT_PATH, "wb") as f: f.write(flax.serialization.to_bytes(bundle))
-    print(f"  TQC checkpoint -> {CKPT_PATH}  (step {step})")
+    with open(path, "wb") as f: f.write(flax.serialization.to_bytes(bundle))
+    print(f"  TQC checkpoint -> {path}  (step {step})")
 
 def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     """Run TQC training for a fixed env-step budget.
@@ -427,6 +441,9 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
            f"{'Time':>8} | {'Dist':>5} {'Ghost':>5} {'Scen':>4}")
     print(hdr); print("─" * len(hdr))
 
+    PRINT_EVERY_CHUNKS = 5   # print every 5th chunk (1/5 of previous frequency)
+    chunk_idx = 0
+
     t_start = time.time()
 
     _LOG_PATH = "checkpoints_tqc/tqc_training_log.csv"
@@ -475,10 +492,12 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
         m, s = divmod(rem, 60)
         time_str = f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
 
-        print(f"{n_updates:>7d} | {total_steps:>10,} | {mean_ret:>7.1f} | "
-              f"{suc_pct:>4.1f}% {col_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% | "
-              f"{m_crit:>7.4f} {m_act:>7.4f} {m_alph:>6.4f} {m_lpi:>6.3f} {m_qm:>7.3f} | "
-              f"{fps:>7,.0f} | {time_str:>8} | {cur_max_dist:>4.1f}m {cur_ghost:>4.2f} scen<={cur_max_scen}")
+        chunk_idx += 1
+        if chunk_idx == 1 or chunk_idx % PRINT_EVERY_CHUNKS == 0:
+            print(f"{n_updates:>7d} | {total_steps:>10,} | {mean_ret:>7.1f} | "
+                  f"{suc_pct:>4.1f}% {col_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% | "
+                  f"{m_crit:>7.4f} {m_act:>7.4f} {m_alph:>6.4f} {m_lpi:>6.3f} {m_qm:>7.3f} | "
+                  f"{fps:>7,.0f} | {time_str:>8} | {cur_max_dist:>4.1f}m {cur_ghost:>4.2f} scen<={cur_max_scen}")
         _log_writer.writerow([total_steps, round(mean_ret, 4),
                                round(suc_pct, 4), round(col_pct, 4),
                                round(pcol_pct, 4), round(tmo_pct, 4), n_ep])
@@ -489,7 +508,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
             # Once a level is passed it can never be unlearned: both the
             # tracking signal (`highest_rolling_suc`) and the per-dimension
             # curriculum state are strictly non-decreasing.
-            rolling_suc         = 0.9 * rolling_suc + 0.1 * suc_pct
+            rolling_suc         = 0.90 * rolling_suc + 0.10 * suc_pct
             highest_rolling_suc = max(highest_rolling_suc, rolling_suc)
 
             new_max_dist, new_ghost, _, new_max_scen = get_continuous_curriculum(highest_rolling_suc)
@@ -504,9 +523,16 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
             # Always sample scenario uniformly from [0, cur_max_scen] at each reset.
             cur_scenario = -1
 
-        if suc_pct > best_suc:
+        # Only save when curriculum is past the trivial phase (≥2 scenarios, goal ≥5m).
+        curriculum_mature = cur_max_scen >= 1 and cur_max_dist >= 5.0
+        if suc_pct > best_suc and curriculum_mature:
             best_suc = suc_pct
             save_checkpoint(sep, tsep, ap, cp, tp, eos, aos, cos, la, laos, n_updates)
+
+    # Always save a final checkpoint so training work is never lost
+    save_checkpoint(sep, tsep, ap, cp, tp, eos, aos, cos, la, laos, n_updates,
+                    filepath="checkpoints_tqc/tqc_final.msgpack")
+    print(f"  Final checkpoint -> checkpoints_tqc/tqc_final.msgpack")
 
     print(f"\nTQC done! {(time.time() - t_start)/3600:.2f}h | Best success: {best_suc:.1f}%")
     _log_file.close()

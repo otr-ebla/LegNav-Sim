@@ -1,27 +1,26 @@
 """
 SACjax.py — Soft Actor-Critic (shared-encoder, fused-JIT)
 
-Architecture:
-  - ONE shared encoder (ep) updated through critic loss + scaled actor gradient.
-  - Actor gradients flow into LidarCNN scaled by ACTOR_ENC_GRAD_SCALE=0.1 via
-    custom_vjp — single CNN pass, zero redundant forwards.
-  - Target LidarCNN (tlcp) & target Q branches (tq1p, tq2p) — EMA of online params.
-  - Buffer stores terminal (done & ~timeout) — bootstraps through timeouts.
-  - obs/next_obs stored as float16 — halves VRAM footprint.
-  - extract_max_v called ONCE per collection step; stored in buffer.
-  - 2 encoder passes per update: enc(obs) [trainable] + enc_tgt(next_obs) [frozen].
-  - Actor Q-eval reuses feat from single actor pass — zero redundant CNN forwards.
-
 """
 
 import os
+import sys
 import csv
+
+# ── GPU selection — must happen BEFORE import jax ────────────────────────────
+import argparse as _ap
+_pre = _ap.ArgumentParser(add_help=False)
+_pre.add_argument("--gpu", type=int, default=None)
+_pre_args, _ = _pre.parse_known_args()
+if _pre_args.gpu is not None:
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(_pre_args.gpu)
 
 # Use setdefault so an orchestrator script (or the user's shell) can pre-set
 # these before importing this module without being overwritten.
 os.environ.setdefault("JAX_PLATFORMS",               "cuda")
 os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
 os.environ.setdefault("TF_GPU_ALLOCATOR",            "cuda_malloc_async")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES",        "0")
 
 import time
 import functools
@@ -41,20 +40,20 @@ from jax_wrappers import make_stacked_env, make_autoreset_env
 # ── Constants ─────────────────────────────────────────────────────────────────
 OBS_SIZE       = 662        # 9 (pose) + 5 (state_vec) + 648 (lidar)
 ACTION_DIM     = 2
-N_ENVS         = 2048       # Match TQC: high parallelism keeps replay-ratio (samples drawn /
-                            # samples collected) sane at G_UPDATES=20.
-BUFFER_CAP     = 500_000    # 500K — fits in VRAM (1.32 GB obs float16)
+N_ENVS         = 2048       # High parallelism; each LOG_EVERY chunk = N_ENVS*LOG_EVERY transitions.
+BUFFER_CAP     = 1_000_000  # 1M — keeps a mix of easy/hard experiences longer
 BATCH_SIZE     = 512
-G_UPDATES      = 20         # Gradient updates per collect step
+G_UPDATES      = 50         # Gradient updates per collect step (raised: more learning per data,
+                            # compensates for the shorter total budget).
 WARMUP_STEPS   = 10_000
 GAMMA          = 0.99
 TAU            = 0.005      # Standard SAC target-EMA rate (per gradient update). The previous
                             # "TAU/G_UPDATES" rescaling was incorrect: SAC's tau is defined per
                             # gradient step, not per env step, and dividing it makes the target
-                            # net 20x too slow — the critic never gets a stable bootstrap.
+                            # net 50x too slow — the critic never gets a stable bootstrap.
 LR             = 3e-4
-TARGET_ENTROPY = -2.0       # -|A| — standard auto-alpha target.
-DEFAULT_TOTAL_ENV_STEPS = 20_000_000   # default budget; override via train(total_env_steps=...)
+TARGET_ENTROPY = -1.0       # -|A| — standard auto-alpha target (raised to keep more exploration).
+DEFAULT_TOTAL_ENV_STEPS = 12_000_000   # convergence happens by ~5M; 12M gives curriculum room.
 LOG_EVERY      = 50         # chunks; each chunk = N_ENVS*LOG_EVERY env steps collected
 SAVE_EVERY     = 5000
 MAX_GRAD_NORM  = 10.0
@@ -489,8 +488,10 @@ def collect_episode_outcomes(rewards, dones, goal_reached, collision, passive_co
 
 # ── Checkpoint ────────────────────────────────────────────────────────────────
 def save_checkpoint(sep, tsep, ahp, q1p, q2p, tq1p, tq2p,
-                    eos, ahos, q1os, q2os, la, alo, step):
+                    eos, ahos, q1os, q2os, la, alo, step,
+                    filepath=None):
     os.makedirs(CKPT_DIR, exist_ok=True)
+    path = filepath or CKPT_PATH
     bundle = {
         "enc_params":        jax.device_get(sep),
         "target_enc_params": jax.device_get(tsep),
@@ -507,9 +508,9 @@ def save_checkpoint(sep, tsep, ahp, q1p, q2p, tq1p, tq2p,
         "alpha_opt_state":   jax.device_get(alo),
         "step":              int(step),
     }
-    with open(CKPT_PATH, "wb") as f:
+    with open(path, "wb") as f:
         f.write(flax.serialization.to_bytes(bundle))
-    print(f"  SAC checkpoint -> {CKPT_PATH}  (step {step})")
+    print(f"  SAC checkpoint -> {path}  (step {step})")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -599,7 +600,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     hdr = (f"{'Upd':>7} | {'Steps':>10} | {'EpRet':>7} | "
            f"{'Suc%':>5} {'ACo%':>5} {'PCo%':>5} {'Tmo%':>5} | "
            f"{'CritL':>7} {'ActL':>7} {'Alpha':>6} {'LogPi':>6} {'Qmean':>7} | "
-           f"{'FPS':>7} | {'Time':>8}")
+           f"{'FPS':>7} | {'Time':>8} | {'Dist':>5} {'Scen':>4} {'Gst':>4}")
     print(hdr)
     print("─" * len(hdr))
 
@@ -613,7 +614,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
                            "pcol_pct", "tmo_pct", "n_ep"])
     _log_file.flush()
 
-    # Print every 10th chunk
+    # Print every 10th chunk (budget is now 12M → ~117 chunks total → ~12 log lines)
     PRINT_EVERY_CHUNKS = 10
 
     while total_steps < total_env_steps:
@@ -649,7 +650,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
             # Once a level is passed it can never be unlearned: both the
             # tracking signal (`highest_rolling_suc`) and the per-dimension
             # curriculum state are strictly non-decreasing.
-            rolling_suc         = 0.9 * rolling_suc + 0.1 * suc_pct
+            rolling_suc         = 0.90 * rolling_suc + 0.10 * suc_pct
             highest_rolling_suc = max(highest_rolling_suc, rolling_suc)
 
             new_max_dist, new_ghost, _, new_max_scen = get_continuous_curriculum(highest_rolling_suc)
@@ -684,7 +685,8 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
                 f"{float(all_metrics['log_pi'].mean()):>6.3f} "
                 f"{float(all_metrics['q_mean'].mean()):>7.3f} | "
                 f"{fps:>7,.0f} | "
-                f"{elapsed_str:>8}"
+                f"{elapsed_str:>8} | "
+                f"{cur_max_dist:>5.1f} {cur_max_scen:>4d} {cur_ghost:>4.2f}"
             )
 
         _log_writer.writerow([total_steps, round(mean_ret, 4),
@@ -692,12 +694,20 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
                                round(pcol_pct, 4), round(tmo_pct, 4), n_ep])
         _log_file.flush()
 
+        # Only save when curriculum is past the trivial phase (≥2 scenarios, goal ≥5m).
+        curriculum_mature = cur_max_scen >= 1 and cur_max_dist >= 5.0
         is_better = (suc_pct > best_suc) or (suc_pct == best_suc and mean_ret > best_ret)
-        if is_better and n_ep > 0:
+        if is_better and n_ep > 0 and curriculum_mature:
             best_suc = suc_pct
             best_ret = mean_ret
             save_checkpoint(sep, tsep, ahp, q1p, q2p, tq1p, tq2p,
                             eos, ahos, q1os, q2os, la, alo, n_updates)
+
+    # Always save a final checkpoint so training work is never lost
+    save_checkpoint(sep, tsep, ahp, q1p, q2p, tq1p, tq2p,
+                    eos, ahos, q1os, q2os, la, alo, n_updates,
+                    filepath="checkpoints_sac/sac_final.msgpack")
+    print(f"  Final checkpoint -> checkpoints_sac/sac_final.msgpack")
 
     elapsed = time.time() - t_start
     print(f"\nSAC done! {elapsed/3600:.2f}h | Best success: {best_suc:.1f}%  Best reward: {best_ret:.1f}")
