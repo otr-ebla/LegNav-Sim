@@ -349,34 +349,57 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
 
     # --- 6: STATIC GROUPS ---
     def _static_groups_scen(k):
-        # 6 groups x 4 people = 24 = NUM_PEOPLE
-        N_GROUPS = 6
-        PPL_PER_GROUP = 4
-        k1, k_cx, k_cy, k_offr, k_offa, k_ang = jax.random.split(k, 6)
+        # 4 groups × 6 people = 24 = NUM_PEOPLE.
+        # Group centers are placed in the 4 room quadrants + random jitter so
+        # they are always well-separated regardless of seed.
+        N_GROUPS      = 4
+        PPL_PER_GROUP = 6
+        k1, k_jx, k_jy, k_offr, k_offa, k_ang, k_rob, k_goal = jax.random.split(k, 8)
 
-        rx, ry, rtheta = ROOM_W / 2.0, 1.0, jnp.pi / 2.0
-        gx, gy = ROOM_W / 2.0, ROOM_H - 1.0
         max_v = jax.random.uniform(k1, minval=0.5, maxval=1.5)
         obs_circles = jnp.zeros((NUM_OBS_CIR, 3))
-        obs_boxes = jnp.zeros((NUM_OBS_BOX, 4))
+        obs_boxes   = jnp.zeros((NUM_OBS_BOX, 4))
 
-        # Sample one center per group, spread across the room
-        gc_x = jax.random.uniform(k_cx, (N_GROUPS,), minval=2.0, maxval=ROOM_W - 2.0)
-        gc_y = jax.random.uniform(k_cy, (N_GROUPS,), minval=2.5, maxval=ROOM_H - 2.5)
+        # ── Group centers: one per quadrant + jitter ──────────────────────────
+        # Base centers at quadrant mid-points (3,3), (9,3), (3,9), (9,9).
+        # Jitter ±1.5 m keeps them inside [1.8, 10.2] after clipping.
+        base_qx = jnp.array([3.0, 9.0, 3.0, 9.0])
+        base_qy = jnp.array([3.0, 3.0, 9.0, 9.0])
+        jx = jax.random.uniform(k_jx, (N_GROUPS,), minval=-1.5, maxval=1.5)
+        jy = jax.random.uniform(k_jy, (N_GROUPS,), minval=-1.5, maxval=1.5)
+        gc_x = jnp.clip(base_qx + jx, 1.8, ROOM_W - 1.8)
+        gc_y = jnp.clip(base_qy + jy, 1.8, ROOM_H - 1.8)
 
-        # Tile centers: each center repeated PPL_PER_GROUP times → (NUM_PEOPLE,)
+        # ── Robot & goal: safe-sampled after group centers are known ──────────
+        # Goal is sampled with _batch_sample_safe_pos so it cannot land inside
+        # any group's exclusive zone (radius = off_r_max + people_r + goal_r + margin).
+        # We build 4 temporary obstacle circles at the group centers and pad to
+        # NUM_OBS_CIR=6 with harmless zero-radius circles at the room origin.
+        _GRP_OBS_R = 1.1 + PEOPLE_RADIUS + GOAL_RADIUS + 0.3   # 2.1 m
+        group_circles = jnp.concatenate([
+            jnp.stack([gc_x, gc_y, jnp.full(N_GROUPS, _GRP_OBS_R)], axis=-1),
+            jnp.zeros((NUM_OBS_CIR - N_GROUPS, 3)),
+        ], axis=0)   # (6, 3)
+
+        gx, gy = _batch_sample_safe_pos(
+            k_goal, clearance=GOAL_RADIUS,
+            obs_circles=group_circles, obs_boxes=obs_boxes,
+            min_val=1.0, max_val=ROOM_W - 1.0,
+        )
+
+        rx     = jax.random.uniform(k_rob, minval=1.0, maxval=ROOM_W - 1.0)
+        ry     = jax.random.uniform(k_rob, minval=1.0, maxval=2.5)
+        rtheta = jax.random.uniform(k_rob, minval=0.0, maxval=2 * jnp.pi)
+
+        # ── Per-person positions: ring around group center ────────────────────
+        # Evenly-spaced angles (0°, 60°, 120°, …) + per-group rotation.
         person_cx = jnp.repeat(gc_x, PPL_PER_GROUP)
         person_cy = jnp.repeat(gc_y, PPL_PER_GROUP)
 
-        # Evenly-spaced angles within each group (0°, 90°, 180°, 270°) + random
-        # per-group rotation → guarantees maximum angular separation regardless of
-        # random seed. Radius 0.8–1.1 m → nearest neighbour ≥ r*√2 ≈ 1.1–1.6 m,
-        # well above the 0.8 m body clearance (2 * PEOPLE_RADIUS).
         group_rot = jax.random.uniform(k_offa, (N_GROUPS,), minval=0.0, maxval=2 * jnp.pi)
-        base_angles = jnp.tile(
-            jnp.arange(PPL_PER_GROUP) * (2 * jnp.pi / PPL_PER_GROUP),
-            N_GROUPS
-        )  # [0, π/2, π, 3π/2, 0, π/2, …]
+        base_angles          = jnp.tile(
+            jnp.arange(PPL_PER_GROUP) * (2 * jnp.pi / PPL_PER_GROUP), N_GROUPS
+        )
         group_rot_per_person = jnp.repeat(group_rot, PPL_PER_GROUP)
         off_a = base_angles + group_rot_per_person
 

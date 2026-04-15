@@ -75,7 +75,20 @@ NUM_PEOPLE = 24
 _GHOST_POS = -999.0
 
 
-def build_hsfm_obstacles(obs_boxes):
+_CIRCLE_SIDES = 8   # octagon approximation (fits 2 groups of 4 edges)
+
+
+def build_hsfm_obstacles(obs_boxes, obs_circles):
+    """
+    Build edge-based obstacle array for JHSFM.
+
+    Includes: room walls + rectangular boxes + circular obstacles
+    (approximated as inscribed octagons split into 2 groups of 4 edges each).
+    Unused slots (hw=0 for boxes, r=0 for circles) are NaN-padded so the
+    JHSFM step ignores them instead of producing fictitious origin forces.
+
+    Returns shape (num_groups, 4, 2, 2): all agents share the same array.
+    """
     room_edges = jnp.array([
         [[0.0, 0.0], [ROOM_W, 0.0]],
         [[ROOM_W, 0.0], [ROOM_W, ROOM_H]],
@@ -83,23 +96,40 @@ def build_hsfm_obstacles(obs_boxes):
         [[0.0, ROOM_H], [0.0, 0.0]]
     ])
 
+    def _nan_if_invalid(pts, valid):
+        return jnp.where(valid, pts, jnp.nan)
+
     def box_to_edges(box):
         cx, cy, hw, hh = box
-        valid = jnp.where(hw > 0.0, 1.0, 0.0)
-        p1 = jnp.array([cx - hw, cy - hh]) * valid
-        p2 = jnp.array([cx + hw, cy - hh]) * valid
-        p3 = jnp.array([cx + hw, cy + hh]) * valid
-        p4 = jnp.array([cx - hw, cy + hh]) * valid
-        return jnp.stack([
+        valid = hw > 0.0
+        p1 = jnp.array([cx - hw, cy - hh])
+        p2 = jnp.array([cx + hw, cy - hh])
+        p3 = jnp.array([cx + hw, cy + hh])
+        p4 = jnp.array([cx - hw, cy + hh])
+        edges = jnp.stack([
             jnp.stack([p1, p2]), jnp.stack([p2, p3]),
             jnp.stack([p3, p4]), jnp.stack([p4, p1])
         ])
+        return _nan_if_invalid(edges, valid)
 
-    box_edges = jax.vmap(box_to_edges)(obs_boxes)
-    # Return (num_obs_groups, 4, 2, 2) — NOT tiled per-agent.
-    # hsfm.py's vectorized_single_update uses in_axes obstacles=None so all
-    # agents share the same obstacle array instead of each getting an identical copy.
-    return jnp.concatenate([room_edges[None, ...], box_edges], axis=0)
+    def circle_to_edges(circle):
+        cx, cy, r = circle
+        valid = r > 0.0
+        angles = jnp.linspace(0.0, 2.0 * jnp.pi, _CIRCLE_SIDES, endpoint=False)
+        vx = cx + r * jnp.cos(angles)
+        vy = cy + r * jnp.sin(angles)
+        verts = jnp.stack([vx, vy], axis=-1)                     # (8, 2)
+        nxt   = jnp.roll(verts, shift=-1, axis=0)                # (8, 2)
+        edges = jnp.stack([verts, nxt], axis=1)                  # (8, 2, 2)
+        # Split 8 edges into 2 groups of 4 to match the (4, 2, 2) group shape.
+        edges = edges.reshape(2, 4, 2, 2)
+        return _nan_if_invalid(edges, valid)
+
+    box_edges = jax.vmap(box_to_edges)(obs_boxes)                # (NB, 4, 2, 2)
+    cir_edges = jax.vmap(circle_to_edges)(obs_circles)           # (NC, 2, 4, 2, 2)
+    cir_edges = cir_edges.reshape(-1, 4, 2, 2)                   # (2*NC, 4, 2, 2)
+
+    return jnp.concatenate([room_edges[None, ...], box_edges, cir_edges], axis=0)
 
 
 def reset_env(key: jax.Array, max_goal_dist: float = 3.0, scenario_idx: int = -1,
@@ -171,7 +201,7 @@ def step_env(key, state, action, ghost_robot: bool = True):
 
     # ── 2. JHSFM substeps ─────────────────────────────────────────────────────
     hsfm_params      = get_standard_humans_parameters(NUM_PEOPLE + 1)
-    static_obstacles = build_hsfm_obstacles(state.obs_boxes)
+    static_obstacles = build_hsfm_obstacles(state.obs_boxes, state.obs_circles)
 
     # Build goal arrays for humans using the active waypoint per human.
     idx_h    = state.people[:, 10]
