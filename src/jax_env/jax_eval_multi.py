@@ -43,9 +43,10 @@ import flax.serialization
 def _parse_args():
     p = argparse.ArgumentParser(description="Universal JAX Evaluation")
     p.add_argument("--algo",     default="ppo",
-                   choices=["ppo", "shac", "sac", "tqc", "mlp"],
+                   choices=["ppo", "shac", "sac", "tqc", "mlp", "hsfm"],
                    help="Algorithm whose checkpoint to load. "
-                        "'mlp' = Vanilla 2×128 MLP baseline (ppo_mlp_baseline.py).")
+                        "'mlp' = Vanilla 2×128 MLP baseline (ppo_mlp_baseline.py). "
+                        "'hsfm' = JHSFM model-based planner.")
     p.add_argument("--ckpt",     default="",
                    help="Path to the checkpoint file (msgpack). "
                         "If empty, a sensible default for the chosen algo is used.")
@@ -282,6 +283,22 @@ def _build_mlp():
         return scale_action_to_env(jnp.squeeze(mean, 0), float(max_v))
 
     return init_params, load, infer, 0
+# ── HSFM planner ──────────────────────────────────────────────────────────────
+# Uses HumanPilot from comparison_policies/jhsfm_planner.py.
+# Zero-shot, model-based, no weights needed.
+
+def _build_hsfm():
+    from comparison_policies.jhsfm_planner import HumanPilot
+
+    pilot = HumanPilot(lidar_n_frames=1)
+
+    def load(path):
+        return None
+
+    def infer(params, obs, max_v):
+        return pilot.act(obs)
+
+    return None, load, infer, 0
 
 
 # ── Default checkpoint paths ───────────────────────────────────────────────────
@@ -292,6 +309,7 @@ _DEFAULT_CKPT = {
     "sac":  "checkpoints_sac/sac_best.msgpack",
     "tqc":  "checkpoints_tqc/tqc_best.msgpack",
     "mlp":  "checkpoints_vanilla_ppo/ppo_mlp_best.msgpack",
+    "hsfm": "", # No checkpoint needed
 }
 
 # ── Policy factory ─────────────────────────────────────────────────────────────
@@ -305,8 +323,10 @@ def build_policy(algo):
         return _build_tqc() + (0,)  # 3 + 1 = 4 elementi
     elif algo == "mlp":
         return _build_mlp()         # 4 elementi
+    elif algo == "hsfm":
+        return _build_hsfm()        # 4 elementi
     else:
-        raise ValueError(f"Unknown algo: {algo}. Valid: ppo, shac, sac, tqc, mlp")
+        raise ValueError(f"Unknown algo: {algo}. Valid: ppo, shac, sac, tqc, mlp, hsfm")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
