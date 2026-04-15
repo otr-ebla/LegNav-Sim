@@ -171,11 +171,24 @@ def train_vae(lidar_frames: np.ndarray, epochs: int, rng: jax.Array):
     optimizer = optax.adam(V_LR)
     opt_state = optimizer.init(params)
 
+    N = lidar_frames.shape[0]
+    n_batches = N // V_BATCH
+    valid_N = n_batches * V_BATCH
+    print(f"\n[V] training VAE: {N:,} frames, batch={V_BATCH}, "
+          f"{n_batches} batches/epoch, {epochs} epochs")
+
+    # Trasferimento massivo del dataset pulito in VRAM (rimane IMMOBILE qui)
+    device_data = jnp.asarray(lidar_frames[:valid_N])
+
     @jax.jit
-    def train_epoch(params, opt_state, epoch_data, epoch_rng):
+    def train_epoch(params, opt_state, perm_batches, epoch_rng, dataset):
         def batch_step(carry, step_data):
             p, os_ = carry
-            batch, sample_rng = step_data
+            b_indices, sample_rng = step_data
+            
+            # Estrazione lazy on-the-fly della batch dalla VRAM tramite gli indici
+            batch = dataset[b_indices]
+            
             def loss_fn(p_):
                 recon, z_mean, z_logvar = vae.apply({"params": p_}, batch, sample_rng)
                 recon_loss = jnp.mean(jnp.sum((recon - batch) ** 2, axis=-1))
@@ -188,29 +201,23 @@ def train_vae(lidar_frames: np.ndarray, epochs: int, rng: jax.Array):
             new_p = optax.apply_updates(p, updates)
             return (new_p, new_os), (loss, recon, kl)
         
-        batch_rngs = jax.random.split(epoch_rng, epoch_data.shape[0])
+        batch_rngs = jax.random.split(epoch_rng, perm_batches.shape[0])
         (new_params, new_opt_state), (losses, recons, kls) = jax.lax.scan(
-            batch_step, (params, opt_state), (epoch_data, batch_rngs)
+            batch_step, (params, opt_state), (perm_batches, batch_rngs)
         )
         return new_params, new_opt_state, jnp.mean(losses), jnp.mean(recons), jnp.mean(kls)
 
-    N = lidar_frames.shape[0]
-    n_batches = N // V_BATCH
-    valid_N = n_batches * V_BATCH
-    print(f"\n[V] training VAE: {N:,} frames, batch={V_BATCH}, "
-          f"{n_batches} batches/epoch, {epochs} epochs")
-
-    # Trasferimento massivo del dataset pulito in VRAM (zero overhead interno)
-    device_data = jnp.asarray(lidar_frames[:valid_N])
-
     for epoch in range(epochs):
         rng, perm_rng, epoch_rng = jax.random.split(rng, 3)
+        
+        # Shuffle ESCLUSIVAMENTE degli indici (pochi MB), aggirando il limite VRAM
         perm = jax.random.permutation(perm_rng, valid_N)
-        epoch_data = device_data[perm].reshape(n_batches, V_BATCH, -1)
+        perm_batches = perm.reshape(n_batches, V_BATCH)
         
         t0 = time.time()
+        # Passiamo device_data esplicitamente per evitare l'allocazione come costante JIT
         params, opt_state, loss_val, recon_val, kl_val = train_epoch(
-            params, opt_state, epoch_data, epoch_rng
+            params, opt_state, perm_batches, epoch_rng, device_data
         )
         # Sincronizzazione unica a fine epoca!
         print(f"[V] epoch {epoch+1}/{epochs}  "
@@ -270,14 +277,14 @@ def train_transformer(encoder_params, lidar_seq: np.ndarray,
     device_z = jnp.asarray(z_all)
 
     @jax.jit
-    def train_epoch(params, opt_state, epoch_env_ids, epoch_start_ts):
+    def train_epoch(params, opt_state, epoch_env_ids, epoch_start_ts, dataset_z):
         def batch_step(carry, step_data):
             p, os_ = carry
             e_ids, s_ts = step_data
             
             # Costruzione della batch generata DIRETTAMENTE su GPU
             def get_seq(e, s):
-                return jax.lax.dynamic_slice(device_z, (s, e, 0), (M_SEQ_LEN, 1, Z))[:, 0, :]
+                return jax.lax.dynamic_slice(dataset_z, (s, e, 0), (M_SEQ_LEN, 1, Z))[:, 0, :]
             
             z_batch = jax.vmap(get_seq)(e_ids, s_ts)
             
@@ -313,8 +320,9 @@ def train_transformer(encoder_params, lidar_seq: np.ndarray,
         start_ts = jax.random.randint(start_rng, (n_batches, M_BATCH), 0, starts_per_env)
 
         t0 = time.time()
+        # Passiamo device_z esplicitamente per evitare l'allocazione come costante JIT
         params, opt_state, loss_val = train_epoch(
-            params, opt_state, env_ids, start_ts
+            params, opt_state, env_ids, start_ts, device_z
         )
         # Sincronizzazione unica a fine epoca!
         print(f"[M] epoch {epoch+1}/{epochs}  "
