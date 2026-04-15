@@ -93,7 +93,7 @@ def _build_chunk_runner(vmap_step, pilot_act, max_goal_dist, ghost_prob, max_sce
         def _step(carry, _):
             s, o, r = carry
             r, step_rng = jax.random.split(r)
-            actions = vmap_act(o)
+            actions = vmap_act(s.env_state)
             step_keys = jax.random.split(step_rng, NUM_ENVS)
             next_obs, next_state, _, _, _ = vmap_step(
                 step_keys, s, actions,
@@ -128,7 +128,7 @@ def collect_expert_lidar(total_frames: int, rng: jax.Array) -> np.ndarray:
         env_rng, max_goal_dist=9.0, ghost_prob=0.0
     )
 
-    pilot = HumanPilot(lidar_n_frames=1)
+    pilot = HumanPilot()
     run_chunk = _build_chunk_runner(vmap_step, pilot.act,
                                     max_goal_dist=9.0,
                                     ghost_prob=0.0,

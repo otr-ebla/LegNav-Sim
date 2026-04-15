@@ -290,13 +290,14 @@ def _build_mlp():
 def _build_hsfm():
     from comparison_policies.jhsfm_planner import HumanPilot
 
-    pilot = HumanPilot(lidar_n_frames=1)
+    pilot = HumanPilot()
 
     def load(path):
         return None
 
-    def infer(params, obs, max_v):
-        return pilot.act(obs)
+    def infer(params, obs, max_v_or_state):
+        # We overloaded the 3rd arg to be `state` for hsfm, but `max_v` for everything else
+        return pilot.act(max_v_or_state)
 
     return None, load, infer, 0
 
@@ -716,7 +717,10 @@ def main():
                 pass
 
         # ── Inference (stateless) ─────────────────────────────────────────────
-        env_action = infer_fn(params, obs, stacked_state.env_state.max_v)
+        if args.algo == "hsfm":
+            env_action = infer_fn(params, obs, stacked_state.env_state)
+        else:
+            env_action = infer_fn(params, obs, stacked_state.env_state.max_v)
 
         rng, step_rng = jax.random.split(rng)
         obs, stacked_state, reward, done, info = fast_step(step_rng, stacked_state, env_action)
