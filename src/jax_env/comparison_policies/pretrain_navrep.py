@@ -22,9 +22,15 @@ Usage
 """
 
 import os
-import sys
+import csv
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES",           "0")
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.88")
+os.environ.setdefault("TF_GPU_ALLOCATOR",               "cuda_malloc_async")
+
 import time
 import argparse
+import sys
 
 _THIS_DIR    = os.path.dirname(os.path.abspath(__file__))
 _JAX_ENV_DIR = os.path.dirname(_THIS_DIR)
@@ -34,18 +40,16 @@ for _p in (_JAX_ENV_DIR, _SRC_DIR, _ROOT_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-os.environ.setdefault("CUDA_VISIBLE_DEVICES",           "0")
-os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.88")
-os.environ.setdefault("TF_GPU_ALLOCATOR",               "cuda_malloc_async")
-
 import jax
+jax.config.update("jax_default_device", jax.devices("cuda")[0])
 import jax.numpy as jnp
 import numpy as np
 import optax
 import flax.serialization
 
-from jax_train import init_env_state, NUM_ENVS
-from jax_env import NUM_RAYS as ENV_NUM_RAYS
+from jax_train import NUM_ENVS
+from jax_wrappers import make_stacked_env
+from jax_env import reset_env, step_env, NUM_RAYS as ENV_NUM_RAYS
 from comparison_policies.jhsfm_planner import HumanPilot
 from comparison_policies.navrep_network import (
     VAE, MWrapper, LidarEncoder, Z_DIM, NUM_RAYS, STACK_DIM,
@@ -57,7 +61,7 @@ _STATE_END = 14   # obs[_STATE_END:] = flattened lidar_stack (3×216)
 
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
-CHUNK_LEN          = 256           # env steps per jit-compiled collection chunk
+CHUNK_LEN          = 64           # env steps per jit-compiled collection chunk
 DEFAULT_FRAMES     = 2_000_000     # total single-frame samples to collect
 DEFAULT_V_EPOCHS   = 5
 DEFAULT_M_EPOCHS   = 5
@@ -77,79 +81,77 @@ VM_CKPT   = os.path.join(CKPT_DIR, "navrep_vm.msgpack")
 # 1) Expert rollout collection
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _extract_latest_lidar(obs_chunk: jnp.ndarray) -> jnp.ndarray:
-    """obs_chunk: (T, N, 662) → most-recent lidar frame (T, N, 216)."""
-    return obs_chunk[..., _STATE_END:].reshape(
-        *obs_chunk.shape[:-1], STACK_DIM, NUM_RAYS
-    )[..., -1, :]
-
-
-def _build_chunk_runner(vmap_step, pilot_act, max_goal_dist, ghost_prob, max_scen):
-    """JIT-compile one chunk of CHUNK_LEN env steps with the HumanPilot expert."""
-    vmap_act = jax.vmap(pilot_act)
-
-    @jax.jit
-    def run_chunk(state, obs, rng):
-        def _step(carry, _):
-            s, o, r = carry
-            r, step_rng = jax.random.split(r)
-            actions = vmap_act(s.env_state)
-            step_keys = jax.random.split(step_rng, NUM_ENVS)
-            next_obs, next_state, _, _, _ = vmap_step(
-                step_keys, s, actions,
-                max_goal_dist, jnp.int32(-1), ghost_prob, jnp.int32(max_scen),
-            )
-            return (next_state, next_obs, r), o
-        (fs, fo, _), obs_seq = jax.lax.scan(
-            _step, (state, obs, rng), None, length=CHUNK_LEN
-        )
-        return obs_seq, fs, fo
-    return run_chunk
-
-
-def collect_expert_lidar(total_frames: int, rng: jax.Array) -> np.ndarray:
+def collect_expert_lidar(total_frames: int, start_rng: jax.Array) -> jnp.ndarray:
     """
-    Roll out HumanPilot (JHSFM) and collect most-recent-frame LiDAR
-    as an array of shape (T_total, NUM_ENVS, 216).
-
-    The robot moves toward its goal using the Social Force Model —
-    the same dynamics used for pedestrians in jax_humans.py —
-    producing naturalistic LiDAR trajectories for V/M pretraining.
+    Esegue in un'unica chiamata JIT su GPU la generazione completa del dataset.
+    Niente ritorni a Python, nessun loop For su CPU. Pura velocità.
     """
-    print(f"[collect] target {total_frames:,} frames "
-          f"({total_frames // NUM_ENVS} env-steps across {NUM_ENVS} envs)\n"
-          f"         expert: HumanPilot (JHSFM — SFM toward goal)")
-
-    n_chunks = max(1, (total_frames + NUM_ENVS * CHUNK_LEN - 1)
-                   // (NUM_ENVS * CHUNK_LEN))
-
-    rng, env_rng = jax.random.split(rng)
-    env_obs, env_state, vmap_step = init_env_state(
-        env_rng, max_goal_dist=9.0, ghost_prob=0.0
-    )
-
+    N_STEPS = total_frames // NUM_ENVS
+    
+    # ── 1. Preparazione dell'Esperto e dell'Ambiente ──────────────────────────
     pilot = HumanPilot()
-    run_chunk = _build_chunk_runner(vmap_step, pilot.act,
-                                    max_goal_dist=9.0,
-                                    ghost_prob=0.0,
-                                    max_scen=12)
+    vmap_act = jax.vmap(pilot.act)
 
-    buffer = []
+    bound_reset = lambda key, max_goal_dist, scenario_idx, ghost_prob: \
+        reset_env(key, max_goal_dist, scenario_idx=scenario_idx, ghost_prob=ghost_prob)
+    
+    rs, ss = make_stacked_env(bound_reset, step_env, stack_dim=3)
+    vmap_reset = jax.vmap(rs, in_axes=(0, None, 0, None))
+    vmap_step  = jax.vmap(ss)
+
+    # ── 2. Il Grafo Monolitico (100% GPU) ─────────────────────────────────────
+    @jax.jit
+    def collect_all_data_gpu(rng):
+        rng_reset, rng_scan = jax.random.split(rng)
+        env_rngs = jax.random.split(rng_reset, NUM_ENVS)
+        
+        # FORZATURA: Solo scenari aperti (0-6) per evitare che JHSFM si blocchi nei muri!
+        scenarios = jax.random.randint(rng_reset, (NUM_ENVS,), 0, 7)
+        obs, stacked_state = vmap_reset(env_rngs, 9.0, scenarios, 0.0)
+
+        def step_fn(carry, step_rng):
+            current_obs, current_state = carry
+            
+            # Inferenza dell'esperto (tutto su GPU)
+            actions = vmap_act(current_state.env_state)
+            
+            # Step dell'ambiente
+            step_rngs = jax.random.split(step_rng, NUM_ENVS)
+            next_obs, next_state, reward, done, info = vmap_step(step_rngs, current_state, actions)
+            
+            # Estrazione precisa del LiDAR (salviamo solo i 216 raggi per non esplodere la RAM)
+            # Nel layout a 662D, l'ultimo frame LiDAR occupa esattamente gli ultimi 216 indici
+            lidar_frame = next_obs[:, -216:]
+            
+            return (next_obs, next_state), lidar_frame
+
+        step_rngs = jax.random.split(rng_scan, N_STEPS)
+        
+        # Un singolo loop JAX che gira N_STEPS volte senza MAI parlare con Python
+        _, lidar_history = jax.lax.scan(step_fn, (obs, stacked_state), step_rngs)
+        
+        return lidar_history  # Shape: (N_STEPS, NUM_ENVS, 216)
+
+    # ── 3. Esecuzione ─────────────────────────────────────────────────────────
+    print(f"\n[collect] target {total_frames:,} frames ({N_STEPS} env-steps)")
+    print(f"          esperto: HumanPilot (JHSFM) - Avvio generazione 100% su GPU...")
     t0 = time.time()
-    for ci in range(n_chunks):
-        rng, chunk_rng = jax.random.split(rng)
-        obs_seq, env_state, env_obs = run_chunk(env_state, env_obs, chunk_rng)
-        lidar = np.asarray(jax.device_get(_extract_latest_lidar(obs_seq)))
-        buffer.append(lidar)
-        elapsed = time.time() - t0
-        done = (ci + 1) * CHUNK_LEN * NUM_ENVS
-        print(f"[collect] chunk {ci+1}/{n_chunks}  frames={done:,}  "
-              f"fps={int(done/elapsed):,}")
-
-    data = np.concatenate(buffer, axis=0)    # (T_total, N, 216)
-    print(f"[collect] done → shape {data.shape}, "
-          f"dtype {data.dtype}, size {data.nbytes/1e6:.1f} MB")
-    return data
+    
+    # Esegue il calcolo e lo mantiene direttamente sulla memoria VRAM
+    lidar_frames_gpu = collect_all_data_gpu(start_rng)
+    
+    # Sincronizzazione per misurare il tempo effettivo
+    jax.block_until_ready(lidar_frames_gpu)
+    
+    print(f"[collect] Completato in {time.time() - t0:.1f} secondi. Boom.")
+    
+    # 1. Per il VAE (Modulo V) serve un array 2D piatto: (N_totali, 216)
+    lidar_frames = lidar_frames_gpu.reshape(-1, 216)
+    
+    # 2. Per il Transformer (Modulo M) serve l'array 3D sequenziale: (Tempo, Ambienti, 216)
+    lidar_seq = lidar_frames_gpu
+    
+    return lidar_frames, lidar_seq
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -170,42 +172,51 @@ def train_vae(lidar_frames: np.ndarray, epochs: int, rng: jax.Array):
     opt_state = optimizer.init(params)
 
     @jax.jit
-    def train_step(params, opt_state, batch, rng):
-        def loss_fn(p):
-            recon, z_mean, z_logvar = vae.apply({"params": p}, batch, rng)
-            recon_loss = jnp.mean(jnp.sum((recon - batch) ** 2, axis=-1))
-            kl = -0.5 * jnp.mean(jnp.sum(
-                1 + z_logvar - z_mean ** 2 - jnp.exp(z_logvar), axis=-1
-            ))
-            return recon_loss + KL_BETA * kl, (recon_loss, kl)
-        (loss, (recon, kl)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
-        updates, opt_state = optimizer.update(grads, opt_state, params)
-        return optax.apply_updates(params, updates), opt_state, loss, recon, kl
+    def train_epoch(params, opt_state, epoch_data, epoch_rng):
+        def batch_step(carry, step_data):
+            p, os_ = carry
+            batch, sample_rng = step_data
+            def loss_fn(p_):
+                recon, z_mean, z_logvar = vae.apply({"params": p_}, batch, sample_rng)
+                recon_loss = jnp.mean(jnp.sum((recon - batch) ** 2, axis=-1))
+                kl = -0.5 * jnp.mean(jnp.sum(
+                    1 + z_logvar - z_mean ** 2 - jnp.exp(z_logvar), axis=-1
+                ))
+                return recon_loss + KL_BETA * kl, (recon_loss, kl)
+            (loss, (recon, kl)), grads = jax.value_and_grad(loss_fn, has_aux=True)(p)
+            updates, new_os = optimizer.update(grads, os_, p)
+            new_p = optax.apply_updates(p, updates)
+            return (new_p, new_os), (loss, recon, kl)
+        
+        batch_rngs = jax.random.split(epoch_rng, epoch_data.shape[0])
+        (new_params, new_opt_state), (losses, recons, kls) = jax.lax.scan(
+            batch_step, (params, opt_state), (epoch_data, batch_rngs)
+        )
+        return new_params, new_opt_state, jnp.mean(losses), jnp.mean(recons), jnp.mean(kls)
 
     N = lidar_frames.shape[0]
     n_batches = N // V_BATCH
+    valid_N = n_batches * V_BATCH
     print(f"\n[V] training VAE: {N:,} frames, batch={V_BATCH}, "
           f"{n_batches} batches/epoch, {epochs} epochs")
 
+    # Trasferimento massivo del dataset pulito in VRAM (zero overhead interno)
+    device_data = jnp.asarray(lidar_frames[:valid_N])
+
     for epoch in range(epochs):
-        rng, perm_rng = jax.random.split(rng)
-        perm = np.asarray(jax.random.permutation(perm_rng, N))
-        shuffled = lidar_frames[perm]
+        rng, perm_rng, epoch_rng = jax.random.split(rng, 3)
+        perm = jax.random.permutation(perm_rng, valid_N)
+        epoch_data = device_data[perm].reshape(n_batches, V_BATCH, -1)
+        
         t0 = time.time()
-        sum_loss = sum_recon = sum_kl = 0.0
-        for bi in range(n_batches):
-            batch = jnp.asarray(shuffled[bi*V_BATCH:(bi+1)*V_BATCH])
-            rng, sample_rng = jax.random.split(rng)
-            params, opt_state, loss, recon, kl = train_step(
-                params, opt_state, batch, sample_rng
-            )
-            sum_loss  += float(loss)
-            sum_recon += float(recon)
-            sum_kl    += float(kl)
+        params, opt_state, loss_val, recon_val, kl_val = train_epoch(
+            params, opt_state, epoch_data, epoch_rng
+        )
+        # Sincronizzazione unica a fine epoca!
         print(f"[V] epoch {epoch+1}/{epochs}  "
-              f"loss={sum_loss/n_batches:.4f}  "
-              f"recon={sum_recon/n_batches:.4f}  "
-              f"kl={sum_kl/n_batches:.4f}  "
+              f"loss={float(loss_val):.4f}  "
+              f"recon={float(recon_val):.4f}  "
+              f"kl={float(kl_val):.4f}  "
               f"({time.time()-t0:.1f}s)")
 
     return params["encoder"]
@@ -255,16 +266,36 @@ def train_transformer(encoder_params, lidar_seq: np.ndarray,
     optimizer = optax.adam(M_LR)
     opt_state = optimizer.init(params)
 
+    # Manteniamo l'intera sequenza latente nella VRAM per indicizzazione ad alta velocità
+    device_z = jnp.asarray(z_all)
+
     @jax.jit
-    def train_step(params, opt_state, z_batch):
-        def loss_fn(p):
-            next_z, _ = m_model.apply({"params": p}, z_batch)
-            pred   = next_z[:, :-1, :]
-            target = z_batch[:, 1:, :]
-            return jnp.mean(jnp.sum((pred - target) ** 2, axis=-1))
-        loss, grads = jax.value_and_grad(loss_fn)(params)
-        updates, opt_state = optimizer.update(grads, opt_state, params)
-        return optax.apply_updates(params, updates), opt_state, loss
+    def train_epoch(params, opt_state, epoch_env_ids, epoch_start_ts):
+        def batch_step(carry, step_data):
+            p, os_ = carry
+            e_ids, s_ts = step_data
+            
+            # Costruzione della batch generata DIRETTAMENTE su GPU
+            def get_seq(e, s):
+                return jax.lax.dynamic_slice(device_z, (s, e, 0), (M_SEQ_LEN, 1, Z))[:, 0, :]
+            
+            z_batch = jax.vmap(get_seq)(e_ids, s_ts)
+            
+            def loss_fn(p_):
+                next_z, _ = m_model.apply({"params": p_}, z_batch)
+                pred   = next_z[:, :-1, :]
+                target = z_batch[:, 1:, :]
+                return jnp.mean(jnp.sum((pred - target) ** 2, axis=-1))
+                
+            loss, grads = jax.value_and_grad(loss_fn)(p)
+            updates, new_os = optimizer.update(grads, os_, p)
+            new_p = optax.apply_updates(p, updates)
+            return (new_p, new_os), loss
+
+        (new_params, new_opt_state), losses = jax.lax.scan(
+            batch_step, (params, opt_state), (epoch_env_ids, epoch_start_ts)
+        )
+        return new_params, new_opt_state, jnp.mean(losses)
 
     # Sample subsequences: pick (env_idx, start_t) pairs.
     starts_per_env = T - M_SEQ_LEN
@@ -275,27 +306,19 @@ def train_transformer(encoder_params, lidar_seq: np.ndarray,
           f"subseq_len={M_SEQ_LEN}  batch={M_BATCH}  "
           f"{n_batches} batches/epoch, {epochs} epochs")
 
-    z_host = z_all  # keep on host, pull slices as needed
-
     for epoch in range(epochs):
         rng, env_rng, start_rng = jax.random.split(rng, 3)
-        env_ids  = np.asarray(jax.random.randint(env_rng, (n_batches * M_BATCH,), 0, N))
-        start_ts = np.asarray(jax.random.randint(start_rng, (n_batches * M_BATCH,), 0, starts_per_env))
+        # JAX genera in modo nativo su GPU senza blocchi numpy
+        env_ids  = jax.random.randint(env_rng, (n_batches, M_BATCH), 0, N)
+        start_ts = jax.random.randint(start_rng, (n_batches, M_BATCH), 0, starts_per_env)
 
         t0 = time.time()
-        sum_loss = 0.0
-        for bi in range(n_batches):
-            idx_e = env_ids[bi*M_BATCH:(bi+1)*M_BATCH]
-            idx_s = start_ts[bi*M_BATCH:(bi+1)*M_BATCH]
-            # Gather (M_BATCH, M_SEQ_LEN, Z) subsequences
-            batch = np.stack(
-                [z_host[s:s+M_SEQ_LEN, e] for s, e in zip(idx_s, idx_e)],
-                axis=0,
-            )
-            params, opt_state, loss = train_step(params, opt_state, jnp.asarray(batch))
-            sum_loss += float(loss)
+        params, opt_state, loss_val = train_epoch(
+            params, opt_state, env_ids, start_ts
+        )
+        # Sincronizzazione unica a fine epoca!
         print(f"[M] epoch {epoch+1}/{epochs}  "
-              f"mse={sum_loss/n_batches:.5f}  "
+              f"mse={float(loss_val):.5f}  "
               f"({time.time()-t0:.1f}s)")
 
     return params["M"]
@@ -339,9 +362,7 @@ def main():
     rng = jax.random.PRNGKey(args.seed)
     rng, coll_rng, v_rng, m_rng = jax.random.split(rng, 4)
 
-    lidar_seq = collect_expert_lidar(args.frames, coll_rng)   # (T, N, 216)
-    T, N, _   = lidar_seq.shape
-    flat_frames = lidar_seq.reshape(T * N, NUM_RAYS).astype(np.float32)
+    flat_frames, lidar_seq = collect_expert_lidar(args.frames, coll_rng)
 
     enc_params = train_vae(flat_frames, args.v_epochs, v_rng)
     m_params   = train_transformer(enc_params, lidar_seq, args.m_epochs, m_rng)

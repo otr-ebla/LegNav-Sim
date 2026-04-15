@@ -31,7 +31,7 @@ def _verify_gpu():
 GPU_DEVICE = _verify_gpu()
 
 # Config
-NUM_ENVS      = 512
+NUM_ENVS      = 1024
 ROLLOUT_STEPS = 128
 OBS_SIZE      = 3 * 3 + 5 + 216 * 3    # 662
 
