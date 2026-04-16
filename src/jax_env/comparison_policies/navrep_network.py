@@ -41,6 +41,13 @@ Z_DIM       = 32
 H_DIM       = 64
 STATE_R_DIM = 14
 
+# Dimensionality of the frozen V+M feature vector fed to the controller
+FEAT_DIM = Z_DIM + H_DIM + STATE_R_DIM   # 32 + 64 + 14 = 110
+
+# Keys in the flat params dict that belong to V (encoder) or M (Transformer).
+# Everything else belongs to controller C.
+_VM_KEYS = frozenset({"encoder", "M"})
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Module V — VAE
@@ -251,3 +258,90 @@ class NavRepActorCritic(nn.Module):
         value = jnp.squeeze(value, axis=-1)
 
         return mean, logstd, value
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Controller-only module (C) — same Dense structure, same Flax param names
+# ══════════════════════════════════════════════════════════════════════════════
+
+class NavRepControllerOnly(nn.Module):
+    """Controller C operating on pre-extracted V+M features (FEAT_DIM = 110).
+
+    Parameter names match the Dense_0..Dense_5 / log_std entries that Flax
+    generates inside NavRepActorCritic, so you can pass the controller subset
+    of the full params dict directly:
+
+        ctrl_params = {k: v for k, v in params.items() if k not in _VM_KEYS}
+        mean, logstd, value = controller_only.apply({"params": ctrl_params}, feat)
+    """
+    action_dim: int = 2
+    hidden_dim: int = 64
+
+    @nn.compact
+    def __call__(self, feat: jnp.ndarray):
+        # Policy head — Dense_0, Dense_1, Dense_2
+        pi = nn.tanh(nn.Dense(self.hidden_dim,
+                              kernel_init=orthogonal(np.sqrt(2)),
+                              bias_init=constant(0.0))(feat))
+        pi = nn.tanh(nn.Dense(self.hidden_dim,
+                              kernel_init=orthogonal(np.sqrt(2)),
+                              bias_init=constant(0.0))(pi))
+        mean = nn.Dense(self.action_dim,
+                        kernel_init=orthogonal(0.01),
+                        bias_init=constant(0.0))(pi)
+
+        raw_logstd = self.param("log_std", constant(-1.0), (self.action_dim,))
+        logstd = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (
+            jnp.tanh(raw_logstd) + 1.0
+        )
+        logstd = jnp.broadcast_to(logstd, mean.shape)
+
+        # Value head — Dense_3, Dense_4, Dense_5
+        vf = nn.tanh(nn.Dense(self.hidden_dim,
+                              kernel_init=orthogonal(np.sqrt(2)),
+                              bias_init=constant(0.0))(feat))
+        vf = nn.tanh(nn.Dense(self.hidden_dim,
+                              kernel_init=orthogonal(np.sqrt(2)),
+                              bias_init=constant(0.0))(vf))
+        value = nn.Dense(1,
+                         kernel_init=orthogonal(1.0),
+                         bias_init=constant(0.0))(vf)
+        return mean, logstd, jnp.squeeze(value, axis=-1)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Feature extractor — runs frozen V+M once, returns feat for controller C
+# ══════════════════════════════════════════════════════════════════════════════
+
+def navrep_extract_features(params: dict, obs: jnp.ndarray) -> jnp.ndarray:
+    """Run frozen V+M on `obs`, return concatenated [z_t, h_t, state_r].
+
+    Args:
+        params: full NavRepActorCritic params (must contain "encoder" and "M").
+        obs:    (..., OBS_SIZE) observation array.
+
+    Returns:
+        feat: (..., FEAT_DIM=110) — stop_gradient already applied to z_t / h_t.
+    """
+    batch_shape = obs.shape[:-1]
+    pose_flat   = obs[..., :_POSE_STACK_END]            # (..., 9)
+    state_vec   = obs[..., _POSE_STACK_END:_STATE_END]  # (..., 5)
+    lidar_flat  = obs[..., _STATE_END:]                 # (..., 3*216)
+    lidar_stack = lidar_flat.reshape(*batch_shape, STACK_DIM, NUM_RAYS)
+
+    # V — encode each of the 3 stacked frames
+    z_mean, _ = LidarEncoder(z_dim=Z_DIM).apply(
+        {"params": params["encoder"]}, lidar_stack
+    )                                                   # (..., 3, Z_DIM)
+
+    # M — causal Transformer over z sequence
+    _, h_seq = TransformerM(z_dim=Z_DIM).apply(
+        {"params": params["M"]}, z_mean
+    )                                                   # (..., 3, H_DIM)
+
+    # Most-recent latent / hidden state, frozen
+    z_t     = jax.lax.stop_gradient(z_mean[..., -1, :])   # (..., 32)
+    h_t     = jax.lax.stop_gradient(h_seq[...,  -1, :])   # (..., 64)
+    state_r = jnp.concatenate([pose_flat, state_vec], axis=-1)  # (..., 14)
+
+    return jnp.concatenate([z_t, h_t, state_r], axis=-1)  # (..., 110)

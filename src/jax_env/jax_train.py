@@ -68,7 +68,7 @@ def rebuild_vmap_step(ghost_prob: float):
     cache_key   = ghost_robot
 
     reset_stacked, step_stacked = make_stacked_env(
-        reset_env, step_env, stack_dim=3, ghost_prob=ghost_prob
+        reset_env, step_env, stack_dim=3
     )
 
     _VMAP_STEP_CACHE.clear()

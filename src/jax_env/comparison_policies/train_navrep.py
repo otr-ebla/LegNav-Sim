@@ -51,6 +51,12 @@ import numpy as np
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
+# Use TF32 (tensor-float32) for matmuls — free ~2× throughput on Ampere+.
+jax.config.update("jax_default_matmul_precision", "tensorfloat32")
+
+# Persistent XLA compilation cache — avoids full recompile on every restart.
+jax.config.update("jax_compilation_cache_dir", "/tmp/jax_navrep_cache")
+
 # ── Shared infrastructure (identical to ppo_mlp_baseline.py) ──────────────────
 from jax_network import squash_corrected_log_prob, LOG_STD_MIN, LOG_STD_MAX
 from jax_train import (
@@ -65,7 +71,13 @@ from jax_ppo import (
     compute_gae,
     _SUC_ANCHORS, _DIST_ANCHORS, _GHOST_ANCHORS, _ENT_ANCHORS, _SCEN_ANCHORS,
 )
-from comparison_policies.navrep_network import NavRepActorCritic
+from comparison_policies.navrep_network import (
+    NavRepActorCritic,
+    NavRepControllerOnly,
+    navrep_extract_features,
+    _VM_KEYS,
+    FEAT_DIM,
+)
 
 # ── Hyperparameters (identical to ppo_mlp_baseline.py) ────────────────────────
 GAMMA          = 0.99
@@ -96,8 +108,10 @@ CKPT_FINAL = os.path.join(CKPT_DIR, "navrep_final.msgpack")
 VM_CKPT    = os.path.join(CKPT_DIR, "navrep_vm.msgpack")
 LOG_PATH   = os.path.join(CKPT_DIR, "navrep_training_log.csv")
 
-# Module-level network + optimizer
-network   = NavRepActorCritic(action_dim=2, hidden_dim=64)
+# Module-level network instances
+network         = NavRepActorCritic(action_dim=2, hidden_dim=64)
+controller_only = NavRepControllerOnly(action_dim=2, hidden_dim=64)
+
 scheduler = None
 optimizer = None
 
@@ -117,9 +131,14 @@ def _load_vm_into(params, vm_path=VM_CKPT):
 # ── PPO loss (same logic as ppo_mlp_baseline.py, uses local `network`) ────────
 
 @jax.jit
-def ppo_loss_fn(params, obs_mb, actions_mb, advantages_mb, returns_mb,
+def ppo_loss_fn(ctrl_params, feat_mb, actions_mb, advantages_mb, returns_mb,
                 old_log_probs, max_v_mb, entropy_coef):
-    mean, logstd, values = network.apply({"params": params}, obs_mb)
+    """PPO loss operating on pre-extracted V+M features.
+
+    Gradients flow only through ctrl_params (Dense_0..5 + log_std).
+    V and M are not touched — features are already frozen upstream.
+    """
+    mean, logstd, values = controller_only.apply({"params": ctrl_params}, feat_mb)
 
     log_prob    = squash_corrected_log_prob(actions_mb, mean, logstd, max_v_mb)
     ratio       = jnp.exp(log_prob - old_log_probs)
@@ -138,44 +157,18 @@ def ppo_loss_fn(params, obs_mb, actions_mb, advantages_mb, returns_mb,
 
 
 @jax.jit
-def ppo_update_epoch(carry, perm):
-    params, opt_state, obs_flat, actions_flat, adv_flat, ret_flat, \
-        old_lp_flat, max_v_flat, entropy_coef = carry
-
-    obs_p     = obs_flat[perm]
-    actions_p = actions_flat[perm]
-    adv_p     = adv_flat[perm]
-    ret_p     = ret_flat[perm]
-    old_lp_p  = old_lp_flat[perm]
-    max_v_p   = max_v_flat[perm]
-
-    def _mb_step(mb_carry, mb_i):
-        p, os_ = mb_carry
-        s = mb_i * MINI_BATCH_SIZE
-        mb_obs     = jax.lax.dynamic_slice_in_dim(obs_p,     s, MINI_BATCH_SIZE, axis=0)
-        mb_actions = jax.lax.dynamic_slice_in_dim(actions_p, s, MINI_BATCH_SIZE, axis=0)
-        mb_adv     = jax.lax.dynamic_slice_in_dim(adv_p,     s, MINI_BATCH_SIZE, axis=0)
-        mb_ret     = jax.lax.dynamic_slice_in_dim(ret_p,     s, MINI_BATCH_SIZE, axis=0)
-        mb_old_lp  = jax.lax.dynamic_slice_in_dim(old_lp_p,  s, MINI_BATCH_SIZE, axis=0)
-        mb_max_v   = jax.lax.dynamic_slice_in_dim(max_v_p,   s, MINI_BATCH_SIZE, axis=0)
-        (loss, aux), grads = jax.value_and_grad(ppo_loss_fn, has_aux=True)(
-            p, mb_obs, mb_actions, mb_adv, mb_ret, mb_old_lp, mb_max_v, entropy_coef
-        )
-        updates, new_os = optimizer.update(grads, os_, p)
-        return (optax.apply_updates(p, updates), new_os), (loss, aux)
-
-    (new_p, new_os), (losses, auxes) = jax.lax.scan(
-        _mb_step, (params, opt_state), jnp.arange(N_MINIBATCHES),
-    )
-    new_carry = (new_p, new_os, obs_p, actions_p, adv_p, ret_p, old_lp_p, max_v_p, entropy_coef)
-    return new_carry, (losses, auxes)
-
-
-@jax.jit
 def run_ppo_updates(train_state, obs_seq, actions_seq, adv_seq, ret_seq,
                     old_lp_seq, max_v_seq, rng_key, entropy_coef):
-    params, opt_state = train_state
-    TN           = BATCH_SIZE
+    """Run PPO_EPOCHS × N_MINIBATCHES gradient steps.
+
+    Key optimisation: V+M features are extracted ONCE for the whole batch
+    before the inner loops, so the frozen encoder + Transformer run only
+    1 forward pass per update instead of PPO_EPOCHS * N_MINIBATCHES = 48.
+    Gradients are computed only w.r.t. controller-C parameters.
+    """
+    params, ctrl_opt_state = train_state
+    TN = BATCH_SIZE
+
     obs_flat     = obs_seq.reshape(TN, OBS_SIZE)
     actions_flat = actions_seq.reshape(TN, -1)
     max_v_flat   = max_v_seq.reshape(TN)
@@ -183,14 +176,64 @@ def run_ppo_updates(train_state, obs_seq, actions_seq, adv_seq, ret_seq,
     adv_flat     = adv_seq.reshape(TN)
     adv_flat     = (adv_flat - adv_flat.mean()) / (adv_flat.std() + 1e-8)
     ret_flat     = ret_seq.reshape(TN)
+
+    # ── Extract V+M features once, chunked to limit peak CNN memory ─────────
+    # Running the CNN on all TN=131072 samples at once would allocate ~2.7 GB
+    # of intermediates.  jax.lax.map processes one MINI_BATCH_SIZE chunk at a
+    # time (O(1) memory in f), cutting peak CNN memory to ~330 MB per chunk.
+    # V+M still runs only N_MINIBATCHES=8 times total (vs 48 before).
+    feat_flat = jax.lax.map(
+        lambda chunk: navrep_extract_features(params, chunk),
+        obs_flat.reshape(N_MINIBATCHES, MINI_BATCH_SIZE, OBS_SIZE),
+    ).reshape(TN, FEAT_DIM)                                # (TN, FEAT_DIM)
+
+    # ── Controller params only (what the optimizer tracks) ──────────────────
+    ctrl_p = {k: v for k, v in params.items() if k not in _VM_KEYS}
+
+    # ── One permutation per epoch ────────────────────────────────────────────
     perms = jax.vmap(lambda k: jax.random.permutation(k, TN))(
         jax.random.split(rng_key, PPO_EPOCHS)
     )
-    carry = (params, opt_state, obs_flat, actions_flat, adv_flat, ret_flat,
-             old_lp_flat, max_v_flat, entropy_coef)
-    carry, (all_losses, all_auxes) = jax.lax.scan(ppo_update_epoch, carry, perms)
+
+    def _epoch(epoch_carry, perm):
+        cp, os_ = epoch_carry
+        feat_p    = feat_flat[perm]
+        actions_p = actions_flat[perm]
+        adv_p     = adv_flat[perm]
+        ret_p     = ret_flat[perm]
+        old_lp_p  = old_lp_flat[perm]
+        max_v_p   = max_v_flat[perm]
+
+        def _mb(mb_carry, mb_i):
+            p, os2 = mb_carry
+            s          = mb_i * MINI_BATCH_SIZE
+            mb_feat    = jax.lax.dynamic_slice_in_dim(feat_p,    s, MINI_BATCH_SIZE, 0)
+            mb_actions = jax.lax.dynamic_slice_in_dim(actions_p, s, MINI_BATCH_SIZE, 0)
+            mb_adv     = jax.lax.dynamic_slice_in_dim(adv_p,     s, MINI_BATCH_SIZE, 0)
+            mb_ret     = jax.lax.dynamic_slice_in_dim(ret_p,     s, MINI_BATCH_SIZE, 0)
+            mb_old_lp  = jax.lax.dynamic_slice_in_dim(old_lp_p,  s, MINI_BATCH_SIZE, 0)
+            mb_max_v   = jax.lax.dynamic_slice_in_dim(max_v_p,   s, MINI_BATCH_SIZE, 0)
+
+            (loss, aux), grads = jax.value_and_grad(ppo_loss_fn, has_aux=True)(
+                p, mb_feat, mb_actions, mb_adv, mb_ret, mb_old_lp, mb_max_v, entropy_coef
+            )
+            updates, new_os2 = optimizer.update(grads, os2, p)
+            return (optax.apply_updates(p, updates), new_os2), (loss, aux)
+
+        (new_cp, new_os), (losses, auxes) = jax.lax.scan(
+            _mb, (cp, os_), jnp.arange(N_MINIBATCHES)
+        )
+        return (new_cp, new_os), (losses, auxes)
+
+    (new_ctrl_p, new_ctrl_os), (all_losses, all_auxes) = jax.lax.scan(
+        _epoch, (ctrl_p, ctrl_opt_state), perms
+    )
+
+    # Merge updated controller params back into full params
+    new_params = {**params, **new_ctrl_p}
+
     last_aux = jax.tree_util.tree_map(lambda x: x[-1, -1], all_auxes)
-    return (carry[0], carry[1]), all_losses.mean(), last_aux
+    return (new_params, new_ctrl_os), all_losses.mean(), last_aux
 
 
 # ── Checkpoint helpers ─────────────────────────────────────────────────────────
@@ -277,13 +320,17 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS,
     n_total = sum(x.size for x in jax.tree_util.tree_leaves(params))
     n_c = sum(
         x.size
-        for k, sub in params.items() if k not in ("encoder", "M")
+        for k, sub in params.items() if k not in _VM_KEYS
         for x in jax.tree_util.tree_leaves(sub)
     )
     print(f"  Parameters  : total={n_total:,}  controller={n_c:,}\n")
 
-    opt_state   = optimizer.init(params)
-    train_state = (params, opt_state)
+    # Optimizer only covers controller C — V and M are frozen.
+    # This avoids initialising Adam slots for the ~95% of params that never
+    # receive gradients, and eliminates the zero-gradient update overhead.
+    ctrl_params    = {k: v for k, v in params.items() if k not in _VM_KEYS}
+    ctrl_opt_state = optimizer.init(ctrl_params)
+    train_state    = (params, ctrl_opt_state)
 
     cur_max_dist, cur_ghost, cur_ent, cur_max_scen = get_continuous_curriculum(0.0)
     rolling_suc         = 0.0
@@ -344,11 +391,23 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS,
             passive_col  = rollout_history["passive_col"]
             active_col   = rollout_history["active_col"]
 
+            # Dispatch episode-outcome scan (async — no host sync yet)
             ep_rets, ep_suc, ep_obs, ep_acol, ep_pcol, ep_tmo, ep_msk = \
                 collect_episode_outcomes(
                     raw_rewards, dones, goal_reached, collision, passive_col, active_col
                 )
 
+            # Dispatch GAE + PPO updates immediately, without waiting for the
+            # episode-stat arrays to land on the host.  The float() syncs below
+            # overlap with the GPU executing run_ppo_updates.
+            advantages, returns = compute_gae(rewards, values, dones, last_val)
+
+            train_state, loss, aux = run_ppo_updates(
+                train_state, obs_seq, acts_seq, advantages, returns,
+                lp_seq, max_v_seq, update_rng, jnp.array(cur_ent),
+            )
+
+            # ── Host sync (GPU is now busy with run_ppo_updates) ─────────────
             n_ep = int(ep_msk.sum())
             if n_ep > 0:
                 mean_ret = float((ep_rets * ep_msk).sum() / n_ep)
@@ -359,13 +418,6 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS,
                 tmo_pct  = float((ep_tmo  * ep_msk).sum() / n_ep) * 100.0
             else:
                 mean_ret = suc_pct = obs_pct = acol_pct = pcol_pct = tmo_pct = 0.0
-
-            advantages, returns = compute_gae(rewards, values, dones, last_val)
-
-            train_state, loss, aux = run_ppo_updates(
-                train_state, obs_seq, acts_seq, advantages, returns,
-                lp_seq, max_v_seq, update_rng, jnp.array(cur_ent),
-            )
 
             pi_loss, v_loss, entropy, kl_div, clip_frac = aux
             elapsed = time.time() - t0
