@@ -37,8 +37,8 @@ HSFM_DT    = 0.01
 # This ensures alpha*log_pi remains a meaningful fraction of the critic signal
 # so the entropy term actually shapes the policy during early training.
 _R_GOAL        =  30.0
-_R_OBS_COL     =  -7.0
-_R_WALL_COL    =  -7.0
+_R_OBS_COL     =  -30.0
+_R_WALL_COL    =  -30.0
 _R_ACTIVE_COL  =  -50.0
 
 _R_PASSIVE_COL =  -3.5

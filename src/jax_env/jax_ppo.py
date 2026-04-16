@@ -45,7 +45,7 @@ LR_END         = 1e-5
 LR_MIN         = 1e-5
 WARMUP_UPDATES = 5
 
-DEFAULT_TOTAL_ENV_STEPS = 50_000_000    # default budget; override via train(total_env_steps=...)
+DEFAULT_TOTAL_ENV_STEPS = 70_000_000    # default budget; override via train(total_env_steps=...)
 
 # ── Minibatch geometry ────────────────────────────────────────────────────────
 # Flat loss over (T*N) samples. Shuffle full batch then split into minibatches.
