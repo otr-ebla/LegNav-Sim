@@ -387,14 +387,15 @@ def draw_star(surface, cx, cy, r_out, r_in, n, color, border=None):
     if border: pygame.draw.polygon(surface, border, pts, 2)
 
 
-def draw_lidar(surface, state, raw_lidar, show):
+def draw_lidar(surface, state, raw_lidar, show, scale=SCALE, sim_h=SIM_SIZE):
     if not show or raw_lidar is None: return
-    rx, ry = W(float(state.x), float(state.y))
+    def W_(x, y): return int(x * scale), int(sim_h - y * scale)
+    rx, ry = W_(float(state.x), float(state.y))
     theta  = float(state.theta)
     angles = theta - FOV / 2.0 + np.arange(NUM_RAYS) * FOV / (NUM_RAYS - 1)
     sp_mask = np.array(state.sp_mask)
     for i, (ang, dist) in enumerate(zip(angles, raw_lidar)):
-        ex, ey = W(state.x + dist * math.cos(ang), state.y + dist * math.sin(ang))
+        ex, ey = W_(state.x + dist * math.cos(ang), state.y + dist * math.sin(ang))
         if sp_mask[i]:
             col = (180, 50, 220)
         else:
@@ -403,7 +404,8 @@ def draw_lidar(surface, state, raw_lidar, show):
         pygame.draw.line(surface, col, (rx, ry), (ex, ey), 1)
 
 
-def draw_shoe(surface, fx, fy, theta, col, border):
+def draw_shoe(surface, fx, fy, theta, col, border, scale=SCALE, sim_h=SIM_SIZE):
+    def W_(x, y): return int(x * scale), int(sim_h - y * scale)
     ct, st = math.cos(theta), math.sin(theta)
     lx, ly = -st, ct
     hL, hW = SHOE_LENGTH * 0.5, SHOE_WIDTH * 0.5
@@ -414,12 +416,14 @@ def draw_shoe(surface, fx, fy, theta, col, border):
         (cx - ct*hL - lx*hW, cy - st*hL - ly*hW),
         (cx - ct*hL + lx*hW, cy - st*hL + ly*hW),
     ]
-    pts = [W(wx, wy) for wx, wy in corners]
+    pts = [W_(wx, wy) for wx, wy in corners]
     pygame.draw.polygon(surface, col,    pts)
     pygame.draw.polygon(surface, border, pts, 1)
 
 
-def draw_humans(surface, state, foot_state_np, show_arrows, use_legs, show_body):
+def draw_humans(surface, state, foot_state_np, show_arrows, use_legs, show_body,
+                scale=SCALE, sim_h=SIM_SIZE):
+    def W_(x, y): return int(x * scale), int(sim_h - y * scale)
     n = int(state.people.shape[0])
     left_legs  = foot_state_np[:, 0:2]
     right_legs = foot_state_np[:, 2:4]
@@ -431,74 +435,94 @@ def draw_humans(surface, state, foot_state_np, show_arrows, use_legs, show_body)
         col, border = _shoe_colour(i)
 
         if show_body:
-            sx, sy = W(px, py)
+            sx, sy = W_(px, py)
             pygame.draw.circle(surface, C_BODY_RING, (sx, sy),
-                                max(3, int(_jax_env.PEOPLE_RADIUS * SCALE)), 1)
+                                max(3, int(_jax_env.PEOPLE_RADIUS * scale)), 1)
 
         if use_legs:
             left_theta  = float(foot_state_np[i, 10])
             right_theta = float(foot_state_np[i, 11])
-            draw_shoe(surface, float(left_legs[i, 0]),  float(left_legs[i, 1]),  left_theta, col, border)
-            draw_shoe(surface, float(right_legs[i, 0]), float(right_legs[i, 1]), right_theta, col, border)
-            leg_r = max(2, int(LEG_RADIUS * SCALE))
-            lx, ly = W(float(left_legs[i, 0]),  float(left_legs[i, 1]))
-            rx_, ry_ = W(float(right_legs[i, 0]), float(right_legs[i, 1]))
+            draw_shoe(surface, float(left_legs[i, 0]),  float(left_legs[i, 1]),  left_theta, col, border, scale, sim_h)
+            draw_shoe(surface, float(right_legs[i, 0]), float(right_legs[i, 1]), right_theta, col, border, scale, sim_h)
+            leg_r = max(2, int(LEG_RADIUS * scale))
+            lx, ly   = W_(float(left_legs[i, 0]),  float(left_legs[i, 1]))
+            rx_, ry_ = W_(float(right_legs[i, 0]), float(right_legs[i, 1]))
             pygame.draw.circle(surface, tuple(min(255,int(c*1.1)) for c in col), (lx, ly), leg_r)
             pygame.draw.circle(surface, (20,20,20), (lx, ly), leg_r, 1)
             pygame.draw.circle(surface, tuple(max(0,int(c*0.75)) for c in col), (rx_, ry_), leg_r)
             pygame.draw.circle(surface, (20,20,20), (rx_, ry_), leg_r, 1)
         else:
-            sx, sy = W(px, py)
-            pr = max(3, int(_jax_env.PEOPLE_RADIUS * SCALE))
+            sx, sy = W_(px, py)
+            pr = max(3, int(_jax_env.PEOPLE_RADIUS * scale))
             pygame.draw.circle(surface, col,    (sx, sy), pr)
             pygame.draw.circle(surface, border, (sx, sy), pr, 1)
             speed = math.hypot(vx, vy)
             if show_arrows and speed > 0.05:
-                ax, ay = W(px + math.cos(theta_h)*0.5, py + math.sin(theta_h)*0.5)
+                ax, ay = W_(px + math.cos(theta_h)*0.5, py + math.sin(theta_h)*0.5)
                 pygame.draw.line(surface, (20,120,20), (sx,sy), (ax,ay), 2)
 
 
-def draw_scene(surface, state, raw_lidar, foot_state_np, show_lidar, show_arrows, use_legs, show_body):
-    pygame.draw.rect(surface, C_FLOOR, (0, 0, SIM_SIZE, SIM_SIZE))
-    for i in range(int(ROOM_W) + 1):
-        sx, _ = W(i, 0); pygame.draw.line(surface, C_GRID, (sx,0), (sx,SIM_SIZE))
-    for j in range(int(ROOM_H) + 1):
-        _, sy = W(0, j); pygame.draw.line(surface, C_GRID, (0,sy), (SIM_SIZE,sy))
-    pygame.draw.rect(surface, C_WALL, (0, 0, SIM_SIZE, SIM_SIZE), 3)
+def draw_scene(surface, state, raw_lidar, foot_state_np, show_lidar, show_arrows, use_legs, show_body,
+               scale=SCALE, sim_h=SIM_SIZE):
+    """Draw the simulation viewport.
 
-    draw_lidar(surface, state, raw_lidar, show_lidar)
+    scale   — pixels per metre (default: module-level SCALE = SIM_SIZE/12).
+    sim_h   — pixel height of the sim area (default: SIM_SIZE).
+    For non-square rooms (e.g. 12×24 m) pass scale = SIM_SIZE/room_h and
+    sim_h = SIM_SIZE so the full corridor fits vertically.
+    """
+    def W_(x, y): return int(x * scale), int(sim_h - y * scale)
+    room_h_m = float(state.room_h)   # physical room height in metres
+    sim_w = int(ROOM_W * scale)      # pixel width of the sim area
+
+    pygame.draw.rect(surface, C_FLOOR, (0, 0, sim_w, sim_h))
+    for i in range(int(ROOM_W) + 1):
+        sx, _ = W_(i, 0); pygame.draw.line(surface, C_GRID, (sx, 0), (sx, sim_h))
+    for j in range(int(room_h_m) + 1):
+        _, sy = W_(0, j); pygame.draw.line(surface, C_GRID, (0, sy), (sim_w, sy))
+    pygame.draw.rect(surface, C_WALL, (0, 0, sim_w, sim_h), 3)
+
+    draw_lidar(surface, state, raw_lidar, show_lidar, scale, sim_h)
 
     for box in np.array(state.obs_boxes):
         cx, cy, hw, hh = box
         if hw > 0:
-            sx, sy = W(cx - hw, cy + hh)
-            pygame.draw.rect(surface, C_BOX,   (sx, sy, int(2*hw*SCALE), int(2*hh*SCALE)))
-            pygame.draw.rect(surface, C_BOX_L, (sx, sy, int(2*hw*SCALE), int(2*hh*SCALE)), 2)
+            sx, sy = W_(cx - hw, cy + hh)
+            pygame.draw.rect(surface, C_BOX,   (sx, sy, int(2*hw*scale), int(2*hh*scale)))
+            pygame.draw.rect(surface, C_BOX_L, (sx, sy, int(2*hw*scale), int(2*hh*scale)), 2)
     for cir in np.array(state.obs_circles):
         cx, cy, r = cir
         if r > 0:
-            sx, sy = W(cx, cy); pr = max(2, int(r * SCALE))
+            sx, sy = W_(cx, cy); pr = max(2, int(r * scale))
             pygame.draw.circle(surface, C_CIRCLE,   (sx, sy), pr)
             pygame.draw.circle(surface, C_CIRCLE_L, (sx, sy), pr, 2)
 
-    gx, gy = W(float(state.goal_x), float(state.goal_y))
-    draw_star(surface, gx, gy, int(0.30*SCALE), int(0.12*SCALE), 5, C_GOAL, C_GOAL2)
-    draw_humans(surface, state, foot_state_np, show_arrows, use_legs, show_body)
+    gx, gy = W_(float(state.goal_x), float(state.goal_y))
+    draw_star(surface, gx, gy, int(0.30*scale), int(0.12*scale), 5, C_GOAL, C_GOAL2)
+    draw_humans(surface, state, foot_state_np, show_arrows, use_legs, show_body, scale, sim_h)
 
-    rx, ry = W(float(state.x), float(state.y)); rr = max(4, int(ROBOT_RADIUS*SCALE))
+    rx, ry = W_(float(state.x), float(state.y)); rr = max(4, int(ROBOT_RADIUS*scale))
     pygame.draw.circle(surface, C_ROBOT,   (rx, ry), rr)
     pygame.draw.circle(surface, C_ROBOT_H, (rx, ry), rr, 2)
-    hx, hy = W(state.x + ROBOT_RADIUS*3*math.cos(float(state.theta)),
-               state.y + ROBOT_RADIUS*3*math.sin(float(state.theta)))
+    hx, hy = W_(state.x + ROBOT_RADIUS*3*math.cos(float(state.theta)),
+                state.y + ROBOT_RADIUS*3*math.sin(float(state.theta)))
     pygame.draw.line(surface, C_ROBOT_H, (rx, ry), (hx, hy), 3)
 
 
 def draw_panel(surface, fonts, algo, ep, step, ep_ret, max_v, v, w,
                goal_dist, goal_align, ch, stats, banner, banner_t,
-               scen_idx, eval_mode, use_legs, raw_lidar, sp_mask, rew_acc, show_radar=True):
-    pygame.draw.rect(surface, C_PANEL, (SIM_SIZE, 0, PANEL_W, WINDOW_H))
-    pygame.draw.line(surface, C_WALL,  (SIM_SIZE, 0), (SIM_SIZE, WINDOW_H), 2)
-    y = 10; lh = 19; x0 = SIM_SIZE + 10
+               scen_idx, eval_mode, use_legs, raw_lidar, sp_mask, rew_acc, show_radar=True,
+               sim_x=SIM_SIZE, win_h=WINDOW_H):
+    """Draw the stats panel to the right of the simulation area.
+
+    sim_x  — x-pixel where the panel starts (= sim viewport width).
+    win_h  — total window height in pixels.
+    Pass these when the sim area is not the default 800×800 square
+    (e.g. the 12×24 m long corridor uses a 400×800 sim area).
+    """
+    pygame.draw.rect(surface, C_PANEL, (sim_x, 0, PANEL_W, win_h))
+    pygame.draw.line(surface, C_WALL,  (sim_x, 0), (sim_x, win_h), 2)
+    y = 10; lh = 19; x0 = sim_x + 10
 
     def txt(s, col=C_TEXT, font="mid"):
         nonlocal y
@@ -515,7 +539,7 @@ def draw_panel(surface, fonts, algo, ep, step, ep_ret, max_v, v, w,
         6: "Groups",
         # ── test scenarios ──
         7:  "S-Corridor",  8:  "Conv.Crowds", 9:  "Seq.Rooms",
-        10: "Zigzag CF",   11: "Furn.Maze",   12: "U-Turn",
+        10: "Zigzag CF",   11: "LongCorr",    12: "U-Turn",
     }.get(scen_idx, "?")
     mode_text = "[RANDOM]" if eval_mode == "random" else "[FIXED]"
     leg_mode  = "LEGS" if use_legs else "CYLINDERS"
@@ -571,8 +595,8 @@ def draw_panel(surface, fonts, algo, ep, step, ep_ret, max_v, v, w,
     # LiDAR radar chart
     if raw_lidar is not None and show_radar:
         radar_r  = 130
-        radar_cx = SIM_SIZE + PANEL_W // 2
-        radar_cy = WINDOW_H - radar_r - 20
+        radar_cx = sim_x + PANEL_W // 2
+        radar_cy = win_h - radar_r - 20
         pygame.draw.circle(surface, (15,15,20),  (radar_cx, radar_cy), radar_r)
         pygame.draw.circle(surface, (50,50,60),  (radar_cx, radar_cy), radar_r, 1)
         pygame.draw.circle(surface, (50,50,60),  (radar_cx, radar_cy), int(radar_r*.66), 1)

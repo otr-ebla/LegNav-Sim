@@ -1,7 +1,7 @@
 """
 test_scenarios_eval.py — Evaluate trained policies on test scenarios (7-12)
 ==========================================================================
-Runs the 6 test scenarios with multi-waypoint support for the robot.
+Runs the 6 test scenarios (7-12) with multi-waypoint support for the robot.
 When the robot reaches a waypoint, the goal is updated to the next one
 and metrics (reward, steps) reset — as if a new episode started — but
 the environment state (people, obstacles, robot position) continues.
@@ -13,7 +13,7 @@ Usage:
   python3 test_scenarios_eval.py --algo mlp  --ckpt checkpoints_vanilla_ppo/ppo_mlp_best.msgpack
 
 Keys:
-  7-9, 0(=10), -(=11), =(=12)   Select test scenario
+  7-9, 0(=10), -/'(=11), =(=12)   Select test scenario
   R     Reset episode    →   Skip to random test scenario
   N     Next waypoint (skip to next, for debugging)
   L     Toggle LiDAR     H   Toggle arrows
@@ -39,7 +39,7 @@ import flax.serialization
 def _parse_args():
     p = argparse.ArgumentParser(description="Test Scenario Evaluation")
     p.add_argument("--algo", default="sac",
-                   choices=["ppo", "shac", "sac", "tqc", "mlp"])
+                   choices=["ppo", "shac", "sac", "tqc", "mlp", "navrep"])
     p.add_argument("--ckpt", default="")
     p.add_argument("--legs",    dest="use_legs", action="store_true",  default=True)
     p.add_argument("--no-legs", dest="use_legs", action="store_false")
@@ -70,7 +70,7 @@ try:
     _saved_argv = _sys.argv
     _sys.argv = _sys.argv[:1]
     from jax_eval_multi import (draw_scene, draw_panel, make_fonts,
-                                C_BG, WINDOW_W, WINDOW_H, FPS_TARGET)
+                                C_BG, WINDOW_W, WINDOW_H, SIM_SIZE, PANEL_W, FPS_TARGET)
     _sys.argv = _saved_argv
     HAS_VIZ = True
 except BaseException:
@@ -84,6 +84,29 @@ except BaseException:
 
 # ── Reuse network builders from jax_eval_multi ───────────────────────────────
 from jax_eval_multi import build_policy, _DEFAULT_CKPT
+
+def _build_navrep():
+    from comparison_policies.navrep_network import NavRepActorCritic
+    from jax_network import scale_action_to_env
+
+    net = NavRepActorCritic(action_dim=ACTION_DIM)
+    rng = jax.random.PRNGKey(0)
+    init_params = net.init(rng, jnp.zeros((1, OBS_SIZE)))["params"]
+
+    def load(path):
+        with open(path, "rb") as f:
+            raw = f.read()
+        bundle = flax.serialization.msgpack_restore(raw)
+        return bundle.get("params", bundle)
+
+    def infer(params, obs, max_v):
+        mean, _, _ = net.apply({"params": params}, obs[None])
+        return scale_action_to_env(jnp.squeeze(mean, 0), float(max_v))
+
+    def reset_cb(): pass
+    return init_params, load, infer, reset_cb
+
+_DEFAULT_CKPT["navrep"] = "checkpoints_navrep/navrep_best.msgpack"
 
 OBS_SIZE   = 662
 ACTION_DIM = 2
@@ -115,11 +138,14 @@ def run_interactive():
         return
 
     algo = args.algo
-    result = build_policy(algo)
-    if len(result) == 4:
-        init_params, load_fn, infer_fn, _ = result
+    if algo == "navrep":
+        init_params, load_fn, infer_fn, _ = _build_navrep()
     else:
-        init_params, load_fn, infer_fn = result
+        result = build_policy(algo)
+        if len(result) == 4:
+            init_params, load_fn, infer_fn, _ = result
+        else:
+            init_params, load_fn, infer_fn = result
 
     ckpt = args.ckpt or _DEFAULT_CKPT.get(algo, "")
     try:
@@ -135,13 +161,23 @@ def run_interactive():
     rng = jax.random.PRNGKey(42)
 
     pygame.init()
-    screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
-    pygame.display.set_caption(f"Test Scenarios — {algo.upper()}")
-    clock = pygame.time.Clock()
-    fonts = make_fonts()
+
+    def _viz_params(room_h_val):
+        """Return (scale, sim_w, sim_h, win_w, win_h) for the given room height."""
+        sc  = SIM_SIZE / max(ROOM_W, room_h_val)
+        sw  = int(ROOM_W * sc)
+        sh  = int(room_h_val * sc)
+        return sc, sw, sh, sw + PANEL_W, sh
 
     rng, reset_rng = jax.random.split(rng)
     obs, stacked_state = fast_reset(reset_rng)
+    _init_rh = float(stacked_state.env_state.room_h)
+    _sc, _sw, _sh, _ww, _wh = _viz_params(_init_rh)
+
+    screen = pygame.display.set_mode((_ww, _wh))
+    pygame.display.set_caption(f"Test Scenarios — {algo.upper()}")
+    clock = pygame.time.Clock()
+    fonts = make_fonts()
 
     # Multi-waypoint tracking
     waypoints = TEST_ROBOT_WAYPOINTS[current_scenario]
@@ -231,7 +267,7 @@ def run_interactive():
 
     scen_name = TEST_SCENARIO_NAMES[current_scenario]
     print(f"Test Scenarios Eval — {algo.upper()}")
-    print(f"Keys: 7-9 select scenario | 0=10, -=11, ==12 | R reset | N next wp | Q quit")
+    print(f"Keys: 7-9 select scenario | 0=10, -/'=11, ==12 | R reset | N next wp | Q quit")
     print(f"Starting scenario {current_scenario}: {scen_name} ({len(waypoints)} waypoints)")
 
     while True:
@@ -281,7 +317,7 @@ def run_interactive():
                 if k == pygame.K_8: new_scen = 8
                 if k == pygame.K_9: new_scen = 9
                 if k == pygame.K_0: new_scen = 10
-                if k == pygame.K_MINUS: new_scen = 11
+                if k in (pygame.K_MINUS, pygame.K_QUOTE): new_scen = 11
                 if k == pygame.K_EQUALS: new_scen = 12
                 if new_scen is not None:
                     current_scenario = new_scen
@@ -318,9 +354,16 @@ def run_interactive():
         galign = (math.atan2(dy, dx) - float(cpu_state.theta) + math.pi) % (2*math.pi) - math.pi
         ch = float(info["closest_human"]) - ROBOT_RADIUS - _jax_env.PEOPLE_RADIUS
 
+        # ── Rescale viewport to fit the current room (24 m corridor → narrower sim) ──
+        rh_val = float(cpu_state.room_h)
+        sc, sw, sh, ww, wh = _viz_params(rh_val)
+        if screen.get_size() != (ww, wh):
+            screen = pygame.display.set_mode((ww, wh))
+
         screen.fill(C_BG)
         draw_scene(screen, cpu_state, raw_lidar, foot_state_np,
-                   show_lidar, show_arrows, use_legs, show_body)
+                   show_lidar, show_arrows, use_legs, show_body,
+                   scale=sc, sim_h=sh)
 
         # Overlay waypoint info on the panel
         wp_banner = f"WP {wp_idx+1}/{len(waypoints)}"
@@ -330,7 +373,8 @@ def run_interactive():
         draw_panel(screen, fonts, f"{algo.upper()} TEST", ep, ep_steps, ep_reward,
                    float(cpu_state.max_v), float(cpu_state.v), float(cpu_state.w),
                    gdist, galign, ch, get_stats(), wp_banner, max(banner_t, 1),
-                   current_scenario, "fixed", use_legs, raw_lidar, sp_mask, rew_acc, show_radar)
+                   current_scenario, "fixed", use_legs, raw_lidar, sp_mask, rew_acc, show_radar,
+                   sim_x=sw, win_h=wh)
 
         if banner_t > 0:
             banner_t -= 1
@@ -379,11 +423,14 @@ def run_interactive():
 def run_headless():
     """Headless batch evaluation: run N episodes per scenario, print stats."""
     algo = args.algo
-    result = build_policy(algo)
-    if len(result) == 4:
-        init_params, load_fn, infer_fn, _ = result
+    if algo == "navrep":
+        init_params, load_fn, infer_fn, _ = _build_navrep()
     else:
-        init_params, load_fn, infer_fn = result
+        result = build_policy(algo)
+        if len(result) == 4:
+            init_params, load_fn, infer_fn, _ = result
+        else:
+            init_params, load_fn, infer_fn = result
 
     ckpt = args.ckpt or _DEFAULT_CKPT.get(algo, "")
     try:

@@ -362,17 +362,25 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS,
 
     t_start = time.time()
 
+    # ── Pre-dispatch the first rollout before the loop ────────────────────────
+    # This primes the pipeline: every iteration will find a rollout already
+    # queued on the GPU, eliminating the idle gap between PPO updates and the
+    # next rollout.
+    rng, _init_rng = jax.random.split(rng)
+    _pending_rollout = collect_rollouts(
+        _init_rng, train_state[0], network.apply, vmap_step,
+        env_state, env_obs, cur_max_dist, jnp.int32(-1), cur_ghost,
+        jnp.int32(cur_max_scen),
+    )
+
     try:
         for update in range(total_updates):
             t0 = time.time()
 
-            rng, rollout_rng, update_rng = jax.random.split(rng, 3)
+            rng, next_rollout_rng, update_rng = jax.random.split(rng, 3)
 
-            rollout_history, env_state, env_obs, last_val = collect_rollouts(
-                rollout_rng, train_state[0], network.apply, vmap_step,
-                env_state, env_obs, cur_max_dist, jnp.int32(-1), cur_ghost,
-                jnp.int32(cur_max_scen),
-            )
+            # ── Unwrap pre-dispatched rollout (JAX futures, no sync yet) ─────
+            rollout_history, env_state, env_obs, last_val = _pending_rollout
 
             raw_rewards = rollout_history["rewards"]
             values      = rollout_history["values"]
@@ -391,15 +399,11 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS,
             passive_col  = rollout_history["passive_col"]
             active_col   = rollout_history["active_col"]
 
-            # Dispatch episode-outcome scan (async — no host sync yet)
             ep_rets, ep_suc, ep_obs, ep_acol, ep_pcol, ep_tmo, ep_msk = \
                 collect_episode_outcomes(
                     raw_rewards, dones, goal_reached, collision, passive_col, active_col
                 )
 
-            # Dispatch GAE + PPO updates immediately, without waiting for the
-            # episode-stat arrays to land on the host.  The float() syncs below
-            # overlap with the GPU executing run_ppo_updates.
             advantages, returns = compute_gae(rewards, values, dones, last_val)
 
             train_state, loss, aux = run_ppo_updates(
@@ -407,7 +411,17 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS,
                 lp_seq, max_v_seq, update_rng, jnp.array(cur_ent),
             )
 
-            # ── Host sync (GPU is now busy with run_ppo_updates) ─────────────
+            # ── Pre-dispatch NEXT rollout immediately (GPU pipeline stays full)
+            # env_state / env_obs / train_state[0] are JAX futures — XLA queues
+            # this computation right after run_ppo_updates, with no CPU stall.
+            # Curriculum values lag by 1 update (negligible for slow schedules).
+            _pending_rollout = collect_rollouts(
+                next_rollout_rng, train_state[0], network.apply, vmap_step,
+                env_state, env_obs, cur_max_dist, jnp.int32(-1), cur_ghost,
+                jnp.int32(cur_max_scen),
+            )
+
+            # ── Host sync — GPU is now executing the next rollout ─────────────
             n_ep = int(ep_msk.sum())
             if n_ep > 0:
                 mean_ret = float((ep_rets * ep_msk).sum() / n_ep)

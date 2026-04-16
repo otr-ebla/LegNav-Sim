@@ -85,6 +85,7 @@ class EnvState:
     human_stop_timers:  jnp.ndarray
     escape_timer:       jnp.int32     # unused in new reward; kept for checkpoint compat
     is_ghost:           jnp.ndarray
+    room_h:             jnp.float32  # physical room height (default 12 m; 24 m for long corridor)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -136,7 +137,7 @@ def get_obs(state: EnvState, key: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray
     raw_lidar = compute_lidar(
         state.x, state.y, state.theta,
         all_circles, state.obs_boxes,
-        NUM_RAYS, float(FOV), MAX_LIDAR_DIST, ROOM_W, ROOM_H
+        NUM_RAYS, float(FOV), MAX_LIDAR_DIST, ROOM_W, state.room_h
     )
 
     # ── NEW: Apply Vectorized Sensor Noise (only when SENSOR_NOISE=True) ────────
@@ -322,6 +323,7 @@ def reset_env(key: jnp.ndarray, max_goal_dist: float = 3.0, **kwargs):
         human_stop_timers=jnp.zeros(NUM_PEOPLE, dtype=jnp.int32),
         escape_timer=0,
         is_ghost=jnp.array(False, dtype=jnp.bool_),
+        room_h=jnp.float32(ROOM_H),
     )
 
     obs, sp_mask = get_obs(state, k_obs)
@@ -345,16 +347,16 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray, **kwargs):
 
     wall_collision = (
         (raw_x < ROBOT_RADIUS) | (raw_x > ROOM_W - ROBOT_RADIUS) |
-        (raw_y < ROBOT_RADIUS) | (raw_y > ROOM_H - ROBOT_RADIUS)
+        (raw_y < ROBOT_RADIUS) | (raw_y > state.room_h - ROBOT_RADIUS)
     )
     new_x = jnp.clip(raw_x, ROBOT_RADIUS, ROOM_W - ROBOT_RADIUS)
-    new_y = jnp.clip(raw_y, ROBOT_RADIUS, ROOM_H - ROBOT_RADIUS)
+    new_y = jnp.clip(raw_y, ROBOT_RADIUS, state.room_h - ROBOT_RADIUS)
 
     human_key, k_obs = jax.random.split(key)
     new_people = update_all_humans(
         state.people, human_key, dt,
         new_x, new_y, new_theta, target_v,
-        ROOM_W, ROOM_H, PEOPLE_RADIUS,
+        ROOM_W, state.room_h, PEOPLE_RADIUS,
         state.obs_circles, state.obs_boxes
     )
 

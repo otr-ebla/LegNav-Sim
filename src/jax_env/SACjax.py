@@ -48,12 +48,10 @@ G_UPDATES      = 50         # Gradient updates per collect step (raised: more le
 WARMUP_STEPS   = 10_000
 GAMMA          = 0.99
 TAU            = 0.005      # Standard SAC target-EMA rate (per gradient update). The previous
-                            # "TAU/G_UPDATES" rescaling was incorrect: SAC's tau is defined per
-                            # gradient step, not per env step, and dividing it makes the target
-                            # net 50x too slow — the critic never gets a stable bootstrap.
+                            
 LR             = 3e-4
-TARGET_ENTROPY = -1.0       # -|A| — standard auto-alpha target (raised to keep more exploration).
-DEFAULT_TOTAL_ENV_STEPS = 12_000_000   # convergence happens by ~5M; 12M gives curriculum room.
+TARGET_ENTROPY = -1.0       
+DEFAULT_TOTAL_ENV_STEPS = 12_000_000  
 LOG_EVERY      = 50         # chunks; each chunk = N_ENVS*LOG_EVERY env steps collected
 SAVE_EVERY     = 5000
 MAX_GRAD_NORM  = 10.0
@@ -63,15 +61,9 @@ MAX_V_OBS_IDX  = 11
 LOG_STD_EPS    = 1e-6
 
 # ── Perception normalization ───────────────────────────────────────────────────
-# LiDAR rays are in meters. Normalize to [0,1] before the first Conv to prevent
-# the CNN from wasting early training steps rescaling weights for meter-scale inputs.
-# VERIFY this matches the MAX_RANGE constant in jax_env.py before running.
-LIDAR_MAX_RANGE = 10.0   # metres — set to your env's actual max sensor range
+LIDAR_MAX_RANGE = 12.0   # metres — set to your env's actual max sensor range
 
 # ── Actor-encoder gradient coupling ───────────────────────────────────────────
-# Scale factor applied to actor gradients flowing back into LidarCNN.
-# 0.0 = full stop_gradient (old behaviour, critic-only encoder)
-# 0.0 = full stop_gradient (standard off-policy practice for stable critic)
 ACTOR_ENC_GRAD_SCALE = 0.0
 
 CKPT_DIR  = "checkpoints_sac"

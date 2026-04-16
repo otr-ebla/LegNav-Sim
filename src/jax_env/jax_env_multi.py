@@ -78,7 +78,7 @@ _GHOST_POS = -999.0
 _CIRCLE_SIDES = 8   # octagon approximation (fits 2 groups of 4 edges)
 
 
-def build_hsfm_obstacles(obs_boxes, obs_circles):
+def build_hsfm_obstacles(obs_boxes, obs_circles, room_h=ROOM_H):
     """
     Build edge-based obstacle array for JHSFM.
 
@@ -88,12 +88,21 @@ def build_hsfm_obstacles(obs_boxes, obs_circles):
     JHSFM step ignores them instead of producing fictitious origin forces.
 
     Returns shape (num_groups, 4, 2, 2): all agents share the same array.
+    room_h is dynamic to support non-standard room heights (e.g. 24 m for
+    the long parallel corridor test scenario).
     """
-    room_edges = jnp.array([
-        [[0.0, 0.0], [ROOM_W, 0.0]],
-        [[ROOM_W, 0.0], [ROOM_W, ROOM_H]],
-        [[ROOM_W, ROOM_H], [0.0, ROOM_H]],
-        [[0.0, ROOM_H], [0.0, 0.0]]
+    rh = jnp.float32(room_h)
+    rw = jnp.float32(ROOM_W)
+    # Build room boundary edges with dynamic room_h
+    p00 = jnp.stack([jnp.float32(0.0), jnp.float32(0.0)])
+    pW0 = jnp.stack([rw,               jnp.float32(0.0)])
+    pWH = jnp.stack([rw,               rh              ])
+    p0H = jnp.stack([jnp.float32(0.0), rh              ])
+    room_edges = jnp.stack([
+        jnp.stack([p00, pW0]),   # bottom wall
+        jnp.stack([pW0, pWH]),   # right wall
+        jnp.stack([pWH, p0H]),   # top wall
+        jnp.stack([p0H, p00]),   # left wall
     ])
 
     def _nan_if_invalid(pts, valid):
@@ -136,7 +145,7 @@ def reset_env(key: jax.Array, max_goal_dist: float = 3.0, scenario_idx: int = -1
               ghost_prob: float = 1.0, max_scenario: int = 6):
     k_main, k_legs, k_obs, k_ghost = jax.random.split(key, 4)
 
-    rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people = \
+    rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people, room_h = \
         generate_scenario(k_main, max_goal_dist, scenario_idx, max_scenario)
     
     #max_v = 0.8
@@ -155,6 +164,7 @@ def reset_env(key: jax.Array, max_goal_dist: float = 3.0, scenario_idx: int = -1
         human_stop_timers=jnp.zeros(NUM_PEOPLE, dtype=jnp.int32),
         escape_timer=0,
         is_ghost=is_ghost,
+        room_h=room_h,
     )
 
     obs, sp_mask = get_obs(state, k_obs)
@@ -194,14 +204,14 @@ def step_env(key, state, action, ghost_robot: bool = True):
 
     # Boolean wall_collision for episode logic (stop_grad'd later)
     wall_collision = (raw_x < ROBOT_RADIUS) | (raw_x > ROOM_W - ROBOT_RADIUS) | \
-                     (raw_y < ROBOT_RADIUS) | (raw_y > ROOM_H - ROBOT_RADIUS)
+                     (raw_y < ROBOT_RADIUS) | (raw_y > state.room_h - ROBOT_RADIUS)
 
     new_x = jnp.clip(raw_x, ROBOT_RADIUS, ROOM_W - ROBOT_RADIUS)
-    new_y = jnp.clip(raw_y, ROBOT_RADIUS, ROOM_H - ROBOT_RADIUS)
+    new_y = jnp.clip(raw_y, ROBOT_RADIUS, state.room_h - ROBOT_RADIUS)
 
     # ── 2. JHSFM substeps ─────────────────────────────────────────────────────
     hsfm_params      = get_standard_humans_parameters(NUM_PEOPLE + 1)
-    static_obstacles = build_hsfm_obstacles(state.obs_boxes, state.obs_circles)
+    static_obstacles = build_hsfm_obstacles(state.obs_boxes, state.obs_circles, state.room_h)
 
     # Build goal arrays for humans using the active waypoint per human.
     idx_h    = state.people[:, 10]
@@ -255,7 +265,7 @@ def step_env(key, state, action, ghost_robot: bool = True):
         clamped_x    = jnp.where(is_dummy_sub, next_h[:, 0],
                                  jnp.clip(next_h[:, 0], 0.1, ROOM_W - 0.1))
         clamped_y    = jnp.where(is_dummy_sub, next_h[:, 1],
-                                 jnp.clip(next_h[:, 1], 0.1, ROOM_H - 0.1))
+                                 jnp.clip(next_h[:, 1], 0.1, state.room_h - 0.1))
                                  
         # Preserve robot row unchanged; only humans are clamped
         clamped_ext  = next_ext.at[:-1, 0].set(clamped_x).at[:-1, 1].set(clamped_y)
@@ -304,7 +314,10 @@ def step_env(key, state, action, ghost_robot: bool = True):
     rand_x_prl = jnp.where(is_wall_walker, g1x, rand_x_corr)
     rand_x = jnp.where(is_parallel, rand_x_prl, rand_x_full)
     
-    rand_y = jnp.full((NUM_PEOPLE,), ROOM_H - 0.2)
+    is_long = state.room_h > 20.0
+    k_respawn_y, _ = jax.random.split(k_respawn2)
+    rand_y_long = jax.random.uniform(k_respawn_y, (NUM_PEOPLE,), minval=20.7, maxval=state.room_h - 0.2)
+    rand_y = jnp.where(is_long, rand_y_long, jnp.full((NUM_PEOPLE,), state.room_h - 0.2))
 
     new_idx = jnp.where(needs_respawn, 0.0, new_idx)
 
@@ -324,8 +337,11 @@ def step_env(key, state, action, ghost_robot: bool = True):
         new_h_state[:, 4], new_h_state[:, 5]   # theta, omega unchanged
     ], axis=-1)
 
+    new_g1x = jnp.where(needs_respawn & is_long, final_px, state.people[:, 6])
+    new_g2x = jnp.where(needs_respawn & is_long, final_px, state.people[:, 8])
+
     new_people = jnp.concatenate(
-        [respawned_h_state, state.people[:, 6:10], new_idx[:, None]], axis=-1
+        [respawned_h_state, new_g1x[:, None], state.people[:, 7:8], new_g2x[:, None], state.people[:, 9:10], new_idx[:, None]], axis=-1
     )
 
     # ── Human stop-and-go ──────────────────────────────────────────────────────
@@ -342,7 +358,10 @@ def step_env(key, state, action, ghost_robot: bool = True):
     prev_timers  = state.human_stop_timers
     in_stop      = prev_timers > 0
     new_timers   = jnp.where(in_stop, prev_timers - 1, 0)
-    start_stop   = ~in_stop & (stop_roll < P_HUMAN_STOP)
+    # Disable stop-and-go in the long parallel corridor (room_h > 12 m) so
+    # pedestrians maintain a continuous flow without freezing mid-corridor.
+    allow_stop   = state.room_h <= jnp.float32(12.0)
+    start_stop   = ~in_stop & (stop_roll < P_HUMAN_STOP) & allow_stop
     new_timers   = jnp.where(start_stop, stop_dur, new_timers)
     is_stopped_h = new_timers > 0
 
