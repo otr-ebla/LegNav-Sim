@@ -1,6 +1,5 @@
 """
-SACjax.py — Soft Actor-Critic (shared-encoder, fused-JIT)
-
+SACjax.py — Soft Actor-Critic (shared-encoder, fused-JIT, curato con Reward Normalization)
 """
 
 import os
@@ -15,8 +14,6 @@ _pre_args, _ = _pre.parse_known_args()
 if _pre_args.gpu is not None:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(_pre_args.gpu)
 
-# Use setdefault so an orchestrator script (or the user's shell) can pre-set
-# these before importing this module without being overwritten.
 os.environ.setdefault("JAX_PLATFORMS",               "cuda")
 os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
 os.environ.setdefault("TF_GPU_ALLOCATOR",            "cuda_malloc_async")
@@ -38,32 +35,26 @@ from jax_env_multi import reset_env, step_env
 from jax_wrappers import make_stacked_env, make_autoreset_env
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-OBS_SIZE       = 662        # 9 (pose) + 5 (state_vec) + 648 (lidar)
+OBS_SIZE       = 662
 ACTION_DIM     = 2
-N_ENVS         = 2048       # High parallelism; each LOG_EVERY chunk = N_ENVS*LOG_EVERY transitions.
-BUFFER_CAP     = 1_000_000  # 1M — keeps a mix of easy/hard experiences longer
+N_ENVS         = 2048
+BUFFER_CAP     = 1_000_000
 BATCH_SIZE     = 512
-G_UPDATES      = 50         # Gradient updates per collect step (raised: more learning per data,
-                            # compensates for the shorter total budget).
+G_UPDATES      = 50
 WARMUP_STEPS   = 10_000
 GAMMA          = 0.99
-TAU            = 0.005      # Standard SAC target-EMA rate (per gradient update). The previous
+TAU            = 0.005
                             
 LR             = 3e-4
 TARGET_ENTROPY = -1.0       
 DEFAULT_TOTAL_ENV_STEPS = 12_000_000  
-LOG_EVERY      = 50         # chunks; each chunk = N_ENVS*LOG_EVERY env steps collected
+LOG_EVERY      = 50
 SAVE_EVERY     = 5000
 MAX_GRAD_NORM  = 10.0
 
-# pose_stack indices 0-8; state_vec[2] = max_v/2 at flat index 9+2 = 11
 MAX_V_OBS_IDX  = 11
 LOG_STD_EPS    = 1e-6
-
-# ── Perception normalization ───────────────────────────────────────────────────
-LIDAR_MAX_RANGE = 12.0   # metres — set to your env's actual max sensor range
-
-# ── Actor-encoder gradient coupling ───────────────────────────────────────────
+LIDAR_MAX_RANGE = 12.0
 ACTOR_ENC_GRAD_SCALE = 0.0
 
 CKPT_DIR  = "checkpoints_sac"
@@ -91,11 +82,7 @@ jax.config.update("jax_default_device", target_gpu)
 reset_stacked, step_stacked = make_stacked_env(reset_env, step_env, stack_dim=3)
 
 def init_env_state(rng_key, max_goal_dist: float = 1.5, ghost_prob: float = 0.0, scenario_idx: int = -1):
-    """Build vmapped step/reset, initialise all envs. Returns (obs, state, vmap_step).
-    vmap_step is NOT jit-wrapped — the outer train_chunk JIT fuses it.
-    """
     step_auto = make_autoreset_env(reset_stacked, step_stacked)
-    # in_axes: (key, state, action, max_goal_dist, scenario_idx, ghost_prob, max_scenario)
     vmap_step = jax.vmap(step_auto, in_axes=(0, 0, 0, None, None, None, None))
 
     def _reset(key):
@@ -107,24 +94,15 @@ def init_env_state(rng_key, max_goal_dist: float = 1.5, ghost_prob: float = 0.0,
 
 
 # ── Shared Encoder + Actor/Critic Heads ──────────────────────────────────────
-# SharedEncoder is imported from jax_network — identical trunk to PPO's
-# EndToEndActorCritic (LidarFrameCNN + FrameStackAttention + MLP).
-# This guarantees SAC, TQC and PPO use the same observation feature extractor
-# for a fair algorithm comparison.
-
 from jax_network import SharedEncoder
 
 _orth_relu = nn.initializers.orthogonal(scale=jnp.sqrt(2.0))
 _orth_out  = nn.initializers.orthogonal(scale=0.01)
 
-
 class SACActorHead(nn.Module):
-    """Policy head: 128-dim shared feat → (mean, log_std)."""
     action_dim:  int   = ACTION_DIM
     LOG_STD_MIN: float = -5.0
-    LOG_STD_MAX: float =  0.5   # Match TQC. Was 2.0, which let std reach e^2 ≈ 7.4 in
-                                # raw action space → policy was effectively pure noise
-                                # for thousands of updates and could not commit.
+    LOG_STD_MAX: float =  0.5
 
     @nn.compact
     def __call__(self, feat: jnp.ndarray):
@@ -132,9 +110,7 @@ class SACActorHead(nn.Module):
         log_std = nn.Dense(self.action_dim, kernel_init=_orth_out, name='log_std')(feat)
         return mean, jnp.clip(log_std, self.LOG_STD_MIN, self.LOG_STD_MAX)
 
-
 class CriticBranch(nn.Module):
-    """Single Q-head: (feat_128, action) → scalar."""
     @nn.compact
     def __call__(self, feat: jnp.ndarray, action: jnp.ndarray):
         x = jnp.concatenate([feat, action], axis=-1)
@@ -142,8 +118,6 @@ class CriticBranch(nn.Module):
         q = nn.LayerNorm()(nn.relu(nn.Dense(128, kernel_init=_orth_relu)(q)))
         return jnp.squeeze(nn.Dense(1)(q), axis=-1)
 
-
-# Module instances (stateless — params stored separately)
 shared_enc = SharedEncoder()
 actor_head  = SACActorHead()
 critic_q1   = CriticBranch()
@@ -151,20 +125,34 @@ critic_q2   = CriticBranch()
 
 
 # ── Optimisers ────────────────────────────────────────────────────────────────
-# Standard Adam learning rates. The previous "ALPHA_LR = LR / G_UPDATES" was
-# wrong: auto-α is *supposed* to track entropy mismatch, and Adam's per-step
-# update is bounded by the learning rate, not the per-chunk drift. Throttling
-# α by 20× simply prevents the policy from ever committing to actions when
-# the initial random policy is too entropic for the target.
-ALPHA_LR = 1e-4   # match TQCjac.py
+ALPHA_LR = 1e-4
 enc_opt        = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR,       eps=1e-5))
 head_actor_opt = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR,       eps=1e-5))
 head_q1_opt    = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR,       eps=1e-5))
 head_q2_opt    = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR,       eps=1e-5))
 alpha_opt      = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(ALPHA_LR, eps=1e-5))
 
-# ── Action squashing + exact log-prob ─────────────────────────────────────────
+# ── Reward Normalization (Running RMS) ────────────────────────────────────────
+@jax.jit
+def update_reward_rms(mean, var, count, batch):
+    """Aggiorna la varianza delle reward usando l'algoritmo di Welford in JAX."""
+    batch_mean = jnp.mean(batch)
+    batch_var = jnp.var(batch)
+    batch_count = batch.shape[0]
 
+    delta = batch_mean - mean
+    tot_count = count + batch_count
+
+    new_mean = mean + delta * batch_count / tot_count
+    m_a = var * count
+    m_b = batch_var * batch_count
+    M2 = m_a + m_b + jnp.square(delta) * count * batch_count / tot_count
+    
+    new_var = jnp.where(tot_count > 0, M2 / tot_count, 1.0)
+    return new_mean, new_var, tot_count
+
+
+# ── Action squashing + exact log-prob ─────────────────────────────────────────
 def _tanh_log_prob_correction(tanh_u, max_v):
     corr_v = (
         jnp.log(max_v * 0.5 + LOG_STD_EPS)
@@ -173,32 +161,23 @@ def _tanh_log_prob_correction(tanh_u, max_v):
     corr_w = jnp.log(1.0 - tanh_u[..., 1] ** 2 + LOG_STD_EPS)
     return -(corr_v + corr_w)
 
-
 def sample_action_sac_batched(rng_key, mean, log_std, max_v):
-    """Fully batched reparameterised sample.
-    mean, log_std : (N, 2)   max_v : (N,)
-    Returns: env_action (N, 2), log_pi (N,)
-    """
     std   = jnp.exp(log_std)
     noise = jax.random.normal(rng_key, shape=mean.shape)
     u     = mean + noise * std
     lp_gauss = jnp.sum(-0.5 * (noise**2 + jnp.log(2.0 * jnp.pi)) - log_std, axis=-1)
     tanh_u = jnp.tanh(u)
+    
+    # Lo scaling consistente avviene qui: usato sia in iterazione che nella loss
     a_v = (tanh_u[:, 0] + 1.0) * 0.5 * max_v
     a_w = tanh_u[:, 1]
     return jnp.stack([a_v, a_w], axis=-1), lp_gauss + _tanh_log_prob_correction(tanh_u, max_v)
 
-
 def extract_max_v(obs):
-    """Decode max_v from observation vector. Call ONCE per step."""
     return obs[..., MAX_V_OBS_IDX] * 2.0
 
 
 # ── Replay buffer (on-GPU circular) ───────────────────────────────────────────
-# VRAM budget: obs/next_obs stored as float16 to halve memory.
-#   500K * 662 * 2B * 2 arrays = 1.32 GB (vs 2.65 GB with float32).
-# buf_sample casts back to float32 before returning — encoder sees full precision.
-# Field 'terminal' = done & ~timeout — only true environmental endings stored.
 def make_buffer(capacity):
     return {
         "obs":      jnp.zeros((capacity, OBS_SIZE),   jnp.float16),
@@ -210,7 +189,6 @@ def make_buffer(capacity):
         "ptr":      jnp.int32(0),
         "size":     jnp.int32(0),
     }
-
 
 @jax.jit
 def buf_add(buf, obs, action, reward, next_obs, terminal, max_v):
@@ -228,7 +206,6 @@ def buf_add(buf, obs, action, reward, next_obs, terminal, max_v):
         "size":     jnp.minimum(jnp.int32(buf["size"] + N), jnp.int32(cap)),
     }
 
-
 @jax.jit(static_argnames=["batch_size"])
 def buf_sample(buf, rng_key, batch_size: int):
     idxs = jax.random.randint(rng_key, (batch_size,), 0, buf["size"])
@@ -241,31 +218,6 @@ def buf_sample(buf, rng_key, batch_size: int):
 
 
 # ── SAC update step ───────────────────────────────────────────────────────────
-# Param layout:
-#   lcp  / lcos   — shared LidarCNN params + opt state
-#   tlcp          — target LidarCNN (EMA of lcp)
-#   ahp  / ahos   — actor head params + opt state
-#   q1p  / q1os   — Q1 branch params + opt state
-#   q2p  / q2os   — Q2 branch params + opt state  (INDEPENDENT of q1p → decorrelated)
-#   tq1p / tq2p   — target Q-branch params (EMA of q1p / q2p)
-#   la   / alo    — log alpha + opt state
-#
-# CNN passes per update:
-#   lidar_cnn(obs)       — online, trainable via critic loss              [1]
-#   lidar_cnn_tgt(next)  — target, stop_grad, for target Q backup        [1]
-#   (actor reuses lcp with scale_gradient — same 2 passes, no extra fwd) [0]
-#   Total: 2 CNN passes  (down from 3; custom_vjp handles backward scaling)
-#
-# Actor→encoder gradient coupling:
-#   Critic pass: full gradient into lcp (critic shapes encoder)
-#   Actor pass:  gradient scaled by ACTOR_ENC_GRAD_SCALE=0.1 into lcp
-#   Net encoder gradient = c_grad_cnn + 0.1 * a_grad_cnn
-#   This lets the actor nudge perception toward navigation-relevant features
-#   without destabilising the critic's value representation.
-# ── Gradient scaling via custom_vjp ──────────────────────────────────────────
-# Scales the backward-pass gradient by `scale` while leaving the forward pass
-# identical. Used to give the actor a soft 0.1x nudge into the shared encoder
-# without running a separate (redundant) CNN forward+backward pass.
 @jax.custom_vjp
 def scale_gradient(x, scale):
     return x
@@ -284,13 +236,11 @@ def sac_update(sep, eos, tsep, ahp, ahos, q1p, q1os, q2p, q2os,
                tq1p, tq2p, la, alo,
                obs, action, reward, next_obs, terminal, max_v_obs, max_v_next, rng_key):
 
-
     rng_c, rng_a = jax.random.split(rng_key)
 
-    # ── 1. Critic loss — Bellman backup ──────────────────────────────────────
+    # 1. Critic loss
     def _critic_loss(sep_, q1p_, q2p_):
         alpha = jax.lax.stop_gradient(jnp.exp(la))
-
         feat_next = jax.lax.stop_gradient(shared_enc.apply({"params": tsep}, next_obs))
         mean_n, lgs_n = actor_head.apply({"params": ahp}, feat_next)
         next_act, next_lp = sample_action_sac_batched(rng_c, mean_n, lgs_n, max_v_next)
@@ -298,6 +248,8 @@ def sac_update(sep, eos, tsep, ahp, ahos, q1p, q1os, q2p, q2os,
         q1_t = critic_q1.apply({"params": tq1p}, feat_next, next_act)
         q2_t = critic_q2.apply({"params": tq2p}, feat_next, next_act)
         v_next = jnp.minimum(q1_t, q2_t) - alpha * next_lp
+        
+        # Reward è già normalizzata prima di essere passata qui
         backup = jax.lax.stop_gradient(reward + GAMMA * (1.0 - terminal) * v_next)
 
         feat_obs = shared_enc.apply({"params": sep_}, obs)
@@ -314,7 +266,7 @@ def sac_update(sep, eos, tsep, ahp, ahos, q1p, q1os, q2p, q2os,
     new_q1p = optax.apply_updates(q1p, q1_upd)
     new_q2p = optax.apply_updates(q2p, q2_upd)
 
-    # ── 2. Actor loss — scaled backward gradient into encoder ────────────────
+    # 2. Actor loss
     def _actor_loss(ahp_, sep_):
         alpha = jax.lax.stop_gradient(jnp.exp(la))
         feat_raw = shared_enc.apply({"params": sep_}, obs)
@@ -332,20 +284,20 @@ def sac_update(sep, eos, tsep, ahp, ahos, q1p, q1os, q2p, q2os,
     ah_upd, new_ahos = head_actor_opt.update(a_grads_head, ahos, ahp)
     new_ahp = optax.apply_updates(ahp, ah_upd)
 
-    # ── 3. Encoder update — critic + actor gradients ─────────────────────────
+    # 3. Encoder update
     combined_enc_grads = jax.tree_util.tree_map(
         lambda cg, ag: cg + ag, c_grads_enc, a_grads_enc_actor
     )
     enc_upd, new_eos = enc_opt.update(combined_enc_grads, eos, sep)
     new_sep = optax.apply_updates(sep, enc_upd)
 
-    # ── 4. Alpha update ───────────────────────────────────────────────────────
+    # 4. Alpha update
     log_pi_sg = jax.lax.stop_gradient(log_pi_mean)
     al_grad   = jax.grad(lambda a: -a * (log_pi_sg + TARGET_ENTROPY))(la)
     al_upd, new_alo = alpha_opt.update(al_grad, alo)
     new_la = optax.apply_updates(la, al_upd)
 
-    # ── 5. Soft target update ─────────────────────────────────────────────────
+    # 5. Soft target update
     new_tsep = jax.tree_util.tree_map(lambda t, o: TAU * o + (1.0 - TAU) * t, tsep, new_sep)
     new_tq1p = jax.tree_util.tree_map(lambda t, o: TAU * o + (1.0 - TAU) * t, tq1p, new_q1p)
     new_tq2p = jax.tree_util.tree_map(lambda t, o: TAU * o + (1.0 - TAU) * t, tq2p, new_q2p)
@@ -365,7 +317,6 @@ def sac_update(sep, eos, tsep, ahp, ahos, q1p, q1os, q2p, q2os,
 # ── Collection step ───────────────────────────────────────────────────────────
 @functools.partial(jax.jit, static_argnums=(5,))
 def collect_step(sep, ahp, env_state, env_obs, rng_key, vmap_step, max_goal_dist, scenario_idx, ghost_prob, max_scenario):
-    """Compute max_v ONCE, sample action via shared encoder + actor head, step env."""
     max_v = extract_max_v(env_obs)
     k_act, k_step = jax.random.split(rng_key)
     feat = shared_enc.apply({"params": sep}, env_obs)
@@ -375,29 +326,21 @@ def collect_step(sep, ahp, env_state, env_obs, rng_key, vmap_step, max_goal_dist
     new_obs, new_state, reward, done, info = vmap_step(
         step_keys, env_state, env_action, max_goal_dist, scenario_idx, ghost_prob, max_scenario
     )
-
-    # Let auto-alpha adapt to the natural Q-scale. Aggressive reward scaling destroys the actor's objective.
     return new_obs, new_state, env_obs, env_action, reward, done, info, max_v
 
 
 # ── Fused GPU train chunk ─────────────────────────────────────────────────────
-# Two-phase design to keep the large buffer OUT of the gradient-update scan carry:
-#   Phase 1 (collect scan, 50 iters): buffer in carry, no gradient computation.
-#   Phase 2 (update scan, G*50 iters): buffer is a closed-over constant — carry
-#            contains only model params + optimizer states (~tens of MB, not GB).
-# This lets XLA treat the 500K buffer as an immutable constant during backprop,
-# avoiding 1000 implicit copies of ~1.3 GB that the mixed-scan design forced.
 @functools.partial(jax.jit, static_argnums=(13,))
 def train_chunk(sep, eos, tsep, ahp, ahos,
                 q1p, q1os, q2p, q2os, tq1p, tq2p,
                 la, alo, vmap_step,
                 buf, es, eo, key,
                 max_goal_dist, scenario_idx, ghost_prob,
-                max_scenario):
+                max_scenario, rmean, rvar, rcount):
 
     # ── Phase 1: collect LOG_EVERY env steps, write to buffer ─────────────────
     def _collect_body(carry, _):
-        es_, eo_, buf_, key_ = carry
+        es_, eo_, buf_, key_, rm_, rv_, rc_ = carry
         key_, k_col = jax.random.split(key_)
         new_eo, new_es, obs_b, env_a, rew, done, info, max_v_cur = collect_step(
             sep, ahp, es_, eo_, k_col, vmap_step, max_goal_dist, scenario_idx, ghost_prob, max_scenario
@@ -405,16 +348,18 @@ def train_chunk(sep, eos, tsep, ahp, ahos,
         terminal = done & ~info["timeout"]
         new_buf = buf_add(buf_, obs_b, env_a, rew, new_eo,
                           terminal.astype(jnp.float32), max_v_cur)
+        
+        # Aggiorniamo le running stats delle reward sulla base dei campioni freschi raccolti
+        new_rm, new_rv, new_rc = update_reward_rms(rm_, rv_, rc_, rew)
+        
         step_data = (rew, done, info["goal_reached"], info["collision"], info["passive_col"])
-        return (new_es, new_eo, new_buf, key_), step_data
+        return (new_es, new_eo, new_buf, key_, new_rm, new_rv, new_rc), step_data
 
-    (new_es, new_eo, new_buf, key), all_step_data = jax.lax.scan(
-        _collect_body, (es, eo, buf, key), None, length=LOG_EVERY
+    (new_es, new_eo, new_buf, key, new_rmean, new_rvar, new_rcount), all_step_data = jax.lax.scan(
+        _collect_body, (es, eo, buf, key, rmean, rvar, rcount), None, length=LOG_EVERY
     )
 
     # ── Phase 2: G_UPDATES * LOG_EVERY gradient steps, buffer as constant ─────
-    # new_buf is captured by closure — XLA sees it as an immutable operand,
-    # so the scan carry only carries params + opt states (no buffer copies).
     def _update_step(update_carry, upd_idx):
         (sep_, eos_, tsep_, ahp_, ahos_,
          q1p_, q1os_, q2p_, q2os_, tq1p_, tq2p_, la_, alo_, key_) = update_carry
@@ -424,12 +369,16 @@ def train_chunk(sep, eos, tsep, ahp, ahos,
             new_buf, k_samp, BATCH_SIZE
         )
         b_max_v_next = extract_max_v(b_next)
+        
+        # Reward Normalization prima del calcolo della Bellman Loss
+        norm_b_rew = b_rew / jnp.sqrt(new_rvar + 1e-8)
+        
         (new_sep_, new_eos_, new_tsep_, new_ahp_, new_ahos_,
          new_q1p_, new_q1os_, new_q2p_, new_q2os_,
          new_tq1p_, new_tq2p_, new_la_, new_alo_, metrics_) = sac_update(
             sep_, eos_, tsep_, ahp_, ahos_,
             q1p_, q1os_, q2p_, q2os_, tq1p_, tq2p_, la_, alo_,
-            b_obs, b_act, b_rew, b_next, b_terminal, b_max_v, b_max_v_next, k_upd
+            b_obs, b_act, norm_b_rew, b_next, b_terminal, b_max_v, b_max_v_next, k_upd
         )
         return (new_sep_, new_eos_, new_tsep_, new_ahp_, new_ahos_,
                 new_q1p_, new_q1os_, new_q2p_, new_q2os_,
@@ -445,7 +394,8 @@ def train_chunk(sep, eos, tsep, ahp, ahos,
 
     new_carry = (new_sep, new_eos, new_tsep, new_ahp, new_ahos,
                  new_q1p, new_q1os, new_q2p, new_q2os, new_tq1p, new_tq2p,
-                 new_la, new_alo, new_buf, new_es, new_eo, key)
+                 new_la, new_alo, new_buf, new_es, new_eo, key,
+                 new_rmean, new_rvar, new_rcount)
     return new_carry, all_step_data, all_metrics
 
 
@@ -508,11 +458,6 @@ def save_checkpoint(sep, tsep, ahp, q1p, q2p, tq1p, tq2p,
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
-    """Run SAC training for a fixed env-step budget.
-
-    Loop exits when `total_steps >= total_env_steps`. Each chunk advances
-    `total_steps` by `N_ENVS * LOG_EVERY` env steps.
-    """
     print("SAC Training  (shared LidarCNN + decoupled Q1/Q2 branches)")
     print(f"  N_ENVS={N_ENVS}  BUFFER={BUFFER_CAP:,}  BATCH={BATCH_SIZE}  G_UPDATES={G_UPDATES}")
     print(f"  gamma={GAMMA}  tau={TAU}  lr={LR}  H*={TARGET_ENTROPY}")
@@ -528,15 +473,12 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
 
     k_se, k_ah, k_q1, k_q2 = jax.random.split(k_init, 4)
 
-    # Init shared encoder (same architecture as PPO's EndToEndActorCritic trunk)
     sep  = shared_enc.init(k_se, dummy_obs)["params"]
-    tsep = jax.tree_util.tree_map(jnp.array, sep)   # target encoder (EMA copy)
+    tsep = jax.tree_util.tree_map(jnp.array, sep)
 
-    # Init actor head — needs encoder forward pass to get 128-dim feature shape
-    dummy_feat = shared_enc.apply({"params": sep}, dummy_obs)   # (2, 128)
+    dummy_feat = shared_enc.apply({"params": sep}, dummy_obs)
     ahp  = actor_head.init(k_ah, dummy_feat)["params"]
 
-    # Init independent Q1 and Q2 branches
     q1p  = critic_q1.init(k_q1, dummy_feat, dummy_act)["params"]
     q2p  = critic_q2.init(k_q2, dummy_feat, dummy_act)["params"]
     tq1p = jax.tree_util.tree_map(jnp.array, q1p)
@@ -546,14 +488,14 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     ahos = head_actor_opt.init(ahp)
     q1os = head_q1_opt.init(q1p)
     q2os = head_q2_opt.init(q2p)
-    # Alpha init: raw Q-values are O(10-100). auto-alpha tunes itself via ALPHA_LR.
-    # Start at 1.0 so early entropy term is non-negligible vs Q, then decays correctly.
-    la   = jnp.array(0.0, dtype=jnp.float32)  # log(1.0) = 0.0 → alpha = 1.0
+
+    la   = jnp.array(0.0, dtype=jnp.float32)
     alo  = alpha_opt.init(la)
 
-    # Initialize curriculum state for fair comparison with PPO
     from jax_ppo import get_continuous_curriculum
-    cur_max_dist, cur_ghost, _, cur_max_scen = get_continuous_curriculum(0.0)
+    # Forza la probabilità dei ghost a 0 all'inizio
+    cur_max_dist, _, _, cur_max_scen = get_continuous_curriculum(0.0)
+    cur_ghost = 0.0
     rolling_suc = 0.0
     highest_rolling_suc = 0.0
     cur_scenario = 0
@@ -567,8 +509,12 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     n_updates   = 0
     best_suc    = 49.5
     best_ret    = -1e9
+    
+    # Init Reward stats
+    r_mean  = jnp.zeros(())
+    r_var   = jnp.ones(())
+    r_count = jnp.zeros(())
 
-    # ── Warmup: fill buffer with random actions ───────────────────────────────
     print("Warming up buffer with random actions...")
     for _ in range((WARMUP_STEPS // N_ENVS) + 1):
         k_warmup, k_act, k_step = jax.random.split(k_warmup, 3)
@@ -606,7 +552,6 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
                            "pcol_pct", "tmo_pct", "n_ep"])
     _log_file.flush()
 
-    # Print every 10th chunk (budget is now 12M → ~117 chunks total → ~12 log lines)
     PRINT_EVERY_CHUNKS = 10
 
     while total_steps < total_env_steps:
@@ -618,11 +563,12 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
             la, alo, vmap_step,
             replay_buf, env_state, env_obs, train_rng,
             cur_max_dist, cur_scenario, cur_ghost,
-            jnp.int32(cur_max_scen)
+            jnp.int32(cur_max_scen), r_mean, r_var, r_count
         )
         (sep, eos, tsep, ahp, ahos,
          q1p, q1os, q2p, q2os, tq1p, tq2p,
-         la, alo, replay_buf, env_state, env_obs, train_rng) = new_carry
+         la, alo, replay_buf, env_state, env_obs, train_rng,
+         r_mean, r_var, r_count) = new_carry
 
         n_updates   += LOG_EVERY * G_UPDATES
         total_steps += N_ENVS * LOG_EVERY
@@ -638,10 +584,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
             pcol_pct = float((ep_pcol * ep_msk).sum() / n_ep) * 100.0
             tmo_pct  = float((ep_tmo  * ep_msk).sum() / n_ep) * 100.0
 
-            # ── Monotonic curriculum ──────────────────────────────────────
-            # Once a level is passed it can never be unlearned: both the
-            # tracking signal (`highest_rolling_suc`) and the per-dimension
-            # curriculum state are strictly non-decreasing.
+            # ── Curriculum Sbloccato ──────────────────────────────────────
             rolling_suc         = 0.90 * rolling_suc + 0.10 * suc_pct
             highest_rolling_suc = max(highest_rolling_suc, rolling_suc)
 
@@ -654,7 +597,6 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
             if new_max_scen > cur_max_scen:
                 cur_max_scen = new_max_scen
 
-            # Always sample scenario uniformly from [0, cur_max_scen] at each reset.
             cur_scenario = -1
         else:
             mean_ret = suc_pct = col_pct = pcol_pct = tmo_pct = 0.0
@@ -686,7 +628,6 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
                                round(pcol_pct, 4), round(tmo_pct, 4), n_ep])
         _log_file.flush()
 
-        # Only save when curriculum is past the trivial phase (≥2 scenarios, goal ≥5m).
         curriculum_mature = cur_max_scen >= 1 and cur_max_dist >= 5.0
         is_better = (suc_pct > best_suc) or (suc_pct == best_suc and mean_ret > best_ret)
         if is_better and n_ep > 0 and curriculum_mature:
@@ -695,7 +636,6 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
             save_checkpoint(sep, tsep, ahp, q1p, q2p, tq1p, tq2p,
                             eos, ahos, q1os, q2os, la, alo, n_updates)
 
-    # Always save a final checkpoint so training work is never lost
     save_checkpoint(sep, tsep, ahp, q1p, q2p, tq1p, tq2p,
                     eos, ahos, q1os, q2os, la, alo, n_updates,
                     filepath="checkpoints_sac/sac_final.msgpack")
@@ -705,7 +645,6 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     print(f"\nSAC done! {elapsed/3600:.2f}h | Best success: {best_suc:.1f}%  Best reward: {best_ret:.1f}")
     _log_file.close()
     print(f"Training log saved -> {_LOG_PATH}")
-
 
 if __name__ == "__main__":
     train()
