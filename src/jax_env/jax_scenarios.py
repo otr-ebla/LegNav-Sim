@@ -515,7 +515,9 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
         ry_off = jax.random.uniform(k_ry_jitter, minval=-1.2, maxval=1.2)
         ry     = jnp.clip(door1_y + ry_off, 1.0, ROOM_H - 1.0)
         rtheta = 0.0   # facing right toward door
-        gx, gy = 6.0, door1_y   # first goal: inside room 2 aligned with door1
+        
+        # Goal iniziale: Stanza 2, subito dopo la porta 1 (x=5.0, y=door1_y).
+        gx, gy = 5.0, door1_y
 
         N_PPL = 6
         px = jnp.array([1.5, 2.5, 5.0, 7.0, 9.5, 10.5])
@@ -734,10 +736,14 @@ TEST_SCENARIO_NAMES = {
 # Single-goal scenarios have one entry; the eval loop completes after it.
 # Multi-goal scenarios list waypoints in order; goal_x/goal_y starts at [0].
 TEST_ROBOT_WAYPOINTS = {
-    7:  [(10.0, 4.0), (2.0, 8.0), (10.5, 10.5)],            # bottleneck1 → bottleneck2 → top-right
-    8:  [(6.0, 11.0)],                                       # single goal
-    9:  [(6.0, 6.0), (10.0, 6.0)],      # room2-centre → room3-centre (robot must pass through random doors)
-    10: [(6.0, 11.0)],                                       # single goal
-    11: [(6.0, 12.0), (6.0, 19.2)],   # half height and 4/5 height
-    12: [(1.5, 1.5), (10.5, 1.5), (10.5, 10.5)],            # down → across → up
+    7:  [(10.0, 4.0), (2.0, 8.0), (10.5, 10.5)],            
+    8:  [(6.0, 11.0)],                                       
+    
+    # -1.0 = flag per door1_y, -2.0 = flag per door2_y (calcolati dinamicamente in eval).
+    # WP1: stanza 2 subito dopo porta 1 | WP2: stanza 3 subito dopo porta 2.
+    9:  [(5.0, -1.0), (9.0, -2.0)],
+    
+    10: [(6.0, 11.0)],                                       
+    11: [(6.0, 12.0), (6.0, 19.2)],   
+    12: [(1.5, 1.5), (10.5, 1.5), (10.5, 10.5)],            
 }

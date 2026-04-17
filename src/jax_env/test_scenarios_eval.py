@@ -62,6 +62,12 @@ from jax_env_multi import reset_env, step_env
 from jax_wrappers import make_stacked_env
 from jax_scenarios import TEST_ROBOT_WAYPOINTS, TEST_SCENARIO_NAMES
 
+# --- INIZIO MODIFICA: Sovrascriviamo i waypoint dello scenario 9 ---
+# -1.0 = door1_y, -2.0 = door2_y (calcolati dinamicamente da obs_boxes).
+# WP1: stanza 1 davanti porta 1 | WP2: stanza 2 davanti porta 2
+TEST_ROBOT_WAYPOINTS[9] = [(7.0, -1.0), (10.0, -2.0)]
+# --- FINE MODIFICA ---
+
 # ── Import eval rendering from jax_eval_multi ────────────────────────────────
 # We reuse the drawing functions from the main eval script.
 try:
@@ -227,6 +233,18 @@ def run_interactive():
         # Update goal in the env state to next waypoint.
         # Reset time_step so the 400-step timeout budget is fresh for each segment.
         next_gx, next_gy = waypoints[wp_idx]
+        
+        # --- INIZIO MODIFICA: Calcolo dinamico Y per lo scenario 9 ---
+        if current_scenario == 9:
+            obs_boxes = stacked_state.env_state.obs_boxes
+            if next_gy == -1.0:
+                # Porta 1: Y basata sul muro inferiore 1
+                next_gy = obs_boxes[0, 1] + obs_boxes[0, 3] + 1.0
+            elif next_gy == -2.0:
+                # Porta 2: Y basata sul muro inferiore 2
+                next_gy = obs_boxes[2, 1] + obs_boxes[2, 3] + 1.0
+        # --- FINE MODIFICA ---
+
         env_state = stacked_state.env_state
         env_state = env_state.replace(
             goal_x=jnp.float32(next_gx),
@@ -487,6 +505,16 @@ def run_headless():
                             wp_idx += 1
                             total_wp_completed += 1
                             next_gx, next_gy = waypoints[wp_idx]
+                            
+                            # --- INIZIO MODIFICA: Calcolo dinamico Y per lo scenario 9 ---
+                            if scen_idx == 9:
+                                obs_boxes = stacked_state.env_state.obs_boxes
+                                if next_gy == -1.0:
+                                    next_gy = obs_boxes[0, 1] + obs_boxes[0, 3] + 1.0
+                                elif next_gy == -2.0:
+                                    next_gy = obs_boxes[2, 1] + obs_boxes[2, 3] + 1.0
+                            # --- FINE MODIFICA ---
+
                             env_state = stacked_state.env_state
                             env_state = env_state.replace(
                                 goal_x=jnp.float32(next_gx),

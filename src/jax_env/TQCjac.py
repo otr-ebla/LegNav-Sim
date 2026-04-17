@@ -40,7 +40,7 @@ from jax_wrappers import make_stacked_env, make_autoreset_env
 OBS_SIZE       = 662
 ACTION_DIM     = 2
 N_ENVS         = 2048
-BUFFER_CAP     = 1_000_000  # 1M — keeps a mix of easy/hard experiences longer
+BUFFER_CAP     = 300_000    # 300K — ~1.5 GB for obs+next_obs (fits 8GB VRAM)
 BATCH_SIZE     = 512
 G_UPDATES      = 20
 WARMUP_STEPS   = 10_000
@@ -187,12 +187,14 @@ def quantile_huber_loss(atoms, targets, taus, kappa=HUBER_KAPPA):
     # Sum over target atoms, mean over quantile atoms, mean over batch
     return jnp.mean(jnp.mean(jnp.sum(rho, axis=2), axis=1))
 
+_BUF_OBS_DTYPE = jnp.bfloat16  # halves obs storage; cast back to float32 at sample time
+
 def make_buffer(capacity):
     return {
-        "obs": jnp.zeros((capacity, OBS_SIZE), jnp.float32),
+        "obs": jnp.zeros((capacity, OBS_SIZE), _BUF_OBS_DTYPE),
         "action": jnp.zeros((capacity, ACTION_DIM), jnp.float32),
         "reward": jnp.zeros((capacity,), jnp.float32),
-        "next_obs": jnp.zeros((capacity, OBS_SIZE), jnp.float32),
+        "next_obs": jnp.zeros((capacity, OBS_SIZE), _BUF_OBS_DTYPE),
         "done": jnp.zeros((capacity,), jnp.float32),
         "ptr": jnp.int32(0), "size": jnp.int32(0),
     }
@@ -202,10 +204,10 @@ def buf_add(buf, obs, action, reward, next_obs, done):
     cap = buf["obs"].shape[0]; N = obs.shape[0]
     idxs = (buf["ptr"] + jnp.arange(N)) % cap
     return {
-        "obs": buf["obs"].at[idxs].set(obs.astype(jnp.float32)),
+        "obs": buf["obs"].at[idxs].set(obs.astype(_BUF_OBS_DTYPE)),
         "action": buf["action"].at[idxs].set(action),
         "reward": buf["reward"].at[idxs].set(reward),
-        "next_obs": buf["next_obs"].at[idxs].set(next_obs.astype(jnp.float32)),
+        "next_obs": buf["next_obs"].at[idxs].set(next_obs.astype(_BUF_OBS_DTYPE)),
         "done": buf["done"].at[idxs].set(done),
         "ptr": jnp.int32((buf["ptr"] + N) % cap),
         "size": jnp.minimum(jnp.int32(buf["size"] + N), jnp.int32(cap)),
@@ -216,7 +218,7 @@ def buf_add(buf, obs, action, reward, next_obs, done):
 def buf_sample(buf, rng_key, batch_size: int):
     max_idx = jnp.maximum(1, buf["size"])
     idxs = jax.random.randint(rng_key, (batch_size,), 0, max_idx)
-    return (buf["obs"][idxs], buf["action"][idxs], buf["reward"][idxs], buf["next_obs"][idxs], buf["done"][idxs])
+    return (buf["obs"][idxs].astype(jnp.float32), buf["action"][idxs], buf["reward"][idxs], buf["next_obs"][idxs].astype(jnp.float32), buf["done"][idxs])
 
 @jax.jit
 def soft_update(target, online):
