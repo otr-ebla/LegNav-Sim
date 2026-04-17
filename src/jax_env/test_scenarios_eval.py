@@ -39,7 +39,7 @@ import flax.serialization
 def _parse_args():
     p = argparse.ArgumentParser(description="Test Scenario Evaluation")
     p.add_argument("--algo", default="sac",
-                   choices=["ppo", "shac", "sac", "tqc", "mlp", "navrep"])
+                   choices=["ppo", "shac", "sac", "tqc", "mlp", "navrep", "tagd"])
     p.add_argument("--ckpt", default="")
     p.add_argument("--legs",    dest="use_legs", action="store_true",  default=True)
     p.add_argument("--no-legs", dest="use_legs", action="store_false")
@@ -114,6 +114,31 @@ def _build_navrep():
 
 _DEFAULT_CKPT["navrep"] = "checkpoints_navrep/navrep_best.msgpack"
 
+
+def _build_tagd():
+    from comparison_policies.tagd_network import TAGDActor
+
+    actor = TAGDActor()
+    rng   = jax.random.PRNGKey(0)
+    init_params = actor.init(rng, jnp.zeros(OBS_SIZE))["params"]
+    jit_act = jax.jit(lambda params, obs: actor.apply({"params": params}, obs))
+
+    def load(path):
+        with open(path, "rb") as f:
+            raw = f.read()
+        bundle = flax.serialization.msgpack_restore(raw)
+        return bundle.get("actor_params", bundle)
+
+    def infer(params, obs, _max_v):
+        # TAGDActor reads max_v from obs[11] internally
+        return jit_act(params, obs)
+
+    def reset_cb(): pass
+
+    return init_params, load, infer, reset_cb
+
+_DEFAULT_CKPT["tagd"] = "checkpoints_tagd/tagd_best.msgpack"
+
 OBS_SIZE   = 662
 ACTION_DIM = 2
 use_legs   = args.use_legs
@@ -146,6 +171,8 @@ def run_interactive():
     algo = args.algo
     if algo == "navrep":
         init_params, load_fn, infer_fn, _ = _build_navrep()
+    elif algo == "tagd":
+        init_params, load_fn, infer_fn, _ = _build_tagd()
     else:
         result = build_policy(algo)
         if len(result) == 4:
@@ -443,6 +470,8 @@ def run_headless():
     algo = args.algo
     if algo == "navrep":
         init_params, load_fn, infer_fn, _ = _build_navrep()
+    elif algo == "tagd":
+        init_params, load_fn, infer_fn, _ = _build_tagd()
     else:
         result = build_policy(algo)
         if len(result) == 4:

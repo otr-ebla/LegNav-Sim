@@ -42,8 +42,8 @@ for _p in (_THIS_DIR, _SRC_DIR, _ROOT_DIR):
 def _parse_args():
     p = argparse.ArgumentParser(description="Visual evaluation — comparison policies")
     p.add_argument("--algo", default="dwa",
-                   choices=["dwa", "mppi", "navrep", "mlp"],
-                   help="Policy to evaluate: dwa | mppi | navrep | mlp")
+                   choices=["dwa", "mppi", "navrep", "mlp", "tagd"],
+                   help="Policy to evaluate: dwa | mppi | navrep | mlp | tagd")
     p.add_argument("--ckpt", default="",
                    help="Checkpoint path (navrep only). "
                         "Default: checkpoints_navrep/navrep_best.msgpack")
@@ -164,9 +164,34 @@ def _build_mlp():
     return init_params, load, infer, reset_cb
 
 
+def _build_tagd():
+    from comparison_policies.tagd_network import TAGDActor
+
+    actor = TAGDActor()
+    rng   = jax.random.PRNGKey(0)
+    init_params = actor.init(rng, jnp.zeros(OBS_SIZE))["params"]
+    jit_act = jax.jit(lambda params, obs: actor.apply({"params": params}, obs))
+
+    def load(path):
+        with open(path, "rb") as f:
+            raw = f.read()
+        bundle = flax.serialization.msgpack_restore(raw)
+        # train_tagd_ddpg.py saves under "actor_params"
+        return bundle.get("actor_params", bundle)
+
+    def infer(params, obs, _max_v):
+        # TAGDActor reads max_v from obs[11] internally — no external scaling needed
+        return jit_act(params, obs)
+
+    def reset_cb(): pass   # stateless
+
+    return init_params, load, infer, reset_cb
+
+
 _DEFAULT_CKPT = {
     "navrep": "checkpoints_navrep/navrep_best.msgpack",
     "mlp":    "checkpoints_vanilla_ppo/ppo_mlp_best.msgpack",
+    "tagd":   "checkpoints_tagd/tagd_best.msgpack",
 }
 
 _BUILDERS = {
@@ -174,6 +199,7 @@ _BUILDERS = {
     "mppi":   _build_mppi,
     "navrep": _build_navrep,
     "mlp":    _build_mlp,
+    "tagd":   _build_tagd,
 }
 
 

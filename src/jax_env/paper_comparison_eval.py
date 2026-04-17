@@ -1,23 +1,25 @@
 """
 paper_comparison_eval.py — Comparison Table for Paper
 =====================================================
-Evaluates all navigation policies on the Random scenario at v_max=1.0 m/s and
-produces a CSV + LaTeX table with the metrics used in the paper.
+Evaluates all navigation policies on the 6 test scenarios (7-12) with v_max
+sampled uniformly in [0.2, 2.0] per episode (matching the training distribution).
+Metrics are aggregated across all scenarios and speed conditions.
 
 Policies:
   Model-Based : DWA, MPPI
-  RL          : MLP, NavRep, PPO (circles), PPO (legs), SAC, TQC
+  RL          : MLP, NavRep, PPO (circles), PPO (legs), SAC, TQC, TAGD
 
 Metrics:
-  Success (%)  |  Obst. Col. (%)  |  Act. Col. (%)  |  Pass. Col. (%)
+  Success (%)  |  Obst. Col. (%)  |  Act. Col. (%)  |  Pass. Col. (%)  |  Timeout (%)
   Yield Score  |  Jerk  |  Time to Goal (s)  |  Min Dist to Humans (m)
 
 Usage:
   cd src/jax_env
-  python3 paper_comparison_eval.py [--envs 1024] [--seed 42]
+  python3 paper_comparison_eval.py [--envs 512] [--seed 42]
 
 Output:
-  paper_comparison_table.csv   — aggregated table (one row per policy)
+  paper_comparison_table.csv          — one aggregated row per policy
+  paper_comparison_table_per_scen.csv — per (policy, scenario) breakdown
 """
 
 import argparse
@@ -38,12 +40,10 @@ import flax.linen as nn
 # ── CLI ────────────────────────────────────────────────────────────────────────
 def _parse():
     p = argparse.ArgumentParser()
-    p.add_argument("--envs",  type=int,   default=1024, help="Parallel envs for RL/DWA (default 1024)")
-    p.add_argument("--envs-mppi", type=int, default=256, help="Parallel envs for MPPI (default 256, heavier carry)")
-    p.add_argument("--seed",  type=int,   default=42)
-    p.add_argument("--scenario", type=int, default=0,   help="Scenario index (default 0 = Random)")
-    p.add_argument("--vmax",  type=float, default=1.0,  help="Max speed m/s (default 1.0)")
-    p.add_argument("--no-legs", action="store_true",    help="Disable leg model for the environment")
+    p.add_argument("--envs",      type=int,  default=512,  help="Parallel envs per scenario (default 512)")
+    p.add_argument("--envs-mppi", type=int,  default=128,  help="Parallel envs for MPPI (default 128)")
+    p.add_argument("--seed",      type=int,  default=42)
+    p.add_argument("--no-legs",   action="store_true",     help="Disable leg model for the environment")
     return p.parse_args()
 
 args = _parse()
@@ -67,10 +67,15 @@ ACTION_DIM = 2
 POSE_SIZE  = 3
 STACK_DIM  = 3
 
-TARGET_SCENARIO = args.scenario
-TARGET_V_MAX    = args.vmax
-N_ENVS          = args.envs
-N_ENVS_MPPI     = args.envs_mppi
+# 6 held-out test scenarios — same as test_scenarios_eval.py
+TEST_SCENARIOS  = list(range(7, 13))   # [7, 8, 9, 10, 11, 12]
+
+# v_max sampled uniformly per episode, matching the training distribution
+V_MAX_MIN = 0.2
+V_MAX_MAX = 2.0
+
+N_ENVS      = args.envs
+N_ENVS_MPPI = args.envs_mppi
 
 YIELD_DIST = 1.5   # m — yield-zone radius (same as benchmark_eval.py)
 YIELD_FOV  = 1.57  # rad ≈ 90°
@@ -80,8 +85,9 @@ HUMAN_R = LEG_RADIUS if _jax_env.USE_LEGS else PEOPLE_RADIUS
 # ── Stacked-env helpers (same as benchmark_eval.py) ──────────────────────────
 
 @jax.jit
-def _reset_stacked(key, v_max):
-    base_obs, base_state = reset_env(key, 9.0, TARGET_SCENARIO, 0.0)
+def _reset_stacked(key, v_max, scenario_idx):
+    """Reset one env for the given scenario with the given v_max."""
+    base_obs, base_state = reset_env(key, 9.0, scenario_idx, 0.0)
     pose      = base_obs[:POSE_SIZE]
     state_vec = base_obs[POSE_SIZE: POSE_SIZE + _SVS]
     lidar     = base_obs[POSE_SIZE + _SVS:]
@@ -112,14 +118,18 @@ def _step_stacked(key, state: StackedEnvState, action):
 
 # ── Core rollout (stateless policies: RL + DWA) ───────────────────────────────
 
-def _rollout_stateless(act_vmap, n_envs, rng_key):
+def _rollout_stateless(act_vmap, n_envs, rng_key, scenario_idx):
     """
     Run n_envs episodes in parallel using lax.scan.
     act_vmap: (obs_batch N×662) -> (actions_batch N×2)   [deterministic / RL]
+    v_max is sampled uniformly in [V_MAX_MIN, V_MAX_MAX] per environment.
     Returns a metrics dict with arrays of shape (n_envs,).
     """
-    reset_keys = jax.random.split(rng_key, n_envs)
-    obs, state = jax.vmap(_reset_stacked, in_axes=(0, None))(reset_keys, TARGET_V_MAX)
+    rng_key, rng_v = jax.random.split(rng_key)
+    v_max_batch = jax.random.uniform(rng_v, (n_envs,), minval=V_MAX_MIN, maxval=V_MAX_MAX)
+    reset_keys  = jax.random.split(rng_key, n_envs)
+    obs, state  = jax.vmap(_reset_stacked, in_axes=(0, 0, None))(
+        reset_keys, v_max_batch, scenario_idx)
 
     init_dist = jnp.sqrt(
         (state.env_state.goal_x - state.env_state.x) ** 2 +
@@ -224,10 +234,13 @@ def _rollout_stateless(act_vmap, n_envs, rng_key):
 
 # ── MPPI rollout (carries u_mean per env) ─────────────────────────────────────
 
-def _rollout_mppi(mppi, n_envs, rng_key):
+def _rollout_mppi(mppi, n_envs, rng_key, scenario_idx):
     """Like _rollout_stateless but carries u_mean_batch for warm-starting."""
-    reset_keys = jax.random.split(rng_key, n_envs)
-    obs, state = jax.vmap(_reset_stacked, in_axes=(0, None))(reset_keys, TARGET_V_MAX)
+    rng_key, rng_v = jax.random.split(rng_key)
+    v_max_batch = jax.random.uniform(rng_v, (n_envs,), minval=V_MAX_MIN, maxval=V_MAX_MAX)
+    reset_keys  = jax.random.split(rng_key, n_envs)
+    obs, state  = jax.vmap(_reset_stacked, in_axes=(0, 0, None))(
+        reset_keys, v_max_batch, scenario_idx)
 
     init_dist = jnp.sqrt(
         (state.env_state.goal_x - state.env_state.x) ** 2 +
@@ -335,6 +348,13 @@ def _rollout_mppi(mppi, n_envs, rng_key):
 
 # ── Network / policy builders ──────────────────────────────────────────────────
 
+_MAX_V_OBS_IDX = 11   # obs[11] = (max_v − 0.2) / 1.8
+
+def _obs_to_max_v(obs):
+    """Decode per-episode v_max from the stacked observation vector."""
+    return jnp.clip(obs[..., _MAX_V_OBS_IDX] * 1.8 + 0.2, 0.2, 2.0)
+
+
 def _load_raw(path):
     with open(path, "rb") as f:
         return flax.serialization.msgpack_restore(f.read())
@@ -351,7 +371,7 @@ def _build_ppo_act_vmap(ckpt_path):
     def act_vmap(obs_batch):   # (N, 662) → (N, 2)
         def _single(obs):
             mean, _, _ = net.apply({"params": params}, obs[None])
-            return scale_action_to_env(jnp.squeeze(mean, 0), TARGET_V_MAX)
+            return scale_action_to_env(jnp.squeeze(mean, 0), _obs_to_max_v(obs))
         return jax.vmap(_single)(obs_batch)
 
     return act_vmap
@@ -368,7 +388,7 @@ def _build_mlp_act_vmap(ckpt_path):
     def act_vmap(obs_batch):
         def _single(obs):
             mean, _, _ = net.apply({"params": params}, obs[None])
-            return scale_action_to_env(jnp.squeeze(mean, 0), TARGET_V_MAX)
+            return scale_action_to_env(jnp.squeeze(mean, 0), _obs_to_max_v(obs))
         return jax.vmap(_single)(obs_batch)
 
     return act_vmap
@@ -385,7 +405,7 @@ def _build_navrep_act_vmap(ckpt_path):
     def act_vmap(obs_batch):
         def _single(obs):
             mean, _, _ = net.apply({"params": params}, obs[None])
-            return scale_action_to_env(jnp.squeeze(mean, 0), TARGET_V_MAX)
+            return scale_action_to_env(jnp.squeeze(mean, 0), _obs_to_max_v(obs))
         return jax.vmap(_single)(obs_batch)
 
     return act_vmap
@@ -417,7 +437,7 @@ def _build_sac_act_vmap(ckpt_path):
             feat = enc.apply({"params": enc_p}, obs[None])
             mean, _ = head.apply({"params": head_p}, feat)
             mean = jnp.squeeze(mean, 0)
-            v = (jnp.tanh(mean[0]) + 1.0) * 0.5 * TARGET_V_MAX
+            v = (jnp.tanh(mean[0]) + 1.0) * 0.5 * _obs_to_max_v(obs)
             w = jnp.tanh(mean[1])
             return jnp.stack([v, w])
         return jax.vmap(_single)(obs_batch)
@@ -445,7 +465,7 @@ def _build_tqc_act_vmap(ckpt_path):
             feat = enc.apply({"params": enc_p}, obs[None])
             mean, _ = head.apply({"params": head_p}, feat)
             mean = jnp.squeeze(mean, 0)
-            v = (jnp.tanh(mean[0]) + 1.0) * 0.5 * TARGET_V_MAX
+            v = (jnp.tanh(mean[0]) + 1.0) * 0.5 * _obs_to_max_v(obs)
             w = jnp.tanh(mean[1])
             return jnp.stack([v, w])
         return jax.vmap(_single)(obs_batch)
@@ -464,7 +484,7 @@ def _build_tagd_act_vmap(ckpt_path):
     from comparison_policies.tagd_network import TAGDActor, make_tagd_act_fn
     bundle = _load_raw(ckpt_path)
     actor_params = bundle.get("actor_params", bundle)
-    return make_tagd_act_fn(actor_params, v_max=TARGET_V_MAX)
+    return make_tagd_act_fn(actor_params)  # TAGDActor reads v_max from obs[11] internally
 
 
 # ── Policy registry ────────────────────────────────────────────────────────────
@@ -516,8 +536,8 @@ def _print_latex(rows):
     header = (
         r"\begin{table*}[t]" "\n"
         r"\centering" "\n"
-        r"\caption{Comparison of Navigation Methods (Scenario: Random, "
-        + f"$v_{{\\max}}={TARGET_V_MAX:.1f}$~m/s)" + r"}" "\n"
+        r"\caption{Comparison of Navigation Methods — Test Scenarios 7--12, "
+        r"$v_{\max} \sim \mathcal{U}[0.2,\,2.0]$~m/s}" "\n"
         r"\label{tab:comparison}" "\n"
         r"\footnotesize" "\n"
         r"\begin{tabular}{lcccccccc}" "\n"
@@ -542,15 +562,28 @@ def _print_latex(rows):
     print(r"\end{table*}")
 
 
+# ── Raw-metrics concatenation helper ──────────────────────────────────────────
+
+def _concat_raw(raw_list):
+    """Concatenate a list of per-scenario raw metric dicts along axis 0."""
+    return {k: np.concatenate([np.array(r[k]) for r in raw_list]) for k in raw_list[0]}
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
     rng = jax.random.PRNGKey(args.seed)
-    rows = []
+    rows      = []   # one row per policy (aggregated over all scenarios)
+    rows_scen = []   # one row per (policy, scenario)
+
+    n_scen = len(TEST_SCENARIOS)
+    n_ep_total = N_ENVS * n_scen
 
     print(f"\n{'='*70}")
-    print(f"Paper Comparison Eval — scenario={TARGET_SCENARIO}, "
-          f"v_max={TARGET_V_MAX}, USE_LEGS={_jax_env.USE_LEGS}")
+    print(f"Paper Comparison Eval — scenarios={TEST_SCENARIOS}")
+    print(f"  v_max ~ U[{V_MAX_MIN}, {V_MAX_MAX}]  |  "
+          f"envs/scenario={N_ENVS}  |  total_eps/policy={n_ep_total}")
+    print(f"  USE_LEGS={_jax_env.USE_LEGS}")
     print(f"{'='*70}\n")
 
     for name, ptype, ckpt, category in POLICY_REGISTRY:
@@ -561,90 +594,94 @@ def main():
 
         t0 = time.time()
 
-        # ── Build policy function and run rollout ──────────────────────────
+        # ── Build policy function ──────────────────────────────────────────
         try:
             if ptype == "dwa":
-                act_vmap = _build_dwa_act_vmap()
-                print(f"  [{name}] compiling DWA kernel ...", end="", flush=True)
-                rng, k = jax.random.split(rng)
-                raw = jax.device_get(jax.block_until_ready(
-                    _rollout_stateless(act_vmap, N_ENVS, k)))
-
+                act_fn = _build_dwa_act_vmap()
             elif ptype == "mppi":
                 from comparison_policies.mppi_planner import MPPI
-                mppi = MPPI()
-                print(f"  [{name}] compiling MPPI kernel (horizon={mppi.horizon}) ...",
-                      end="", flush=True)
-                rng, k = jax.random.split(rng)
-                raw = jax.device_get(jax.block_until_ready(
-                    _rollout_mppi(mppi, N_ENVS_MPPI, k)))
-
+                _mppi = MPPI()
             elif ptype == "ppo":
-                act_vmap = _build_ppo_act_vmap(ckpt)
-                print(f"  [{name}] compiling PPO kernel ...", end="", flush=True)
-                rng, k = jax.random.split(rng)
-                raw = jax.device_get(jax.block_until_ready(
-                    _rollout_stateless(act_vmap, N_ENVS, k)))
-
+                act_fn = _build_ppo_act_vmap(ckpt)
             elif ptype == "mlp":
-                act_vmap = _build_mlp_act_vmap(ckpt)
-                print(f"  [{name}] compiling MLP kernel ...", end="", flush=True)
-                rng, k = jax.random.split(rng)
-                raw = jax.device_get(jax.block_until_ready(
-                    _rollout_stateless(act_vmap, N_ENVS, k)))
-
+                act_fn = _build_mlp_act_vmap(ckpt)
             elif ptype == "navrep":
-                act_vmap = _build_navrep_act_vmap(ckpt)
-                print(f"  [{name}] compiling NavRep kernel ...", end="", flush=True)
-                rng, k = jax.random.split(rng)
-                raw = jax.device_get(jax.block_until_ready(
-                    _rollout_stateless(act_vmap, N_ENVS, k)))
-
+                act_fn = _build_navrep_act_vmap(ckpt)
             elif ptype == "sac":
-                act_vmap = _build_sac_act_vmap(ckpt)
-                print(f"  [{name}] compiling SAC kernel ...", end="", flush=True)
-                rng, k = jax.random.split(rng)
-                raw = jax.device_get(jax.block_until_ready(
-                    _rollout_stateless(act_vmap, N_ENVS, k)))
-
+                act_fn = _build_sac_act_vmap(ckpt)
             elif ptype == "tqc":
-                act_vmap = _build_tqc_act_vmap(ckpt)
-                print(f"  [{name}] compiling TQC kernel ...", end="", flush=True)
-                rng, k = jax.random.split(rng)
-                raw = jax.device_get(jax.block_until_ready(
-                    _rollout_stateless(act_vmap, N_ENVS, k)))
-
+                act_fn = _build_tqc_act_vmap(ckpt)
             elif ptype == "tagd":
-                act_vmap = _build_tagd_act_vmap(ckpt)
-                print(f"  [{name}] compiling TAGD kernel ...", end="", flush=True)
-                rng, k = jax.random.split(rng)
-                raw = jax.device_get(jax.block_until_ready(
-                    _rollout_stateless(act_vmap, N_ENVS, k)))
-
+                act_fn = _build_tagd_act_vmap(ckpt)
             else:
                 raise ValueError(f"Unknown policy type: {ptype!r}")
-
         except Exception as e:
-            print(f"\n  [{name}] ERROR: {e}")
+            print(f"\n  [{name}] BUILD ERROR: {e}")
             import traceback; traceback.print_exc()
             continue
 
-        elapsed = time.time() - t0
-        metrics = _agg(raw)
+        # ── Iterate over all 6 test scenarios ─────────────────────────────
+        all_raw = []
         n_ep = N_ENVS_MPPI if ptype == "mppi" else N_ENVS
+        first_scen = True
 
-        print(f" done ({elapsed:.1f}s, N={n_ep})")
-        tmo = metrics['Timeout']
-        _sum = metrics['Success'] + metrics['Obst. Col.'] + metrics['Act. Col.'] + metrics['Pass. Col.'] + tmo
-        print(f"    Suc={metrics['Success']:.1f}%  "
+        for scen in TEST_SCENARIOS:
+            scen_jax = jnp.int32(scen)
+            rng, k = jax.random.split(rng)
+            label = f"scen{scen}"
+            if first_scen:
+                print(f"  [{name}] compiling on scen {scen} ...", end="", flush=True)
+            else:
+                print(f"    scen {scen} ...", end="", flush=True)
+
+            try:
+                if ptype == "mppi":
+                    raw_s = jax.device_get(jax.block_until_ready(
+                        _rollout_mppi(_mppi, N_ENVS_MPPI, k, scen_jax)))
+                else:
+                    raw_s = jax.device_get(jax.block_until_ready(
+                        _rollout_stateless(act_fn, N_ENVS, k, scen_jax)))
+            except Exception as e:
+                print(f" ERROR: {e}")
+                import traceback; traceback.print_exc()
+                break
+
+            scen_metrics = _agg(raw_s)
+            rows_scen.append({"Method": name, "Type": category,
+                              "Scenario": scen, **scen_metrics})
+            all_raw.append(raw_s)
+
+            tmo  = scen_metrics['Timeout']
+            _sum = (scen_metrics['Success'] + scen_metrics['Obst. Col.'] +
+                    scen_metrics['Act. Col.'] + scen_metrics['Pass. Col.'] + tmo)
+            print(f" Suc={scen_metrics['Success']:.1f}% "
+                  f"Col={scen_metrics['Obst. Col.']:.1f}+{scen_metrics['Act. Col.']:.1f}"
+                  f"+{scen_metrics['Pass. Col.']:.1f} "
+                  f"Tmo={tmo:.1f}% (Σ={_sum:.1f}%)")
+            first_scen = False
+
+        if not all_raw or len(all_raw) < n_scen:
+            print(f"  [{name}] incomplete — skipping aggregation.")
+            continue
+
+        # ── Aggregate across all scenarios ─────────────────────────────────
+        merged = _concat_raw(all_raw)
+        metrics = _agg(merged)
+        elapsed = time.time() - t0
+
+        tmo  = metrics['Timeout']
+        _sum = (metrics['Success'] + metrics['Obst. Col.'] +
+                metrics['Act. Col.'] + metrics['Pass. Col.'] + tmo)
+        print(f"  [{name}] TOTAL ({elapsed:.0f}s, N={n_ep * n_scen}): "
+              f"Suc={metrics['Success']:.1f}%  "
               f"ObsCol={metrics['Obst. Col.']:.1f}%  "
               f"ActCol={metrics['Act. Col.']:.1f}%  "
               f"PasCol={metrics['Pass. Col.']:.1f}%  "
-              f"Tmo={tmo:.1f}%  (sum={_sum:.1f}%)  "
+              f"Tmo={tmo:.1f}%  (Σ={_sum:.1f}%)  "
               f"Yield={metrics['Yield Score']:.2f}  "
               f"Jerk={metrics['Jerk']:.1f}  "
               f"T={metrics['Time to Goal']:.1f}s  "
-              f"MinD={metrics['Min Dist (m)']:.2f}m")
+              f"MinD={metrics['Min Dist (m)']:.2f}m\n")
 
         rows.append({"Method": name, "Type": category, **metrics})
 
@@ -652,15 +689,16 @@ def main():
         print("No policies evaluated. Check checkpoint paths.")
         return
 
-    # ── Save CSV ──────────────────────────────────────────────────────────────
+    # ── Save CSVs ─────────────────────────────────────────────────────────────
     df = pd.DataFrame(rows)
-    csv_path = "paper_comparison_table.csv"
-    df.to_csv(csv_path, index=False, float_format="%.3f")
-    print(f"\nSaved {csv_path}")
+    df_scen = pd.DataFrame(rows_scen)
+    df.to_csv("paper_comparison_table.csv", index=False, float_format="%.3f")
+    df_scen.to_csv("paper_comparison_table_per_scen.csv", index=False, float_format="%.3f")
+    print(f"Saved paper_comparison_table.csv  +  paper_comparison_table_per_scen.csv")
 
     # ── Print table ───────────────────────────────────────────────────────────
     print("\n" + "="*70)
-    print("RESULTS TABLE")
+    print("RESULTS TABLE (aggregated over scenarios 7-12, random v_max)")
     print("="*70)
     cols_show = ["Method", "Type", "Success", "Obst. Col.", "Act. Col.",
                  "Pass. Col.", "Timeout", "Yield Score", "Jerk", "Time to Goal", "Min Dist (m)"]
