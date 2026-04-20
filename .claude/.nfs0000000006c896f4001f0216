@@ -18,7 +18,9 @@
       "Bash(ls -la /home/alberto_vaglio/indoor-rl-nav/src/jax_env/*.py)",
       "Bash(wc -l /home/alberto_vaglio/indoor-rl-nav/src/jax_env/*.py)",
       "Bash(nvidia-smi --query-gpu=name,memory.total,memory.used,memory.free --format=csv,noheader)",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(grep -rn \"class.*Buffer\\\\|class.*Replay\" /home/alberto_vaglio/indoor-rl-nav/src/jax_env/*.py)",
+      "Bash(python plot_scratch/plot_training_rewards.py)"
     ]
   }
 }

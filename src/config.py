@@ -13,7 +13,7 @@ class SimConfig:
     HSFM_DT = 0.01
     ROOM_SIDE_LENGTH = 10.0  # meters
     ROOM_SIZE = (ROOM_SIDE_LENGTH, ROOM_SIDE_LENGTH)  # meters
-    MAX_STEPS = 400
+    MAX_STEPS = 600
     HUMANS_RADIUS = 0.4  # meters
     PEOPLE_RADIUS = 0.4
     HUMANS_VELOCITY = 1.0 # m/s

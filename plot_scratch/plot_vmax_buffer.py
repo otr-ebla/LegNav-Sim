@@ -137,7 +137,7 @@ axes[1].set_ylabel("Density", fontsize=11)
 axes[1].set_xlim(-1.0, 1.0)
 axes[1].legend(title="Assigned Robot Vmax", fontsize=10, title_fontsize=11)
 
-axes[2].set_title("True EFFECTIVE Applied Linear Velocity vs Assigned 'Vmax'", fontsize=13, pad=10)
+axes[2].set_title("Actually Applied Linear Velocity vs Assigned 'Vmax'", fontsize=13, pad=10)
 axes[2].set_xlabel("Applied Linear Velocity [m/s]", fontsize=11, labelpad=8)
 axes[2].set_ylabel("Density", fontsize=11)
 axes[2].set_xlim(0, 2.0)
