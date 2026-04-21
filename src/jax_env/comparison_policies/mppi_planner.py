@@ -98,7 +98,7 @@ class MPPI(DWA):
         # weights compose additively over the horizon on the same scale.
         velocity_cost_weight:     float = 1.5,
         goal_distance_cost_weight: float = 3.0,
-        obstacle_cost_weight:     float = 3.0,
+        obstacle_cost_weight:     float = 1.5,
         control_cost_weight:      float = 0.0,
         terminal_cost_weight:     float = 15.0,
         # Warm-start bias (normalised v). A larger value keeps the Gaussian
