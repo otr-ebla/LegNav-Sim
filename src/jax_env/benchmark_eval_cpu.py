@@ -1,22 +1,15 @@
 """
-benchmark_eval.py — High-Speed Evaluation Dashboard
-===================================================
-Evaluates RL models across all 7 scenarios and generates a visual dashboard.
-
-OOM FIX: Removed the nested vmap over (N_SCENARIOS x N_SPEEDS) that tried to
-allocate ~5.4 GiB for a single compiled graph. Evaluation is now a sequential
-Python loop over (scenario, speed) pairs; each iteration dispatches a single
-vmap over N_ENVS environments, which is the actual parallelism budget the GPU
-can handle. Compile time drops to seconds and VRAM stays under 2 GiB.
-
+benchmark_eval_cpu.py — CPU-Only Evaluation Dashboard
+=====================================================
+Identical to benchmark_eval.py but forces JAX to run on CPU only.
+Used to compare CPU vs GPU evaluation speed.
 """
 
 import os
 import time
 import warnings
 
-os.environ["JAX_PLATFORMS"] = "cuda,cpu"
-os.environ["XLA_FLAGS"] = "--xla_gpu_enable_triton_gemm=true"
+os.environ["JAX_PLATFORMS"] = "cpu"
 os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
 os.environ["SDL_VIDEODRIVER"] = "dummy"
 warnings.filterwarnings("ignore")
@@ -425,8 +418,8 @@ def _plot_dashboard(df, scatter_data):
     # Position 12 intentionally left empty (training curves removed)
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])
-    plt.savefig("Evaluation_Dashboard.png", dpi=300)
-    print("Saved 'Evaluation_Dashboard.png'")
+    plt.savefig("Evaluation_Dashboard_cpu.png", dpi=300)
+    print("Saved 'Evaluation_Dashboard_cpu.png'")
 
     _plot_proximity_speed(scatter_data)
 
@@ -490,8 +483,8 @@ def _plot_proximity_speed(scatter_data):
         ax.grid(True, alpha=0.25)
 
     plt.tight_layout()
-    plt.savefig("proximity_speed_scatter.png", dpi=180)
-    print("Saved 'proximity_speed_scatter.png'")
+    plt.savefig("proximity_speed_scatter_cpu.png", dpi=180)
+    print("Saved 'proximity_speed_scatter_cpu.png'")
     plt.close(fig)
 
 
@@ -864,16 +857,16 @@ def _plot_test_dashboard(test_df):
     ax.tick_params(labelsize=FS_TICK)
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])
-    plt.savefig("Test_Scenario_Dashboard.png", dpi=300)
-    print("Saved 'Test_Scenario_Dashboard.png'")
+    plt.savefig("Test_Scenario_Dashboard_cpu.png", dpi=300)
+    print("Saved 'Test_Scenario_Dashboard_cpu.png'")
     plt.close(fig)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
     t_total = time.time()
-    gpu = jax.devices("cuda")[0] if jax.devices("cuda") else jax.devices()[0]
-    print(f"Running on: {gpu}\n")
+    cpu = jax.devices("cpu")[0]
+    print(f"Running on: {cpu}\n")
 
     # Load available checkpoints
     policies = {}
@@ -883,7 +876,7 @@ def main():
             continue
         try:
             params = _LOADERS[name](path)
-            policies[name] = jax.device_put(params, gpu)
+            policies[name] = jax.device_put(params, cpu)
             print(f"  {name}: loaded from {path}")
         except Exception as e:
             print(f"  {name}: failed to load ({e}), skipping.")
@@ -895,14 +888,13 @@ def main():
     rng = jax.random.PRNGKey(42)
 
     # ── Warm-up: compile all kernels ────────────────────────────────────────
-    # Dispatch all warmup calls without blocking, then wait once at the end.
-    print("\nCompiling evaluation kernels (all policies)...")
+    print("\nCompiling evaluation kernels (all policies, CPU)...")
     t_compile = time.time()
-    warmup_futures = {}
     for p_name, params in policies.items():
         rng, k_warmup = jax.random.split(rng)
-        warmup_futures[p_name] = _EVAL_FN[p_name](
-            params, jnp.int32(0), jnp.float32(1.0), k_warmup)
+        jax.block_until_ready(_EVAL_FN[p_name](
+            params, jnp.int32(0), jnp.float32(1.0), k_warmup))
+        print(f"  {p_name} rollout kernel compiled.")
 
     rng, k_wu_reset = jax.random.split(rng)
     wu_reset_keys = jax.random.split(k_wu_reset, N_TEST_ENVS)
@@ -910,21 +902,15 @@ def main():
         dynamic_reset_stacked, in_axes=(0, None, None, None)
     )(wu_reset_keys, 9.0, jnp.int32(7), jnp.float32(1.0))
 
-    seg_futures = {}
     for p_name, params in policies.items():
         rng, k_seg = jax.random.split(rng)
-        seg_futures[p_name] = _SEG_FN[p_name](
-            params, wu_obs, wu_state, k_seg, jnp.int32(0))
-
-    # Single barrier for all compilations
-    for p_name in policies:
-        jax.block_until_ready(warmup_futures[p_name])
-        jax.block_until_ready(seg_futures[p_name])
+        jax.block_until_ready(
+            _SEG_FN[p_name](params, wu_obs, wu_state, k_seg, jnp.int32(0)))
+        print(f"  {p_name} segment kernel compiled.")
     t_compile = time.time() - t_compile
     print(f"  All kernels compiled in {t_compile:.1f}s\n")
 
-    # ── Training-scenario evaluation (pipelined dispatch) ───────────────────
-    # Pre-generate all RNG keys so dispatch is not blocked by Python key-splits.
+    # ── Training-scenario evaluation ────────────────────────────────────────
     total_cells = N_SCENARIOS * N_SPEEDS
     all_frames   = []
     scatter_data = {}
@@ -937,55 +923,57 @@ def main():
         eval_fn  = _EVAL_FN[p_name]
         t_policy = time.time()
 
-        # Pre-split all RNG keys for this policy
         n_cells = N_SCENARIOS * N_SPEEDS
         rng, batch_rng = jax.random.split(rng)
         cell_keys = jax.random.split(batch_rng, n_cells)
 
-        # Dispatch all cells without blocking — GPU stays saturated
-        futures = []
+        sd_list, sv_list = [], []
+        cell_idx = 0
         for si in range(N_SCENARIOS):
+            t_scen = time.time()
             for vi, v_max in enumerate(MAX_V_TESTS):
                 idx = si * N_SPEEDS + vi
-                fut = eval_fn(params, jnp.int32(si),
-                              jnp.float32(v_max), cell_keys[idx])
-                futures.append((si, v_max, fut))
+                cell = jax.device_get(jax.block_until_ready(
+                    eval_fn(params, jnp.int32(si),
+                            jnp.float32(v_max), cell_keys[idx])
+                ))
+                cell_idx += 1
 
-        # Collect results (device_get implicitly waits)
-        sd_list, sv_list = [], []
-        for si, v_max, fut in futures:
-            cell = jax.device_get(fut)
+                sd = cell["step_dists"].ravel()
+                sv = cell["step_vs"].ravel()
+                ok = np.isfinite(sd) & np.isfinite(sv)
+                sd_list.append(sd[ok])
+                sv_list.append(sv[ok])
 
-            sd = cell["step_dists"].ravel()
-            sv = cell["step_vs"].ravel()
-            ok = np.isfinite(sd) & np.isfinite(sv)
-            sd_list.append(sd[ok])
-            sv_list.append(sv[ok])
+                all_frames.append(pd.DataFrame({
+                    "Policy":        p_name,
+                    "Scenario":      si,
+                    "Max_V":         v_max,
+                    "Success":       cell["success"],
+                    "Active Col":    cell["act_col"],
+                    "Passive Col":   cell["pass_col"],
+                    "Timeout":       cell["timeout"],
+                    "SPL":           cell["spl"],
+                    "Jerk":          cell["jerk"],
+                    "Min Dist":      cell["min_dist"],
+                    "Time to Goal":  cell["time"],
+                    "Yield Score":   cell["yield_score"],
+                }))
 
-            all_frames.append(pd.DataFrame({
-                "Policy":        p_name,
-                "Scenario":      si,
-                "Max_V":         v_max,
-                "Success":       cell["success"],
-                "Active Col":    cell["act_col"],
-                "Passive Col":   cell["pass_col"],
-                "Timeout":       cell["timeout"],
-                "SPL":           cell["spl"],
-                "Jerk":          cell["jerk"],
-                "Min Dist":      cell["min_dist"],
-                "Time to Goal":  cell["time"],
-                "Yield Score":   cell["yield_score"],
-            }))
+            suc_pct = np.mean([f["Success"].mean() for f in all_frames[-N_SPEEDS:]]) * 100
+            print(f"    {p_name} | {SCEN_NAMES[si]:<11s} "
+                  f"({cell_idx:>2d}/{total_cells}) "
+                  f"suc={suc_pct:5.1f}%  "
+                  f"{time.time() - t_scen:.1f}s")
 
         scatter_data[p_name] = (np.concatenate(sd_list), np.concatenate(sv_list))
-        suc_pct = np.mean([f["Success"].mean() for f in all_frames[-n_cells:]]) * 100
-        print(f"  {p_name}: suc={suc_pct:5.1f}%  {time.time() - t_policy:.1f}s")
+        print(f"  {p_name} total: {time.time() - t_policy:.1f}s\n")
 
     t_train_eval = time.time() - t_train_eval
 
     df = pd.concat(all_frames, ignore_index=True)
-    df.to_csv("evaluation_raw_data.csv", index=False)
-    print("Saved evaluation_raw_data.csv\n")
+    df.to_csv("evaluation_raw_data_cpu.csv", index=False)
+    print("Saved evaluation_raw_data_cpu.csv\n")
 
     print("Generating training-scenario dashboard...")
     _plot_dashboard(df, scatter_data)
@@ -1002,8 +990,8 @@ def main():
     test_df = run_test_scenarios(policies, rng)
     t_test_eval = time.time() - t_test_eval
 
-    test_df.to_csv("test_evaluation_raw_data.csv", index=False)
-    print("Saved test_evaluation_raw_data.csv\n")
+    test_df.to_csv("test_evaluation_raw_data_cpu.csv", index=False)
+    print("Saved test_evaluation_raw_data_cpu.csv\n")
 
     print("Generating test-scenario dashboard...")
     _plot_test_dashboard(test_df)
@@ -1011,7 +999,7 @@ def main():
     # ── Timing summary ─────────────────────────────────────────────────────
     t_total = time.time() - t_total
     print("\n" + "="*60)
-    print("GPU BENCHMARK TIMING SUMMARY")
+    print("CPU BENCHMARK TIMING SUMMARY")
     print("="*60)
     print(f"  Compilation:           {t_compile:8.1f}s")
     print(f"  Training-scenario eval:{t_train_eval:8.1f}s")
