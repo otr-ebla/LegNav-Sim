@@ -39,7 +39,7 @@ import flax.serialization
 def _parse_args():
     p = argparse.ArgumentParser(description="Test Scenario Evaluation")
     p.add_argument("--algo", default="sac",
-                   choices=["ppo", "shac", "sac", "tqc", "mlp", "navrep", "tagd"])
+                   choices=["ppo", "shac", "sac", "tqc", "mlp", "navrep", "tagd", "mppi"])
     p.add_argument("--ckpt", default="")
     p.add_argument("--legs",    dest="use_legs", action="store_true",  default=True)
     p.add_argument("--no-legs", dest="use_legs", action="store_false")
@@ -188,6 +188,9 @@ def run_interactive():
         params = init_params
         print(f"Checkpoint not found — running with random weights.")
 
+    # Optional per-policy reset (MPPI reseeds its warm-start u_mean).
+    _policy_reset = getattr(infer_fn, "reset_hook", lambda: None)
+
     current_scenario = max(7, min(12, args.scenario))
     fast_reset, fast_step = build_fast_reset(current_scenario)
 
@@ -240,6 +243,7 @@ def run_interactive():
         nonlocal rng
         rng, reset_rng = jax.random.split(rng)
         obs, stacked_state = fast_reset(reset_rng)
+        _policy_reset()
         wp_idx = 0
         wp_segment_reward = 0.0
         wp_segment_steps = 0
@@ -301,6 +305,11 @@ def run_interactive():
         obs = jnp.concatenate([
             new_pose_stack.flatten(), state_vec, new_lidar_stack.flatten()
         ])
+
+        # Waypoint change = goal change, so any stateful policy (MPPI) must
+        # drop its warm-start plan: the previous u_mean was aiming at the
+        # old waypoint and is now stale.
+        _policy_reset()
 
         # Reset per-segment counters — new episode starts from here
         wp_segment_reward = 0.0
@@ -487,6 +496,9 @@ def run_headless():
         params = init_params
         print(f"Checkpoint not found — running with random weights.")
 
+    # Optional per-policy reset (MPPI reseeds its warm-start u_mean).
+    _policy_reset = getattr(infer_fn, "reset_hook", lambda: None)
+
     n_episodes = args.episodes
     rng = jax.random.PRNGKey(42)
 
@@ -505,6 +517,7 @@ def run_headless():
         for ep in range(n_episodes):
             rng, reset_rng = jax.random.split(rng)
             obs, stacked_state = fast_reset(reset_rng)
+            _policy_reset()
             wp_idx = 0
             ep_reward = 0.0; ep_steps = 0   # reset at start of every segment
             episode_done = False
@@ -569,6 +582,8 @@ def run_headless():
                                 state_vec,
                                 stacked_state.lidar_stack.flatten()
                             ])
+                            # Waypoint changed → drop stale warm-start plan.
+                            _policy_reset()
                             break  # break inner for-loop; while resets counters
                         elif goal:
                             # All waypoints reached

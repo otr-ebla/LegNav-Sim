@@ -1,68 +1,6 @@
 """
 mppi_planner.py — Model Predictive Path Integral (MPPI) for indoor-rl-nav
 ==========================================================================
-
-Zero-shot stochastic control policy. No training required.
-Adapted from the original implementation by Alberto's colleague (socialjym/LaserNav).
-
-Reference
----------
-Williams et al., "Model Predictive Path Integral Control: From Theory to
-Parallel Computation and Practice", ICRA 2017.
-
-Key adaptations
----------------
-* Inherits from :class:`~comparison_policies.dwa_planner.DWA` to reuse
-  ``motion()``, ``decode_obs()``, and ``_wrap_angle()``.
-* Decodes the **662-dim stacked observation** (same as DWA).
-* Works entirely in the **robot's ego frame** (robot at origin at call time).
-* Action space: **rectangular** v_norm ∈ [0, 1], w ∈ [−1, +1].
-  The original triangle constraint (wheels_distance) is dropped — our env
-  clips v and w independently.
-* ``u_mean`` (warm-start control sequence) is stored **normalised**:
-  ``u_mean[t, 0]`` = v_norm ∈ [0, 1], ``u_mean[t, 1]`` = w ∈ [−1, 1].
-  This makes the carry valid even when max_v changes between episodes.
-* ``max_v`` is decoded dynamically from the observation and used only at
-  rollout time (``actual_v = v_norm × max_v``).
-* Both ``act()`` and helper methods are ``@jax.jit``-compiled and
-  ``jax.vmap``-compatible.
-
-MPPI algorithm (one call to ``act()``)
---------------------------------------
-::
-
-    1. Decode obs  →  goal_ego, max_v, point_cloud
-    2. Sample ε ~ N(0, Σ) of shape (K, H, 2)
-    3. Perturbed controls: V = clamp(u_mean + ε)      (K, H, 2)
-    4. Rollout K trajectories → cumulative costs (K,)
-    5. Weights: w_k = exp(−(cost_k − β) / λ)  (normalised)
-    6. Update: u_mean += Σ w_k · ε_k
-    7. Clamp and shift u_mean (slide window by 1 step)
-    8. action = u_mean[0] × [max_v, 1]
-
-Observation layout (same as dwa_planner.py)
--------------------------------------------
-::
-
-    obs[0:9]    pose_stack   — 3 × (gdx_ego/D, gdy_ego/D, θ/π),  oldest→newest
-    obs[9:14]   state_vec    — (v/vmax, w, (vmax-0.2)/1.8, d/D, align/π)
-    obs[14:662] lidar_stack  — 3 × 216 inverse-normalised rays,  oldest→newest
-
-Usage
------
-::
-
-    from comparison_policies.mppi_planner import MPPI
-
-    mppi   = MPPI()
-    u_mean = mppi.init_u_mean()   # (H, 2) zeros — call once per episode
-
-    # Inside episode loop:
-    rng, subkey = jax.random.split(rng)
-    action, u_mean = mppi.act(obs, u_mean, subkey)
-
-    # With full diagnostics (trajectories, costs):
-    action, u_mean, trajectories, costs = mppi.act_with_info(obs, u_mean, subkey)
 """
 
 import sys
@@ -86,7 +24,13 @@ for _p in (_JAX_ENV_DIR, _SRC_DIR, _ROOT_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from comparison_policies.dwa_planner import DWA    # reuse motion() and decode_obs()
+from comparison_policies.dwa_planner import DWA, _MAX_GOAL_DIST   # reuse motion() and decode_obs()
+
+# Large-but-finite collision cost in the obstacle critic. Picked so that
+# (i)  exp(-collision_cost / temperature) ≈ 0 → colliding samples vanish
+# (ii) we can cheaply detect "all rollouts collided" by thresholding on
+#      total_cost, without having to thread a collision flag through lax.scan.
+_COLLISION_COST = 1.0e6
 
 
 # ===========================================================================
@@ -145,15 +89,18 @@ class MPPI(DWA):
         self,
         # MPPI hyperparameters
         num_samples:              int   = 512,
-        horizon:                  int   = 20,
-        temperature:              float = 0.1,
+        horizon:                  int   = 10,
+        temperature:              float = 1.0,
         noise_sigma:              jnp.ndarray = jnp.array([0.25, 0.5]),
-        # Cost weights
+        # Cost weights (goal/terminal critics now normalised by _MAX_GOAL_DIST)
         velocity_cost_weight:     float = 0.3,
-        goal_distance_cost_weight: float = 1.5,
+        goal_distance_cost_weight: float = 3.0,
         obstacle_cost_weight:     float = 3.0,
         control_cost_weight:      float = 0.05,
-        terminal_cost_weight:     float = 5.0,
+        terminal_cost_weight:     float = 10.0,
+        # Warm-start bias (normalised v) to avoid the clip-at-0 asymmetry
+        # that would otherwise dominate the first few steps after reset.
+        warm_start_v_norm:        float = 0.3,
         # Obstacle filtering for rollout critic
         obstacle_max_dist:        float = 5.0,
         # Pass remaining kwargs to DWA
@@ -176,6 +123,7 @@ class MPPI(DWA):
         self.obstacle_cost_weight      = obstacle_cost_weight
         self.control_cost_weight       = control_cost_weight
         self.terminal_cost_weight      = terminal_cost_weight
+        self.warm_start_v_norm         = warm_start_v_norm
         self.obstacle_max_dist         = obstacle_max_dist
 
         self.name = "MPPI"
@@ -186,14 +134,16 @@ class MPPI(DWA):
 
     def init_u_mean(self) -> jnp.ndarray:
         """
-        Return a zeroed control sequence for warm-starting a new episode.
+        Return the warm-start control sequence for a new episode.
 
-        Returns
-        -------
-        jnp.ndarray
-            Shape (horizon, 2) — normalised [v_norm=0, w=0] for all steps.
+        The v_norm channel is initialised at ``warm_start_v_norm`` (default 0.3)
+        rather than zero: with u_mean=0 the sampling distribution is centred at
+        the lower edge of the v action space, so ~50% of samples clip to v=0
+        and the robot starts stalled. A small positive bias keeps the clip
+        roughly symmetric in (0, 1).
         """
-        return jnp.zeros((self.horizon, 2), dtype=jnp.float32)
+        u0 = jnp.zeros((self.horizon, 2), dtype=jnp.float32)
+        return u0.at[:, 0].set(self.warm_start_v_norm)
 
     # =======================================================================
     # Action-space helpers
@@ -237,8 +187,13 @@ class MPPI(DWA):
         pose:     jnp.ndarray,   # (3,) [x, y, θ] in ego frame
         goal_ego: jnp.ndarray,   # (2,) [gdx, gdy] in ego frame [m]
     ) -> jnp.ndarray:
-        """Euclidean distance from current rollout pose to the goal [m]."""
-        return jnp.linalg.norm(pose[:2] - goal_ego)
+        """
+        Distance from rollout pose to the goal, normalised by the room diagonal
+        so the value lives in [0, ~1] regardless of map size. Keeps the per-step
+        goal term on the same scale as the obstacle/velocity critics (≤ 1)
+        instead of growing linearly with absolute distance in metres.
+        """
+        return jnp.linalg.norm(pose[:2] - goal_ego) / _MAX_GOAL_DIST
 
     @partial(jit, static_argnames=("self",))
     def _obstacle_critic(
@@ -272,7 +227,7 @@ class MPPI(DWA):
 
         return lax.cond(
             min_dist - self.robot_radius <= 0.0,
-            lambda: jnp.array(100.0),         # collision → large-but-finite cost
+            lambda: jnp.array(_COLLISION_COST),   # collision → dominant cost
             lambda: 1.0 / (min_dist + 1e-6),
         )
 
@@ -313,8 +268,15 @@ class MPPI(DWA):
         Simulate one control sequence and return cumulative cost + trajectory.
 
         The rollout operates in the ego frame (robot starts at [0, 0, 0]).
-        Per-step cost is evaluated at the PRE-STEP pose (before applying the
-        action), consistent with the original socialjym implementation.
+        Per-step cost is evaluated at the POST-STEP pose (after applying the
+        action). The start pose is always (0, 0, 0) — the ego origin — where
+        the LiDAR scan was produced. Because salt-&-pepper noise and scan
+        saturation create spurious "ghost" points at roughly robot_radius
+        from the origin, evaluating the obstacle critic at the start pose
+        would trigger a spurious collision for EVERY rollout and silently
+        force the all-collision fallback every step. Skipping the pre-step
+        evaluation (equivalently: aligning with DWA, which scores from
+        ``traj[1:]``) avoids this failure mode.
 
         Parameters
         ----------
@@ -334,8 +296,8 @@ class MPPI(DWA):
             # Scale to actual action for kinematic step
             actual_action = jnp.array([action_norm[0] * max_v, action_norm[1]])
             next_pose = self.motion(pose, actual_action)
-            # Step cost evaluated at CURRENT (pre-step) pose
-            cost = self._step_cost(pose, action_norm, goal_ego, point_cloud)
+            # Step cost evaluated at POST-step pose (see docstring)
+            cost = self._step_cost(next_pose, action_norm, goal_ego, point_cloud)
             return (next_pose, total_cost + cost), next_pose   # save next_pose for trajectory
 
         (final_pose, total_cost), next_poses = lax.scan(
@@ -463,29 +425,49 @@ class MPPI(DWA):
         weights = jnp.exp(-(costs - beta) / self.temperature)      # (K,)
         weights = weights / (jnp.sum(weights) + 1e-8)              # normalise
 
-        # ── 6. Weighted update of u_mean (use ε, not V, per MPPI theory) ──
-        # perturbations: (H, 2)  weighted sum over samples
+        # ── 6. Weighted update of u_mean ─────────────────────────────────
+        # Use the *effective* perturbations (V_clamped − u_mean) rather than
+        # raw ε: when u_mean is near the action-space boundary and samples
+        # get clipped, raw ε no longer reflects the control that was
+        # actually simulated, which biases the update.
+        deltas = V_clamped - u_mean[None, :, :]                    # (K, H, 2)
         perturbations = jnp.sum(
-            weights[:, None, None] * noise,
+            weights[:, None, None] * deltas,
             axis=0,
-        )
+        )                                                           # (H, 2)
         u_mean_updated = vmap(self._clamp_action_norm)(
             u_mean + perturbations
-        )   # (H, 2)
+        )
 
-        # ── 7. Extract first action (scale to actual speed) ───────────────
-        first_norm = u_mean_updated[0]      # (2,) normalised
+        # ── 7. All-collision fallback ────────────────────────────────────
+        # If every sampled rollout collided, the weighted blend above is
+        # meaningless (all rollouts are equally bad) and MPPI would output
+        # arbitrary noise. Detect by cost threshold (collisions add at least
+        # obstacle_cost_weight · _COLLISION_COST per colliding step) and fall
+        # back to a DWA-style "stop and rotate toward goal" action.
+        all_collide = jnp.all(costs > 0.5 * _COLLISION_COST)
+        goal_align  = jnp.arctan2(goal_ego[1], goal_ego[0])
+        fallback_norm = jnp.array([0.0, jnp.clip(goal_align, -1.0, 1.0)])
+
+        # ── 8. Extract first action (scale to actual speed) ───────────────
+        first_norm = jnp.where(all_collide, fallback_norm, u_mean_updated[0])
         action = jnp.array([
             first_norm[0] * max_v,          # v ∈ [0, max_v]
             first_norm[1],                  # w ∈ [−1, 1]
         ])
 
-        # ── 8. Shift warm-start: slide window left by 1 step ─────────────
-        # Old u_mean[1:] become u_mean_new[:-1]; the last step is zeroed.
-        u_mean_shifted = jnp.concatenate([
-            u_mean_updated[1:],
-            jnp.zeros((1, 2), dtype=jnp.float32),
-        ], axis=0)   # (H, 2)
+        # ── 9. Shift warm-start: slide window left by 1 step ─────────────
+        # Old u_mean[1:] become u_mean_new[:-1]; the last step is re-seeded
+        # with the warm_start bias so the robot doesn't drift to v=0 over
+        # the horizon when the policy is coasting.
+        tail = jnp.array([[self.warm_start_v_norm, 0.0]], dtype=jnp.float32)
+        u_mean_shifted = jnp.concatenate([u_mean_updated[1:], tail], axis=0)
+
+        # On all-collision, reset the warm-start: keeping a window full of
+        # colliding controls poisons the next few steps.
+        u_mean_shifted = jnp.where(
+            all_collide, self.init_u_mean(), u_mean_shifted
+        )
 
         return action, u_mean_shifted, trajectories, costs
 

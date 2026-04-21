@@ -588,6 +588,7 @@ def step_env(key, state, action, ghost_robot: bool = True):
         "passive_col":   passive_col,
         "active_col":    active_col,
         "closest_human": closest_human,
+        "closest_shoe_surface": closest_shoe_surface,
         "sp_mask":       sp_mask,
         "timeout":       timeout,
         "instant_col":   instant_col,

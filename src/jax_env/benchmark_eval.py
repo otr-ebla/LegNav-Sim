@@ -39,7 +39,6 @@ jax_env.USE_LEGS = True
 from jax_env import ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS, DT, MAX_STEPS
 from jax_env_multi import reset_env, step_env
 from jax_wrappers import StackedEnvState
-from jax_legs import LEG_RADIUS
 from jax_network import SharedEncoder, EndToEndActorCritic, scale_action_to_env
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -187,8 +186,6 @@ def _rollout_body(net_apply_fn, squash_fn, params, scen_idx, target_max_v, rng_k
         jnp.zeros(N_ENVS),                        # yield_comply_steps
     )
 
-    human_r = LEG_RADIUS if jax_env.USE_LEGS else PEOPLE_RADIUS
-
     def _step(carry, step_idx):
         state, obs, v_p, av_p, w_p, aw_p, pl, mhd, active, yz_steps, yc_steps = carry
         k_step = jax.random.fold_in(rng_key, step_idx)
@@ -211,7 +208,10 @@ def _rollout_body(net_apply_fn, squash_fn, params, scen_idx, target_max_v, rng_k
         jerk_w = jnp.where(active, jnp.abs((aw - aw_p) / DT), 0.0)
         pl     = pl + jnp.where(active, v * DT, 0.0)
 
-        ch  = info["closest_human"] - ROBOT_RADIUS - human_r
+        if jax_env.USE_LEGS:
+            ch = info["closest_shoe_surface"]
+        else:
+            ch = info["closest_human"] - ROBOT_RADIUS - PEOPLE_RADIUS
         mhd = jnp.where(active, jnp.minimum(mhd, ch), mhd)
 
         g  = info["goal_reached"] & active
@@ -512,8 +512,6 @@ N_TEST_SCENS  = len(TEST_SCEN_IDS)
 
 def _segment_core(net_apply_fn, squash_fn, params,
                   init_obs, init_state, rng_key, step_offset):
-    human_r = LEG_RADIUS if jax_env.USE_LEGS else PEOPLE_RADIUS
-
     init_dist = jnp.sqrt(
         (init_state.env_state.goal_x - init_state.env_state.x) ** 2 +
         (init_state.env_state.goal_y - init_state.env_state.y) ** 2
@@ -554,7 +552,10 @@ def _segment_core(net_apply_fn, squash_fn, params,
         aw = (w - w_p) / DT
 
         pl  = pl  + jnp.where(active, v * DT, 0.0)
-        ch  = info["closest_human"] - ROBOT_RADIUS - human_r
+        if jax_env.USE_LEGS:
+            ch = info["closest_shoe_surface"]
+        else:
+            ch = info["closest_human"] - ROBOT_RADIUS - PEOPLE_RADIUS
         mhd = jnp.where(active, jnp.minimum(mhd, ch), mhd)
 
         g  = info["goal_reached"] & active

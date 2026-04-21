@@ -43,10 +43,11 @@ import flax.serialization
 def _parse_args():
     p = argparse.ArgumentParser(description="Universal JAX Evaluation")
     p.add_argument("--algo",     default="ppo",
-                   choices=["ppo", "shac", "sac", "tqc", "mlp", "hsfm"],
+                   choices=["ppo", "shac", "sac", "tqc", "mlp", "hsfm", "mppi"],
                    help="Algorithm whose checkpoint to load. "
                         "'mlp' = Vanilla 2×128 MLP baseline (ppo_mlp_baseline.py). "
-                        "'hsfm' = JHSFM model-based planner.")
+                        "'hsfm' = JHSFM model-based planner. "
+                        "'mppi' = Model Predictive Path Integral (no checkpoint).")
     p.add_argument("--ckpt",     default="",
                    help="Path to the checkpoint file (msgpack). "
                         "If empty, a sensible default for the chosen algo is used.")
@@ -302,6 +303,38 @@ def _build_hsfm():
     return None, load, infer, 0
 
 
+# ── MPPI planner ──────────────────────────────────────────────────────────────
+# Stateful: carries ``u_mean`` across steps and re-seeds it at every episode
+# reset. The per-episode reset is exposed as ``infer.reset_hook()`` so the
+# main loop (and test_scenarios_eval) can call it without knowing anything
+# MPPI-specific about the policy.
+
+def _build_mppi():
+    from comparison_policies.mppi_planner import MPPI
+
+    mppi = MPPI()
+    # Mutable container so nested closures can update it in place.
+    state = {
+        "u_mean": mppi.init_u_mean(),
+        "rng":    jax.random.PRNGKey(0xBEEF),
+    }
+
+    def load(path):
+        return None
+
+    def infer(params, obs, max_v):
+        state["rng"], subkey = jax.random.split(state["rng"])
+        action, new_u_mean = mppi.act(obs, state["u_mean"], subkey)
+        state["u_mean"] = new_u_mean
+        return action
+
+    def reset_hook():
+        state["u_mean"] = mppi.init_u_mean()
+
+    infer.reset_hook = reset_hook    # type: ignore[attr-defined]
+    return None, load, infer, 0
+
+
 # ── Default checkpoint paths ───────────────────────────────────────────────────
 
 _DEFAULT_CKPT = {
@@ -311,6 +344,7 @@ _DEFAULT_CKPT = {
     "tqc":  "checkpoints_tqc/tqc_best.msgpack",
     "mlp":  "checkpoints_vanilla_ppo/ppo_mlp_best.msgpack",
     "hsfm": "", # No checkpoint needed
+    "mppi": "", # No checkpoint needed
 }
 
 # ── Policy factory ─────────────────────────────────────────────────────────────
@@ -326,8 +360,10 @@ def build_policy(algo):
         return _build_mlp()         # 4 elementi
     elif algo == "hsfm":
         return _build_hsfm()        # 4 elementi
+    elif algo == "mppi":
+        return _build_mppi()        # 4 elementi (infer_fn carries reset_hook attribute)
     else:
-        raise ValueError(f"Unknown algo: {algo}. Valid: ppo, shac, sac, tqc, mlp, hsfm")
+        raise ValueError(f"Unknown algo: {algo}. Valid: ppo, shac, sac, tqc, mlp, hsfm, mppi")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -669,8 +705,12 @@ def main():
     pygame.display.set_caption(f"JAX Eval — {algo.upper()}")
     clock = pygame.time.Clock(); fonts = make_fonts()
 
+    # Optional per-policy reset hook (MPPI uses it to reseed u_mean).
+    _policy_reset = getattr(infer_fn, "reset_hook", lambda: None)
+
     rng, reset_rng = jax.random.split(rng)
     obs, stacked_state = fast_reset(reset_rng)
+    _policy_reset()
 
     _REW_KEYS = ["rew_progress","rew_step","rew_smooth","rew_yield"]
     ep=0; ep_steps=0; ep_reward=0.0; ep_hist=[]
@@ -706,6 +746,7 @@ def main():
                     fast_reset, fast_step = build_fast_reset(current_scenario)
                     rng, reset_rng = jax.random.split(rng)
                     obs, stacked_state = fast_reset(reset_rng)
+                    _policy_reset()
                     ep_reward=0.0; ep_steps=0; banner_t=0
                 if k == pygame.K_7:
                     evaluation_mode  = "random"
@@ -713,10 +754,12 @@ def main():
                     fast_reset, fast_step = build_fast_reset(current_scenario)
                     rng, reset_rng = jax.random.split(rng)
                     obs, stacked_state = fast_reset(reset_rng)
+                    _policy_reset()
                     ep_reward=0.0; ep_steps=0; banner_t=0
                 if k == pygame.K_r:
                     rng, reset_rng = jax.random.split(rng)
                     obs, stacked_state = fast_reset(reset_rng)
+                    _policy_reset()
                     ep_reward=0.0; ep_steps=0; banner_t=0
                 if k == pygame.K_RIGHT:
                     # Skip this episode — do NOT record it in ep_hist
@@ -725,6 +768,7 @@ def main():
                         fast_reset, fast_step = build_fast_reset(current_scenario)
                     rng, reset_rng = jax.random.split(rng)
                     obs, stacked_state = fast_reset(reset_rng)
+                    _policy_reset()
                     ep_reward=0.0; ep_steps=0
                     banner="skipped"; banner_t=FPS_TARGET
 
@@ -802,6 +846,7 @@ def main():
 
             rng, reset_rng = jax.random.split(rng)
             obs, stacked_state = fast_reset(reset_rng)
+            _policy_reset()
 
 
 if __name__ == "__main__":

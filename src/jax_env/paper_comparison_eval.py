@@ -247,7 +247,9 @@ def _rollout_mppi(mppi, n_envs, rng_key, scenario_idx):
         (state.env_state.goal_y - state.env_state.y) ** 2
     )
 
-    u_mean_init = jnp.zeros((n_envs, mppi.horizon, 2))
+    u_mean_init = jnp.broadcast_to(
+        mppi.init_u_mean(), (n_envs, mppi.horizon, 2)
+    )
 
     carry0 = (
         state, obs,
@@ -304,9 +306,12 @@ def _rollout_mppi(mppi, n_envs, rng_key, scenario_idx):
         jv  = jnp.where(active, jnp.abs((av - av_p) / DT), 0.0)
         jw  = jnp.where(active, jnp.abs((aw - aw_p) / DT), 0.0)
 
-        # Reset u_mean to zeros on done (new episode starts fresh)
+        # On episode end, re-seed u_mean with the warm-start bias (zeros
+        # would start the next episode from a stalled v=0 prior).
+        fresh_u_mean = jnp.broadcast_to(
+            mppi.init_u_mean(), new_u_mean.shape)
         new_u_mean = jnp.where(
-            done[:, None, None], jnp.zeros_like(new_u_mean), new_u_mean)
+            done[:, None, None], fresh_u_mean, new_u_mean)
 
         step_data   = (active, g, c, ac, pc, jv + jw, v)
         next_active = active & ~done
