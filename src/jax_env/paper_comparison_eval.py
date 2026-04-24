@@ -78,9 +78,14 @@ N_ENVS      = args.envs
 N_ENVS_MPPI = args.envs_mppi
 
 YIELD_DIST = 1.5   # m — yield-zone radius (same as benchmark_eval.py)
-YIELD_FOV  = 1.57  # rad ≈ 90°
+YIELD_FOV  = 0.785  # rad = 45° → 90° total FOV (±45°)
 
 HUMAN_R = LEG_RADIUS if _jax_env.USE_LEGS else PEOPLE_RADIUS
+
+# ── Social Score constants (NaviSTAR, Eq. 20-22) ─────────────────────────────
+SC_NU       = 0.35    # ν  — weight between F_time and F_scc
+SC_NU_PRIME = 0.25    # ν' — penalty factor for failure rate
+SC_DU       = 0.45    # d_u — uncomfortable distance threshold (m)
 
 # ── Stacked-env helpers (same as benchmark_eval.py) ──────────────────────────
 
@@ -192,7 +197,7 @@ def _rollout_stateless(act_vmap, n_envs, rng_key, scenario_idx):
         jv  = jnp.where(active, jnp.abs((av - av_p) / DT), 0.0)
         jw  = jnp.where(active, jnp.abs((aw - aw_p) / DT), 0.0)
 
-        step_data  = (active, g, c, ac, pc, jv + jw, v)
+        step_data  = (active, g, c, ac, pc, jv + jw, v, ch)
         next_active = active & ~done
         return (next_state, next_obs, pl, mhd, v, w, av, aw,
                 next_active, yz, yc), step_data
@@ -202,7 +207,7 @@ def _rollout_stateless(act_vmap, n_envs, rng_key, scenario_idx):
 
     (_, _, final_pl, final_mhd, _, _, _, _,
      _, final_yz, final_yc) = final_carry
-    active_mask, goals, cols, act_cols, pass_cols, jerks, step_vs = step_data
+    active_mask, goals, cols, act_cols, pass_cols, jerks, step_vs, step_ch = step_data
 
     ep_lens   = active_mask.sum(axis=0)
     ep_goal   = goals.any(axis=0)
@@ -229,6 +234,9 @@ def _rollout_stateless(act_vmap, n_envs, rng_key, scenario_idx):
         "min_dist":   final_mhd,
         "yield_score":yield_sc,
         "spl":        ep_goal * (init_dist / jnp.maximum(final_pl, init_dist)),
+        "step_ch":    step_ch,           # (MAX_STEPS, n_envs) — per-step closest human
+        "active_mask":active_mask,       # (MAX_STEPS, n_envs) — bool mask
+        "ep_lens":    ep_lens,            # (n_envs,)
     }
 
 
@@ -313,7 +321,7 @@ def _rollout_mppi(mppi, n_envs, rng_key, scenario_idx):
         new_u_mean = jnp.where(
             done[:, None, None], fresh_u_mean, new_u_mean)
 
-        step_data   = (active, g, c, ac, pc, jv + jw, v)
+        step_data   = (active, g, c, ac, pc, jv + jw, v, ch)
         next_active = active & ~done
         return (next_state, next_obs, pl, mhd, v, w, av, aw,
                 next_active, yz, yc, new_u_mean), step_data
@@ -323,7 +331,7 @@ def _rollout_mppi(mppi, n_envs, rng_key, scenario_idx):
 
     (_, _, final_pl, final_mhd, _, _, _, _,
      _, final_yz, final_yc, _) = final_carry
-    active_mask, goals, cols, act_cols, pass_cols, jerks, _ = step_data
+    active_mask, goals, cols, act_cols, pass_cols, jerks, _, step_ch = step_data
 
     ep_lens   = active_mask.sum(axis=0)
     ep_goal   = goals.any(axis=0)
@@ -348,6 +356,9 @@ def _rollout_mppi(mppi, n_envs, rng_key, scenario_idx):
         "min_dist":   final_mhd,
         "yield_score":yield_sc,
         "spl":        ep_goal * (init_dist / jnp.maximum(final_pl, init_dist)),
+        "step_ch":    step_ch,
+        "active_mask":active_mask,
+        "ep_lens":    ep_lens,
     }
 
 
@@ -516,11 +527,102 @@ POLICY_REGISTRY = [
 ]
 
 
+# ── Social Score (NaviSTAR, Eq. 20-22) ────────────────────────────────────────
+
+def _compute_social_score(raw, nu=SC_NU, nu_prime=SC_NU_PRIME, d_u=SC_DU):
+    """
+    Compute the Social Score F_SC ∈ (−∞, 100] from raw rollout metrics.
+
+    F_SC = 100 · [ν · F_time + (1 − ν) · F_scc + ν' · F_F]   (Eq. 20)
+
+    F_time  — navigation time cost          (Eq. 21)
+    F_scc   — social compliance cost         (Eq. 22)
+    F_F     — failure penalty (≤ 0)
+
+    Parameters
+    ----------
+    raw : dict  — raw metrics from _rollout_stateless / _rollout_mppi.
+    nu, nu_prime, d_u : float — paper hyperparameters.
+    """
+    success   = np.array(raw["success"]).astype(bool)
+    time_goal = np.array(raw["time_goal"])   # NaN for failed episodes
+    step_ch   = np.array(raw["step_ch"])     # (MAX_STEPS, N) closest-human dist per step
+    active    = np.array(raw["active_mask"]) # (MAX_STEPS, N) bool
+    ep_lens   = np.array(raw["ep_lens"])     # (N,)
+    n_total   = len(success)
+
+    # ── F_time (Eq. 21) ──────────────────────────────────────────────────────
+    # "min" = minimum navigation time in ALL cases (including failed, counted
+    # as ep_lens * DT), "max" = maximum time among successful cases.
+    all_times = ep_lens * DT
+    suc_times = time_goal[success]
+
+    if len(suc_times) == 0:
+        # No successful episodes → F_time undefined; score is dominated by F_F
+        F_time = 0.0
+    else:
+        t_min = float(all_times.min())     # min time across ALL cases
+        t_max = float(suc_times.max())     # max time among successful cases
+        denom = t_max - t_min if t_max > t_min else 1.0
+        F_time = 1.0 - float(np.mean((suc_times - t_min) / denom))
+        F_time = float(np.clip(F_time, 0.0, 1.0))
+
+    # ── F_scc (Eq. 22) ───────────────────────────────────────────────────────
+    # Identify "uncomfortable segments": steps where closest human < d_u.
+    # For each episode, compute  (d_u · #uncomfortable_steps) / sum(closest_dist)
+    # then average via sigmoid and mix with K1/K2.
+    K1 = int(success.sum())    # number of successful cases
+
+    # Per-episode: sum of closest-human distances (integral ∫dis·dt approximated
+    # as Σ dis_t · Δt, but Δt = DT is constant so it cancels with d_u · Δt in
+    # the numerator).
+    # Uncomfortable episodes = those with at least one step where ch < d_u.
+    ch_active = np.where(active, step_ch, np.inf)   # mask out inactive steps
+    uncomf_mask = ch_active < d_u                    # (MAX_STEPS, N)
+    has_uncomf  = uncomf_mask.any(axis=0)            # (N,) episodes with any uncomfortable step
+    K2 = int(has_uncomf.sum())
+
+    if K2 == 0:
+        # No uncomfortable segments at all → perfect social compliance
+        F_scc = 1.0
+    else:
+        # For each episode with uncomfortable segments, compute the ratio
+        # r_k = (d_u · Δt · #uncomf_steps) / (Σ_{all active steps} dis_t · Δt)
+        # Δt cancels:  r_k = (d_u · #uncomf_steps) / Σ dis_t
+        n_uncomf_steps = uncomf_mask.sum(axis=0)                      # (N,)
+        sum_dist       = np.where(active, step_ch, 0.0).sum(axis=0)  # (N,)
+        sum_dist       = np.maximum(sum_dist, 1e-8)
+
+        ratio = (d_u * n_uncomf_steps) / sum_dist   # (N,)
+        # Only consider episodes that have uncomfortable segments
+        ratio_uncomf = ratio[has_uncomf]
+
+        # sigmoid(r - 1) as in the paper
+        sig_vals = 1.0 / (1.0 + np.exp(-(ratio_uncomf - 1.0)))
+        avg_sig  = float(np.mean(sig_vals))
+
+        k1_k2_ratio = K1 / K2 if K2 > 0 else 1.0
+        F_scc = 1.0 - 0.5 * (avg_sig + k1_k2_ratio)
+        F_scc = float(np.clip(F_scc, 0.0, 1.0))
+
+    # ── F_F (failure penalty, ≤ 0) ───────────────────────────────────────────
+    n_collision = int(np.array(raw["obs_col"]).sum() +
+                      np.array(raw["act_col"]).sum() +
+                      np.array(raw["pass_col"]).sum())
+    n_timeout   = int(np.array(raw["timeout"]).sum())
+    F_F = -(n_collision + n_timeout) / max(n_total, 1)
+
+    # ── Final social score ────────────────────────────────────────────────────
+    F_SC = 100.0 * (nu * F_time + (1.0 - nu) * F_scc + nu_prime * F_F)
+    return float(F_SC)
+
+
 # ── Aggregate helper ───────────────────────────────────────────────────────────
 
 def _agg(raw):
     """Compute mean from a raw metrics dict (arrays of shape N_ENVS)."""
     n = len(raw["success"])
+    social_sc = _compute_social_score(raw)
     return {
         "N":           n,
         "Success":     float(np.mean(raw["success"])) * 100,
@@ -532,6 +634,7 @@ def _agg(raw):
         "Jerk":        float(np.nanmean(raw["jerk"])),
         "Time to Goal":float(np.nanmean(raw["time_goal"])),
         "Min Dist (m)":float(np.mean(raw["min_dist"])),
+        "Social Score":social_sc,
     }
 
 
@@ -545,10 +648,11 @@ def _print_latex(rows):
         r"$v_{\max} \sim \mathcal{U}[0.2,\,2.0]$~m/s}" "\n"
         r"\label{tab:comparison}" "\n"
         r"\footnotesize" "\n"
-        r"\begin{tabular}{lcccccccc}" "\n"
+        r"\begin{tabular}{lccccccccccc}" "\n"
         r"\toprule" "\n"
         r"Method & Type & Success (\%) & Obst. Col. (\%) & Act. Col. (\%) "
-        r"& Pass. Col. (\%) & Timeout (\%) & Yield Score & Jerk & Time (s) & Min Dist (m) \\" "\n"
+        r"& Pass. Col. (\%) & Timeout (\%) & Yield Score & Jerk & Time (s) "
+        r"& Min Dist (m) & $F_{SC}$ \\" "\n"
         r"\midrule"
     )
     print(header)
@@ -560,7 +664,8 @@ def _print_latex(rows):
             f"{r['Act. Col.']:.1f} & {r['Pass. Col.']:.1f} & "
             f"{r['Timeout']:.1f} & "
             f"{r['Yield Score']:.2f} & {r['Jerk']:.1f} & "
-            f"{r['Time to Goal']:.1f} & {r['Min Dist (m)']:.2f} \\\\"
+            f"{r['Time to Goal']:.1f} & {r['Min Dist (m)']:.2f} & "
+            f"{r['Social Score']:.1f} \\\\"
         )
     print(r"\bottomrule")
     print(r"\end{tabular}")
@@ -686,7 +791,8 @@ def main():
               f"Yield={metrics['Yield Score']:.2f}  "
               f"Jerk={metrics['Jerk']:.1f}  "
               f"T={metrics['Time to Goal']:.1f}s  "
-              f"MinD={metrics['Min Dist (m)']:.2f}m\n")
+              f"MinD={metrics['Min Dist (m)']:.2f}m  "
+              f"SocSc={metrics['Social Score']:.1f}\n")
 
         rows.append({"Method": name, "Type": category, **metrics})
 
@@ -706,7 +812,8 @@ def main():
     print("RESULTS TABLE (aggregated over scenarios 7-12, random v_max)")
     print("="*70)
     cols_show = ["Method", "Type", "Success", "Obst. Col.", "Act. Col.",
-                 "Pass. Col.", "Timeout", "Yield Score", "Jerk", "Time to Goal", "Min Dist (m)"]
+                 "Pass. Col.", "Timeout", "Yield Score", "Jerk", "Time to Goal",
+                 "Min Dist (m)", "Social Score"]
     print(df[cols_show].to_string(index=False, float_format="%.2f"))
 
     print("\n" + "="*70)

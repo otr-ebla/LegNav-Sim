@@ -43,8 +43,9 @@ import flax.serialization
 def _parse_args():
     p = argparse.ArgumentParser(description="Universal JAX Evaluation")
     p.add_argument("--algo",     default="ppo",
-                   choices=["ppo", "shac", "sac", "tqc", "mlp", "hsfm", "mppi"],
+                   choices=["ppo", "shac", "sac", "tqc", "mlp", "hsfm", "mppi", "ppo_circles"],
                    help="Algorithm whose checkpoint to load. "
+                        "'ppo_circles' = PPO model trained with circle humans. "
                         "'mlp' = Vanilla 2×128 MLP baseline (ppo_mlp_baseline.py). "
                         "'hsfm' = JHSFM model-based planner. "
                         "'mppi' = Model Predictive Path Integral (no checkpoint).")
@@ -339,6 +340,7 @@ def _build_mppi():
 
 _DEFAULT_CKPT = {
     "ppo":  "checkpoints/ppo_attn_final.msgpack",
+    "ppo_circles": "checkpoints/ppo_circles_best.msgpack",
     "shac": "checkpoints/shac_best.msgpack",
     "sac":  "checkpoints_sac/sac_best.msgpack",
     "tqc":  "checkpoints_tqc/tqc_best.msgpack",
@@ -350,7 +352,7 @@ _DEFAULT_CKPT = {
 # ── Policy factory ─────────────────────────────────────────────────────────────
 
 def build_policy(algo):
-    if algo in ("ppo", "shac"):
+    if algo in ("ppo", "shac", "ppo_circles"):
         return _build_ppo_shac()    # 4 elementi
     elif algo == "sac":
         return _build_sac() + (0,)  # 3 + 1 = 4 elementi
@@ -363,7 +365,7 @@ def build_policy(algo):
     elif algo == "mppi":
         return _build_mppi()        # 4 elementi (infer_fn carries reset_hook attribute)
     else:
-        raise ValueError(f"Unknown algo: {algo}. Valid: ppo, shac, sac, tqc, mlp, hsfm, mppi")
+        raise ValueError(f"Unknown algo: {algo}. Valid: ppo, ppo_circles, shac, sac, tqc, mlp, hsfm, mppi")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

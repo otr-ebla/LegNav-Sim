@@ -39,7 +39,7 @@ import flax.serialization
 def _parse_args():
     p = argparse.ArgumentParser(description="Test Scenario Evaluation")
     p.add_argument("--algo", default="sac",
-                   choices=["ppo", "shac", "sac", "tqc", "mlp", "navrep", "tagd", "mppi"])
+                   choices=["ppo", "shac", "sac", "tqc", "mlp", "navrep", "tagd", "mppi", "ppo_circles"])
     p.add_argument("--ckpt", default="")
     p.add_argument("--legs",    dest="use_legs", action="store_true",  default=True)
     p.add_argument("--no-legs", dest="use_legs", action="store_false")

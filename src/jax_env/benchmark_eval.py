@@ -162,7 +162,12 @@ def step_stacked_headless(key, state: StackedEnvState, action):
 # ── Core Evaluation Kernel ───────────────────────────────────────────────────
 
 YIELD_DIST = 1.5
-YIELD_FOV  = 1.57
+YIELD_FOV  = 0.785  # rad = 45° → 90° total FOV (±45°)
+
+# ── Social Score constants (NaviSTAR, Eq. 20-22) ─────────────────────────────
+SC_NU       = 0.35    # ν  — weight between F_time and F_scc
+SC_NU_PRIME = 0.25    # ν' — penalty factor for failure rate
+SC_DU       = 0.45    # d_u — uncomfortable distance threshold (m)
 
 def _rollout_body(net_apply_fn, squash_fn, params, scen_idx, target_max_v, rng_key):
     reset_keys = jax.random.split(rng_key, N_ENVS)
@@ -274,6 +279,9 @@ def _rollout_body(net_apply_fn, squash_fn, params, scen_idx, target_max_v, rng_k
         "yield_score": yield_score,
         "step_dists":  step_dists,
         "step_vs":     step_vs,
+        "step_ch":     step_dists,    # closest human (NaN-masked by active)
+        "active_mask": active_mask,   # (MAX_STEPS, N_ENVS) bool
+        "ep_lens":     ep_lens,       # (N_ENVS,)
     }
 
 
@@ -294,6 +302,68 @@ def evaluate_cell_tqc(params, scen_idx, target_max_v, rng_key):
                          scen_idx, target_max_v, rng_key)
 
 _EVAL_FN = {"PPO": evaluate_cell_ppo, "SAC": evaluate_cell_sac, "TQC": evaluate_cell_tqc}
+
+
+# ── Social Score (NaviSTAR, Eq. 20-22) ────────────────────────────────────────
+
+def _compute_social_score(cell, nu=SC_NU, nu_prime=SC_NU_PRIME, d_u=SC_DU):
+    """
+    Compute the Social Score F_SC ∈ (−∞, 100] from a single evaluation cell.
+
+    F_SC = 100 · [ν · F_time + (1 − ν) · F_scc + ν' · F_F]   (Eq. 20)
+    """
+    success   = np.array(cell["success"]).astype(bool)
+    ep_lens   = np.array(cell["ep_lens"])
+    active    = np.array(cell["active_mask"])   # (MAX_STEPS, N)
+    # step_ch has NaN for inactive steps; replace NaN with inf for masking
+    step_ch_raw = np.array(cell["step_ch"])     # (MAX_STEPS, N)
+    step_ch = np.where(np.isfinite(step_ch_raw), step_ch_raw, np.inf)
+    active_bool = np.array(active).astype(bool)
+    n_total = len(success)
+
+    # ── F_time (Eq. 21) ──────────────────────────────────────────────────────
+    all_times = ep_lens * DT
+    suc_times = np.array(cell["time"])
+    suc_times = suc_times[success]
+    suc_times = suc_times[np.isfinite(suc_times)]
+
+    if len(suc_times) == 0:
+        F_time = 0.0
+    else:
+        t_min = float(all_times.min())
+        t_max = float(suc_times.max())
+        denom = t_max - t_min if t_max > t_min else 1.0
+        F_time = 1.0 - float(np.mean((suc_times - t_min) / denom))
+        F_time = float(np.clip(F_time, 0.0, 1.0))
+
+    # ── F_scc (Eq. 22) ───────────────────────────────────────────────────────
+    K1 = int(success.sum())
+    ch_for_mask = np.where(active_bool, step_ch, np.inf)
+    uncomf_mask = ch_for_mask < d_u
+    has_uncomf  = uncomf_mask.any(axis=0)
+    K2 = int(has_uncomf.sum())
+
+    if K2 == 0:
+        F_scc = 1.0
+    else:
+        n_uncomf_steps = uncomf_mask.sum(axis=0)
+        sum_dist = np.where(active_bool, step_ch, 0.0).sum(axis=0)
+        sum_dist = np.maximum(sum_dist, 1e-8)
+        ratio = (d_u * n_uncomf_steps) / sum_dist
+        ratio_uncomf = ratio[has_uncomf]
+        sig_vals = 1.0 / (1.0 + np.exp(-(ratio_uncomf - 1.0)))
+        avg_sig  = float(np.mean(sig_vals))
+        k1_k2_ratio = K1 / K2 if K2 > 0 else 1.0
+        F_scc = 1.0 - 0.5 * (avg_sig + k1_k2_ratio)
+        F_scc = float(np.clip(F_scc, 0.0, 1.0))
+
+    # ── F_F (failure penalty, ≤ 0) ───────────────────────────────────────────
+    n_col     = int(np.array(cell["act_col"]).sum() + np.array(cell["pass_col"]).sum())
+    n_timeout = int(np.array(cell["timeout"]).sum())
+    F_F = -(n_col + n_timeout) / max(n_total, 1)
+
+    F_SC = 100.0 * (nu * F_time + (1.0 - nu) * F_scc + nu_prime * F_F)
+    return float(F_SC)
 
 
 # ── Checkpoint loading ───────────────────────────────────────────────────────
@@ -976,6 +1046,7 @@ def main():
                 "Min Dist":      cell["min_dist"],
                 "Time to Goal":  cell["time"],
                 "Yield Score":   cell["yield_score"],
+                "Social Score":  _compute_social_score(cell),
             }))
 
         scatter_data[p_name] = (np.concatenate(sd_list), np.concatenate(sv_list))
