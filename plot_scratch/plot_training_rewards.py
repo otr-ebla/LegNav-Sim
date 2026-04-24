@@ -15,8 +15,8 @@ LOG_FILES = {
 
 COLORS = {
     "PPO": "#2196F3",
-    "SAC": "#4CAF50",
-    "TQC": "#FF5722",
+    "SAC": "#FF5722",
+    "TQC": "#4CAF50",
 }
 
 SMOOTH_WINDOW = 10  # rolling mean window (set to 1 to disable)
