@@ -210,14 +210,19 @@ def _rollout_stateless(act_vmap, n_envs, rng_key, scenario_idx):
     active_mask, goals, cols, act_cols, pass_cols, jerks, step_vs, step_ch = step_data
 
     ep_lens   = active_mask.sum(axis=0)
-    ep_goal   = goals.any(axis=0)
-    ep_col    = cols.any(axis=0)
-    ep_actcol = act_cols.any(axis=0)
-    ep_pscol  = pass_cols.any(axis=0)
 
-    # obs_col = any collision that is neither active-human nor passive-human
-    ep_obscol = ep_col & ~ep_actcol & ~ep_pscol
-    ep_tmo    = ~ep_goal & ~ep_col   # ran out of MAX_STEPS
+
+    has_any_collision = cols.any(axis=0)
+    
+    ep_actcol = act_cols.any(axis=0) 
+    ep_pscol  = pass_cols.any(axis=0) & ~ep_actcol
+    ep_obscol = has_any_collision & ~act_cols.any(axis=0) & ~pass_cols.any(axis=0)
+    
+    # 3. Successo: Goal raggiunto MA solo se non ci sono state collisioni
+    ep_goal = goals.any(axis=0) & ~has_any_collision
+    
+    # 4. Timeout: Tutto ciò che non è né successo né collisione
+    ep_tmo = ~(ep_goal | has_any_collision)
 
     avg_jerk   = jerks.sum(axis=0) / jnp.maximum(ep_lens, 1)
     time_goal  = jnp.where(ep_goal, ep_lens * DT, jnp.nan)
