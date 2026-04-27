@@ -346,15 +346,14 @@ def _compute_social_score(cell, nu=SC_NU, nu_prime=SC_NU_PRIME, d_u=SC_DU):
     if K2 == 0:
         F_scc = 1.0
     else:
-        n_uncomf_steps = uncomf_mask.sum(axis=0)
         sum_dist = np.where(active_bool, step_ch, 0.0).sum(axis=0)
         sum_dist = np.maximum(sum_dist, 1e-8)
-        ratio = (d_u * n_uncomf_steps) / sum_dist
+        ratio = d_u / sum_dist
         ratio_uncomf = ratio[has_uncomf]
         sig_vals = 1.0 / (1.0 + np.exp(-(ratio_uncomf - 1.0)))
         avg_sig  = float(np.mean(sig_vals))
-        k1_k2_ratio = K1 / K2 if K2 > 0 else 1.0
-        F_scc = 1.0 - 0.5 * (avg_sig + k1_k2_ratio)
+        k2_k1_ratio = K2 / K1 if K1 > 0 else 1.0
+        F_scc = 1.0 - 0.5 * (avg_sig + k2_k1_ratio)
         F_scc = float(np.clip(F_scc, 0.0, 1.0))
 
     # ── F_F (failure penalty, ≤ 0) ───────────────────────────────────────────

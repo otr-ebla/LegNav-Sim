@@ -587,13 +587,11 @@ def _compute_social_score(raw, nu=SC_NU, nu_prime=SC_NU_PRIME, d_u=SC_DU):
         F_scc = 1.0
     else:
         # For each episode with uncomfortable segments, compute the ratio
-        # r_k = (d_u · Δt · #uncomf_steps) / (Σ_{all active steps} dis_t · Δt)
-        # Δt cancels:  r_k = (d_u · #uncomf_steps) / Σ dis_t
-        n_uncomf_steps = uncomf_mask.sum(axis=0)                      # (N,)
+        # r_k = d_u / Σ_{all active steps} dis_t  (Δt cancels in num/denom)
         sum_dist       = np.where(active, step_ch, 0.0).sum(axis=0)  # (N,)
         sum_dist       = np.maximum(sum_dist, 1e-8)
 
-        ratio = (d_u * n_uncomf_steps) / sum_dist   # (N,)
+        ratio = d_u / sum_dist   # (N,)
         # Only consider episodes that have uncomfortable segments
         ratio_uncomf = ratio[has_uncomf]
 
@@ -601,8 +599,8 @@ def _compute_social_score(raw, nu=SC_NU, nu_prime=SC_NU_PRIME, d_u=SC_DU):
         sig_vals = 1.0 / (1.0 + np.exp(-(ratio_uncomf - 1.0)))
         avg_sig  = float(np.mean(sig_vals))
 
-        k1_k2_ratio = K1 / K2 if K2 > 0 else 1.0
-        F_scc = 1.0 - 0.5 * (avg_sig + k1_k2_ratio)
+        k2_k1_ratio = K2 / K1 if K1 > 0 else 1.0
+        F_scc = 1.0 - 0.5 * (avg_sig + k2_k1_ratio)
         F_scc = float(np.clip(F_scc, 0.0, 1.0))
 
     # ── F_F (failure penalty, ≤ 0) ───────────────────────────────────────────
