@@ -80,7 +80,7 @@ N_ENVS_MPPI = args.envs_mppi
 YIELD_DIST = 1.5   # m — yield-zone radius (same as benchmark_eval.py)
 YIELD_FOV  = 0.785  # rad = 45° → 90° total FOV (±45°)
 
-HUMAN_R = LEG_RADIUS if _jax_env.USE_LEGS else PEOPLE_RADIUS
+HUMAN_R = LEG_RADIUS if _jax_env.USE_LEGS else PEOPLE_RADIUS  # kept for reference; ch now uses closest_shoe_surface from info
 
 # ── Social Score constants (NaviSTAR, Eq. 20-22) ─────────────────────────────
 SC_NU       = 0.35    # ν  — weight between F_time and F_scc
@@ -171,7 +171,10 @@ def _rollout_stateless(act_vmap, n_envs, rng_key, scenario_idx):
         aw = (w - w_p) / DT
 
         pl  = pl + jnp.where(active, v * DT, 0.0)
-        ch  = info["closest_human"] - ROBOT_RADIUS - HUMAN_R
+        # closest_shoe_surface = min gap from robot boundary to nearest shoe-box
+        # surface (USE_LEGS=True) or body-circle edge (USE_LEGS=False).
+        # Computed in jax_env_multi.step_env — consistent with benchmark_eval.py.
+        ch  = info["closest_shoe_surface"]
         mhd = jnp.where(active, jnp.minimum(mhd, ch), mhd)
 
         # Yield score (same logic as benchmark_eval.py)
@@ -296,7 +299,7 @@ def _rollout_mppi(mppi, n_envs, rng_key, scenario_idx):
         aw = (w - w_p) / DT
 
         pl  = pl + jnp.where(active, v * DT, 0.0)
-        ch  = info["closest_human"] - ROBOT_RADIUS - HUMAN_R
+        ch  = info["closest_shoe_surface"]
         mhd = jnp.where(active, jnp.minimum(mhd, ch), mhd)
 
         ppl     = next_state.env_state.people

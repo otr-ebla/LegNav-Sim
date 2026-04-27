@@ -311,6 +311,74 @@ def draw_shoes_only(surface, state, foot_state_np, use_legs):
                   right_theta, col, border)
 
 
+def compute_min_dist_to_humans(robot_x, robot_y, state, foot_state_np, use_legs):
+    """
+    Compute the true minimum distance between the robot circle boundary and
+    the nearest point on any human shoe box (USE_LEGS=True) or human body
+    circle (USE_LEGS=False).
+
+    Returns a float in metres: 0.0 means contact/overlap.
+    """
+    robot_x = float(robot_x)
+    robot_y = float(robot_y)
+    n_people = int(state.people.shape[0])
+    min_d = float("inf")
+
+    if use_legs:
+        # Shoe-box AABB distance — mirrors _box_dist logic in jax_env.step_env
+        # foot_state_np : (N, >=12)
+        #   cols 0:2  = left  foot world xy
+        #   cols 2:4  = right foot world xy
+        #   col  10   = left  shoe heading theta
+        #   col  11   = right shoe heading theta
+        left_xy  = foot_state_np[:, 0:2]   # (N, 2)
+        right_xy = foot_state_np[:, 2:4]   # (N, 2)
+        left_th  = foot_state_np[:, 10]    # (N,)
+        right_th = foot_state_np[:, 11]    # (N,)
+
+        half_L = SHOE_LENGTH * 0.5
+        half_W = SHOE_WIDTH  * 0.5
+
+        for i in range(n_people):
+            for foot_xy, theta in (
+                (left_xy[i],  float(left_th[i])),
+                (right_xy[i], float(right_th[i])),
+            ):
+                fx, fy = float(foot_xy[0]), float(foot_xy[1])
+                cos_t = math.cos(theta)
+                sin_t = math.sin(theta)
+                # Shoe centre (same offset used in draw_shoe)
+                cx = fx + cos_t * half_L
+                cy = fy + sin_t * half_L
+
+                # Vector from shoe centre to robot, in shoe-local frame
+                dx_w = robot_x - cx
+                dy_w = robot_y - cy
+                # Rotate into shoe-local axes
+                dx_loc =  cos_t * dx_w + sin_t * dy_w
+                dy_loc = -sin_t * dx_w + cos_t * dy_w
+
+                # AABB clamp distance in local frame
+                ddx = max(abs(dx_loc) - half_L, 0.0)
+                ddy = max(abs(dy_loc) - half_W, 0.0)
+                d_box = math.hypot(ddx, ddy)
+
+                # Subtract robot radius to get gap from robot boundary
+                gap = d_box - ROBOT_RADIUS
+                if gap < min_d:
+                    min_d = gap
+    else:
+        # Cylinder model: centre-to-centre minus both radii
+        for i in range(n_people):
+            px = float(state.people[i, 0])
+            py = float(state.people[i, 1])
+            d = math.hypot(robot_x - px, robot_y - py) - ROBOT_RADIUS - PEOPLE_RADIUS
+            if d < min_d:
+                min_d = d
+
+    return max(min_d, 0.0)   # clamp to 0 (negative = overlap)
+
+
 def draw_scene(surface, state, raw_lidar, foot_state_np, show_lidar, show_arrows, use_legs):
     pygame.draw.rect(surface, C_FLOOR, (0, 0, SIM_SIZE, SIM_SIZE))
     for i in range(int(ROOM_W) + 1):
@@ -386,7 +454,7 @@ def draw_panel(surface, fonts, ep, step, ep_ret, v, w, goal_dist, goal_align,
     sep()
     txt(f"Goal  {goal_dist:>5.2f} m",       font="mid")
     txt(f"Align {math.degrees(goal_align):>+5.1f}°", font="mid")
-    txt(f"Human {closest_h:>5.2f} m",       font="mid")
+    txt(f"Min Dist{closest_h:>4.2f} m",       font="mid")
     sep()
     txt(f"Ep ret {ep_ret:>+7.2f}", C_GOAL, "mid")
     sep()
@@ -513,7 +581,10 @@ def main():
         dy     = float(cpu_state.goal_y) - float(cpu_state.y)
         gdist  = math.hypot(dx, dy)
         galign = (math.atan2(dy, dx) - float(cpu_state.theta) + math.pi) % (2*math.pi) - math.pi
-        ch     = float(info["closest_human"]) - ROBOT_RADIUS - PEOPLE_RADIUS
+        ch = compute_min_dist_to_humans(
+            float(cpu_state.x), float(cpu_state.y),
+            cpu_state, foot_state_np, use_legs
+        )
 
         screen.fill(C_BG)
         draw_scene(screen, cpu_state, raw_lidar, foot_state_np,
