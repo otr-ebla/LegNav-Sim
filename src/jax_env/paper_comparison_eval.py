@@ -26,8 +26,9 @@ import argparse
 import os
 import time
 import warnings
+from functools import partial
 
-os.environ["JAX_PLATFORMS"] = "cpu"
+#os.environ["JAX_PLATFORMS"] = "cpu"
 warnings.filterwarnings("ignore")
 
 import jax
@@ -122,7 +123,7 @@ def _step_stacked(key, state: StackedEnvState, action):
 
 
 # ── Core rollout (stateless policies: RL + DWA) ───────────────────────────────
-
+@partial(jax.jit, static_argnums=(0, 1))
 def _rollout_stateless(act_vmap, n_envs, rng_key, scenario_idx):
     """
     Run n_envs episodes in parallel using lax.scan.
@@ -249,7 +250,7 @@ def _rollout_stateless(act_vmap, n_envs, rng_key, scenario_idx):
 
 
 # ── MPPI rollout (carries u_mean per env) ─────────────────────────────────────
-
+@partial(jax.jit, static_argnums=(0, 1))
 def _rollout_mppi(mppi, n_envs, rng_key, scenario_idx):
     """Like _rollout_stateless but carries u_mean_batch for warm-starting."""
     rng_key, rng_v = jax.random.split(rng_key)
