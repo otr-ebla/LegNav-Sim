@@ -28,10 +28,13 @@ import time
 import warnings
 from functools import partial
 
-#os.environ["JAX_PLATFORMS"] = "cpu"
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.88")
+os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
 warnings.filterwarnings("ignore")
 
 import jax
+jax.config.update("jax_default_device", jax.devices("cuda")[0])
 import jax.numpy as jnp
 import numpy as np
 import pandas as pd
@@ -409,7 +412,7 @@ def _build_mlp_act_vmap(ckpt_path):
     bundle = _load_raw(ckpt_path)
     params = bundle.get("params", bundle)
 
-    @jax.jit
+    
     def act_vmap(obs_batch):
         def _single(obs):
             mean, _, _ = net.apply({"params": params}, obs[None])
@@ -426,7 +429,6 @@ def _build_navrep_act_vmap(ckpt_path):
     bundle = _load_raw(ckpt_path)
     params = bundle.get("params", bundle)
 
-    @jax.jit
     def act_vmap(obs_batch):
         def _single(obs):
             mean, _, _ = net.apply({"params": params}, obs[None])
@@ -456,7 +458,7 @@ def _build_sac_act_vmap(ckpt_path):
     enc_p  = bundle["enc_params"]
     head_p = bundle["actor_head_params"]
 
-    @jax.jit
+    
     def act_vmap(obs_batch):
         def _single(obs):
             feat = enc.apply({"params": enc_p}, obs[None])
@@ -484,7 +486,6 @@ def _build_tqc_act_vmap(ckpt_path):
     enc_p  = bundle["enc_params"]
     head_p = bundle["actor_params"]
 
-    @jax.jit
     def act_vmap(obs_batch):
         def _single(obs):
             feat = enc.apply({"params": enc_p}, obs[None])
