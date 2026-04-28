@@ -121,10 +121,10 @@ sns.set_theme(style="whitegrid", rc={"axes.spines.right": False, "axes.spines.to
 for vmax_val in discrete_vmax_choices:
     mask = max_v_data == vmax_val
     if np.any(mask):
-        # Utilizzo di histplot con kde=True, stat="density" per la corretta proporzione, e bins per la risoluzione
-        sns.histplot(raw_v[mask], ax=axes[0], label=f"v={vmax_val}", kde=True, stat="density", alpha=0.3, edgecolor="none", bins=30)
-        sns.histplot(raw_w[mask], ax=axes[1], label=f"v={vmax_val}", kde=True, stat="density", alpha=0.3, edgecolor="none", bins=30)
-        sns.histplot(eff_v[mask], ax=axes[2], label=f"v={vmax_val}", kde=True, stat="density", alpha=0.3, edgecolor="none", bins=30)
+        # Using kdeplot to generate only density lines
+        sns.kdeplot(raw_v[mask], ax=axes[0], label=f"v={vmax_val}")
+        sns.kdeplot(raw_w[mask], ax=axes[1], label=f"v={vmax_val}")
+        sns.kdeplot(eff_v[mask], ax=axes[2], label=f"v={vmax_val}")
 
 axes[0].set_title("PPO Extracted LINEAR Velocity vs Assigned 'Vmax'", fontsize=13, pad=10)
 axes[0].set_xlabel("Generated Linear Actuation [sigmoid(raw_v) : 0 to 1]", fontsize=11, labelpad=8)
