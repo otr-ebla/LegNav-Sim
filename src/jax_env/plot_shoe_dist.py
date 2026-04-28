@@ -87,7 +87,7 @@ def main():
     parser.add_argument("--envs", default=2048, type=int, help="Envs per batch for smooth distributions")
     args = parser.parse_args()
 
-    ckpt = "checkpoints/ppo_attn_best.msgpack"
+    ckpt = "checkpoints/ppo_attn_final.msgpack"
     print(f"Loading PPO checkpoint: {ckpt}")
     act_vmap = _build_ppo_act_vmap(ckpt)
 
@@ -133,8 +133,44 @@ def main():
     ax.set_xlabel("Surface-to-Surface Distance (m)", fontsize=12)
     ax.set_ylabel("Density", fontsize=12)
 
+    # --- Find peaks and draw vertical lines with staggered labels ---
+    peaks = []
+    # Seaborn adds the KDE curves to ax.lines. We extract the raw x,y data from them.
+    for line in ax.lines:
+        x_data = line.get_xdata()
+        y_data = line.get_ydata()
+        if len(x_data) > 0:
+            max_idx = np.argmax(y_data)
+            peaks.append((x_data[max_idx], y_data[max_idx], line.get_color()))
+
+    # Sort peaks left-to-right to reliably stagger the text
+    peaks.sort(key=lambda p: p[0])
+
+    y_min, y_max_axis = ax.get_ylim()
+    
+    for i, (x_max, y_max, color) in enumerate(peaks):
+        # Draw the vertical dashed line from the peak to the x-axis
+        ax.vlines(x=x_max, ymin=0, ymax=y_max, color=color, linestyle='--', linewidth=1.5, alpha=0.8)
+
+        # Stagger text heights to prevent overlap (pushes labels down in a staircase)
+        offset_multiplier = i + 1 
+        y_text = 0 - (offset_multiplier * 0.05 * y_max_axis)
+
+        # Annotate with a small connector line pointing to the exact x-axis location
+        ax.annotate(
+            f"{x_max:.2f}m",
+            xy=(x_max, 0),
+            xytext=(x_max, y_text),
+            color=color,
+            ha="center", va="top",
+            fontweight="bold",
+            arrowprops=dict(arrowstyle="-", color=color, alpha=0.5, shrinkA=0, shrinkB=0)
+        )
+    # ----------------------------------------------------------------
+
     plt.tight_layout()
-    plt.savefig("shoe_distance_distribution.png", dpi=300)
+    # Use bbox_inches='tight' so the saved image doesn't cut off the annotations hanging below the axis
+    plt.savefig("shoe_distance_distribution.png", dpi=300, bbox_inches='tight')
     print("\nSaved 'shoe_distance_distribution.png'")
 
 if __name__ == "__main__":
