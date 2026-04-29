@@ -15,7 +15,7 @@ import os
 import time
 import warnings
 
-os.environ["JAX_PLATFORMS"] = "cuda,cpu"
+os.environ["JAX_PLATFORMS"] = "cuda"
 os.environ["XLA_FLAGS"] = "--xla_gpu_enable_triton_gemm=true"
 os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
 os.environ["SDL_VIDEODRIVER"] = "dummy"
@@ -873,7 +873,9 @@ def _plot_test_dashboard(test_df):
     fig.suptitle("Test Scenario Evaluation Dashboard (Scenarios 7-12)",
                  fontsize=12, weight="bold")
 
-    # ── (0,0) Success rate per scenario ─────────────────────────────────────
+    # ── ROW 0: BAR PLOTS + SUCCESS LINE ─────────────────────────────────────
+    
+    # (0,0) Success rate per scenario (BAR)
     scen_suc = (test_df.groupby(["Scenario_Name", "Policy"])["Success"]
                 .mean().reset_index())
     scen_suc["Success"] *= 100
@@ -886,7 +888,7 @@ def _plot_test_dashboard(test_df):
     ax.tick_params(labelsize=FS_TICK)
     ax.legend(fontsize=FS_LEG)
 
-    # ── (0,1) Overall outcome breakdown ─────────────────────────────────────
+    # (0,1) Overall outcome breakdown (BAR)
     rate_df = (test_df.groupby("Policy")[
         ["Success", "Active Col", "Passive Col", "Timeout"]
     ].mean().reset_index())
@@ -900,11 +902,25 @@ def _plot_test_dashboard(test_df):
     ax.tick_params(labelsize=FS_TICK)
     ax.legend(fontsize=FS_LEG)
 
-    # ── (0,2) Success vs max speed ───────────────────────────────────────────
+    # (0,2) Multi-waypoint full-path success (BAR)
+    multi_wp = test_df[test_df["N_Waypoints"] > 1]
+    ax = axes[0, 2]
+    if not multi_wp.empty:
+        mw_suc = (multi_wp.groupby(["Scenario_Name", "Policy"])["Success"]
+                  .mean().reset_index())
+        mw_suc["Success"] *= 100
+        sns.barplot(data=mw_suc, x="Scenario_Name", y="Success", hue="Policy", ax=ax)
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha="right", fontsize=FS_TICK)
+    ax.set_title("Multi-Waypoint Success", fontsize=FS_TITLE)
+    ax.set_ylim(0, 100)
+    ax.set_ylabel("Full-Path Success (%)", fontsize=FS_LABEL)
+    ax.tick_params(labelsize=FS_TICK)
+
+    # (0,3) Success vs max speed (LINE)
     spd_suc = (test_df.groupby(["Max_V", "Policy"])["Success"]
                .mean().reset_index())
     spd_suc["Success"] *= 100
-    ax = axes[0, 2]
+    ax = axes[0, 3]
     sns.lineplot(data=spd_suc, x="Max_V", y="Success", hue="Policy",
                  marker="o", linewidth=LW, markersize=MS, ax=ax)
     ax.set_title("Success Rate vs. Max Speed", fontsize=FS_TITLE)
@@ -915,86 +931,51 @@ def _plot_test_dashboard(test_df):
     ax.tick_params(labelsize=FS_TICK)
     ax.legend(fontsize=FS_LEG)
 
-    # ── (0,3) Min Human Distance box-plot ───────────────────────────────────
-    # 'Min Dist' = surface-to-surface gap: robot boundary → nearest shoe-box
-    # surface (USE_LEGS=True) or body-circle edge (USE_LEGS=False), exactly
-    # as returned by info["closest_shoe_surface"] in jax_env_multi.step_env.
-    # Data are from the randomly-initialised test scenario episodes.
-    ax = axes[0, 3]
+    # ── ROW 1: BOX PLOTS + SAFETY LINE ──────────────────────────────────────
+    
+    # (1,0) Min Human Distance box-plot (BOX)
+    ax = axes[1, 0]
     palette = {p: POLICY_COLORS.get(p, "#888888") for p in test_df["Policy"].unique()}
-    sns.boxplot(
-        data=test_df,
-        x="Policy", y="Min Dist",
-        hue="Policy",
-        palette=palette,
-        showfliers=False,
-        ax=ax,
-    )
-    ax.axhline(0.0, color="red", linestyle="--", linewidth=1.0, alpha=0.7,
-               label="Collision (0 m)")
-    ax.set_title("Min Human Distance (robot edge → shoe)", fontsize=FS_TITLE)
+    sns.boxplot(data=test_df, x="Policy", y="Min Dist", hue="Policy",
+                palette=palette, showfliers=False, ax=ax)
+    ax.axhline(0.0, color="red", linestyle="--", linewidth=1.0, alpha=0.7, label="Collision")
+    ax.set_title("Min Human Distance (Global)", fontsize=FS_TITLE)
     ax.set_ylabel("Surface distance (m)", fontsize=FS_LABEL)
     ax.set_xlabel("")
     ax.tick_params(labelsize=FS_TICK)
     ax.legend(fontsize=FS_LEG)
 
-    # ── (1,0) SPL (successful episodes only) ────────────────────────────────
+    # (1,1) SPL (successful episodes only) (BOX)
     suc_only = test_df[test_df["Success"] == 1.0]
-    ax = axes[1, 0]
-    if not suc_only.empty:
-        sns.boxplot(data=suc_only, x="Policy", y="SPL", hue="Policy",
-                    ax=ax, showfliers=False)
-    ax.set_title("SPL (successful eps)", fontsize=FS_TITLE)
-    ax.set_ylabel("SPL", fontsize=FS_LABEL)
-    ax.tick_params(labelsize=FS_TICK)
-
-    # ── (1,1) Safety Margin vs speed ────────────────────────────────────────
-    # Min Dist = info["closest_shoe_surface"] = robot boundary → nearest shoe
-    # surface (same formula as paper_comparison_eval.py). Mean over all test
-    # episodes (randomly initialised) at each max-speed setting.
     ax = axes[1, 1]
-    sns.lineplot(data=test_df, x="Max_V", y="Min Dist", hue="Policy",
-                 marker="^", linewidth=LW, markersize=MS, ax=ax)
-    ax.set_title("Safety Margin vs. Max Speed", fontsize=FS_TITLE)
-    ax.axhline(0.0, color="red", linestyle="--", alpha=0.5, label="Collision")
-    ax.set_xticks(MAX_V_TESTS)
-    ax.set_xlabel("Max Linear Speed (m/s)", fontsize=FS_LABEL)
-    ax.set_ylabel("Min Human Distance (m)", fontsize=FS_LABEL)
+    if not suc_only.empty:
+        sns.boxplot(data=suc_only, x="Policy", y="SPL", hue="Policy", ax=ax, showfliers=False)
+    ax.set_title("SPL (Successful Eps)", fontsize=FS_TITLE)
+    ax.set_ylabel("SPL", fontsize=FS_LABEL)
+    ax.set_xlabel("")
     ax.tick_params(labelsize=FS_TICK)
-    ax.legend(fontsize=FS_LEG)
 
-    # ── (1,2) Multi-waypoint full-path success ───────────────────────────────
-    multi_wp = test_df[test_df["N_Waypoints"] > 1]
+    # (1,2) Min Human Distance by Scenario (BOX)
     ax = axes[1, 2]
-    if not multi_wp.empty:
-        mw_suc = (multi_wp.groupby(["Scenario_Name", "Policy"])["Success"]
-                  .mean().reset_index())
-        mw_suc["Success"] *= 100
-        sns.barplot(data=mw_suc, x="Scenario_Name", y="Success", hue="Policy", ax=ax)
-        ax.set_xticklabels(ax.get_xticklabels(), rotation=20, ha="right", fontsize=FS_TICK)
-    ax.set_title("Multi-Waypoint: Full-Path Success", fontsize=FS_TITLE)
-    ax.set_ylim(0, 100)
-    ax.set_ylabel("Full-Path Success (%)", fontsize=FS_LABEL)
-    ax.tick_params(labelsize=FS_TICK)
-
-    # ── (1,3) Min Human Distance box-plot per scenario ───────────────────────
-    # Same metric as (0,3) but broken down by test scenario, giving a finer
-    # view of proximity behaviour across different layout topologies.
-    ax = axes[1, 3]
-    sns.boxplot(
-        data=test_df,
-        x="Scenario_Name", y="Min Dist",
-        hue="Policy",
-        palette=palette,
-        showfliers=False,
-        ax=ax,
-    )
-    ax.axhline(0.0, color="red", linestyle="--", linewidth=1.0, alpha=0.7,
-               label="Collision (0 m)")
+    sns.boxplot(data=test_df, x="Scenario_Name", y="Min Dist", hue="Policy",
+                palette=palette, showfliers=False, ax=ax)
+    ax.axhline(0.0, color="red", linestyle="--", linewidth=1.0, alpha=0.7)
     ax.set_title("Min Human Distance by Scenario", fontsize=FS_TITLE)
     ax.set_ylabel("Surface distance (m)", fontsize=FS_LABEL)
     ax.set_xlabel("")
-    ax.set_xticklabels(ax.get_xticklabels(), rotation=25, ha="right", fontsize=FS_TICK)
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha="right", fontsize=FS_TICK)
+    ax.tick_params(labelsize=FS_TICK)
+    ax.get_legend().remove()
+
+    # (1,3) Safety Margin vs speed (LINE)
+    ax = axes[1, 3]
+    sns.lineplot(data=test_df, x="Max_V", y="Min Dist", hue="Policy",
+                 marker="^", linewidth=LW, markersize=MS, ax=ax)
+    ax.set_title("Safety Margin vs. Max Speed", fontsize=FS_TITLE)
+    ax.axhline(0.0, color="red", linestyle="--", alpha=0.5)
+    ax.set_xticks(MAX_V_TESTS)
+    ax.set_xlabel("Max Speed (m/s)", fontsize=FS_LABEL)
+    ax.set_ylabel("Min Distance (m)", fontsize=FS_LABEL)
     ax.tick_params(labelsize=FS_TICK)
     ax.legend(fontsize=FS_LEG)
 
