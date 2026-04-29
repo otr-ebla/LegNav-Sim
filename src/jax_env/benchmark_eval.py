@@ -439,6 +439,10 @@ def _plot_dashboard(df, scatter_data):
     ax6.tick_params(labelsize=FS_TICK)
 
     ax7 = plt.subplot(R, C, 7)
+    # 'Min Dist' = info["closest_shoe_surface"] from jax_env_multi.step_env:
+    # surface-to-surface gap between the robot boundary and the nearest point
+    # on the closest shoe-box (USE_LEGS=True) or body-circle edge (USE_LEGS=False).
+    # Consistent with paper_comparison_eval.py.
     sns.lineplot(data=df, x="Max_V", y="Min Dist", hue="Policy",
                  marker="^", linewidth=LW, markersize=MS, ax=ax7)
     ax7.set_title("Safety Margin vs. Max Speed", fontsize=FS_TITLE)
@@ -841,7 +845,20 @@ def run_test_scenarios(policies, rng):
 
 
 def _plot_test_dashboard(test_df):
-    """Compact dashboard for the 6 test scenarios."""
+    """Compact dashboard for the 6 test scenarios.
+
+    NOTE on distance semantics:
+    'Min Dist' = closest_shoe_surface from jax_env_multi.step_env, which is
+    the surface-to-surface gap between the robot circle boundary (ROBOT_RADIUS)
+    and the nearest point on the closest shoe AABB of any pedestrian
+    (USE_LEGS=True), or the body-circle edge (USE_LEGS=False).
+    This definition is identical to paper_comparison_eval.py and is used
+    consistently in both the Safety Margin line-plot and the Min Human Distance
+    box-plot below.
+    All data come from the randomly-initialised test episodes produced by
+    run_test_scenarios() (scenarios chosen at the start of each episode via
+    dynamic_reset_stacked with random RNG keys).
+    """
     sns.set_theme(style="whitegrid", palette="muted")
 
     FS_TITLE = 9
@@ -851,7 +868,8 @@ def _plot_test_dashboard(test_df):
     LW = 2
     MS = 5
 
-    fig, axes = plt.subplots(2, 3, figsize=(14, 8))
+    # Expand to 2×4 to accommodate the new Min Human Distance box-plot.
+    fig, axes = plt.subplots(2, 4, figsize=(18, 8))
     fig.suptitle("Test Scenario Evaluation Dashboard (Scenarios 7-12)",
                  fontsize=12, weight="bold")
 
@@ -897,6 +915,29 @@ def _plot_test_dashboard(test_df):
     ax.tick_params(labelsize=FS_TICK)
     ax.legend(fontsize=FS_LEG)
 
+    # ── (0,3) Min Human Distance box-plot ───────────────────────────────────
+    # 'Min Dist' = surface-to-surface gap: robot boundary → nearest shoe-box
+    # surface (USE_LEGS=True) or body-circle edge (USE_LEGS=False), exactly
+    # as returned by info["closest_shoe_surface"] in jax_env_multi.step_env.
+    # Data are from the randomly-initialised test scenario episodes.
+    ax = axes[0, 3]
+    palette = {p: POLICY_COLORS.get(p, "#888888") for p in test_df["Policy"].unique()}
+    sns.boxplot(
+        data=test_df,
+        x="Policy", y="Min Dist",
+        hue="Policy",
+        palette=palette,
+        showfliers=False,
+        ax=ax,
+    )
+    ax.axhline(0.0, color="red", linestyle="--", linewidth=1.0, alpha=0.7,
+               label="Collision (0 m)")
+    ax.set_title("Min Human Distance (robot edge → shoe)", fontsize=FS_TITLE)
+    ax.set_ylabel("Surface distance (m)", fontsize=FS_LABEL)
+    ax.set_xlabel("")
+    ax.tick_params(labelsize=FS_TICK)
+    ax.legend(fontsize=FS_LEG)
+
     # ── (1,0) SPL (successful episodes only) ────────────────────────────────
     suc_only = test_df[test_df["Success"] == 1.0]
     ax = axes[1, 0]
@@ -907,7 +948,10 @@ def _plot_test_dashboard(test_df):
     ax.set_ylabel("SPL", fontsize=FS_LABEL)
     ax.tick_params(labelsize=FS_TICK)
 
-    # ── (1,1) Safety margin vs speed ────────────────────────────────────────
+    # ── (1,1) Safety Margin vs speed ────────────────────────────────────────
+    # Min Dist = info["closest_shoe_surface"] = robot boundary → nearest shoe
+    # surface (same formula as paper_comparison_eval.py). Mean over all test
+    # episodes (randomly initialised) at each max-speed setting.
     ax = axes[1, 1]
     sns.lineplot(data=test_df, x="Max_V", y="Min Dist", hue="Policy",
                  marker="^", linewidth=LW, markersize=MS, ax=ax)
@@ -932,6 +976,27 @@ def _plot_test_dashboard(test_df):
     ax.set_ylim(0, 100)
     ax.set_ylabel("Full-Path Success (%)", fontsize=FS_LABEL)
     ax.tick_params(labelsize=FS_TICK)
+
+    # ── (1,3) Min Human Distance box-plot per scenario ───────────────────────
+    # Same metric as (0,3) but broken down by test scenario, giving a finer
+    # view of proximity behaviour across different layout topologies.
+    ax = axes[1, 3]
+    sns.boxplot(
+        data=test_df,
+        x="Scenario_Name", y="Min Dist",
+        hue="Policy",
+        palette=palette,
+        showfliers=False,
+        ax=ax,
+    )
+    ax.axhline(0.0, color="red", linestyle="--", linewidth=1.0, alpha=0.7,
+               label="Collision (0 m)")
+    ax.set_title("Min Human Distance by Scenario", fontsize=FS_TITLE)
+    ax.set_ylabel("Surface distance (m)", fontsize=FS_LABEL)
+    ax.set_xlabel("")
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=25, ha="right", fontsize=FS_TICK)
+    ax.tick_params(labelsize=FS_TICK)
+    ax.legend(fontsize=FS_LEG)
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.savefig("Test_Scenario_Dashboard.png", dpi=300)

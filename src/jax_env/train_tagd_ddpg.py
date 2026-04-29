@@ -1,5 +1,9 @@
 """
 train_tagd_ddpg.py — DDPG training for the TAGD navigation policy
+
+References: Spatiotemporal Attention Enhances Lidar-Based
+Robot Navigation in Dynamic Environments (De Heuvel et al. IEEE RA-L 2024)
+
 =================================================================
 Trains the TAGD actor-critic (comparison_policies/tagd_network.py) using the
 standard Deep Deterministic Policy Gradient algorithm (Lillicrap et al. 2015).
