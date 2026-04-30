@@ -44,26 +44,6 @@ def apply_unimix(logits: jnp.ndarray, mix_ratio: float = 0.01) -> jnp.ndarray:
     return jnp.log(mixed_probs)
 
 
-# ---------------------------------------------------------------------------
-# Block-Diagonal GRU
-#
-# Standard GRU with hidden size H: recurrent weight matrix per gate is (H, H),
-# costing O(H^2) parameters and FLOPs.
-#
-# Block-diagonal GRU: partitions H into `num_blocks` slices of `block_size`.
-# Each block's recurrent weight is (block_size, block_size). Total recurrent
-# params per gate = num_blocks * block_size^2 = H * block_size = H^2/num_blocks.
-# With num_blocks=8, block_size=64: 8 * 64^2 = 32768 vs 512^2 = 262144 — 8x
-# fewer parameters and proportionally fewer FLOPs per recurrent step.
-#
-# The input projection remains full-width (dense over the full input), since
-# the input path does not dominate the parameter budget.
-#
-# Implementation: nn.vmap a single-block Dense pair over the block axis.
-# XLA sees `num_blocks` independent (block_size, block_size) matmuls and
-# fuses them into a single batched GEMM — faster than sequential Dense calls.
-# ---------------------------------------------------------------------------
-
 class _SingleBlockRec(nn.Module):
     """One block's recurrent projection: [S] -> (r_h [S], u_h [S])."""
     block_size: int
@@ -149,20 +129,13 @@ class CategoricalStraightThrough(nn.Module):
         probs     = jnp.exp(log_probs)
 
         if self.sample:
-            # Gumbel-max trick requires log_probs, not raw logits.
-            # Using raw logits here would bypass the unimix floor: a near-zero
-            # category still has a large negative raw logit, so the 1% uniform
-            # injection never influences which category gets selected.
-            # log_probs already encodes the mixture; argmax(log_probs + Gumbel)
-            # is a valid sample from the regularized distribution.
+
             key          = self.make_rng('gumbel')
             u            = jax.random.uniform(key, logits.shape, minval=1e-8, maxval=1.0 - 1e-8)
             gumbel_noise = -jnp.log(-jnp.log(u))
             indices      = jnp.argmax(log_probs + gumbel_noise, axis=-1)
         else:
-            # Greedy: argmax over regularized log_probs.
-            # log is monotone so argmax(log_probs) == argmax(mixed_probs),
-            # selecting the mode of the unimix distribution rather than raw logits.
+
             indices = jnp.argmax(log_probs, axis=-1)
 
         hard_z = jax.nn.one_hot(indices, CATEGORY_SIZE, dtype=jnp.float32)
@@ -181,14 +154,14 @@ class RSSM(nn.Module):
         # Block-diagonal GRU — 8x fewer recurrent parameters than nn.GRUCell(512)
         self.cell      = BlockDiagonalGRU(num_blocks=GRU_NUM_BLOCKS, block_size=GRU_BLOCK_SIZE)
         self.step_dense = nn.Dense(DETERMINISTIC_SIZE)
-        self.step_norm  = nn.LayerNorm()
+        self.step_norm  = nn.RMSNorm()
 
         self.prior_dense1 = nn.Dense(DETERMINISTIC_SIZE)
-        self.prior_norm1  = nn.LayerNorm()
+        self.prior_norm1  = nn.RMSNorm()
         self.prior_dense2 = nn.Dense(LATENT_SIZE)
 
         self.post_dense1  = nn.Dense(DETERMINISTIC_SIZE)
-        self.post_norm1   = nn.LayerNorm()
+        self.post_norm1   = nn.RMSNorm()
         self.post_dense2  = nn.Dense(LATENT_SIZE)
 
         self.sampler_train = CategoricalStraightThrough(sample=True)
@@ -260,12 +233,12 @@ class RSSM(nn.Module):
 
 class DreamerEncoder(nn.Module):
     stack_dim: int = 3
-    num_rays:  int = 108
+    num_rays:  int = 216
 
     @nn.compact
     def __call__(self, obs: jnp.ndarray) -> jnp.ndarray:
         pose_size  = 3 * self.stack_dim
-        state_size = 9
+        state_size = 5
 
         pose_stack = obs[..., :pose_size]
         state_vec  = obs[..., pose_size : pose_size + state_size]
@@ -277,10 +250,11 @@ class DreamerEncoder(nn.Module):
         cnn = nn.swish(nn.Conv(features=32, kernel_size=(7,), strides=(2,), padding='SAME')(lidar_cnn))
         cnn = nn.swish(nn.Conv(features=64, kernel_size=(5,), strides=(2,), padding='SAME')(cnn))
         cnn = nn.swish(nn.Conv(features=64, kernel_size=(3,), strides=(2,), padding='SAME')(cnn))
-        cnn_feat = nn.LayerNorm()(cnn.reshape((*batch_shape, -1)))
+        cnn_feat = nn.RMSNorm()(cnn.reshape((*batch_shape, -1)))
 
-        global_in   = jnp.concatenate([pose_stack, state_vec], axis=-1)
+        # V3: Vector inputs must be symlog transformed
+        global_in   = symlog(jnp.concatenate([pose_stack, state_vec], axis=-1))
         global_feat = nn.swish(nn.Dense(128)(global_in))
 
         fused = jnp.concatenate([cnn_feat, global_feat], axis=-1)
-        return nn.swish(nn.LayerNorm()(nn.Dense(DETERMINISTIC_SIZE)(fused)))
+        return nn.swish(nn.RMSNorm()(nn.Dense(DETERMINISTIC_SIZE)(fused)))

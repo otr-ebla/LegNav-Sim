@@ -64,7 +64,7 @@ class DWAPlanner:
         n_samples = v_flat.shape[0]
 
         # 3. Lidar points
-        lidar_norm = obs['lidar'][-108:] 
+        lidar_norm = obs['lidar'][-216:]
         lidar_dists = self.max_lidar_dist - (lidar_norm * (self.max_lidar_dist - self.min_lidar_dist))
         lidar_angles = np.linspace(-self.fov/2, self.fov/2, len(lidar_dists))
         

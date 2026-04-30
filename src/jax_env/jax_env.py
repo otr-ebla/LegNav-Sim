@@ -3,8 +3,8 @@ jax_env.py — Core 2D Navigation Environment
 ============================================
 Previous fixes: A (LiDAR anchor), B (passive_col), C (resample cap),
                 D (no nested JIT), E (person spawn clearance).
-Obs layout (single frame): pose(3) + state_vec(9) + lidar(NUM_RAYS) = 120
-Stacked × 3: 9 + 9 + 324 = 342  (UNCHANGED)
+Obs layout (single frame): pose(3) + state_vec(5) + lidar(NUM_RAYS) = 224
+Stacked × 3: 9 + 5 + 648 = 662
 """
 
 import math
@@ -33,7 +33,6 @@ SENSOR_NOISE = True
 DT             = RobotConfig.DT
 MAX_STEPS      = SimConfig.MAX_STEPS
 NUM_RAYS       = LidarConfig.NUM_RAYS
-REAR_RAYS      = 4
 NUM_PEOPLE     = 18
 NUM_OBS_CIR    = 7
 NUM_OBS_BOX    = 7
@@ -42,7 +41,7 @@ ROOM_H         = 12.0
 ROBOT_RADIUS   = RobotConfig.RADIUS
 PEOPLE_RADIUS  = SimConfig.HUMANS_RADIUS
 MAX_LIDAR_DIST = 12.0
-FOV            = math.pi         # 180° forward-facing LiDAR
+FOV            = 2.0 * math.pi   # 360° full-circle LiDAR
 GOAL_RADIUS    = 0.3
 COMFORT_DIST   = 1.0
 COMFORT_COEF   = 0.03
@@ -52,9 +51,9 @@ PROGRESS_COEF  = 1.0
 MAX_RESAMPLE_ITERS = 200
 DEFAULT_MIN_GOAL_DIST = 3.0
 
-STATE_VEC_SIZE  = 9   # v, w, max_v_norm, goal_dist, goal_align, rear_prox×4
+STATE_VEC_SIZE  = 5   # v, w, max_v_norm, goal_dist, goal_align
 _MAX_GOAL_DIST  = math.sqrt(ROOM_W**2 + ROOM_H**2)
-SINGLE_OBS_SIZE = 3 + STATE_VEC_SIZE + NUM_RAYS   # 120
+SINGLE_OBS_SIZE = 3 + STATE_VEC_SIZE + NUM_RAYS   # 224
 
 # ── Human idle / stop-and-go behaviour ─────────────────────────────────────────────
 # Each step an active human has P_HUMAN_STOP probability of starting a stop.
@@ -85,6 +84,8 @@ class EnvState:
     sp_mask:            jnp.ndarray
     human_stop_timers:  jnp.ndarray
     escape_timer:       jnp.int32     # unused in new reward; kept for checkpoint compat
+    is_ghost:           jnp.ndarray
+    room_h:             jnp.float32  # physical room height (default 12 m; 24 m for long corridor)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -124,19 +125,19 @@ def get_obs(state: EnvState, key: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray
       USE_LEGS=False → N_people + N_obs_circles     (cylinder model)
     compute_lidar handles variable circle counts via vmap, so this is fine.
 
-    OBS_SIZE = 342 is UNCHANGED — the output vector layout is identical.
+    OBS_SIZE = 662 — the output vector layout is identical.
     """
     # ── Build human geometry for LiDAR ───────────────────────────────────────
     # USE_LEGS is a Python bool → resolved at trace time, no conditional overhead
     human_circles = get_leg_circles(state.people, state.foot_state, use_legs=USE_LEGS)
     all_circles = jnp.concatenate([human_circles, state.obs_circles], axis=0)
 
-    # Front LiDAR sweep — 108 rays, FOV=π
+    # Full 360° LiDAR sweep — 216 rays, FOV=2π
     # NOTE: shoes are NOT included here — LiDAR only sees leg circles, not shoes.
     raw_lidar = compute_lidar(
         state.x, state.y, state.theta,
         all_circles, state.obs_boxes,
-        NUM_RAYS, float(FOV), MAX_LIDAR_DIST, ROOM_W, ROOM_H
+        NUM_RAYS, float(FOV), MAX_LIDAR_DIST, ROOM_W, state.room_h
     )
 
     # ── NEW: Apply Vectorized Sensor Noise (only when SENSOR_NOISE=True) ────────
@@ -159,19 +160,8 @@ def get_obs(state: EnvState, key: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray
         sp_mask = jnp.zeros(raw_lidar.shape, dtype=bool)
     # ──────────────────────────────────────────────────────────────────────────
 
-    # Rear sweep — 4 rays, FOV=0.75π
-    _REAR_FOV = float(jnp.pi * 0.75)
-    rear_raw = compute_lidar(
-        state.x, state.y, state.theta + jnp.pi,
-        all_circles, state.obs_boxes,
-        REAR_RAYS, _REAR_FOV, MAX_LIDAR_DIST, ROOM_W, ROOM_H
-    )
-
     inv_lidar = jnp.clip(
         (MAX_LIDAR_DIST - noisy_lidar) / (MAX_LIDAR_DIST - ROBOT_RADIUS), 0.0, 1.0
-    )
-    rear_prox_vec = jnp.clip(
-        (MAX_LIDAR_DIST - rear_raw) / (MAX_LIDAR_DIST - ROBOT_RADIUS), 0.0, 1.0
     )
 
     dx    = state.goal_x - state.x
@@ -192,16 +182,15 @@ def get_obs(state: EnvState, key: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray
         s_theta,
     ])
 
-    state_vec_scalars = jnp.array([
+    state_vec = jnp.array([
         state.v / jnp.maximum(state.max_v, 1e-3),
         state.w,
         (state.max_v - 0.2) / 1.8,
         goal_dist / _MAX_GOAL_DIST,
         goal_align / jnp.pi,
-    ])
-    state_vec = jnp.concatenate([state_vec_scalars, rear_prox_vec])  # (9,)
+    ])  # (5,)
 
-    return jnp.concatenate([pose_vec, state_vec, inv_lidar]), sp_mask  # 3+9+108 = 120
+    return jnp.concatenate([pose_vec, state_vec, inv_lidar]), sp_mask  # 3+5+216 = 224
 
 
 # ── Reset ─────────────────────────────────────────────────────────────────────
@@ -333,6 +322,8 @@ def reset_env(key: jnp.ndarray, max_goal_dist: float = 3.0, **kwargs):
         sp_mask=jnp.zeros(NUM_RAYS, dtype=jnp.bool_),
         human_stop_timers=jnp.zeros(NUM_PEOPLE, dtype=jnp.int32),
         escape_timer=0,
+        is_ghost=jnp.array(False, dtype=jnp.bool_),
+        room_h=jnp.float32(ROOM_H),
     )
 
     obs, sp_mask = get_obs(state, k_obs)
@@ -356,16 +347,16 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray, **kwargs):
 
     wall_collision = (
         (raw_x < ROBOT_RADIUS) | (raw_x > ROOM_W - ROBOT_RADIUS) |
-        (raw_y < ROBOT_RADIUS) | (raw_y > ROOM_H - ROBOT_RADIUS)
+        (raw_y < ROBOT_RADIUS) | (raw_y > state.room_h - ROBOT_RADIUS)
     )
     new_x = jnp.clip(raw_x, ROBOT_RADIUS, ROOM_W - ROBOT_RADIUS)
-    new_y = jnp.clip(raw_y, ROBOT_RADIUS, ROOM_H - ROBOT_RADIUS)
+    new_y = jnp.clip(raw_y, ROBOT_RADIUS, state.room_h - ROBOT_RADIUS)
 
     human_key, k_obs = jax.random.split(key)
     new_people = update_all_humans(
         state.people, human_key, dt,
         new_x, new_y, new_theta, target_v,
-        ROOM_W, ROOM_H, PEOPLE_RADIUS,
+        ROOM_W, state.room_h, PEOPLE_RADIUS,
         state.obs_circles, state.obs_boxes
     )
 
@@ -392,10 +383,9 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray, **kwargs):
     # Still paused after decrement = should be frozen this step
     is_stopped_h = new_timers > 0                                        # (N,)
 
-    # Clamp velocity to zero for stopped humans (vx col 2, vy col 3)
-    frozen_vx    = jnp.where(is_stopped_h, 0.0, new_people[:, 2])
-    frozen_vy    = jnp.where(is_stopped_h, 0.0, new_people[:, 3])
-    new_people   = new_people.at[:, 2].set(frozen_vx).at[:, 3].set(frozen_vy)
+    # Prevent JHSFM drift by carrying over the old state entirely, with zeroed velocities.
+    frozen_people = state.people.at[:, 2:4].set(0.0)
+    new_people = jnp.where(is_stopped_h[:, None], frozen_people, new_people)
 
     # ── Advance leg gait phases ───────────────────────────────────────────────
     new_foot_state = advance_feet(state.foot_state, new_people, dt)
@@ -544,9 +534,9 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray, **kwargs):
 
     # Yield penalty is absolute (not normalised by max_v):
     # moving at 2 m/s costs ~5x more than at 0.4 m/s — strong deterrent at any speed
-    yield_penalty = -7.5 * urgency * target_v
+    yield_penalty = -0.5 * urgency * target_v  # Reduced from -7.5 to prevent paralysis
     # Yield bonus: full value while urgency is present, no time-decay
-    yield_bonus   =  0.5 * urgency
+    yield_bonus   =  0.1 * urgency
 
     yield_reward = jnp.where(
         is_yield_situation,
@@ -583,8 +573,16 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray, **kwargs):
         "goal_reached":  goal_reached,
         "collision":     collision,
         "passive_col":   passive_col,
-        "active_col":    active_col,    # <-- Added this line
+        "active_col":    active_col,
         "closest_human": closest_human,
         "sp_mask":       sp_mask,
+        # Per-step reward components (raw, before terminal overrides)
+        "rew_progress":  progress,
+        "rew_step":      jnp.array(step_pen, dtype=jnp.float32),
+        "rew_smooth":    smooth,
+        "rew_speed":     speed_bon_yield,
+        "rew_heading":   heading_bon,
+        "rew_comfort":   comfort_pen,
+        "rew_yield":     yield_reward,
     }
     return obs, new_state, reward, done, info

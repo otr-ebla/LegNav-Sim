@@ -18,12 +18,12 @@ FIXES vs previous version:
                       at construction time by sampling a Python bool.
     The sampled bool is baked into the closure — JAX never sees a traced bool.
 
-    For curriculum decay: rebuild make_stacked_env at each stage change in
-    jax_ppo.py with the new ghost_prob, same as rebuilding for max_goal_dist.
-    make_autoreset_env is ghost_agnostic (behaviour is locked in step_fn).
+    For curriculum updates: rebuild make_stacked_env whenever ghost_prob changes
+    (driven by get_continuous_curriculum in jax_ppo.py), same as rebuilding
+    for max_goal_dist. make_autoreset_env is ghost-agnostic (behaviour is locked in step_fn).
 
-Obs layout: [pose_stack(3*stack_dim=9) | state_vec(9) | lidar_stack(num_rays*stack_dim=324)]
-Total: 9 + 9 + 324 = 342
+Obs layout: [pose_stack(3*stack_dim=9) | state_vec(5) | lidar_stack(num_rays*stack_dim=648)]
+Total: 9 + 5 + 648 = 662
 """
 
 import jax
@@ -43,16 +43,11 @@ class StackedEnvState:
 
 
 def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3,
-                     num_rays: int = NUM_RAYS, ghost_robot: bool = True,
-                     ghost_prob: float = 1.0):
-    
-    # Resolve ghost_robot once at construction time — never a traced value.
-    if ghost_prob < 1.0:
-        ghost_robot = (_random.random() < ghost_prob)
+                     num_rays: int = NUM_RAYS):
 
-    def reset_stacked(key, max_goal_dist: float = 3.0, **kwargs):
+    def reset_stacked(key, max_goal_dist: float = 3.0, ghost_prob: float = 1.0, scenario_idx: int = -1, **kwargs):
         # Passes any extra dynamic args (like scenario_idx) gracefully down to the environment
-        base_obs, base_state = base_reset_fn(key, max_goal_dist, **kwargs)
+        base_obs, base_state = base_reset_fn(key, max_goal_dist=max_goal_dist, scenario_idx=scenario_idx, ghost_prob=ghost_prob, **kwargs)
         pose      = base_obs[0:POSE_SIZE]
         state_vec = base_obs[POSE_SIZE : POSE_SIZE + STATE_VEC_SIZE]
         lidar     = base_obs[POSE_SIZE + STATE_VEC_SIZE:]
@@ -71,9 +66,8 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3,
         return flat_obs, stacked_state
 
     def step_stacked(key, state: StackedEnvState, action):
-        # ghost_robot is captured from the enclosing scope as a Python bool
         base_obs, new_base_state, reward, done, info = base_step_fn(
-            key, state.env_state, action, ghost_robot=ghost_robot
+            key, state.env_state, action
         )
 
         new_pose      = base_obs[0:POSE_SIZE]
@@ -97,12 +91,15 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3,
 
 
 def make_autoreset_env(reset_fn, step_fn):
-    def step_autoreset(key, state, action, max_goal_dist, scenario_idx):
+    def step_autoreset(key, state, action, max_goal_dist, scenario_idx, ghost_prob, max_scenario):
         step_key, reset_key = jax.random.split(key)
         obs, next_state, reward, done, info = step_fn(step_key, state, action)
-        
-        # Passes the active scenario strictly into the auto-reset dynamically
-        reset_obs, reset_state = reset_fn(reset_key, max_goal_dist=max_goal_dist, scenario_idx=scenario_idx)
+
+        # max_scenario flows via **kwargs through reset_stacked → reset_env → generate_scenario
+        # so the random draw on reset is capped to [0, max_scenario] (curriculum range).
+        reset_obs, reset_state = reset_fn(reset_key, max_goal_dist=max_goal_dist,
+                                          scenario_idx=scenario_idx, ghost_prob=ghost_prob,
+                                          max_scenario=max_scenario)
 
         def _select(reset_leaf, next_leaf):
             d = jnp.asarray(done)

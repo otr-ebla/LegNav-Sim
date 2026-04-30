@@ -9,7 +9,8 @@ PEOPLE_RADIUS = 0.4   # FIX: was 0.2 — must match jax_env.py (PEOPLE_RADIUS=0.
                       # With 0.2, PERSON_ROBOT_CLEAR=0.7m but body_thresh=0.6m -> margin <0.1m
                       # -> immediate collisions at first step guaranteed
 GOAL_RADIUS = 0.3
-NUM_PEOPLE = 12
+N_BASE_PEOPLE = 12   # people count for all scenarios except static_groups
+NUM_PEOPLE    = 24   # total slots; static_groups fills all, others pad with dummies
 NUM_OBS_CIR = 6
 NUM_OBS_BOX = 6
 
@@ -50,30 +51,44 @@ def _batch_sample_safe_pos(key, clearance, obs_circles, obs_boxes, min_val, max_
     best_idx = jnp.argmax(is_safe_mask)
     return guesses_x[best_idx], guesses_y[best_idx]
 
-def generate_scenario(key: jnp.ndarray, max_goal_dist: float, scenario_idx: int = -1):
+def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
+                      scenario_idx: int = -1, max_scenario: int = 6):
     """
     Generate a scenario.
+
+    scenario_idx < 0  → random draw from [0, max_scenario] (uniform).
+    scenario_idx >= 0 → pin to that exact index (used for eval / test scenarios).
+    max_scenario      → upper bound for random training draws; set to cur_max_scen
+                        from the curriculum so the robot always sees *all* unlocked
+                        scenarios, not just the hardest one (fixes Scenario Amnesia).
     """
     # Minimum goal distance floor — goal never spawns inside the robot
     _MIN_GOAL_FLOOR = 0.8
 
     k_scen, k_branch = jax.random.split(key)
-    
-    # Sample a random scenario normally
-    sampled_idx = jax.random.randint(k_scen, (), 0, 7)
-    
-    # If the user requested a specific scenario, use it
+
+    # Sample uniformly from the full range of currently-unlocked scenarios.
+    # max_scenario is a JAX integer so randint can handle it dynamically.
+    sampled_idx = jax.random.randint(k_scen, (), 0, jnp.int32(max_scenario) + 1)
+
+    # If the caller pinned a specific scenario (>= 0), use it; else use the draw.
     idx = jnp.where(scenario_idx < 0, sampled_idx, jnp.int32(scenario_idx))
-    
-    # REMOVED the hardcoded curriculum logic here.
 
     def pack_human(px, py, th, g1x, g1y, g2x, g2y):
         return jnp.stack([
-            px, py, jnp.zeros_like(px), jnp.zeros_like(px), th, 
+            px, py, jnp.zeros_like(px), jnp.zeros_like(px), th,
             jnp.zeros_like(px), g1x, g1y, g2x, g2y, jnp.zeros_like(px)
         ], axis=-1)
 
-    # --- 0: RANDOM STATIC ---
+    def _make_dummies(n):
+        dummy_x = jnp.full((n,), -999.0)
+        return jnp.stack([
+            dummy_x, dummy_x, jnp.zeros(n), jnp.zeros(n),
+            jnp.zeros(n), jnp.zeros(n), dummy_x, dummy_x,
+            dummy_x, dummy_x, jnp.full((n,), -1.0)
+        ], axis=-1)
+
+    # --- 0: RANDOM (obstacles + moving people) ---
     def _random_scen(k):
         k1, k2, k_robot, k_goal, k_people_keys, k8, k9 = jax.random.split(k, 7)
         max_v = jax.random.uniform(k1, minval=0.2, maxval=2.0)
@@ -107,47 +122,47 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float, scenario_idx: int 
         kgx, kgy = jax.random.split(k_goal, 2)
         g_guesses_x = jax.random.uniform(kgx, (N_GUESSES,), minval=margin, maxval=ROOM_W-margin)
         g_guesses_y = jax.random.uniform(kgy, (N_GUESSES,), minval=margin, maxval=ROOM_H-margin)
-        
+
         def check_goal_safe(x, y):
             safe_env = _is_safe(x, y, GOAL_CLEARANCE, obs_circles, obs_boxes)
             dist = jnp.sqrt((x - rx)**2 + (y - ry)**2)
             dist_ok = (dist >= _MIN_GOAL_FLOOR) & (dist <= max_goal_dist)
             return safe_env & dist_ok
-            
+
         g_safe_mask = jax.vmap(check_goal_safe)(g_guesses_x, g_guesses_y)
         g_best_idx = jnp.argmax(g_safe_mask)
         gx, gy = g_guesses_x[g_best_idx], g_guesses_y[g_best_idx]
 
-        # Vectorized People Spawn
+        # Vectorized People Spawn — two distinct waypoints so people actually patrol
         PERSON_CLEARANCE   = PEOPLE_RADIUS + 0.15
-        # FIX: was +0.3 -> center-to-center clearance = 0.2+0.2+0.3 = 0.7m
-        # but body_thresh in jax_env = 0.2+0.4 = 0.6m -> real margin < 0.1m
-        # after a single human step -> immediate collision guaranteed.
-        # With PEOPLE_RADIUS now corrected to 0.4: 0.2+0.4+0.6 = 1.2m -> safe margin.
         PERSON_ROBOT_CLEAR = ROBOT_RADIUS + PEOPLE_RADIUS + 0.6
         PERSON_GOAL_CLEAR  = GOAL_RADIUS + PEOPLE_RADIUS + 0.3
 
         def init_person(pkey):
-            pk_pos, pk_g1x, pk_g1y = jax.random.split(pkey, 3)
+            pk_pos, pk_g1x, pk_g1y, pk_g2x, pk_g2y = jax.random.split(pkey, 5)
             kpx, kpy = jax.random.split(pk_pos, 2)
             px_guesses = jax.random.uniform(kpx, (N_GUESSES,), minval=1.0, maxval=ROOM_W-1.0)
             py_guesses = jax.random.uniform(kpy, (N_GUESSES,), minval=1.0, maxval=ROOM_H-1.0)
-            
+
             def check_person_safe(x, y):
                 env_ok = _is_safe(x, y, PERSON_CLEARANCE, obs_circles, obs_boxes)
                 r_ok = jnp.sqrt((x - rx)**2 + (y - ry)**2) >= PERSON_ROBOT_CLEAR
                 g_ok = jnp.sqrt((x - gx)**2 + (y - gy)**2) >= PERSON_GOAL_CLEAR
                 return env_ok & r_ok & g_ok
-                
+
             p_safe_mask = jax.vmap(check_person_safe)(px_guesses, py_guesses)
             p_best_idx = jnp.argmax(p_safe_mask)
             px, py = px_guesses[p_best_idx], py_guesses[p_best_idx]
-            
+
+            # Two independent random waypoints → person patrols back and forth
             g1x = jax.random.uniform(pk_g1x, minval=1.0, maxval=ROOM_W-1.0)
             g1y = jax.random.uniform(pk_g1y, minval=1.0, maxval=ROOM_H-1.0)
-            return jnp.array([px, py, 0.0, 0.0, 0.0, 0.0, g1x, g1y, g1x, g1y, 0.0])
-            
-        people = jax.vmap(init_person)(jax.random.split(k_people_keys, NUM_PEOPLE))
+            g2x = jax.random.uniform(pk_g2x, minval=1.0, maxval=ROOM_W-1.0)
+            g2y = jax.random.uniform(pk_g2y, minval=1.0, maxval=ROOM_H-1.0)
+            return jnp.array([px, py, 0.0, 0.0, 0.0, 0.0, g1x, g1y, g2x, g2y, 0.0])
+
+        people_base = jax.vmap(init_person)(jax.random.split(k_people_keys, N_BASE_PEOPLE))
+        people = jnp.concatenate([people_base, _make_dummies(NUM_PEOPLE - N_BASE_PEOPLE)], axis=0)
         return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
 
     # --- 1: PARALLEL TRAFFIC (CORRIDOR) ---
@@ -192,7 +207,9 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float, scenario_idx: int 
         g1x = jnp.concatenate([g1x_walls, g1x_random])
         g1y = jnp.full((N_PRL,), 1.0)
         
-        people_prl = pack_human(px, py, jnp.full((N_PRL,), -jnp.pi/2), g1x, g1y, g1x, g1y)
+        g2x = g1x
+        g2y = jnp.full((N_PRL,), ROOM_H - 0.2)
+        people_prl = pack_human(px, py, jnp.full((N_PRL,), -jnp.pi/2), g1x, g1y, g2x, g2y)
         
         n_pad = NUM_PEOPLE - N_PRL
         dummy_x = jnp.full((n_pad,), -999.0)
@@ -214,8 +231,8 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float, scenario_idx: int 
         obs_circles = jnp.zeros((NUM_OBS_CIR, 3))
         obs_boxes = jnp.zeros((NUM_OBS_BOX, 4))
 
-        py = jax.random.uniform(k4, (NUM_PEOPLE,), minval=1.5, maxval=ROOM_H - 1.5)
-        left_mask = jnp.arange(NUM_PEOPLE) % 2 == 0
+        py = jax.random.uniform(k4, (N_BASE_PEOPLE,), minval=1.5, maxval=ROOM_H - 1.5)
+        left_mask = jnp.arange(N_BASE_PEOPLE) % 2 == 0
         px = jnp.where(left_mask, 0.6, ROOM_W - 0.6)
         wall_near = jnp.where(left_mask, 0.6, ROOM_W - 0.6)
         wall_far  = jnp.where(left_mask, ROOM_W - 0.6, 0.6)
@@ -224,7 +241,8 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float, scenario_idx: int 
         g2x = wall_near; g2y = py
         angles = jnp.where(left_mask, 0.0, jnp.pi)
 
-        people = pack_human(px, py, angles, g1x, g1y, g2x, g2y)
+        people_base = pack_human(px, py, angles, g1x, g1y, g2x, g2y)
+        people = jnp.concatenate([people_base, _make_dummies(NUM_PEOPLE - N_BASE_PEOPLE)], axis=0)
         return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
 
     # --- 3: CIRCULAR CROSSING ---
@@ -237,15 +255,16 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float, scenario_idx: int 
         obs_boxes = jnp.zeros((NUM_OBS_BOX, 4))
         
         cx, cy, radius = ROOM_W / 2.0, ROOM_H / 2.0, jnp.minimum(ROOM_W, ROOM_H) / 2.0 - 1.5
-        spawn_angles = jnp.linspace(0, 2*jnp.pi, NUM_PEOPLE, endpoint=False) + jax.random.uniform(k2, (NUM_PEOPLE,), minval=-0.2, maxval=0.2)
+        spawn_angles = jnp.linspace(0, 2*jnp.pi, N_BASE_PEOPLE, endpoint=False) + jax.random.uniform(k2, (N_BASE_PEOPLE,), minval=-0.2, maxval=0.2)
         px = cx + radius * jnp.cos(spawn_angles)
         py = cy + radius * jnp.sin(spawn_angles)
-        
+
         g1x = cx + radius * jnp.cos(spawn_angles + jnp.pi)
         g1y = cy + radius * jnp.sin(spawn_angles + jnp.pi)
         g2x, g2y = px, py
-        
-        people = pack_human(px, py, spawn_angles + jnp.pi, g1x, g1y, g2x, g2y)
+
+        people_base = pack_human(px, py, spawn_angles + jnp.pi, g1x, g1y, g2x, g2y)
+        people = jnp.concatenate([people_base, _make_dummies(NUM_PEOPLE - N_BASE_PEOPLE)], axis=0)
         return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
 
     # --- 4: BOTTLENECK ---
@@ -254,13 +273,9 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float, scenario_idx: int 
         k1, k2, k3, k4, k5, k6, k7 = jax.random.split(k, 7)
         gap_center_x = jax.random.uniform(k1, minval=2.5, maxval=ROOM_W-2.5)
         
-        rx_raw = jax.random.uniform(k7, minval=1.0, maxval=ROOM_W-1.0)
-        dist_to_gap = rx_raw - gap_center_x
-        in_zone = jnp.abs(dist_to_gap) < 1.5
-        
-        push_dir = jnp.where(dist_to_gap >= 0.0, 1.0, -1.0)
-        rx = jnp.where(in_zone, gap_center_x + push_dir * 1.5, rx_raw)
-        rx = jnp.clip(rx, 1.0, ROOM_W - 1.0)
+        # Robot spawns in front of the gap (small jitter so it's not always exactly centered)
+        rx_jitter = jax.random.uniform(k7, minval=-0.4, maxval=0.4)
+        rx = jnp.clip(gap_center_x + rx_jitter, 1.0, ROOM_W - 1.0)
         
         ry, rtheta = 1.5, jnp.pi / 2.0
         gx, gy = gap_center_x, ROOM_H - 1.5
@@ -313,77 +328,422 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float, scenario_idx: int 
         rx, ry, rtheta = ends_x[start_idx], ends_y[start_idx], ends_th[start_idx]
         gx, gy = ends_x[goal_idx],  ends_y[goal_idx]
         
-        sides = jax.random.randint(k4, (NUM_PEOPLE,), 0, 2)
-        vx = jax.random.uniform(k5, (NUM_PEOPLE,), minval=cw - gap/2 + 0.5, maxval=cw + gap/2 - 0.5)
-        vy = jax.random.uniform(k6, (NUM_PEOPLE,), minval=1.0, maxval=ROOM_H - 1.0)
-        hx = jax.random.uniform(k5, (NUM_PEOPLE,), minval=1.0, maxval=ROOM_W - 1.0)
-        hy = jax.random.uniform(k6, (NUM_PEOPLE,), minval=ch - gap/2 + 0.5, maxval=ch + gap/2 - 0.5)
-        
+        sides = jax.random.randint(k4, (N_BASE_PEOPLE,), 0, 2)
+        vx = jax.random.uniform(k5, (N_BASE_PEOPLE,), minval=cw - gap/2 + 0.5, maxval=cw + gap/2 - 0.5)
+        vy = jax.random.uniform(k6, (N_BASE_PEOPLE,), minval=1.0, maxval=ROOM_H - 1.0)
+        hx = jax.random.uniform(k5, (N_BASE_PEOPLE,), minval=1.0, maxval=ROOM_W - 1.0)
+        hy = jax.random.uniform(k6, (N_BASE_PEOPLE,), minval=ch - gap/2 + 0.5, maxval=ch + gap/2 - 0.5)
+
         px = jnp.where(sides == 0, vx, hx)
         py = jnp.where(sides == 0, vy, hy)
-        
+
         g1x = jnp.where(sides == 0, px, 1.0)
         g1y = jnp.where(sides == 0, ROOM_H - 1.0, py)
         g2x = jnp.where(sides == 0, px, ROOM_W - 1.0)
         g2y = jnp.where(sides == 0, 1.0, py)
-        
+
         angles = jnp.where(sides == 0, jnp.pi/2, 0.0)
-        people = pack_human(px, py, angles, g1x, g1y, g2x, g2y)
+        people_base = pack_human(px, py, angles, g1x, g1y, g2x, g2y)
+        people = jnp.concatenate([people_base, _make_dummies(NUM_PEOPLE - N_BASE_PEOPLE)], axis=0)
         return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
 
     # --- 6: STATIC GROUPS ---
     def _static_groups_scen(k):
-        k1, k2, k3, k4 = jax.random.split(k, 4)
-        rx, ry, rtheta = ROOM_W / 2.0, 1.0, jnp.pi / 2.0
-        gx, gy = ROOM_W / 2.0, ROOM_H - 1.0
+        # 4 groups × 6 people = 24 = NUM_PEOPLE.
+        # Group centers are placed in the 4 room quadrants + random jitter so
+        # they are always well-separated regardless of seed.
+        N_GROUPS      = 4
+        PPL_PER_GROUP = 6
+        k1, k_jx, k_jy, k_offr, k_offa, k_ang, k_rob, k_goal = jax.random.split(k, 8)
+
         max_v = jax.random.uniform(k1, minval=0.5, maxval=1.5)
         obs_circles = jnp.zeros((NUM_OBS_CIR, 3))
-        obs_boxes = jnp.zeros((NUM_OBS_BOX, 4))
-        
-        group_centers_x = jax.random.uniform(k2, (NUM_PEOPLE,), minval=2.0, maxval=ROOM_W-2.0)
-        group_centers_y = jax.random.uniform(k3, (NUM_PEOPLE,), minval=2.0, maxval=ROOM_H-2.0)
-        angles = jax.random.uniform(k4, (NUM_PEOPLE,), minval=0, maxval=2*jnp.pi)
-        
-        px = group_centers_x + 0.6 * jnp.cos(angles)
-        py = group_centers_y + 0.6 * jnp.sin(angles)
+        obs_boxes   = jnp.zeros((NUM_OBS_BOX, 4))
+
+        # ── Group centers: one per quadrant + jitter ──────────────────────────
+        # Base centers at quadrant mid-points (3,3), (9,3), (3,9), (9,9).
+        # Jitter ±1.5 m keeps them inside [1.8, 10.2] after clipping.
+        base_qx = jnp.array([3.0, 9.0, 3.0, 9.0])
+        base_qy = jnp.array([3.0, 3.0, 9.0, 9.0])
+        jx = jax.random.uniform(k_jx, (N_GROUPS,), minval=-1.5, maxval=1.5)
+        jy = jax.random.uniform(k_jy, (N_GROUPS,), minval=-1.5, maxval=1.5)
+        gc_x = jnp.clip(base_qx + jx, 1.8, ROOM_W - 1.8)
+        gc_y = jnp.clip(base_qy + jy, 1.8, ROOM_H - 1.8)
+
+        # ── Robot & goal: safe-sampled after group centers are known ──────────
+        # Goal is sampled with _batch_sample_safe_pos so it cannot land inside
+        # any group's exclusive zone (radius = off_r_max + people_r + goal_r + margin).
+        # We build 4 temporary obstacle circles at the group centers and pad to
+        # NUM_OBS_CIR=6 with harmless zero-radius circles at the room origin.
+        _GRP_OBS_R = 1.1 + PEOPLE_RADIUS + GOAL_RADIUS + 0.3   # 2.1 m
+        group_circles = jnp.concatenate([
+            jnp.stack([gc_x, gc_y, jnp.full(N_GROUPS, _GRP_OBS_R)], axis=-1),
+            jnp.zeros((NUM_OBS_CIR - N_GROUPS, 3)),
+        ], axis=0)   # (6, 3)
+
+        gx, gy = _batch_sample_safe_pos(
+            k_goal, clearance=GOAL_RADIUS,
+            obs_circles=group_circles, obs_boxes=obs_boxes,
+            min_val=1.0, max_val=ROOM_W - 1.0,
+        )
+
+        rx     = jax.random.uniform(k_rob, minval=1.0, maxval=ROOM_W - 1.0)
+        ry     = jax.random.uniform(k_rob, minval=1.0, maxval=2.5)
+        rtheta = jax.random.uniform(k_rob, minval=0.0, maxval=2 * jnp.pi)
+
+        # ── Per-person positions: ring around group center ────────────────────
+        # Evenly-spaced angles (0°, 60°, 120°, …) + per-group rotation.
+        person_cx = jnp.repeat(gc_x, PPL_PER_GROUP)
+        person_cy = jnp.repeat(gc_y, PPL_PER_GROUP)
+
+        group_rot = jax.random.uniform(k_offa, (N_GROUPS,), minval=0.0, maxval=2 * jnp.pi)
+        base_angles          = jnp.tile(
+            jnp.arange(PPL_PER_GROUP) * (2 * jnp.pi / PPL_PER_GROUP), N_GROUPS
+        )
+        group_rot_per_person = jnp.repeat(group_rot, PPL_PER_GROUP)
+        off_a = base_angles + group_rot_per_person
+
+        off_r = jax.random.uniform(k_offr, (NUM_PEOPLE,), minval=0.8, maxval=1.1)
+        px = jnp.clip(person_cx + off_r * jnp.cos(off_a), 1.0, ROOM_W - 1.0)
+        py = jnp.clip(person_cy + off_r * jnp.sin(off_a), 1.0, ROOM_H - 1.0)
+
+        angles = jax.random.uniform(k_ang, (NUM_PEOPLE,), minval=0.0, maxval=2 * jnp.pi)
+
+        # Static: goal == current position so nobody moves
         people = pack_human(px, py, angles, px, py, px, py)
         return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
     
+    # ── 7: S-CORRIDOR (test) ─────────────────────────────────────────────────
+    def _s_corridor_scen(k):
+        """S-shaped corridor. Robot: bottom-left → right bottleneck (y=4) →
+           left bottleneck (y=8) → top-right. People spread across all 3 sections."""
+        k1, k2, k3, k4, k5, k6, k7 = jax.random.split(k, 7)
+        max_v = jax.random.uniform(k1, minval=0.5, maxval=1.5)
+        obs_circles = jnp.zeros((NUM_OBS_CIR, 3))
+        obs_boxes = jnp.zeros((NUM_OBS_BOX, 4))
+        # Wall 1: center (4,4), hw=4 → spans x=0..8; gap on RIGHT (x=8..12)
+        obs_boxes = obs_boxes.at[0].set([4.0, 4.0, 4.0, 0.2])
+        # Wall 2: center (8,8), hw=4 → spans x=4..12; gap on LEFT (x=0..4)
+        obs_boxes = obs_boxes.at[1].set([8.0, 8.0, 4.0, 0.2])
+
+        rx, ry, rtheta = 1.5, 1.5, jnp.pi / 2.0
+        # First robot waypoint = right-side gap of wall 1
+        gx, gy = 10.0, 4.0
+
+        # --- 3 people in bottom section (y < 4), patrolling left ↔ right ---
+        N_BOT = 3
+        px_b = jax.random.uniform(k2, (N_BOT,), minval=1.0, maxval=7.0)
+        py_b = jax.random.uniform(k3, (N_BOT,), minval=1.0, maxval=3.5)
+        ang_b = jax.random.uniform(k4, (N_BOT,), minval=-jnp.pi, maxval=jnp.pi)
+        ppl_bot = pack_human(px_b, py_b, ang_b,
+                             jnp.full((N_BOT,), 1.0), py_b,
+                             jnp.full((N_BOT,), 7.0), py_b)
+
+        # --- 3 people in middle section (4 < y < 8), patrolling left ↔ right ---
+        N_MID = 3
+        px_m = jax.random.uniform(k5, (N_MID,), minval=5.0, maxval=11.0)
+        py_m = jax.random.uniform(k6, (N_MID,), minval=4.5, maxval=7.5)
+        ang_m = jax.random.uniform(k7, (N_MID,), minval=-jnp.pi, maxval=jnp.pi)
+        ppl_mid = pack_human(px_m, py_m, ang_m,
+                             jnp.full((N_MID,), 5.0), py_m,
+                             jnp.full((N_MID,), 11.0), py_m)
+
+        # --- 2 people in top section (y > 8), patrolling left ↔ right ---
+        N_TOP = 2
+        k8, k9, k10 = jax.random.split(k2, 3)   # reuse k2 branch — distinct enough
+        px_t = jax.random.uniform(k8, (N_TOP,), minval=1.0, maxval=11.0)
+        py_t = jax.random.uniform(k9, (N_TOP,), minval=8.5, maxval=11.0)
+        ang_t = jax.random.uniform(k10, (N_TOP,), minval=-jnp.pi, maxval=jnp.pi)
+        ppl_top = pack_human(px_t, py_t, ang_t,
+                             jnp.full((N_TOP,), 1.0), py_t,
+                             jnp.full((N_TOP,), 11.0), py_t)
+
+        N_PPL = N_BOT + N_MID + N_TOP
+        people = jnp.concatenate([ppl_bot, ppl_mid, ppl_top,
+                                   _make_dummies(NUM_PEOPLE - N_PPL)], axis=0)
+        return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
+
+    # ── 8: CONVERGING CROWDS (test) ──────────────────────────────────────────
+    def _converging_crowds_scen(k):
+        """4 groups of 3 from each corner, patrolling between corner and center."""
+        k1, k2 = jax.random.split(k, 2)
+        max_v = jax.random.uniform(k1, minval=0.5, maxval=1.5)
+        obs_circles = jnp.zeros((NUM_OBS_CIR, 3))
+        obs_boxes = jnp.zeros((NUM_OBS_BOX, 4))
+        rx, ry, rtheta = ROOM_W / 2.0, 1.0, jnp.pi / 2.0
+        gx, gy = ROOM_W / 2.0, ROOM_H - 1.0
+
+        N_PPL = 12
+        cx, cy = ROOM_W / 2.0, ROOM_H / 2.0
+        corners_x = jnp.array([2.0, ROOM_W - 2.0, 2.0, ROOM_W - 2.0])
+        corners_y = jnp.array([2.0, 2.0, ROOM_H - 2.0, ROOM_H - 2.0])
+        offsets = jax.random.uniform(k2, (N_PPL, 2), minval=-0.8, maxval=0.8)
+        group_idx = jnp.arange(N_PPL) // 3
+        px = jnp.clip(corners_x[group_idx] + offsets[:, 0], 1.0, ROOM_W - 1.0)
+        py = jnp.clip(corners_y[group_idx] + offsets[:, 1], 1.0, ROOM_H - 1.0)
+        angles = jnp.arctan2(cy - py, cx - px)
+        # Patrol: corner <-> center
+        people_base = pack_human(px, py, angles,
+                                 jnp.full((N_PPL,), cx), jnp.full((N_PPL,), cy),
+                                 px, py)
+        people = jnp.concatenate([people_base, _make_dummies(NUM_PEOPLE - N_PPL)], axis=0)
+        return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
+
+    # ── 9: SEQUENTIAL ROOMS — robot multi-waypoint (test) ────────────────────
+    def _sequential_rooms_scen(k):
+        """3 rooms with doorways. Robot's first goal is in room 2 (eval script advances)."""
+        k1, k2, k3, k4, k5, k_rx, k_ry_jitter = jax.random.split(k, 7)
+        max_v = jax.random.uniform(k1, minval=0.5, maxval=1.5)
+        obs_circles = jnp.zeros((NUM_OBS_CIR, 3))
+        obs_boxes = jnp.zeros((NUM_OBS_BOX, 4))
+        # Two vertical walls at x=4 and x=8 with doorway gaps
+        door1_y = jax.random.uniform(k2, minval=3.0, maxval=ROOM_H - 3.0)
+        door2_y = jax.random.uniform(k3, minval=3.0, maxval=ROOM_H - 3.0)
+        gap = 2.0
+        w1_bot_hh = (door1_y - gap / 2.0) / 2.0
+        w1_top_hh = (ROOM_H - door1_y - gap / 2.0) / 2.0
+        obs_boxes = obs_boxes.at[0].set([4.0, w1_bot_hh, 0.15, w1_bot_hh])
+        obs_boxes = obs_boxes.at[1].set([4.0, door1_y + gap / 2.0 + w1_top_hh, 0.15, w1_top_hh])
+        w2_bot_hh = (door2_y - gap / 2.0) / 2.0
+        w2_top_hh = (ROOM_H - door2_y - gap / 2.0) / 2.0
+        obs_boxes = obs_boxes.at[2].set([8.0, w2_bot_hh, 0.15, w2_bot_hh])
+        obs_boxes = obs_boxes.at[3].set([8.0, door2_y + gap / 2.0 + w2_top_hh, 0.15, w2_top_hh])
+
+        # Robot spawns randomly in room 1 but approximately in front of door1_y.
+        # x random in [0.8, 3.2], y = door1_y + small jitter (±1.2), facing right.
+        rx     = jax.random.uniform(k_rx, minval=0.8, maxval=3.2)
+        ry_off = jax.random.uniform(k_ry_jitter, minval=-1.2, maxval=1.2)
+        ry     = jnp.clip(door1_y + ry_off, 1.0, ROOM_H - 1.0)
+        rtheta = 0.0   # facing right toward door
+        
+        # Goal iniziale: Stanza 2, subito dopo la porta 1 (x=5.0, y=door1_y).
+        gx, gy = 5.0, door1_y
+
+        N_PPL = 6
+        px = jnp.array([1.5, 2.5, 5.0, 7.0, 9.5, 10.5])
+        py = jax.random.uniform(k4, (N_PPL,), minval=2.0, maxval=ROOM_H - 2.0)
+        angles = jax.random.uniform(k5, (N_PPL,), minval=-jnp.pi, maxval=jnp.pi)
+        people_base = pack_human(px, py, angles,
+                                 px, jnp.full((N_PPL,), 2.0),
+                                 px, jnp.full((N_PPL,), ROOM_H - 2.0))
+        people = jnp.concatenate([people_base, _make_dummies(NUM_PEOPLE - N_PPL)], axis=0)
+        return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
+
+    # ── 10: ZIGZAG COUNTER-FLOW (test) ───────────────────────────────────────
+    def _zigzag_counterflow_scen(k):
+        """Two groups walking in opposite directions with lateral shifts."""
+        k1, k2, k3, k4 = jax.random.split(k, 4)
+        max_v = jax.random.uniform(k1, minval=0.5, maxval=1.5)
+        obs_circles = jnp.zeros((NUM_OBS_CIR, 3))
+        obs_boxes = jnp.zeros((NUM_OBS_BOX, 4))
+        rx, ry, rtheta = ROOM_W / 2.0, 1.0, jnp.pi / 2.0
+        gx, gy = ROOM_W / 2.0, ROOM_H - 1.0
+
+        N_PPL = 12
+        is_group_a = jnp.arange(N_PPL) % 2 == 0
+        px_a = jax.random.uniform(k2, (N_PPL,), minval=2.0, maxval=5.0)
+        px_b = jax.random.uniform(k3, (N_PPL,), minval=7.0, maxval=10.0)
+        px = jnp.where(is_group_a, px_a, px_b)
+        py_a = jax.random.uniform(k4, (N_PPL,), minval=1.0, maxval=4.0)
+        py_b = jax.random.uniform(k4, (N_PPL,), minval=8.0, maxval=11.0)
+        py = jnp.where(is_group_a, py_a, py_b)
+        angles = jnp.where(is_group_a, jnp.pi / 2.0, -jnp.pi / 2.0)
+        # Shifted goals for zigzag effect
+        g1x = jnp.where(is_group_a, px + 2.0, px - 2.0)
+        g1y = jnp.where(is_group_a, ROOM_H - 1.0, 1.0)
+        people_base = pack_human(px, py, angles, g1x, g1y, px, py)
+        people = jnp.concatenate([people_base, _make_dummies(NUM_PEOPLE - N_PPL)], axis=0)
+        return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
+
+    # ── 11: LONG PARALLEL CORRIDOR (test) ────────────────────────────────────
+    def _parallel_long_scen(k):
+        """Double-length parallel-traffic corridor.
+        The room height for this scenario is 24 m. Robot starts at the bottom 
+        and must reach halfway (12.0) then 4/5 of the way (19.2) through a flow of
+        24 pedestrians teleporting to the top when reaching the bottom."""
+        H = 24.0   # physical room height for this scenario
+        k1, k_rx, k_px, k_py = jax.random.split(k, 4)
+        max_v = jax.random.uniform(k1, minval=0.5, maxval=1.5)
+
+        corridor_width = 4.0
+        wall_width = (ROOM_W - corridor_width) / 2.0   # 4.0
+
+        obs_circles = jnp.zeros((NUM_OBS_CIR, 3))
+        obs_boxes = jnp.zeros((NUM_OBS_BOX, 4))
+        # Left wall: fills [0, wall_width] × [0, H]
+        obs_boxes = obs_boxes.at[0].set([wall_width / 2.0, H / 2.0,
+                                         wall_width / 2.0, H / 2.0])
+        # Right wall: fills [ROOM_W-wall_width, ROOM_W] × [0, H]
+        obs_boxes = obs_boxes.at[1].set([ROOM_W - wall_width / 2.0, H / 2.0,
+                                         wall_width / 2.0, H / 2.0])
+
+        # Robot: random x within corridor, starts at the very bottom, faces up
+        rx = jax.random.uniform(k_rx, minval=4.8, maxval=7.2)
+        ry, rtheta = 0.5, jnp.pi / 2.0
+        # First goal: half height of the 24 m corridor
+        gx, gy = 6.0, H / 2.0   # 12.0
+
+        # 18 pedestrians — spawning randomly from 1/3 height to the top, tracking downwards
+        N_PRL = 13
+        px = jax.random.uniform(k_px, (N_PRL,), minval=4.8, maxval=7.2)
+        py = jax.random.uniform(k_py, (N_PRL,), minval=H / 3.0, maxval=H - 0.2)
+        
+        # Bottom destination is 1.0 so that is_parallel logic in jax_env_multi.py triggers
+        g1x = px;  g1y = jnp.full((N_PRL,), 1.0)
+        g2x = px;  g2y = jnp.full((N_PRL,), H - 0.4)
+
+        people_prl = pack_human(px, py, jnp.full((N_PRL,), -jnp.pi / 2.0),
+                                g1x, g1y, g2x, g2y)
+        n_pad = NUM_PEOPLE - N_PRL
+        dummy_x = jnp.full((n_pad,), -999.0)
+        dummy_rows = jnp.stack([
+            dummy_x, dummy_x, jnp.zeros(n_pad), jnp.zeros(n_pad),
+            jnp.zeros(n_pad), jnp.zeros(n_pad), dummy_x, dummy_x,
+            dummy_x, dummy_x, jnp.full((n_pad,), -1.0)
+        ], axis=-1)
+        people = jnp.concatenate([people_prl, dummy_rows], axis=0)
+        return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
+
+    # ── 12: U-TURN CORRIDOR — robot multi-waypoint (test) ────────────────────
+    def _uturn_corridor_scen(k):
+        """U-shaped corridor. 4 people per corridor.
+        Left/bottom corridors: random bounce. Right corridor: continuous top→bottom
+        flow (staggered start, all heading down initially — same mechanism as the
+        parallel-traffic training scenario)."""
+        k1, k2, k3, k4, k5 = jax.random.split(k, 5)
+        max_v = jax.random.uniform(k1, minval=0.5, maxval=1.5)
+        obs_circles = jnp.zeros((NUM_OBS_CIR, 3))
+        obs_boxes = jnp.zeros((NUM_OBS_BOX, 4))
+        corridor_w = 3.0
+        block_hw = (ROOM_W - 2 * corridor_w) / 2.0
+        block_hh = (ROOM_H - corridor_w) / 2.0
+        obs_boxes = obs_boxes.at[0].set([ROOM_W / 2.0, corridor_w + block_hh, block_hw, block_hh])
+
+        rx, ry, rtheta = corridor_w / 2.0, ROOM_H - 1.5, -jnp.pi / 2.0
+        gx, gy = corridor_w / 2.0, corridor_w / 2.0   # first waypoint: bottom-left
+
+        N_PER  = 4                            # people per corridor
+        cL     = corridor_w / 2.0            # 1.5  — left corridor centre x
+        cR     = ROOM_W - corridor_w / 2.0   # 10.5 — right corridor centre x
+        cB     = corridor_w / 2.0            # 1.5  — bottom corridor centre y
+        y_top  = ROOM_H - 1.5               # 10.5
+        y_bot  = 1.5
+        x_left  = 1.5
+        x_right = ROOM_W - 1.5              # 10.5
+
+        # ── Left corridor: 4 people, random y positions, bounce up↔down ──────
+        left_px  = jnp.full((N_PER,), cL)
+        left_py  = jax.random.uniform(k2, (N_PER,), minval=y_bot + 1.0, maxval=y_top)
+        left_g1x = jnp.full((N_PER,), cL);  left_g1y = jnp.full((N_PER,), y_bot)
+        left_g2x = jnp.full((N_PER,), cL);  left_g2y = jnp.full((N_PER,), y_top)
+        left_ang = jax.random.uniform(k3, (N_PER,), minval=-jnp.pi, maxval=jnp.pi)
+
+        # ── Bottom corridor: 4 people, spread along x, bounce left↔right ─────
+        bot_px  = jax.random.uniform(k4, (N_PER,), minval=x_left + 0.5, maxval=x_right - 0.5)
+        bot_py  = jnp.full((N_PER,), cB)
+        bot_g1x = jnp.full((N_PER,), x_left);  bot_g1y = jnp.full((N_PER,), cB)
+        bot_g2x = jnp.full((N_PER,), x_right); bot_g2y = jnp.full((N_PER,), cB)
+        bot_ang = jax.random.uniform(k5, (N_PER,), minval=-jnp.pi, maxval=jnp.pi)
+
+        # ── Right corridor: continuous top→bottom flow ────────────────────────
+        # 4 people evenly staggered from top to bottom (all waypoint_idx=0 → heading
+        # to g1=bottom). When each reaches the bottom it bounces back to g2=top,
+        # restarting the cycle. Staggering ensures someone is always going down.
+        right_px  = jnp.full((N_PER,), cR)
+        right_py  = jnp.linspace(y_top, y_bot + 2.0, N_PER)   # [10.5, 7.5, 5.0, 3.5]
+        right_g1x = jnp.full((N_PER,), cR);  right_g1y = jnp.full((N_PER,), y_bot)
+        right_g2x = jnp.full((N_PER,), cR);  right_g2y = jnp.full((N_PER,), y_top)
+        right_ang = jnp.full((N_PER,), -jnp.pi / 2.0)          # all pointing DOWN
+
+        # Concatenate all three corridors (12 people total)
+        N_PPL = 3 * N_PER
+        px  = jnp.concatenate([left_px,  bot_px,  right_px])
+        py  = jnp.concatenate([left_py,  bot_py,  right_py])
+        g1x = jnp.concatenate([left_g1x, bot_g1x, right_g1x])
+        g1y = jnp.concatenate([left_g1y, bot_g1y, right_g1y])
+        g2x = jnp.concatenate([left_g2x, bot_g2x, right_g2x])
+        g2y = jnp.concatenate([left_g2y, bot_g2y, right_g2y])
+        ang = jnp.concatenate([left_ang,  bot_ang,  right_ang])
+
+        people_base = pack_human(px, py, ang, g1x, g1y, g2x, g2y)
+        people = jnp.concatenate([people_base, _make_dummies(NUM_PEOPLE - N_PPL)], axis=0)
+        return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
+
     branches = [
-        _random_scen, 
-        _parallel_scen, 
-        _perpendicular_scen, 
-        _circular_scen, 
-        _bottleneck_scen, 
-        _intersection_scen, 
-        _static_groups_scen
+        _random_scen,
+        _parallel_scen,
+        _perpendicular_scen,
+        _circular_scen,
+        _bottleneck_scen,
+        _intersection_scen,
+        _static_groups_scen,
+        _s_corridor_scen,          # 7
+        _converging_crowds_scen,   # 8
+        _sequential_rooms_scen,    # 9
+        _zigzag_counterflow_scen,  # 10
+        _parallel_long_scen,       # 11
+        _uturn_corridor_scen,      # 12
     ]
 
     # Compile all scenarios into the XLA switch statement
     raw_rx, raw_ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people = jax.lax.switch(idx, branches, k_branch)
 
+    # Room height: scenario 11 (Long Parallel Corridor) uses a 24 m room;
+    # all other scenarios use the standard 12 m room.
+    room_h = jnp.where(jnp.int32(idx) == 11, jnp.float32(24.0), jnp.float32(ROOM_H))
+
     # ── Universal Robot Safety Check (Vectorized) ──
-    # Post-process: Guarantees the robot NEVER spawns directly on top of a human 
+    # Post-process: Guarantees the robot NEVER spawns directly on top of a human
     # OR inside a wall in ANY scenario, using parallel offsets instead of while_loop.
     k_safe, k_off_x, k_off_y = jax.random.split(key, 3)
-    
+
     # Generate N_GUESSES offsets. First offset is (0.0, 0.0) to keep intended spawn if safe.
     off_x = jnp.concatenate([jnp.array([0.0]), jax.random.uniform(k_off_x, (N_GUESSES-1,), minval=-2.0, maxval=2.0)])
     off_y = jnp.concatenate([jnp.array([0.0]), jax.random.uniform(k_off_y, (N_GUESSES-1,), minval=-2.0, maxval=2.0)])
-    
+
     rx_guesses = jnp.clip(raw_rx + off_x, 1.0, ROOM_W - 1.0)
-    ry_guesses = jnp.clip(raw_ry + off_y, 1.0, ROOM_H - 1.0)
-    
+    ry_guesses = jnp.clip(raw_ry + off_y, 1.0, room_h - 1.0)
+
     def check_post_safe(x, y):
         dist = jnp.sqrt((people[:, 0] - x)**2 + (people[:, 1] - y)**2)
         human_ok = jnp.min(dist) >= 1.0
         wall_ok = _is_safe(x, y, ROBOT_RADIUS + 0.3, obs_circles, obs_boxes)
         return human_ok & wall_ok
-        
+
     safe_mask = jax.vmap(check_post_safe)(rx_guesses, ry_guesses)
     best_idx = jnp.argmax(safe_mask)
-    
+
     rx_safe = rx_guesses[best_idx]
     ry_safe = ry_guesses[best_idx]
 
-    return rx_safe, ry_safe, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
+    return rx_safe, ry_safe, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people, room_h
+
+
+# ── Robot waypoint sequences for test scenarios (used by eval scripts) ────────
+# The env always has a single goal. The eval loop advances through these
+# waypoints: when goal_reached fires, it updates state.goal_x/goal_y to the
+# next waypoint via state.replace(). Metrics reset between waypoints.
+TEST_SCENARIO_NAMES = {
+    7: "S-Corridor",
+    8: "Converging Crowds",
+    9: "Sequential Rooms",
+    10: "Zigzag Counter-flow",
+    11: "Long Parallel Corridor",
+    12: "U-Turn Corridor",
+}
+
+# Robot waypoint lists per test scenario.
+# Single-goal scenarios have one entry; the eval loop completes after it.
+# Multi-goal scenarios list waypoints in order; goal_x/goal_y starts at [0].
+TEST_ROBOT_WAYPOINTS = {
+    7:  [(10.0, 4.0), (2.0, 8.0), (10.5, 10.5)],            
+    8:  [(6.0, 11.0)],                                       
+    
+    # -1.0 = flag per door1_y, -2.0 = flag per door2_y (calcolati dinamicamente in eval).
+    # WP1: stanza 2 subito dopo porta 1 | WP2: stanza 3 subito dopo porta 2.
+    9:  [(5.0, -1.0), (9.0, -2.0)],
+    
+    10: [(6.0, 11.0)],                                       
+    11: [(6.0, 12.0), (6.0, 19.2)],   
+    12: [(1.5, 1.5), (10.5, 1.5), (10.5, 10.5)],            
+}

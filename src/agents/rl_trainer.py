@@ -326,7 +326,7 @@ if __name__ == '__main__':
     # Configurazione 
     static_cfg = StaticConfig(
         dt=0.1, room_width=15.0, room_height=15.0, max_lin_vel=1.0, max_ang_vel=jnp.pi,
-        robot_radius=0.2, num_rays=108, max_lidar_distance=20.0, num_people=5, people_radius=0.2,
+        robot_radius=0.2, num_rays=216, max_lidar_distance=20.0, num_people=5, people_radius=0.2,
         min_circ_obstacles=2, max_circ_obstacles=5, obst_min_radius=0.3, obst_max_radius=1.5, obst_clearance=0.2,
         min_rect_obstacles=1, max_rect_obstacles=3, rect_min_width=1.0, rect_max_width=3.0, rect_min_height=1.0, rect_max_height=3.0,
         goal_radius=0.3, goal_min_robot_dist=3.0, goal_reward=10.0,

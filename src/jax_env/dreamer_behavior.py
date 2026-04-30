@@ -21,9 +21,9 @@ class DreamerActor(nn.Module):
     def __call__(self, h_t: jnp.ndarray,
                  z_t: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
         x = jnp.concatenate([h_t, z_t], axis=-1)
-        x = nn.swish(nn.LayerNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
-        x = nn.swish(nn.LayerNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
-        x = nn.swish(nn.LayerNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
+        x = nn.swish(nn.RMSNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
+        x = nn.swish(nn.RMSNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
+        x = nn.swish(nn.RMSNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
         mean    = nn.Dense(self.action_dim)(x)
         std_raw = nn.Dense(self.action_dim)(x)
         std     = jax.nn.softplus(std_raw) + self.min_std
@@ -34,10 +34,11 @@ class DreamerCritic(nn.Module):
     @nn.compact
     def __call__(self, h_t: jnp.ndarray, z_t: jnp.ndarray) -> jnp.ndarray:
         x = jnp.concatenate([h_t, z_t], axis=-1)
-        x = nn.swish(nn.LayerNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
-        x = nn.swish(nn.LayerNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
-        x = nn.swish(nn.LayerNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
-        return nn.Dense(255)(x)
+        x = nn.swish(nn.RMSNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
+        x = nn.swish(nn.RMSNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
+        x = nn.swish(nn.RMSNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
+        # V3 zero-initialization to prevent early value hallucination
+        return nn.Dense(255, kernel_init=jax.nn.initializers.zeros)(x)
 
 
 # ---------------------------------------------------------------------------

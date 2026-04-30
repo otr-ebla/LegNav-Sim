@@ -3,29 +3,30 @@ benchmark_eval.py — High-Speed Evaluation Dashboard
 ===================================================
 Evaluates RL models across all 7 scenarios and generates a visual dashboard.
 
-OOM FIX: Removed the nested vmap over (N_SCENARIOS × N_SPEEDS) that tried to
+OOM FIX: Removed the nested vmap over (N_SCENARIOS x N_SPEEDS) that tried to
 allocate ~5.4 GiB for a single compiled graph. Evaluation is now a sequential
 Python loop over (scenario, speed) pairs; each iteration dispatches a single
 vmap over N_ENVS environments, which is the actual parallelism budget the GPU
 can handle. Compile time drops to seconds and VRAM stays under 2 GiB.
 
-TRAINING CURVES: A 9th panel plots episode reward over training steps, loaded
-from CSV logs written by jax_ppo.py / SACjax.py / TQCjac.py. If a log file is
-missing the panel shows a "no data" notice instead of crashing.
 """
 
 import os
-import sys
 import time
 import warnings
 
 os.environ["JAX_PLATFORMS"] = "cuda,cpu"
 os.environ["XLA_FLAGS"] = "--xla_gpu_enable_triton_gemm=true"
-os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"  # suppress pygame banner
+os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
+os.environ["SDL_VIDEODRIVER"] = "dummy"
 warnings.filterwarnings("ignore")
+
+import matplotlib
+matplotlib.use("Agg")
 
 import jax
 import jax.numpy as jnp
+import flax.linen as nn
 import flax.serialization
 import numpy as np
 import pandas as pd
@@ -38,72 +39,103 @@ jax_env.USE_LEGS = True
 from jax_env import ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS, DT, MAX_STEPS
 from jax_env_multi import reset_env, step_env
 from jax_wrappers import StackedEnvState
-from jax_legs import LEG_RADIUS
-from jax_network import EndToEndActorCritic
-from SACjax import ObsEncoder as _SACEncoder, ActorHead as _SACHead
-import flax.linen as nn
-from TQCjac import TQCActorNetwork as _TQCActorNetwork
+from jax_network import SharedEncoder, EndToEndActorCritic, scale_action_to_env
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-OBS_SIZE   = 342
+OBS_SIZE   = 662
 ACTION_DIM = 2
-N_ENVS     = 4096   # parallelism per (scenario, speed) cell — fits in VRAM
+N_ENVS     = 4096
 
 MAX_V_TESTS = [0.2, 0.5, 0.75, 1.0, 1.33, 1.66, 2.0]
 N_SCENARIOS = 7
 N_SPEEDS    = len(MAX_V_TESTS)
 
-# Training-curve CSV paths written by each trainer
-TRAINING_LOG_PATHS = {
-    "PPO": "checkpoints/ppo_training_log.csv",
-    "SAC": "checkpoints_sac/sac_training_log.csv",
-    "TQC": "checkpoints_tqc/tqc_training_log.csv",
+SCEN_NAMES = {
+    0: "Random", 1: "Parallel", 2: "Perpend", 3: "Circular",
+    4: "Bottleneck", 5: "Intersect", 6: "Groups",
 }
 
-_ppo_net     = EndToEndActorCritic(action_dim=ACTION_DIM)
-_sac_enc     = _SACEncoder()
-_sac_head    = _SACHead(action_dim=ACTION_DIM)
-_tqc_net = _TQCActorNetwork()  # monolithic — ObsEncoder_0/ inside actor_params
+POLICY_COLORS = {"PPO": "#4C72B0", "SAC": "#DD8452", "TQC": "#55A868"}
 
-# _rollout_body calls net_apply_fn({"params": params}, obs) for ALL networks.
-# Both _sac_apply and _tqc_apply mirror that Flax convention:
-#   variables["params"] = {"enc": enc_params, "head": head_params}
+# ── Network definitions (must match training code exactly) ────────────────────
+
+# PPO: EndToEndActorCritic (monolithic encoder+actor+critic)
+_ppo_net = EndToEndActorCritic(action_dim=ACTION_DIM)
+
+# SAC: SharedEncoder + SACActorHead (LOG_STD_MAX=2.0, named Dense layers)
+class _SACActorHead(nn.Module):
+    action_dim:  int   = ACTION_DIM
+    LOG_STD_MIN: float = -5.0
+    LOG_STD_MAX: float =  2.0
+
+    @nn.compact
+    def __call__(self, feat):
+        mean    = nn.Dense(self.action_dim, name='mean')(feat)
+        log_std = nn.Dense(self.action_dim, name='log_std')(feat)
+        return mean, jnp.clip(log_std, self.LOG_STD_MIN, self.LOG_STD_MAX)
+
+# TQC: SharedEncoder + TQCActorHead (LOG_STD_MAX=0.5, unnamed Dense layers)
+class _TQCActorHead(nn.Module):
+    action_dim:  int   = ACTION_DIM
+    LOG_STD_MIN: float = -5.0
+    LOG_STD_MAX: float =  0.5
+
+    @nn.compact
+    def __call__(self, feat):
+        mean    = nn.Dense(self.action_dim)(feat)
+        log_std = nn.Dense(self.action_dim)(feat)
+        return mean.astype(jnp.float32), jnp.clip(log_std.astype(jnp.float32),
+                                                   self.LOG_STD_MIN, self.LOG_STD_MAX)
+
+_shared_enc  = SharedEncoder()
+_sac_head    = _SACActorHead()
+_tqc_head    = _TQCActorHead()
+
+
+# ── Unified apply functions ──────────────────────────────────────────────────
+# All apply functions take ({"params": params}, obs) and return a tuple whose
+# first element is the action mean, matching _rollout_body expectations.
+
 def _sac_apply(variables, obs):
-    p    = variables["params"]
-    feat = _sac_enc.apply({"params": p["enc"]}, obs)
+    p = variables["params"]
+    feat = _shared_enc.apply({"params": p["enc"]}, obs)
     return _sac_head.apply({"params": p["head"]}, feat)
 
+def _tqc_apply(variables, obs):
+    p = variables["params"]
+    feat = _shared_enc.apply({"params": p["enc"]}, obs)
+    return _tqc_head.apply({"params": p["head"]}, feat)
 
 
-# ── Action Squashing ──────────────────────────────────────────────────────────
-def _squash_ppo(mean, max_v):
-    v = jax.nn.sigmoid(mean[..., 0]) * max_v
+# ── Action squashing (same formula for all three) ────────────────────────────
+def _squash_action(mean, max_v):
+    v = (jnp.tanh(mean[..., 0]) * 0.5 + 0.5) * max_v
     w = jnp.tanh(mean[..., 1])
     return jnp.stack([v, w], axis=-1)
 
-def _squash_sac_tqc(mean, max_v):
-    t = jnp.tanh(mean)
-    v = (t[..., 0] + 1.0) * 0.5 * max_v
-    w = t[..., 1]
-    return jnp.stack([v, w], axis=-1)
 
-# ── Environment Wrappers ──────────────────────────────────────────────────────
+# ── Environment Wrappers ────────────────────────────────────────────────────
+from jax_env import STATE_VEC_SIZE as _SVS
+
+POSE_SIZE  = 3
+STACK_DIM  = 3
+
 @jax.jit
 def dynamic_reset_stacked(key, min_dist, scen_idx, target_max_v):
-    base_obs, base_state = reset_env(key, min_dist, scen_idx)
-    pose      = base_obs[0:3]
-    state_vec = base_obs[3:12]
-    lidar     = base_obs[12:]
+    base_obs, base_state = reset_env(key, min_dist, scen_idx, 0.0)  # ghost_prob=0.0: pedestrians always avoid the robot (matches jax_eval_multi)
+    pose      = base_obs[0:POSE_SIZE]
+    state_vec = base_obs[POSE_SIZE : POSE_SIZE + _SVS]
+    lidar     = base_obs[POSE_SIZE + _SVS:]
 
     base_state = base_state.replace(max_v=target_max_v)
+    # state_vec layout: [v, w, max_v_norm, goal_dist, goal_align]
     new_state_vec = jnp.array([
         0.0, 0.0, (target_max_v - 0.2) / 1.8,
         state_vec[3], state_vec[4],
-        state_vec[5], state_vec[6], state_vec[7], state_vec[8],
     ])
 
-    lidar_stack = jnp.tile(lidar[None, :], (3, 1))
-    pose_stack  = jnp.tile(pose[None, :],  (3, 1))
+    lidar_stack = jnp.tile(lidar[None, :], (STACK_DIM, 1))
+    pose_stack  = jnp.tile(pose[None, :],  (STACK_DIM, 1))
     stacked_state = StackedEnvState(
         env_state=base_state, lidar_stack=lidar_stack, pose_stack=pose_stack
     )
@@ -114,9 +146,9 @@ def dynamic_reset_stacked(key, min_dist, scen_idx, target_max_v):
 @jax.jit
 def step_stacked_headless(key, state: StackedEnvState, action):
     base_obs, new_base_state, reward, done, info = step_env(key, state.env_state, action)
-    new_pose      = base_obs[0:3]
-    new_state_vec = base_obs[3:12]
-    new_lidar     = base_obs[12:]
+    new_pose      = base_obs[0:POSE_SIZE]
+    new_state_vec = base_obs[POSE_SIZE : POSE_SIZE + _SVS]
+    new_lidar     = base_obs[POSE_SIZE + _SVS:]
 
     new_lidar_stack = jnp.concatenate([state.lidar_stack[1:], new_lidar[None]], axis=0)
     new_pose_stack  = jnp.concatenate([state.pose_stack[1:],  new_pose[None]],  axis=0)
@@ -127,20 +159,20 @@ def step_stacked_headless(key, state: StackedEnvState, action):
     return flat_obs, new_stacked_state, reward, done, info
 
 
-# ── Core Evaluation Kernel ────────────────────────────────────────────────────
-# Each network type gets its OWN JIT-compiled function so that `params` always
-# belongs to exactly one architecture.  Applying all three networks to the same
-# params (as the previous version did with jnp.where) causes Flax to look for
-# kernel shapes that don't exist in the checkpoint → ScopeParamNotFoundError.
-#
-# All three kernels share the same rollout body; only the forward-pass line
-# differs.  Each is compiled once on first call and reused for all 49 cells.
+# ── Core Evaluation Kernel ───────────────────────────────────────────────────
+
+YIELD_DIST = 1.5
+YIELD_FOV  = 0.785  # rad = 45° → 90° total FOV (±45°)
+
+# ── Social Score constants (NaviSTAR, Eq. 20-22) ─────────────────────────────
+SC_NU       = 0.35    # ν  — weight between F_time and F_scc
+SC_NU_PRIME = 0.25    # ν' — penalty factor for failure rate
+SC_DU       = 0.45    # d_u — uncomfortable distance threshold (m)
 
 def _rollout_body(net_apply_fn, squash_fn, params, scen_idx, target_max_v, rng_key):
-    """Inner rollout used by all three per-network eval functions."""
     reset_keys = jax.random.split(rng_key, N_ENVS)
     obs, state = jax.vmap(dynamic_reset_stacked, in_axes=(0, None, None, None))(
-        reset_keys, 3.0, scen_idx, target_max_v
+        reset_keys, 9.0, scen_idx, target_max_v  # max_goal_dist=9.0 matches jax_eval_multi
     )
 
     init_dist = jnp.sqrt(
@@ -155,21 +187,15 @@ def _rollout_body(net_apply_fn, squash_fn, params, scen_idx, target_max_v, rng_k
         jnp.zeros(N_ENVS),                        # path_len
         jnp.full(N_ENVS, 100.0),                  # min_human_dist
         jnp.ones(N_ENVS, dtype=jnp.bool_),        # active
-        jnp.zeros(N_ENVS),                        # yield_zone_steps (denominator)
-        jnp.zeros(N_ENVS),                        # yield_comply_steps (numerator)
+        jnp.zeros(N_ENVS),                        # yield_zone_steps
+        jnp.zeros(N_ENVS),                        # yield_comply_steps
     )
-
-    human_r = LEG_RADIUS if jax_env.USE_LEGS else PEOPLE_RADIUS
-
-    YIELD_DIST = 1.5   # m  — must match jax_env_multi.py YIELD_DIST
-    YIELD_FOV  = 1.57  # rad — forward 90° each side
 
     def _step(carry, step_idx):
         state, obs, v_p, av_p, w_p, aw_p, pl, mhd, active, yz_steps, yc_steps = carry
         k_step = jax.random.fold_in(rng_key, step_idx)
 
         raw_out = net_apply_fn({"params": params}, obs)
-        # PPO returns (mean, logstd, value); SAC/TQC return (mean, log_std)
         mean = raw_out[0]
         action = jax.vmap(squash_fn)(mean, state.env_state.max_v)
 
@@ -187,33 +213,27 @@ def _rollout_body(net_apply_fn, squash_fn, params, scen_idx, target_max_v, rng_k
         jerk_w = jnp.where(active, jnp.abs((aw - aw_p) / DT), 0.0)
         pl     = pl + jnp.where(active, v * DT, 0.0)
 
-        ch  = info["closest_human"] - ROBOT_RADIUS - human_r
+        if jax_env.USE_LEGS:
+            ch = info["closest_shoe_surface"]
+        else:
+            ch = info["closest_human"] - ROBOT_RADIUS - PEOPLE_RADIUS
         mhd = jnp.where(active, jnp.minimum(mhd, ch), mhd)
 
         g  = info["goal_reached"] & active
         c  = info["collision"]    & active
         pc = info["passive_col"]  & active
 
-        # ── Yielding score accumulators ───────────────────────────────────────
-        # next_state carries batched tensors: x/y/theta shape (N_ENVS,),
-        # people shape (N_ENVS, NUM_PEOPLE, 11).  All ops must be explicitly
-        # batched — no implicit broadcasting across the env dimension.
-        ppl      = next_state.env_state.people          # (N_ENVS, NUM_PEOPLE, 11)
-        px_all   = ppl[:, :, 0]                         # (N_ENVS, NUM_PEOPLE)
-        py_all   = ppl[:, :, 1]
-        rx_b     = next_state.env_state.x[:, None]      # (N_ENVS, 1)
-        ry_b     = next_state.env_state.y[:, None]
-        rth_b    = next_state.env_state.theta[:, None]
-        dp_x     = px_all - rx_b                        # (N_ENVS, NUM_PEOPLE)
-        dp_y     = py_all - ry_b
-        dists_p  = jnp.sqrt(dp_x**2 + dp_y**2 + 1e-8)
-        rel_ang  = jnp.arctan2(dp_y, dp_x) - rth_b
-        rel_ang  = (rel_ang + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
-        active_p = ppl[:, :, 10] >= 0.0                # (N_ENVS, NUM_PEOPLE)
-        in_yz    = (dists_p < YIELD_DIST) & (jnp.abs(rel_ang) < YIELD_FOV) & active_p
-        any_in_yz = jnp.any(in_yz, axis=1)             # (N_ENVS,)
-
-        robot_stopped = v <= 0.1                        # (N_ENVS,)
+        # Yielding score
+        ppl    = next_state.env_state.people
+        dp_x   = ppl[:, :, 0] - next_state.env_state.x[:, None]
+        dp_y   = ppl[:, :, 1] - next_state.env_state.y[:, None]
+        dists_p = jnp.sqrt(dp_x**2 + dp_y**2 + 1e-8)
+        rel_ang = jnp.arctan2(dp_y, dp_x) - next_state.env_state.theta[:, None]
+        rel_ang = (rel_ang + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
+        active_p  = ppl[:, :, 10] >= 0.0
+        in_yz     = (dists_p < YIELD_DIST) & (jnp.abs(rel_ang) < YIELD_FOV) & active_p
+        any_in_yz = jnp.any(in_yz, axis=1)
+        robot_stopped = v <= 0.1
 
         new_yz_steps = yz_steps + jnp.where(active & any_in_yz, 1.0, 0.0)
         new_yc_steps = yc_steps + jnp.where(active & any_in_yz & robot_stopped, 1.0, 0.0)
@@ -242,16 +262,10 @@ def _rollout_body(net_apply_fn, squash_fn, params, scen_idx, target_max_v, rng_k
     spl      = ep_goal * (init_dist / jnp.maximum(final_pl, init_dist))
     time_g   = jnp.where(ep_goal, ep_lens * DT, jnp.nan)
 
-    # Yielding score: fraction of yield-zone steps where robot was stopped.
-    # NaN when the robot never encountered anyone in its yield zone.
-    yield_score = jnp.where(
-        final_yz > 0,
-        final_yc / final_yz,
-        jnp.nan,
-    )
+    yield_score = jnp.where(final_yz > 0, final_yc / final_yz, jnp.nan)
 
-    step_dists = jnp.where(active_mask, step_dists, jnp.nan)  # (T, N)
-    step_vs    = jnp.where(active_mask, step_vs,    jnp.nan)  # (T, N)
+    step_dists = jnp.where(active_mask, step_dists, jnp.nan)
+    step_vs    = jnp.where(active_mask, step_vs,    jnp.nan)
 
     return {
         "success":     ep_goal.astype(jnp.float32),
@@ -263,319 +277,225 @@ def _rollout_body(net_apply_fn, squash_fn, params, scen_idx, target_max_v, rng_k
         "min_dist":    final_mhd,
         "time":        time_g,
         "yield_score": yield_score,
-        "step_dists":  step_dists,   # (MAX_STEPS, N_ENVS)
-        "step_vs":     step_vs,      # (MAX_STEPS, N_ENVS)
+        "step_dists":  step_dists,
+        "step_vs":     step_vs,
+        "step_ch":     step_dists,    # closest human (NaN-masked by active)
+        "active_mask": active_mask,   # (MAX_STEPS, N_ENVS) bool
+        "ep_lens":     ep_lens,       # (N_ENVS,)
     }
 
 
-# One JIT kernel per network — params stay within their own architecture scope.
+# One JIT kernel per network architecture.
 @jax.jit
-def evaluate_cell_ppo(params, scen_idx: int, target_max_v: float, rng_key):
-    return _rollout_body(_ppo_net.apply, _squash_ppo, params,
+def evaluate_cell_ppo(params, scen_idx, target_max_v, rng_key):
+    return _rollout_body(_ppo_net.apply, _squash_action, params,
                          scen_idx, target_max_v, rng_key)
 
 @jax.jit
-def evaluate_cell_sac(params, scen_idx: int, target_max_v: float, rng_key):
-    return _rollout_body(_sac_apply, _squash_sac_tqc, params,
+def evaluate_cell_sac(params, scen_idx, target_max_v, rng_key):
+    return _rollout_body(_sac_apply, _squash_action, params,
                          scen_idx, target_max_v, rng_key)
 
 @jax.jit
-def evaluate_cell_tqc(params, scen_idx: int, target_max_v: float, rng_key):
-    return _rollout_body(_tqc_net.apply, _squash_sac_tqc, params,
+def evaluate_cell_tqc(params, scen_idx, target_max_v, rng_key):
+    return _rollout_body(_tqc_apply, _squash_action, params,
                          scen_idx, target_max_v, rng_key)
 
 _EVAL_FN = {"PPO": evaluate_cell_ppo, "SAC": evaluate_cell_sac, "TQC": evaluate_cell_tqc}
 
 
-# ── Checkpoint loading ────────────────────────────────────────────────────────
-def load_checkpoint_safe(path, p_name, dummy_params):
-    if not os.path.exists(path):
-        return None
+# ── Social Score (NaviSTAR, Eq. 20-22) ────────────────────────────────────────
+
+def _compute_social_score(cell, nu=SC_NU, nu_prime=SC_NU_PRIME, d_u=SC_DU):
+    """
+    Compute the Social Score F_SC ∈ (−∞, 100] from a single evaluation cell.
+
+    F_SC = 100 · [ν · F_time + (1 − ν) · F_scc + ν' · F_F]   (Eq. 20)
+    """
+    success   = np.array(cell["success"]).astype(bool)
+    ep_lens   = np.array(cell["ep_lens"])
+    active    = np.array(cell["active_mask"])   # (MAX_STEPS, N)
+    # step_ch has NaN for inactive steps; replace NaN with inf for masking
+    step_ch_raw = np.array(cell["step_ch"])     # (MAX_STEPS, N)
+    step_ch = np.where(np.isfinite(step_ch_raw), step_ch_raw, np.inf)
+    active_bool = np.array(active).astype(bool)
+    n_total = len(success)
+
+    # ── F_time (Eq. 21) ──────────────────────────────────────────────────────
+    all_times = ep_lens * DT
+    suc_times = np.array(cell["time"])
+    suc_times = suc_times[success]
+    suc_times = suc_times[np.isfinite(suc_times)]
+
+    if len(suc_times) == 0:
+        F_time = 0.0
+    else:
+        t_min = float(all_times.min())
+        t_max = float(suc_times.max())
+        denom = t_max - t_min if t_max > t_min else 1.0
+        F_time = 1.0 - float(np.mean((suc_times - t_min) / denom))
+        F_time = float(np.clip(F_time, 0.0, 1.0))
+
+    # ── F_scc (Eq. 22) ───────────────────────────────────────────────────────
+    K1 = int(success.sum())
+    ch_for_mask = np.where(active_bool, step_ch, np.inf)
+    uncomf_mask = ch_for_mask < d_u
+    has_uncomf  = uncomf_mask.any(axis=0)
+    K2 = int(has_uncomf.sum())
+
+    if K2 == 0:
+        F_scc = 1.0
+    else:
+        sum_dist = np.where(active_bool, step_ch, 0.0).sum(axis=0)
+        sum_dist = np.maximum(sum_dist, 1e-8)
+        ratio = d_u / sum_dist
+        ratio_uncomf = ratio[has_uncomf]
+        sig_vals = 1.0 / (1.0 + np.exp(-(ratio_uncomf - 1.0)))
+        avg_sig  = float(np.mean(sig_vals))
+        k2_k1_ratio = K2 / K1 if K1 > 0 else 1.0
+        F_scc = 1.0 - 0.5 * (avg_sig + k2_k1_ratio)
+        F_scc = float(np.clip(F_scc, 0.0, 1.0))
+
+    # ── F_F (failure penalty, ≤ 0) ───────────────────────────────────────────
+    n_col     = int(np.array(cell["act_col"]).sum() + np.array(cell["pass_col"]).sum())
+    n_timeout = int(np.array(cell["timeout"]).sum())
+    F_F = -(n_col + n_timeout) / max(n_total, 1)
+
+    F_SC = 100.0 * (nu * F_time + (1.0 - nu) * F_scc + nu_prime * F_F)
+    return float(F_SC)
+
+
+# ── Checkpoint loading ───────────────────────────────────────────────────────
+
+def _load_raw(path):
     with open(path, "rb") as f:
-        raw = f.read()
-    
-    bundle = flax.serialization.msgpack_restore(raw)
-    
-    # PPO è stato addestrato e salvato come un singolo blocco unificato
-    if p_name == "PPO":
-        if "actor_params" in bundle: return bundle["actor_params"]
-        if "params" in bundle: return bundle["params"]
-        return bundle
-        
-    # SAC: checkpoint salvato come due pytree separati da SACjax.py.
-    # Ricostruiamo un dict con chiavi fisse "enc"/"head" usate da _sac_apply.
-    # SAC: saved as actor_enc_params + actor_head_params by SACjax.py
-    if p_name == "SAC":
-        if "actor_enc_params" in bundle and "actor_head_params" in bundle:
-            return {"enc": bundle["actor_enc_params"], "head": bundle["actor_head_params"]}
-        raise KeyError(f"SAC checkpoint unexpected keys: {list(bundle.keys())}")
-
-    # TQC: monolithic checkpoint — actor_params has ObsEncoder_0/ + Dense_0/1.
-    if p_name == "TQC":
-        if "actor_params" in bundle:
-            return bundle["actor_params"]
-        raise KeyError(f"TQC checkpoint unexpected keys: {list(bundle.keys())}")
-            
-    return bundle
+        return flax.serialization.msgpack_restore(f.read())
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-def main():
-    gpu = jax.devices("cuda")[0] if jax.devices("cuda") else jax.devices()[0]
+def load_ppo(path):
+    """PPO checkpoint: {"params": ..., "opt_state": ...}"""
+    bundle = _load_raw(path)
+    return bundle.get("params", bundle)
 
-    # 1. Generiamo i parametri fittizi per scoprire la struttura esatta richiesta da Flax
-    rng_init = jax.random.PRNGKey(0)
-    dummy_obs = jnp.zeros((1, OBS_SIZE))
-    ppo_dummy = _ppo_net.init(rng_init, dummy_obs)["params"]
 
-    # 2. Carichiamo mappando le vecchie chiavi sulle nuove strutture
-    raw_policies = {
-        "PPO": load_checkpoint_safe("checkpoints/ppo_model_best.msgpack", "PPO", ppo_dummy),
-        "SAC": load_checkpoint_safe("checkpoints_sac/sac_best.msgpack", "SAC", None),
-        "TQC": load_checkpoint_safe("checkpoints_tqc/tqc_best.msgpack", "TQC", None),
-    }
-    
-    policies = {
-        name: jax.device_put(p, gpu)
-        for name, p in raw_policies.items()
-        if p is not None
-    }
+def load_sac(path):
+    """SAC checkpoint: {"enc_params": ..., "actor_head_params": ...}"""
+    bundle = _load_raw(path)
+    return {"enc": bundle["enc_params"], "head": bundle["actor_head_params"]}
 
-    if not policies:
-        print("No valid checkpoints found. Please train a model first.")
-        return
 
-    rng = jax.random.PRNGKey(42)
+def load_tqc(path):
+    """TQC checkpoint: {"enc_params": ..., "actor_params": ...}"""
+    bundle = _load_raw(path)
+    return {"enc": bundle["enc_params"], "head": bundle["actor_params"]}
 
-    # ── Warm-up: compile only the kernel(s) we actually have checkpoints for ──
-    print("Compiling evaluation kernels (one per available policy, ~30 s each)...")
-    for p_name, params in policies.items():
-        rng, k_warmup = jax.random.split(rng)
-        jax.block_until_ready(_EVAL_FN[p_name](params, 0, 1.0, k_warmup))
-        print(f"  {p_name} kernel compiled.")
-    print()
 
-    # ── Sequential evaluation loop ────────────────────────────────────────────
-    results      = []
-    scatter_data = {}   # {policy_name: (dists_array, vs_array)}
-    scen_names = {
-        0: "Random", 1: "Parallel", 2: "Perpend", 3: "Circular",
-        4: "Bottleneck", 5: "Intersect", 6: "Groups",
-    }
+_CKPT_PATHS = {
+    "PPO": "checkpoints/ppo_attn_best.msgpack",
+    "SAC": "checkpoints_sac/sac_best.msgpack",
+    "TQC": "checkpoints_tqc/tqc_best.msgpack",
+}
 
-    print("Executing evaluation grid (sequential cells, parallel envs)...")
-    for p_name, params in policies.items():
-        eval_fn  = _EVAL_FN[p_name]
-        t_policy = time.time()
-        _sd_list, _sv_list = [], []
-        for si in range(N_SCENARIOS):
-            for vi, v_max in enumerate(MAX_V_TESTS):
-                rng, cell_rng = jax.random.split(rng)
-                cell = jax.device_get(jax.block_until_ready(
-                    eval_fn(params, si, float(v_max), cell_rng)
-                ))
-                sd = cell["step_dists"].ravel()
-                sv = cell["step_vs"].ravel()
-                ok = np.isfinite(sd) & np.isfinite(sv)
-                _sd_list.append(sd[ok])
-                _sv_list.append(sv[ok])
-                for i in range(N_ENVS):
-                    results.append({
-                        "Policy":        p_name,
-                        "Scenario":      si,
-                        "Max_V":         v_max,
-                        "Success":       cell["success"][i],
-                        "Active Col":    cell["act_col"][i],
-                        "Passive Col":   cell["pass_col"][i],
-                        "Timeout":       cell["timeout"][i],
-                        "SPL":           cell["spl"][i],
-                        "Jerk":          cell["jerk"][i],
-                        "Min Dist":      cell["min_dist"][i],
-                        "Time to Goal":  cell["time"][i],
-                        "Yield Score":   cell["yield_score"][i],
-                    })
-        scatter_data[p_name] = (
-            np.concatenate(_sd_list),
-            np.concatenate(_sv_list),
-        )
-        print(f"  {p_name} done in {time.time() - t_policy:.1f}s")
+_LOADERS = {"PPO": load_ppo, "SAC": load_sac, "TQC": load_tqc}
 
-    df = pd.DataFrame(results)
-    df.to_csv("evaluation_raw_data.csv", index=False)
-    print("Saved evaluation_raw_data.csv\n")
 
-    # ── Dashboard ─────────────────────────────────────────────────────────────
-    print("Generating dashboard...")
+# ── Dashboard plotting ──────────────────────────────────────────────────────
+
+def _plot_dashboard(df, scatter_data):
     sns.set_theme(style="whitegrid", palette="muted")
 
-    # Layout: 3 rows × 4 cols = 12 panels
-    #   Row 1: Success, Active Col, Passive Col, Timeout  — all vs Max_V
-    #   Row 2: SPL, Time to Goal, Safety Margin, Jerk
-    #   Row 3: Yield Score vs Max_V, Success by Scenario, Overall Outcomes, Training Curves
-    fig = plt.figure(figsize=(36, 21))
+    fig = plt.figure(figsize=(16, 12))
     fig.suptitle("RL Navigation Policies: Evaluation Dashboard",
-                 fontsize=28, weight="bold")
+                 fontsize=14, weight="bold")
 
-    R, C = 3, 4   # rows, cols
+    R, C = 3, 4
+    FS_TITLE = 9
+    FS_LABEL = 8
+    FS_TICK  = 7
+    FS_LEG   = 6
+    LW = 2
+    MS = 5
 
     # ── Row 1: outcome rates vs Max_V ────────────────────────────────────────
+    _outcome_vs_speed(fig, R, C, 1, df, "Success",     "Success Rate vs. Max Speed",      "o")
+    _outcome_vs_speed(fig, R, C, 2, df, "Active Col",  "Active Collisions vs. Max Speed",  "X")
+    _outcome_vs_speed(fig, R, C, 3, df, "Passive Col", "Passive Collisions vs. Max Speed", "o")
+    _outcome_vs_speed(fig, R, C, 4, df, "Timeout",     "Timeout Rate vs. Max Speed",       "s")
 
-    # 1. Success vs Speed
-    v_suc_df = df.groupby(["Max_V","Policy"])["Success"].mean().reset_index()
-    v_suc_df["Success"] *= 100
-    ax1 = plt.subplot(R, C, 1)
-    sns.lineplot(data=v_suc_df, x="Max_V", y="Success", hue="Policy",
-                 marker="o", linewidth=3, markersize=8, ax=ax1)
-    ax1.set_title("Success Rate vs. Max Speed", fontsize=13)
-    ax1.set_xticks(MAX_V_TESTS)
-    ax1.set_ylim(0, 100)
-    ax1.set_xlabel("Max Linear Speed (m/s)")
-    ax1.set_ylabel("Rate (%)")
-
-    # 2. Active Collisions vs Speed
-    v_acol_df = df.groupby(["Max_V","Policy"])["Active Col"].mean().reset_index()
-    v_acol_df["Active Col"] *= 100
-    ax2 = plt.subplot(R, C, 2)
-    sns.lineplot(data=v_acol_df, x="Max_V", y="Active Col", hue="Policy",
-                 marker="X", linewidth=3, markersize=8, ax=ax2)
-    ax2.set_title("Active Collisions vs. Max Speed", fontsize=13)
-    ax2.set_xticks(MAX_V_TESTS)
-    ax2.set_ylim(0, 100)
-    ax2.set_xlabel("Max Linear Speed (m/s)")
-    ax2.set_ylabel("Rate (%)")
-
-    # 3. Passive Collisions vs Speed
-    v_pcol_df = df.groupby(["Max_V","Policy"])["Passive Col"].mean().reset_index()
-    v_pcol_df["Passive Col"] *= 100
-    ax3 = plt.subplot(R, C, 3)
-    sns.lineplot(data=v_pcol_df, x="Max_V", y="Passive Col", hue="Policy",
-                 marker="o", linewidth=3, markersize=8, ax=ax3)
-    ax3.set_title("Passive Collisions vs. Max Speed", fontsize=13)
-    ax3.set_xticks(MAX_V_TESTS)
-    ax3.set_ylim(0, 100)
-    ax3.set_xlabel("Max Linear Speed (m/s)")
-    ax3.set_ylabel("Rate (%)")
-
-    # 4. Timeout vs Speed
-    v_tmo_df = df.groupby(["Max_V","Policy"])["Timeout"].mean().reset_index()
-    v_tmo_df["Timeout"] *= 100
-    ax4 = plt.subplot(R, C, 4)
-    sns.lineplot(data=v_tmo_df, x="Max_V", y="Timeout", hue="Policy",
-                 marker="s", linewidth=3, markersize=8, ax=ax4)
-    ax4.set_title("Timeout Rate vs. Max Speed", fontsize=13)
-    ax4.set_xticks(MAX_V_TESTS)
-    ax4.set_ylim(0, 100)
-    ax4.set_xlabel("Max Linear Speed (m/s)")
-    ax4.set_ylabel("Rate (%)")
-
-    # ── Row 2: quality metrics ────────────────────────────────────────────────
+    # ── Row 2: quality metrics ───────────────────────────────────────────────
     suc = df[df["Success"] == 1.0]
 
-    # 5. SPL (successful episodes only)
     ax5 = plt.subplot(R, C, 5)
     sns.boxplot(data=suc, x="Policy", y="SPL", hue="Policy", ax=ax5, showfliers=False)
-    ax5.set_title("Success-weighted Path Length (SPL)", fontsize=13)
-    ax5.set_ylabel("SPL")
+    ax5.set_title("Success-weighted Path Length (SPL)", fontsize=FS_TITLE)
+    ax5.set_ylabel("SPL", fontsize=FS_LABEL)
+    ax5.tick_params(labelsize=FS_TICK)
 
-    # 6. Time to Goal (successful episodes only)
     ax6 = plt.subplot(R, C, 6)
     sns.boxplot(data=suc, x="Policy", y="Time to Goal", hue="Policy",
                 ax=ax6, showfliers=False)
-    ax6.set_title("Time to Reach Goal (seconds)", fontsize=13)
-    ax6.set_ylabel("seconds")
+    ax6.set_title("Time to Reach Goal (seconds)", fontsize=FS_TITLE)
+    ax6.set_ylabel("seconds", fontsize=FS_LABEL)
+    ax6.tick_params(labelsize=FS_TICK)
 
-    # 7. Safety Margin (Min Human Dist) vs Speed
     ax7 = plt.subplot(R, C, 7)
+    # 'Min Dist' = info["closest_shoe_surface"] from jax_env_multi.step_env:
+    # surface-to-surface gap between the robot boundary and the nearest point
+    # on the closest shoe-box (USE_LEGS=True) or body-circle edge (USE_LEGS=False).
+    # Consistent with paper_comparison_eval.py.
     sns.lineplot(data=df, x="Max_V", y="Min Dist", hue="Policy",
-                 marker="^", linewidth=3, markersize=8, ax=ax7)
-    ax7.set_title("Safety Margin vs. Max Speed", fontsize=13)
+                 marker="^", linewidth=LW, markersize=MS, ax=ax7)
+    ax7.set_title("Safety Margin vs. Max Speed", fontsize=FS_TITLE)
     ax7.axhline(0.0, color="red", linestyle="--", alpha=0.5, label="Collision Threshold")
     ax7.set_xticks(MAX_V_TESTS)
-    ax7.set_xlabel("Max Linear Speed (m/s)")
-    ax7.set_ylabel("Min Human Distance (m)")
-    ax7.legend(fontsize=9)
+    ax7.set_xlabel("Max Linear Speed (m/s)", fontsize=FS_LABEL)
+    ax7.set_ylabel("Min Human Distance (m)", fontsize=FS_LABEL)
+    ax7.tick_params(labelsize=FS_TICK)
+    ax7.legend(fontsize=FS_LEG)
 
-    # 8. Kinematic Jerk
     ax8 = plt.subplot(R, C, 8)
     sns.boxplot(data=df, x="Policy", y="Jerk", hue="Policy", ax=ax8, showfliers=False)
-    ax8.set_title("Average Kinematic Jerk (Smoothness)", fontsize=13)
-    ax8.set_ylabel("Jerk (m/s³ + rad/s³)")
+    ax8.set_title("Average Kinematic Jerk (Smoothness)", fontsize=FS_TITLE)
+    ax8.set_ylabel("Jerk (m/s^3 + rad/s^3)", fontsize=FS_LABEL)
+    ax8.tick_params(labelsize=FS_TICK)
 
-    # ── Row 3: yielding, scenario breakdown, overall, training ───────────────
-
-    # 9. Yielding Score vs Speed
-    # YS = fraction of yield-zone steps where robot was stopped (v ≤ 0.1 m/s).
-    # NaN episodes (no yield-zone encounters) are excluded from the mean.
+    # ── Row 3: yielding, scenario breakdown, overall ─────────────────────────
     v_ys_df = df.groupby(["Max_V","Policy"])["Yield Score"].mean().reset_index()
     ax9 = plt.subplot(R, C, 9)
     sns.lineplot(data=v_ys_df, x="Max_V", y="Yield Score", hue="Policy",
-                 marker="D", linewidth=3, markersize=8, ax=ax9)
-    ax9.set_title("Yielding Score vs. Max Speed", fontsize=13)
+                 marker="D", linewidth=LW, markersize=MS, ax=ax9)
+    ax9.set_title("Yielding Score vs. Max Speed", fontsize=FS_TITLE)
     ax9.set_xticks(MAX_V_TESTS)
     ax9.set_ylim(0, 1)
-    ax9.set_xlabel("Max Linear Speed (m/s)")
-    ax9.set_ylabel("Yield Compliance (0–1)")
+    ax9.set_xlabel("Max Linear Speed (m/s)", fontsize=FS_LABEL)
+    ax9.set_ylabel("Yield Compliance (0-1)", fontsize=FS_LABEL)
+    ax9.tick_params(labelsize=FS_TICK)
     ax9.axhline(1.0, color="green", linestyle=":", alpha=0.4)
     ax9.axhline(0.5, color="gray",  linestyle=":", alpha=0.4)
+    ax9.legend(fontsize=FS_LEG)
 
-    # 10. Success by Scenario
-    scen_names = {
-        0: "Random", 1: "Parallel", 2: "Perpend", 3: "Circular",
-        4: "Bottleneck", 5: "Intersect", 6: "Groups",
-    }
     scen_df = df.groupby(["Scenario","Policy"])["Success"].mean().reset_index()
     scen_df["Success"] *= 100
-    scen_df["Scenario_Name"] = scen_df["Scenario"].map(scen_names)
+    scen_df["Scenario_Name"] = scen_df["Scenario"].map(SCEN_NAMES)
     ax10 = plt.subplot(R, C, 10)
     sns.barplot(data=scen_df, x="Scenario_Name", y="Success", hue="Policy", ax=ax10)
-    ax10.set_title("Success Rate by Layout Topology", fontsize=13)
-    ax10.set_xticklabels(ax10.get_xticklabels(), rotation=30, ha="right")
+    ax10.set_title("Success Rate by Layout Topology", fontsize=FS_TITLE)
+    ax10.set_xticklabels(ax10.get_xticklabels(), rotation=30, ha="right", fontsize=FS_TICK)
     ax10.set_ylim(0, 100)
-    ax10.set_ylabel("Success Rate (%)")
+    ax10.set_ylabel("Success Rate (%)", fontsize=FS_LABEL)
+    ax10.tick_params(labelsize=FS_TICK)
 
-    # 11. Overall Episode Outcomes (bar chart)
     rate_df   = df.groupby("Policy")[["Success","Active Col","Passive Col","Timeout"]].mean().reset_index()
     rate_melt = rate_df.melt(id_vars="Policy", var_name="Outcome", value_name="Rate")
     rate_melt["Rate"] *= 100
     ax11 = plt.subplot(R, C, 11)
     sns.barplot(data=rate_melt, x="Outcome", y="Rate", hue="Policy", ax=ax11)
-    ax11.set_title("Overall Episode Outcomes (%)", fontsize=13)
+    ax11.set_title("Overall Episode Outcomes (%)", fontsize=FS_TITLE)
     ax11.set_ylim(0, 100)
-    ax11.set_ylabel("Rate (%)")
+    ax11.set_ylabel("Rate (%)", fontsize=FS_LABEL)
+    ax11.tick_params(labelsize=FS_TICK)
 
-    # 12. Training Curves — episode reward over environment steps
-    ax12 = plt.subplot(R, C, 12)
-    any_log = False
-    POLICY_COLORS = {"PPO": "#4C72B0", "SAC": "#DD8452", "TQC": "#55A868"}
-    for p_name, log_path in TRAINING_LOG_PATHS.items():
-        if os.path.exists(log_path):
-            try:
-                log_df = pd.read_csv(log_path)
-                x_millions = log_df["step"] / 1e6
-                w = max(5, len(log_df) // 30)
-                smoothed = log_df["mean_ep_reward"].rolling(window=w, min_periods=1).mean()
-                ax12.plot(x_millions, log_df["mean_ep_reward"],
-                          alpha=0.18, linewidth=1, color=POLICY_COLORS.get(p_name))
-                ax12.plot(x_millions, smoothed,
-                          label=p_name, linewidth=2.5, color=POLICY_COLORS.get(p_name))
-                any_log = True
-            except Exception as e:
-                print(f"  Warning: could not read {log_path}: {e}")
-
-    if any_log:
-        ax12.set_xlabel("Environment Steps (millions)", fontsize=11)
-        ax12.set_ylabel("Mean Episode Reward", fontsize=11)
-        ax12.set_title("Episode Reward During Training", fontsize=13)
-        ax12.axhline(0, color="gray", linestyle=":", linewidth=0.8, alpha=0.6)
-        ax12.legend(fontsize=10)
-    else:
-        ax12.text(0.5, 0.5,
-                  "No training logs found.\nRun trainers to generate\n"
-                  "checkpoints/*/training_log.csv",
-                  ha="center", va="center", transform=ax12.transAxes,
-                  fontsize=11, color="gray")
-        ax12.set_title("Episode Reward During Training", fontsize=13)
-        ax12.set_axis_off()
+    # Position 12 intentionally left empty (training curves removed)
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.savefig("Evaluation_Dashboard.png", dpi=300)
@@ -584,73 +504,637 @@ def main():
     _plot_proximity_speed(scatter_data)
 
 
-def _plot_proximity_speed(scatter_data: dict):
-    """
-    One panel per policy: raw scatter of every active timestep across all
-    episodes, scenarios and speed caps.
-    x = surface distance to nearest human (m)  — negative means collision
-    y = robot linear speed at that moment (m/s)
-    """
+def _outcome_vs_speed(fig, R, C, pos, df, col, title, marker):
+    grp = df.groupby(["Max_V","Policy"])[col].mean().reset_index()
+    grp[col] *= 100
+    ax = plt.subplot(R, C, pos)
+    sns.lineplot(data=grp, x="Max_V", y=col, hue="Policy",
+                 marker=marker, linewidth=2, markersize=5, ax=ax)
+    ax.set_title(title, fontsize=9)
+    ax.set_xticks(MAX_V_TESTS)
+    ax.set_ylim(0, 100)
+    ax.set_xlabel("Max Linear Speed (m/s)", fontsize=8)
+    ax.set_ylabel("Rate (%)", fontsize=8)
+    ax.tick_params(labelsize=7)
+    ax.legend(fontsize=6)
+
+
+def _plot_proximity_speed(scatter_data):
     policies = list(scatter_data.keys())
     if not policies:
         return
 
-    POLICY_COLORS = {"PPO": "#4C72B0", "SAC": "#DD8452", "TQC": "#55A868"}
-    MAX_PTS = 120_000   # sub-sample per policy so the PNG stays manageable
+    MAX_PTS = 120_000
 
     fig, axes = plt.subplots(
         1, len(policies),
-        figsize=(8 * len(policies), 7),
+        figsize=(4 * len(policies), 3.5),
         sharey=True, squeeze=False
     )
     fig.suptitle(
-        "Linear Speed vs. Distance to Nearest Human\n"
-        "(all active timesteps · all scenarios · all speed caps)",
-        fontsize=15, weight="bold"
+        "Linear Speed vs. Distance to Nearest Human",
+        fontsize=10, weight="bold"
     )
 
-    for col, p_name in enumerate(policies):
-        ax    = axes[0, col]
+    for col_idx, p_name in enumerate(policies):
+        ax    = axes[0, col_idx]
         color = POLICY_COLORS.get(p_name, "#888888")
         dists, vs = scatter_data[p_name]
 
-        # Discard anything outside plausible physical range
         ok    = (dists >= -0.3) & (dists <= 4.0) & (vs >= 0.0) & (vs <= 2.05)
-        dists = dists[ok]
-        vs    = vs[ok]
-        n     = len(dists)
+        dists, vs = dists[ok], vs[ok]
+        n = len(dists)
 
-        # Sub-sample for rendering
         if n > MAX_PTS:
-            rng_sc = np.random.default_rng(0)
-            idx    = rng_sc.choice(n, MAX_PTS, replace=False)
+            idx = np.random.default_rng(0).choice(n, MAX_PTS, replace=False)
             dists, vs = dists[idx], vs[idx]
 
-        ax.scatter(
-            dists, vs,
-            s=1.5, alpha=0.08, color=color,
-            rasterized=True
-        )
-
-        # Reference lines
-        ax.axvline(0.0, color="red",    lw=1.5, ls="--", alpha=0.8,
-                   label="Collision (0 m)")
-        ax.axvline(0.5, color="orange", lw=1.2, ls=":",  alpha=0.7,
-                   label="Comfort (0.5 m)")
-
+        ax.scatter(dists, vs, s=1.0, alpha=0.08, color=color, rasterized=True)
+        ax.axvline(0.0, color="red",    lw=1.0, ls="--", alpha=0.8, label="Collision (0 m)")
+        ax.axvline(0.5, color="orange", lw=0.8, ls=":",  alpha=0.7, label="Comfort (0.5 m)")
         ax.set_xlim(-0.2, 3.8)
         ax.set_ylim(-0.05, 2.1)
-        ax.set_xlabel("Surface distance to nearest human (m)", fontsize=12)
-        if col == 0:
-            ax.set_ylabel("Linear speed (m/s)", fontsize=12)
-        ax.set_title(f"{p_name}  —  {n:,} pts", fontsize=13, weight="bold")
-        ax.legend(fontsize=9, loc="upper left")
+        ax.set_xlabel("Surface distance to nearest human (m)", fontsize=8)
+        if col_idx == 0:
+            ax.set_ylabel("Linear speed (m/s)", fontsize=8)
+        ax.set_title(f"{p_name}  -  {n:,} pts", fontsize=9, weight="bold")
+        ax.legend(fontsize=6, loc="upper left")
+        ax.tick_params(labelsize=7)
         ax.grid(True, alpha=0.25)
 
     plt.tight_layout()
     plt.savefig("proximity_speed_scatter.png", dpi=180)
     print("Saved 'proximity_speed_scatter.png'")
     plt.close(fig)
+
+
+# ── Test Scenario Configuration ──────────────────────────────────────────────
+from jax_scenarios import TEST_ROBOT_WAYPOINTS, TEST_SCENARIO_NAMES
+
+N_TEST_ENVS   = 512
+TEST_SCEN_IDS = sorted(TEST_SCENARIO_NAMES.keys())   # [7, 8, 9, 10, 11, 12]
+N_TEST_SCENS  = len(TEST_SCEN_IDS)
+
+
+# ── Per-waypoint Segment Rollout ──────────────────────────────────────────────
+#
+# Runs MAX_STEPS steps from a provided (obs, state) without calling reset.
+# Saves the stacked state at the moment the goal is first reached (pre-done,
+# i.e. before step_env internally resets the env) so the outer Python loop can
+# set a new goal and continue from the arrival position.
+
+def _segment_core(net_apply_fn, squash_fn, params,
+                  init_obs, init_state, rng_key, step_offset):
+    init_dist = jnp.sqrt(
+        (init_state.env_state.goal_x - init_state.env_state.x) ** 2 +
+        (init_state.env_state.goal_y - init_state.env_state.y) ** 2
+    )
+
+    carry = (
+        init_state, init_obs,
+        jnp.zeros(N_TEST_ENVS),           # path_len
+        jnp.full(N_TEST_ENVS, 100.0),     # min_human_dist
+        jnp.zeros(N_TEST_ENVS),           # v_p
+        jnp.zeros(N_TEST_ENVS),           # w_p
+        jnp.zeros(N_TEST_ENVS),           # av_p
+        jnp.zeros(N_TEST_ENVS),           # aw_p
+        jnp.ones(N_TEST_ENVS,  dtype=jnp.bool_),   # active
+        jnp.zeros(N_TEST_ENVS, dtype=jnp.bool_),   # gr_flag (goal reached ever)
+        init_state,                        # gr_state (pre-done state at first goal)
+        init_obs,                          # gr_obs
+    )
+
+    def _step(carry, step_idx):
+        (state, obs, pl, mhd, v_p, w_p, av_p, aw_p,
+         active, gr_flag, gr_state, gr_obs) = carry
+
+        k_step = jax.random.fold_in(rng_key, step_offset + step_idx)
+
+        raw_out = net_apply_fn({"params": params}, obs)
+        mean    = raw_out[0]
+        action  = jax.vmap(squash_fn)(mean, state.env_state.max_v)
+
+        step_keys = jax.random.split(k_step, N_TEST_ENVS)
+        next_obs, next_state, _, done, info = jax.vmap(step_stacked_headless)(
+            step_keys, state, action
+        )
+
+        v  = next_state.env_state.v
+        w  = next_state.env_state.w
+        av = (v - v_p) / DT
+        aw = (w - w_p) / DT
+
+        pl  = pl  + jnp.where(active, v * DT, 0.0)
+        if jax_env.USE_LEGS:
+            ch = info["closest_shoe_surface"]
+        else:
+            ch = info["closest_human"] - ROBOT_RADIUS - PEOPLE_RADIUS
+        mhd = jnp.where(active, jnp.minimum(mhd, ch), mhd)
+
+        g  = info["goal_reached"] & active
+        c  = info["collision"]    & active
+        pc = info["passive_col"]  & active
+
+        # On the first step where goal is reached, save the PRE-step state/obs.
+        # (next_state is already reset by step_env; we need the arrival state.)
+        first_goal = g & ~gr_flag
+
+        def _sel(new_a, old_a):
+            if new_a.ndim == 1:
+                return jnp.where(first_goal, new_a, old_a)
+            return jnp.where(
+                first_goal.reshape([-1] + [1] * (new_a.ndim - 1)), new_a, old_a
+            )
+
+        new_gr_state = jax.tree_util.tree_map(_sel, state, gr_state)
+        new_gr_obs   = _sel(obs, gr_obs)
+        new_gr_flag  = gr_flag | g
+
+        next_active = active & ~done
+        step_data   = (active, g, c, pc, v, ch)
+        return (
+            next_state, next_obs, pl, mhd, v, av, w, aw,
+            next_active, new_gr_flag, new_gr_state, new_gr_obs
+        ), step_data
+
+    final_carry, step_data = jax.lax.scan(
+        _step, carry, jnp.arange(MAX_STEPS, dtype=jnp.uint32)
+    )
+    (_, _, final_pl, final_mhd, _, _, _, _,
+     _, final_gr_flag, final_gr_state, final_gr_obs) = final_carry
+    active_mask, goals, cols, pcols, step_vs, step_dists = step_data
+
+    ep_goal = goals.any(axis=0)
+    ep_col  = cols.any(axis=0)
+    ep_pcol = pcols.any(axis=0)
+
+    act_col  = ep_col  & ~ep_pcol & ~ep_goal
+    pass_col = ep_pcol & ~ep_goal
+    tmo      = ~ep_goal & ~ep_col & ~ep_pcol
+
+    spl = ep_goal * (init_dist / jnp.maximum(final_pl, init_dist))
+
+    metrics = {
+        "goal_reached": ep_goal,
+        "act_col":      act_col.astype(jnp.float32),
+        "pass_col":     pass_col.astype(jnp.float32),
+        "timeout":      tmo.astype(jnp.float32),
+        "spl":          spl,
+        "min_dist":     final_mhd,
+    }
+    return metrics, final_gr_state, final_gr_obs, final_gr_flag
+
+
+@jax.jit
+def segment_ppo(params, init_obs, init_state, rng_key, step_offset):
+    return _segment_core(_ppo_net.apply, _squash_action, params,
+                         init_obs, init_state, rng_key, step_offset)
+
+@jax.jit
+def segment_sac(params, init_obs, init_state, rng_key, step_offset):
+    return _segment_core(_sac_apply, _squash_action, params,
+                         init_obs, init_state, rng_key, step_offset)
+
+@jax.jit
+def segment_tqc(params, init_obs, init_state, rng_key, step_offset):
+    return _segment_core(_tqc_apply, _squash_action, params,
+                         init_obs, init_state, rng_key, step_offset)
+
+_SEG_FN = {"PPO": segment_ppo, "SAC": segment_sac, "TQC": segment_tqc}
+
+
+def _run_single_wp_cell(seg_fn, params, scen_id, v_max, cell_rng):
+    """Single-waypoint scenario: one dispatch, no chaining."""
+    reset_keys = jax.random.split(cell_rng, N_TEST_ENVS)
+    obs, state = jax.vmap(
+        dynamic_reset_stacked, in_axes=(0, None, None, None)
+    )(reset_keys, 9.0, jnp.int32(scen_id), jnp.float32(v_max))
+    # Returns future (not blocked)
+    return seg_fn(params, obs, state, cell_rng, jnp.int32(0))
+
+
+def _run_multi_wp_cell(seg_fn, params, scen_id, v_max, cell_rng, waypoints):
+    """Multi-waypoint scenario: must chain waypoints sequentially."""
+    n_wp = len(waypoints)
+    reset_keys = jax.random.split(cell_rng, N_TEST_ENVS)
+    obs, state = jax.vmap(
+        dynamic_reset_stacked, in_axes=(0, None, None, None)
+    )(reset_keys, 9.0, jnp.int32(scen_id), jnp.float32(v_max))
+
+    still_alive  = np.ones(N_TEST_ENVS,  dtype=bool)
+    overall_col  = np.zeros(N_TEST_ENVS, dtype=bool)
+    overall_pcol = np.zeros(N_TEST_ENVS, dtype=bool)
+
+    for wp_idx in range(n_wp):
+        step_off = jnp.int32(wp_idx * MAX_STEPS)
+        metrics, gr_state, gr_obs, gr_flag = jax.device_get(
+            seg_fn(params, obs, state, cell_rng, step_off)
+        )
+
+        m_col  = metrics["act_col"].astype(bool)
+        m_pcol = metrics["pass_col"].astype(bool)
+        m_goal = metrics["goal_reached"]
+
+        overall_col  |= m_col  & still_alive
+        overall_pcol |= m_pcol & still_alive
+
+        if wp_idx < n_wp - 1:
+            next_gx, next_gy = waypoints[wp_idx + 1]
+            new_env_state = gr_state.env_state.replace(
+                goal_x=jnp.where(gr_flag, next_gx,
+                                 gr_state.env_state.goal_x),
+                goal_y=jnp.where(gr_flag, next_gy,
+                                 gr_state.env_state.goal_y),
+                max_v=jnp.full(N_TEST_ENVS, v_max),
+            )
+            state = gr_state.replace(env_state=new_env_state)
+            obs   = gr_obs
+            still_alive = still_alive & m_goal
+
+    final_success = still_alive & metrics["goal_reached"]
+    tmo = ~final_success & ~overall_col & ~overall_pcol
+    return {
+        "goal_reached": final_success,
+        "act_col": overall_col,
+        "pass_col": overall_pcol,
+        "timeout": tmo,
+        "spl": metrics["spl"],
+        "min_dist": metrics["min_dist"],
+    }
+
+
+def run_test_scenarios(policies, rng):
+    """
+    Evaluates all policies on test scenarios 7-12.
+    Single-waypoint scenarios are dispatched without blocking for pipelining.
+    Multi-waypoint scenarios chain waypoints sequentially per cell.
+    """
+    all_frames  = []
+
+    for p_name, params in policies.items():
+        seg_fn   = _SEG_FN[p_name]
+        t_policy = time.time()
+
+        # Pre-split all RNG keys for this policy
+        n_total = N_TEST_SCENS * N_SPEEDS
+        rng, batch_rng = jax.random.split(rng)
+        cell_keys = jax.random.split(batch_rng, n_total)
+        key_idx = 0
+
+        for scen_id in TEST_SCEN_IDS:
+            waypoints = TEST_ROBOT_WAYPOINTS[scen_id]
+            n_wp      = len(waypoints)
+            t_scen    = time.time()
+
+            if n_wp == 1:
+                # Single-waypoint: dispatch all speeds, then collect
+                futures = []
+                for vi, v_max in enumerate(MAX_V_TESTS):
+                    fut = _run_single_wp_cell(
+                        seg_fn, params, scen_id, v_max, cell_keys[key_idx])
+                    futures.append((v_max, fut))
+                    key_idx += 1
+
+                for v_max, fut in futures:
+                    res = jax.device_get(fut)
+                    m = res[0]  # metrics dict
+                    all_frames.append(pd.DataFrame({
+                        "Policy":        p_name,
+                        "Scenario":      scen_id,
+                        "Scenario_Name": TEST_SCENARIO_NAMES[scen_id],
+                        "Max_V":         v_max,
+                        "N_Waypoints":   n_wp,
+                        "Success":       np.array(m["goal_reached"]).astype(float),
+                        "Active Col":    np.array(m["act_col"]),
+                        "Passive Col":   np.array(m["pass_col"]),
+                        "Timeout":       np.array(m["timeout"]),
+                        "SPL":           np.array(m["spl"]),
+                        "Min Dist":      np.array(m["min_dist"]),
+                    }))
+            else:
+                # Multi-waypoint: sequential per cell, but dispatch resets
+                for vi, v_max in enumerate(MAX_V_TESTS):
+                    m = _run_multi_wp_cell(
+                        seg_fn, params, scen_id, v_max,
+                        cell_keys[key_idx], waypoints)
+                    key_idx += 1
+                    all_frames.append(pd.DataFrame({
+                        "Policy":        p_name,
+                        "Scenario":      scen_id,
+                        "Scenario_Name": TEST_SCENARIO_NAMES[scen_id],
+                        "Max_V":         v_max,
+                        "N_Waypoints":   n_wp,
+                        "Success":       np.array(m["goal_reached"]).astype(float),
+                        "Active Col":    np.array(m["act_col"]).astype(float),
+                        "Passive Col":   np.array(m["pass_col"]).astype(float),
+                        "Timeout":       np.array(m["timeout"]).astype(float),
+                        "SPL":           np.array(m["spl"]),
+                        "Min Dist":      np.array(m["min_dist"]),
+                    }))
+
+            suc_pct = np.mean(
+                [f["Success"].mean() for f in all_frames[-N_SPEEDS:]]
+            ) * 100
+            print(f"    {p_name} | {TEST_SCENARIO_NAMES[scen_id]:<22s} "
+                  f"suc={suc_pct:5.1f}%  "
+                  f"{time.time() - t_scen:.1f}s")
+
+        print(f"  {p_name} test total: {time.time() - t_policy:.1f}s\n")
+
+    return pd.concat(all_frames, ignore_index=True)
+
+
+def _plot_test_dashboard(test_df):
+    """Compact dashboard for the 6 test scenarios.
+
+    NOTE on distance semantics:
+    'Min Dist' = closest_shoe_surface from jax_env_multi.step_env, which is
+    the surface-to-surface gap between the robot circle boundary (ROBOT_RADIUS)
+    and the nearest point on the closest shoe AABB of any pedestrian
+    (USE_LEGS=True), or the body-circle edge (USE_LEGS=False).
+    This definition is identical to paper_comparison_eval.py and is used
+    consistently in both the Safety Margin line-plot and the Min Human Distance
+    box-plot below.
+    All data come from the randomly-initialised test episodes produced by
+    run_test_scenarios() (scenarios chosen at the start of each episode via
+    dynamic_reset_stacked with random RNG keys).
+    """
+    sns.set_theme(style="whitegrid", palette="muted")
+
+    FS_TITLE = 9
+    FS_LABEL = 8
+    FS_TICK  = 7
+    FS_LEG   = 6
+    LW = 2
+    MS = 5
+
+    # Expand to 2×4 to accommodate the new Min Human Distance box-plot.
+    fig, axes = plt.subplots(2, 4, figsize=(18, 8))
+    fig.suptitle("Test Scenario Evaluation Dashboard (Scenarios 7-12)",
+                 fontsize=12, weight="bold")
+
+    # ── ROW 0: BAR PLOTS + SUCCESS LINE ─────────────────────────────────────
+    
+    # (0,0) Success rate per scenario (BAR)
+    scen_suc = (test_df.groupby(["Scenario_Name", "Policy"])["Success"]
+                .mean().reset_index())
+    scen_suc["Success"] *= 100
+    ax = axes[0, 0]
+    sns.barplot(data=scen_suc, x="Scenario_Name", y="Success", hue="Policy", ax=ax)
+    ax.set_title("Success Rate by Test Scenario", fontsize=FS_TITLE)
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha="right", fontsize=FS_TICK)
+    ax.set_ylim(0, 100)
+    ax.set_ylabel("Success Rate (%)", fontsize=FS_LABEL)
+    ax.tick_params(labelsize=FS_TICK)
+    ax.legend(fontsize=FS_LEG)
+
+    # (0,1) Overall outcome breakdown (BAR)
+    rate_df = (test_df.groupby("Policy")[
+        ["Success", "Active Col", "Passive Col", "Timeout"]
+    ].mean().reset_index())
+    rate_melt = rate_df.melt(id_vars="Policy", var_name="Outcome", value_name="Rate")
+    rate_melt["Rate"] *= 100
+    ax = axes[0, 1]
+    sns.barplot(data=rate_melt, x="Outcome", y="Rate", hue="Policy", ax=ax)
+    ax.set_title("Overall Outcomes", fontsize=FS_TITLE)
+    ax.set_ylim(0, 100)
+    ax.set_ylabel("Rate (%)", fontsize=FS_LABEL)
+    ax.tick_params(labelsize=FS_TICK)
+    ax.legend(fontsize=FS_LEG)
+
+    # (0,2) Multi-waypoint full-path success (BAR)
+    multi_wp = test_df[test_df["N_Waypoints"] > 1]
+    ax = axes[0, 2]
+    if not multi_wp.empty:
+        mw_suc = (multi_wp.groupby(["Scenario_Name", "Policy"])["Success"]
+                  .mean().reset_index())
+        mw_suc["Success"] *= 100
+        sns.barplot(data=mw_suc, x="Scenario_Name", y="Success", hue="Policy", ax=ax)
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha="right", fontsize=FS_TICK)
+    ax.set_title("Multi-Waypoint Success", fontsize=FS_TITLE)
+    ax.set_ylim(0, 100)
+    ax.set_ylabel("Full-Path Success (%)", fontsize=FS_LABEL)
+    ax.tick_params(labelsize=FS_TICK)
+
+    # (0,3) Success vs max speed (LINE)
+    spd_suc = (test_df.groupby(["Max_V", "Policy"])["Success"]
+               .mean().reset_index())
+    spd_suc["Success"] *= 100
+    ax = axes[0, 3]
+    sns.lineplot(data=spd_suc, x="Max_V", y="Success", hue="Policy",
+                 marker="o", linewidth=LW, markersize=MS, ax=ax)
+    ax.set_title("Success Rate vs. Max Speed", fontsize=FS_TITLE)
+    ax.set_xticks(MAX_V_TESTS)
+    ax.set_ylim(0, 100)
+    ax.set_xlabel("Max Linear Speed (m/s)", fontsize=FS_LABEL)
+    ax.set_ylabel("Success Rate (%)", fontsize=FS_LABEL)
+    ax.tick_params(labelsize=FS_TICK)
+    ax.legend(fontsize=FS_LEG)
+
+    # ── ROW 1: BOX PLOTS + SAFETY LINE ──────────────────────────────────────
+    
+    # (1,0) Min Human Distance box-plot (BOX)
+    ax = axes[1, 0]
+    palette = {p: POLICY_COLORS.get(p, "#888888") for p in test_df["Policy"].unique()}
+    sns.boxplot(data=test_df, x="Policy", y="Min Dist", hue="Policy",
+                palette=palette, showfliers=False, ax=ax)
+    ax.axhline(0.0, color="red", linestyle="--", linewidth=1.0, alpha=0.7, label="Collision")
+    ax.set_title("Min Human Distance (Global)", fontsize=FS_TITLE)
+    ax.set_ylabel("Surface distance (m)", fontsize=FS_LABEL)
+    ax.set_xlabel("")
+    ax.tick_params(labelsize=FS_TICK)
+    ax.legend(fontsize=FS_LEG)
+
+    # (1,1) SPL (successful episodes only) (BOX)
+    suc_only = test_df[test_df["Success"] == 1.0]
+    ax = axes[1, 1]
+    if not suc_only.empty:
+        sns.boxplot(data=suc_only, x="Policy", y="SPL", hue="Policy", ax=ax, showfliers=False)
+    ax.set_title("SPL (Successful Eps)", fontsize=FS_TITLE)
+    ax.set_ylabel("SPL", fontsize=FS_LABEL)
+    ax.set_xlabel("")
+    ax.tick_params(labelsize=FS_TICK)
+
+    # (1,2) Min Human Distance by Scenario (BOX)
+    ax = axes[1, 2]
+    sns.boxplot(data=test_df, x="Scenario_Name", y="Min Dist", hue="Policy",
+                palette=palette, showfliers=False, ax=ax)
+    ax.axhline(0.0, color="red", linestyle="--", linewidth=1.0, alpha=0.7)
+    ax.set_title("Min Human Distance by Scenario", fontsize=FS_TITLE)
+    ax.set_ylabel("Surface distance (m)", fontsize=FS_LABEL)
+    ax.set_xlabel("")
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha="right", fontsize=FS_TICK)
+    ax.tick_params(labelsize=FS_TICK)
+    ax.get_legend().remove()
+
+    # (1,3) Safety Margin vs speed (LINE)
+    ax = axes[1, 3]
+    sns.lineplot(data=test_df, x="Max_V", y="Min Dist", hue="Policy",
+                 marker="^", linewidth=LW, markersize=MS, ax=ax)
+    ax.set_title("Safety Margin vs. Max Speed", fontsize=FS_TITLE)
+    ax.axhline(0.0, color="red", linestyle="--", alpha=0.5)
+    ax.set_xticks(MAX_V_TESTS)
+    ax.set_xlabel("Max Speed (m/s)", fontsize=FS_LABEL)
+    ax.set_ylabel("Min Distance (m)", fontsize=FS_LABEL)
+    ax.tick_params(labelsize=FS_TICK)
+    ax.legend(fontsize=FS_LEG)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.savefig("Test_Scenario_Dashboard.png", dpi=300)
+    print("Saved 'Test_Scenario_Dashboard.png'")
+    plt.close(fig)
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+def main():
+    t_total = time.time()
+    gpu = jax.devices("cuda")[0] if jax.devices("cuda") else jax.devices()[0]
+    print(f"Running on: {gpu}\n")
+
+    # Load available checkpoints
+    policies = {}
+    for name, path in _CKPT_PATHS.items():
+        if not os.path.exists(path):
+            print(f"  {name}: checkpoint not found at {path}, skipping.")
+            continue
+        try:
+            params = _LOADERS[name](path)
+            policies[name] = jax.device_put(params, gpu)
+            print(f"  {name}: loaded from {path}")
+        except Exception as e:
+            print(f"  {name}: failed to load ({e}), skipping.")
+
+    if not policies:
+        print("No valid checkpoints found. Please train a model first.")
+        return
+
+    rng = jax.random.PRNGKey(42)
+
+    # ── Warm-up: compile all kernels ────────────────────────────────────────
+    # Dispatch all warmup calls without blocking, then wait once at the end.
+    print("\nCompiling evaluation kernels (all policies)...")
+    t_compile = time.time()
+    warmup_futures = {}
+    for p_name, params in policies.items():
+        rng, k_warmup = jax.random.split(rng)
+        warmup_futures[p_name] = _EVAL_FN[p_name](
+            params, jnp.int32(0), jnp.float32(1.0), k_warmup)
+
+    rng, k_wu_reset = jax.random.split(rng)
+    wu_reset_keys = jax.random.split(k_wu_reset, N_TEST_ENVS)
+    wu_obs, wu_state = jax.vmap(
+        dynamic_reset_stacked, in_axes=(0, None, None, None)
+    )(wu_reset_keys, 9.0, jnp.int32(7), jnp.float32(1.0))
+
+    seg_futures = {}
+    for p_name, params in policies.items():
+        rng, k_seg = jax.random.split(rng)
+        seg_futures[p_name] = _SEG_FN[p_name](
+            params, wu_obs, wu_state, k_seg, jnp.int32(0))
+
+    # Single barrier for all compilations
+    for p_name in policies:
+        jax.block_until_ready(warmup_futures[p_name])
+        jax.block_until_ready(seg_futures[p_name])
+    t_compile = time.time() - t_compile
+    print(f"  All kernels compiled in {t_compile:.1f}s\n")
+
+    # ── Training-scenario evaluation (pipelined dispatch) ───────────────────
+    # Pre-generate all RNG keys so dispatch is not blocked by Python key-splits.
+    total_cells = N_SCENARIOS * N_SPEEDS
+    all_frames   = []
+    scatter_data = {}
+
+    print(f"Executing evaluation grid ({N_SCENARIOS} scenarios x {N_SPEEDS} speeds "
+          f"= {total_cells} cells, {N_ENVS} envs each)...")
+    t_train_eval = time.time()
+
+    for p_name, params in policies.items():
+        eval_fn  = _EVAL_FN[p_name]
+        t_policy = time.time()
+
+        # Pre-split all RNG keys for this policy
+        n_cells = N_SCENARIOS * N_SPEEDS
+        rng, batch_rng = jax.random.split(rng)
+        cell_keys = jax.random.split(batch_rng, n_cells)
+
+        # Dispatch all cells without blocking — GPU stays saturated
+        futures = []
+        for si in range(N_SCENARIOS):
+            for vi, v_max in enumerate(MAX_V_TESTS):
+                idx = si * N_SPEEDS + vi
+                fut = eval_fn(params, jnp.int32(si),
+                              jnp.float32(v_max), cell_keys[idx])
+                futures.append((si, v_max, fut))
+
+        # Collect results (device_get implicitly waits)
+        sd_list, sv_list = [], []
+        for si, v_max, fut in futures:
+            cell = jax.device_get(fut)
+
+            sd = cell["step_dists"].ravel()
+            sv = cell["step_vs"].ravel()
+            ok = np.isfinite(sd) & np.isfinite(sv)
+            sd_list.append(sd[ok])
+            sv_list.append(sv[ok])
+
+            all_frames.append(pd.DataFrame({
+                "Policy":        p_name,
+                "Scenario":      si,
+                "Max_V":         v_max,
+                "Success":       cell["success"],
+                "Active Col":    cell["act_col"],
+                "Passive Col":   cell["pass_col"],
+                "Timeout":       cell["timeout"],
+                "SPL":           cell["spl"],
+                "Jerk":          cell["jerk"],
+                "Min Dist":      cell["min_dist"],
+                "Time to Goal":  cell["time"],
+                "Yield Score":   cell["yield_score"],
+                "Social Score":  _compute_social_score(cell),
+            }))
+
+        scatter_data[p_name] = (np.concatenate(sd_list), np.concatenate(sv_list))
+        suc_pct = np.mean([f["Success"].mean() for f in all_frames[-n_cells:]]) * 100
+        print(f"  {p_name}: suc={suc_pct:5.1f}%  {time.time() - t_policy:.1f}s")
+
+    t_train_eval = time.time() - t_train_eval
+
+    df = pd.concat(all_frames, ignore_index=True)
+    df.to_csv("evaluation_raw_data.csv", index=False)
+    print("Saved evaluation_raw_data.csv\n")
+
+    print("Generating training-scenario dashboard...")
+    _plot_dashboard(df, scatter_data)
+
+    # ── Test scenario evaluation ───────────────────────────────────────────
+    print("\n" + "="*60)
+    print(f"Executing test scenario grid "
+          f"({N_TEST_SCENS} scenarios x {N_SPEEDS} speeds = "
+          f"{N_TEST_SCENS * N_SPEEDS} cells, {N_TEST_ENVS} envs each)...")
+    print("NOTE: multi-waypoint scenarios (7, 9, 12) chain segments —")
+    print("      success requires reaching the *last* waypoint.\n")
+
+    t_test_eval = time.time()
+    test_df = run_test_scenarios(policies, rng)
+    t_test_eval = time.time() - t_test_eval
+
+    test_df.to_csv("test_evaluation_raw_data.csv", index=False)
+    print("Saved test_evaluation_raw_data.csv\n")
+
+    print("Generating test-scenario dashboard...")
+    _plot_test_dashboard(test_df)
+
+    # ── Timing summary ─────────────────────────────────────────────────────
+    t_total = time.time() - t_total
+    print("\n" + "="*60)
+    print("GPU BENCHMARK TIMING SUMMARY")
+    print("="*60)
+    print(f"  Compilation:           {t_compile:8.1f}s")
+    print(f"  Training-scenario eval:{t_train_eval:8.1f}s")
+    print(f"  Test-scenario eval:    {t_test_eval:8.1f}s")
+    print(f"  Total (incl. plots):   {t_total:8.1f}s")
+    print("="*60)
 
 
 if __name__ == "__main__":

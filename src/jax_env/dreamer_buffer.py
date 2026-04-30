@@ -33,11 +33,7 @@ def init_buffer(capacity: int, num_envs: int,
 
 
 def buffer_ready(buffer_state: ReplayBufferState, seq_len: int) -> bool:
-    """
-    BUG D FIX: Python-level guard promised by the docstring but absent from the
-    original file.  Returns True iff the buffer contains at least one complete
-    sequence window of length seq_len, making sample_sequences safe to call.
-    """
+
     insert_idx = int(buffer_state.insert_idx)
     is_full    = bool(buffer_state.is_full)
     return is_full or (insert_idx >= seq_len)

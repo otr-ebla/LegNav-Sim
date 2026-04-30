@@ -74,12 +74,12 @@ def run_evaluation():
     raw_env = DummyVecEnv([make_env])
 
     # B. APPLICHIAMO LO STACKING (Come riga 80 di run_ppo.py)
-    # Questo trasforma l'osservazione da (108,) a (5, 108)
+    # Transforms observation from (216,) to (5, 216)
     print(f"📦 Applicazione VecTemporalStack (dim={STACK_DIM})")
     stacked_env = VecTemporalStack(raw_env, stack_dim=STACK_DIM)
 
     # C. APPLICHIAMO LA NORMALIZZAZIONE (Come riga 86 di run_ppo.py)
-    # Ora passiamo 'stacked_env' che ha la shape corretta (5, 108) che il pkl si aspetta.
+    # Pass 'stacked_env' with the correct shape (5, 216) expected by the pkl.
     if os.path.exists(VECNORM_PATH):
         print(f"📥 Caricamento VecNormalize da {VECNORM_PATH}")
         env = VecNormalize.load(VECNORM_PATH, stacked_env)

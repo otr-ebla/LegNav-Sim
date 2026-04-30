@@ -24,7 +24,7 @@ NORMALIZATION_FILE = "./2_Mno_obstacles_part2.pkl"
 # [AGGIORNATO] Parametri allineati con nav_env.py e gym_nav_env.py
 MAX_LIN_VEL = 0.3   # TurtleBot4 Limit
 MAX_ANG_VEL = 2.3   # TurtleBot4 Limit
-NUM_RAYS_MODEL = 108
+NUM_RAYS_MODEL = 216
 STACK_SIZE = 3
 
 # [AGGIORNATO] Parametri Lidar/Ambiente (NavEnv)
@@ -81,7 +81,7 @@ class RLNavNode(Node):
         # 1. Caricamento Modello e Normalizzazione
         self.get_logger().info(f"Caricamento modello da {MODEL_PATH}...")
         
-        # Calcolo dimensione osservazione: 4 scalari + (108 * 3) lidar
+        # Observation dimension: 4 scalars + (216 * 3) lidar
         obs_dim = 4 + (NUM_RAYS_MODEL * STACK_SIZE) 
         
         # Definizione spazi per VecNormalize
@@ -150,7 +150,7 @@ class RLNavNode(Node):
         shift_amount = -(len(cleaned_ranges) // 4) 
         aligned_ranges = np.roll(cleaned_ranges, shift_amount)
 
-        # 3. Downsampling a 108 raggi
+        # 3. Downsample to 216 rays
         if len(aligned_ranges) >= NUM_RAYS_MODEL:
             indices = np.linspace(0, len(aligned_ranges) - 1, NUM_RAYS_MODEL, dtype=int)
             downsampled = aligned_ranges[indices]

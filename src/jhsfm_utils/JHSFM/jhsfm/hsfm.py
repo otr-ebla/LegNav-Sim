@@ -156,21 +156,28 @@ def single_update(idx: int, humans_state: jnp.ndarray, human_goal: jnp.ndarray, 
         self_parameters[14] * jnp.dot(social_force + obstacle_force, jnp.array([-s, c])) - self_parameters[15] * self_state[3]
     ])
     
-    # Integrate position and angles
-    new_px = self_state[0] + dt * linear_velocity[0]
-    new_py = self_state[1] + dt * linear_velocity[1]
-    new_th = wrap_angle(self_state[4] + dt * self_state[5])
+    # 1. Integrate velocities and omega FIRST (Semi-Implicit Euler for stability)
     new_om = jnp.clip(self_state[5] + dt * (torque / inertia), -10.0, 10.0)
     
-    # Integrate velocities
     new_bvx = self_state[2] + dt * (global_force[0] / self_parameters[1])
     new_bvy = self_state[3] + dt * (global_force[1] / self_parameters[1])
     
-    # Smooth velocity projection (replaces lax.cond)
+    # Smooth velocity projection
     speed = jnp.hypot(new_bvx, new_bvy)
     scale = self_parameters[2] / jnp.maximum(speed, self_parameters[2])
     new_bvx *= scale
     new_bvy *= scale
+    
+    # 2. Convert NEW body velocity to NEW world linear velocity
+    new_th = wrap_angle(self_state[4] + dt * new_om)
+    c_new = jnp.cos(new_th)
+    s_new = jnp.sin(new_th)
+    new_linear_vx = c_new * new_bvx - s_new * new_bvy
+    new_linear_vy = s_new * new_bvx + c_new * new_bvy
+    
+    # 3. Integrate position using the NEW velocities
+    new_px = self_state[0] + dt * new_linear_vx
+    new_py = self_state[1] + dt * new_linear_vy
 
     # Compile the final state
     updated_human_state = jnp.array([new_px, new_py, new_bvx, new_bvy, new_th, new_om])

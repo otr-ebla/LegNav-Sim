@@ -132,7 +132,7 @@ def _get_ray_boxes_intersections(x0, y0, dx, dy, boxes):
 # static_argnums: num_rays (5), fov (6), max_dist (7), room_w (8), room_h (9)
 # ---------------------------------------------------------------------------
 
-@functools.partial(jax.jit, static_argnums=(5, 6, 7, 8, 9))
+@functools.partial(jax.jit, static_argnums=(5, 6, 7))
 def compute_lidar(x, y, theta, circles, boxes, num_rays, fov, max_dist, room_w, room_h):
     angles = theta - fov * 0.5 + jnp.arange(num_rays) * (fov / (num_rays - 1))
 

@@ -11,13 +11,13 @@ from dreamer_rssm import DETERMINISTIC_SIZE, symlog, apply_unimix
 
 
 class ObservationDecoder(nn.Module):
-    obs_dim: int = 342
+    obs_dim: int = 662
 
     @nn.compact
     def __call__(self, h_t: jnp.ndarray, z_t: jnp.ndarray) -> jnp.ndarray:
         x = jnp.concatenate([h_t, z_t], axis=-1)
-        x = nn.swish(nn.LayerNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
-        x = nn.swish(nn.LayerNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
+        x = nn.swish(nn.RMSNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
+        x = nn.swish(nn.RMSNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
         return nn.Dense(self.obs_dim)(x)
 
 
@@ -27,17 +27,18 @@ class RewardDecoder(nn.Module):
     @nn.compact
     def __call__(self, h_t: jnp.ndarray, z_t: jnp.ndarray) -> jnp.ndarray:
         x = jnp.concatenate([h_t, z_t], axis=-1)
-        x = nn.swish(nn.LayerNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
-        x = nn.swish(nn.LayerNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
-        return nn.Dense(self.num_bins)(x)
+        x = nn.swish(nn.RMSNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
+        x = nn.swish(nn.RMSNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
+        # V3 zero-initialization to prevent early reward hallucination
+        return nn.Dense(self.num_bins, kernel_init=jax.nn.initializers.zeros)(x)
 
 
 class ContinueDecoder(nn.Module):
     @nn.compact
     def __call__(self, h_t: jnp.ndarray, z_t: jnp.ndarray) -> jnp.ndarray:
         x = jnp.concatenate([h_t, z_t], axis=-1)
-        x = nn.swish(nn.LayerNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
-        x = nn.swish(nn.LayerNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
+        x = nn.swish(nn.RMSNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
+        x = nn.swish(nn.RMSNorm()(nn.Dense(DETERMINISTIC_SIZE)(x)))
         return jnp.squeeze(nn.Dense(1)(x), axis=-1)
 
 def two_hot_encode(target: jnp.ndarray, min_val: float = -20.0, max_val: float = 20.0, num_bins: int = 255) -> jnp.ndarray:
@@ -78,13 +79,7 @@ def compute_kl_loss(
     posterior_logits: jnp.ndarray,
     free_nats: float = 1.0,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    # apply_unimix returns log((1-alpha)*softmax(logits) + alpha*(1/K)).
-    # Using raw log_softmax here would produce unregularized log-probs: a
-    # near-zero category has log-prob near -inf, and the gradient of the KL
-    # sum w.r.t. that logit is unbounded — the exact NaN explosion Unimix
-    # was designed to prevent. The uniform floor (alpha=0.01) ensures every
-    # log-prob is bounded away from -inf, bounding the gradient magnitude and
-    # protecting the GRU weights that generated these logits.
+
     prior_log_probs     = apply_unimix(prior_logits)
     posterior_log_probs = apply_unimix(posterior_logits)
     # posterior_probs derived from the same regularized distribution so the
@@ -105,7 +100,8 @@ def compute_kl_loss(
     kl_prior_loss     = jnp.mean(jnp.maximum(kl_prior,     free_nats))
     kl_posterior_loss = jnp.mean(jnp.maximum(kl_posterior, free_nats))
 
-    loss   = 0.8 * kl_prior_loss + 0.2 * kl_posterior_loss
+    # V3 Dynamics and Representation loss weights: beta_dyn=1.0, beta_rep=0.1
+    loss   = 1.0 * kl_prior_loss + 0.1 * kl_posterior_loss
     raw_kl = jnp.mean(jnp.sum(posterior_probs * (posterior_log_probs - prior_log_probs), axis=-1))
     return loss, raw_kl
 
@@ -115,7 +111,7 @@ def world_model_loss(
     obs_pred, reward_pred, continue_logits,
     prior_logits, posterior_logits,
 ):
-    obs_loss    = jnp.mean((obs_pred - obs_target) ** 2)
+    obs_loss    = 0.5 * jnp.mean((obs_pred - symlog(obs_target)) ** 2)
     reward_loss = jnp.mean(two_hot_loss(reward_pred, reward_target))
 
     continue_target = 1.0 - done_target.astype(jnp.float32)

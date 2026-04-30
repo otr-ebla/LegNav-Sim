@@ -14,7 +14,7 @@ if project_root not in sys.path:
 
 from jax_env import (EnvState, get_obs,
                      ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS, DT,
-                     MAX_STEPS, GOAL_RADIUS,
+                     MAX_STEPS, GOAL_RADIUS, NUM_RAYS,
                      USE_LEGS,
                      P_HUMAN_STOP, STOP_MIN_STEPS, STOP_MAX_STEPS)
 from jax_scenarios import generate_scenario
@@ -36,94 +36,122 @@ HSFM_DT    = 0.01
 # Terminal rewards (all /10 from original to keep Q-values O(100) not O(1000)).
 # This ensures alpha*log_pi remains a meaningful fraction of the critic signal
 # so the entropy term actually shapes the policy during early training.
-_R_GOAL        =  10.0
-_R_OBS_COL     =  -9.0
-_R_WALL_COL    =  -9.0
-_R_ACTIVE_COL  =  -9.0
+_R_GOAL        =  30.0
+_R_OBS_COL     =  -30.0
+_R_WALL_COL    =  -30.0
+_R_ACTIVE_COL  =  -50.0
 
 _R_PASSIVE_COL =  -3.5
 _R_TIMEOUT     =  -9.0
 
 
-_PROGRESS_COEF =  1.5
+_PROGRESS_COEF =  2.0
+
+# ---- Reward shaping constants for social navigation ----
 
 # Step penalty — small constant cost per timestep, encourages efficiency.
-_STEP_PEN      =  -0.008
+# Step penalty — small constant cost per timestep, encourages efficiency.
+_STEP_PEN      =  -0.075   # Drastically increased. Standing still is no longer a safe haven.
 
-# Jerk penalty — discourages angular velocity changes (smooth paths).
-_JERK_WEIGHT   =   0.008
-
-# ── Comfort penalty parameters (replaces old clearance-factor multiplier) ─────
-# OLD DESIGN (broken): clearance_factor multiplied progress reward.
-#   With 12 humans in 12×12m, closest_shoe_surface < 0.8m ~49% of the time,
-#   so CF < 0.5 half the time → progress reward suppressed → robot freezes.
-#
-# NEW DESIGN: progress reward is ALWAYS at full strength (never multiplied).
-#   Instead, an additive comfort penalty discourages lingering near humans.
-#   The robot is free to pass through crowded zones (progress pulls it forward)
-#   but learns to prefer wider paths when available.
-#
-# comfort_penalty = -_COMFORT_COEF * max(0, 1 - d / _COMFORT_DIST) * (1 + v/max_v)
-#
-#   _COMFORT_DIST : radius of the "personal space" zone [m]
-#                   Humans closer than this generate a per-step penalty.
-#   _COMFORT_COEF : base penalty magnitude at d=0 (body contact distance).
-#                   Scaled by (1 + v/max_v) so fast approaches cost more.
-#
-# Intuition for the policy:
-#   d > 1.2 m → no comfort penalty, full progress
-#   d = 0.6 m → penalty ≈ -0.075 * (1 + v/max_v)  → prefers wider path
-#   d = 0.0 m → penalty ≈ -0.15  * (1 + v/max_v)  → strong deterrent
-#   But even at d=0 the net reward of moving toward goal is still positive
-#   (progress ≈ 1.2/step vs penalty ≈ 0.3) → robot never freezes.
+# Smoothness & Rotation penalties (Lowered to unblock exploration)
+_SMOOTH_WEIGHT =   0.08    # Reduced to stop paralyzing the agent's steering
+_ROT_WEIGHT    =   0.03   # Low: allow steering around humans, only penalizes extreme spinning
 
 _COMFORT_DIST  = 1.2   # m — personal space boundary
 _COMFORT_COEF  = 0.015 # base penalty at d=0 (before speed scaling) — /10 from 0.15
 
+_YIELD_DIST    = 1.8   # m — distance to start yielding (wider detection zone)
+_YIELD_COEF    = 10   # must dominate progress_coef so braking near humans is always preferred
+
+
+# -------------------
+
+
 N_SUBSTEPS = int(DT / HSFM_DT)
-NUM_PEOPLE = 12
+NUM_PEOPLE = 24
 
 # Position used to hide the robot from HSFM when ghost_robot=True.
 # Far outside the room so social forces from the robot on humans are zero.
 _GHOST_POS = -999.0
 
 
-def build_hsfm_obstacles(obs_boxes):
-    room_edges = jnp.array([
-        [[0.0, 0.0], [ROOM_W, 0.0]],
-        [[ROOM_W, 0.0], [ROOM_W, ROOM_H]],
-        [[ROOM_W, ROOM_H], [0.0, ROOM_H]],
-        [[0.0, ROOM_H], [0.0, 0.0]]
+_CIRCLE_SIDES = 8   # octagon approximation (fits 2 groups of 4 edges)
+
+
+def build_hsfm_obstacles(obs_boxes, obs_circles, room_h=ROOM_H):
+    """
+    Build edge-based obstacle array for JHSFM.
+
+    Includes: room walls + rectangular boxes + circular obstacles
+    (approximated as inscribed octagons split into 2 groups of 4 edges each).
+    Unused slots (hw=0 for boxes, r=0 for circles) are NaN-padded so the
+    JHSFM step ignores them instead of producing fictitious origin forces.
+
+    Returns shape (num_groups, 4, 2, 2): all agents share the same array.
+    room_h is dynamic to support non-standard room heights (e.g. 24 m for
+    the long parallel corridor test scenario).
+    """
+    rh = jnp.float32(room_h)
+    rw = jnp.float32(ROOM_W)
+    # Build room boundary edges with dynamic room_h
+    p00 = jnp.stack([jnp.float32(0.0), jnp.float32(0.0)])
+    pW0 = jnp.stack([rw,               jnp.float32(0.0)])
+    pWH = jnp.stack([rw,               rh              ])
+    p0H = jnp.stack([jnp.float32(0.0), rh              ])
+    room_edges = jnp.stack([
+        jnp.stack([p00, pW0]),   # bottom wall
+        jnp.stack([pW0, pWH]),   # right wall
+        jnp.stack([pWH, p0H]),   # top wall
+        jnp.stack([p0H, p00]),   # left wall
     ])
+
+    def _nan_if_invalid(pts, valid):
+        return jnp.where(valid, pts, jnp.nan)
 
     def box_to_edges(box):
         cx, cy, hw, hh = box
-        valid = jnp.where(hw > 0.0, 1.0, 0.0)
-        p1 = jnp.array([cx - hw, cy - hh]) * valid
-        p2 = jnp.array([cx + hw, cy - hh]) * valid
-        p3 = jnp.array([cx + hw, cy + hh]) * valid
-        p4 = jnp.array([cx - hw, cy + hh]) * valid
-        return jnp.stack([
+        valid = hw > 0.0
+        p1 = jnp.array([cx - hw, cy - hh])
+        p2 = jnp.array([cx + hw, cy - hh])
+        p3 = jnp.array([cx + hw, cy + hh])
+        p4 = jnp.array([cx - hw, cy + hh])
+        edges = jnp.stack([
             jnp.stack([p1, p2]), jnp.stack([p2, p3]),
             jnp.stack([p3, p4]), jnp.stack([p4, p1])
         ])
+        return _nan_if_invalid(edges, valid)
 
-    box_edges = jax.vmap(box_to_edges)(obs_boxes)
-    # Return (num_obs_groups, 4, 2, 2) — NOT tiled per-agent.
-    # hsfm.py's vectorized_single_update uses in_axes obstacles=None so all
-    # agents share the same obstacle array instead of each getting an identical copy.
-    return jnp.concatenate([room_edges[None, ...], box_edges], axis=0)
+    def circle_to_edges(circle):
+        cx, cy, r = circle
+        valid = r > 0.0
+        angles = jnp.linspace(0.0, 2.0 * jnp.pi, _CIRCLE_SIDES, endpoint=False)
+        vx = cx + r * jnp.cos(angles)
+        vy = cy + r * jnp.sin(angles)
+        verts = jnp.stack([vx, vy], axis=-1)                     # (8, 2)
+        nxt   = jnp.roll(verts, shift=-1, axis=0)                # (8, 2)
+        edges = jnp.stack([verts, nxt], axis=1)                  # (8, 2, 2)
+        # Split 8 edges into 2 groups of 4 to match the (4, 2, 2) group shape.
+        edges = edges.reshape(2, 4, 2, 2)
+        return _nan_if_invalid(edges, valid)
+
+    box_edges = jax.vmap(box_to_edges)(obs_boxes)                # (NB, 4, 2, 2)
+    cir_edges = jax.vmap(circle_to_edges)(obs_circles)           # (NC, 2, 4, 2, 2)
+    cir_edges = cir_edges.reshape(-1, 4, 2, 2)                   # (2*NC, 4, 2, 2)
+
+    return jnp.concatenate([room_edges[None, ...], box_edges, cir_edges], axis=0)
 
 
-def reset_env(key: jax.Array, max_goal_dist: float = 3.0, scenario_idx: int = -1):
-    k_main, k_legs, k_obs = jax.random.split(key, 3)
+def reset_env(key: jax.Array, max_goal_dist: float = 3.0, scenario_idx: int = -1,
+              ghost_prob: float = 1.0, max_scenario: int = 6):
+    k_main, k_legs, k_obs, k_ghost = jax.random.split(key, 4)
 
-    rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people = \
-        generate_scenario(k_main, max_goal_dist, scenario_idx)
+    rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people, room_h = \
+        generate_scenario(k_main, max_goal_dist, scenario_idx, max_scenario)
     
     #max_v = 0.8
 
     foot_state = init_foot_state(people, k_legs)
+    is_ghost   = jax.random.bernoulli(k_ghost, p=ghost_prob)
 
     state = EnvState(
         x=rx, y=ry, theta=rtheta, v=0.0, w=0.0,
@@ -132,9 +160,11 @@ def reset_env(key: jax.Array, max_goal_dist: float = 3.0, scenario_idx: int = -1
         time_step=0,
         foot_state=foot_state,
         time_stopped=0,
-        sp_mask=jnp.zeros(108, dtype=jnp.bool_),
+        sp_mask=jnp.zeros(NUM_RAYS, dtype=jnp.bool_),
         human_stop_timers=jnp.zeros(NUM_PEOPLE, dtype=jnp.int32),
         escape_timer=0,
+        is_ghost=is_ghost,
+        room_h=room_h,
     )
 
     obs, sp_mask = get_obs(state, k_obs)
@@ -174,21 +204,14 @@ def step_env(key, state, action, ghost_robot: bool = True):
 
     # Boolean wall_collision for episode logic (stop_grad'd later)
     wall_collision = (raw_x < ROBOT_RADIUS) | (raw_x > ROOM_W - ROBOT_RADIUS) | \
-                     (raw_y < ROBOT_RADIUS) | (raw_y > ROOM_H - ROBOT_RADIUS)
+                     (raw_y < ROBOT_RADIUS) | (raw_y > state.room_h - ROBOT_RADIUS)
 
     new_x = jnp.clip(raw_x, ROBOT_RADIUS, ROOM_W - ROBOT_RADIUS)
-    new_y = jnp.clip(raw_y, ROBOT_RADIUS, ROOM_H - ROBOT_RADIUS)
+    new_y = jnp.clip(raw_y, ROBOT_RADIUS, state.room_h - ROBOT_RADIUS)
 
     # ── 2. JHSFM substeps ─────────────────────────────────────────────────────
     hsfm_params      = get_standard_humans_parameters(NUM_PEOPLE + 1)
-    static_obstacles = build_hsfm_obstacles(state.obs_boxes)
-
-    if ghost_robot:
-        hsfm_rx = jnp.array(_GHOST_POS)
-        hsfm_ry = jnp.array(_GHOST_POS)
-    else:
-        hsfm_rx = new_x
-        hsfm_ry = new_y
+    static_obstacles = build_hsfm_obstacles(state.obs_boxes, state.obs_circles, state.room_h)
 
     # Build goal arrays for humans using the active waypoint per human.
     idx_h    = state.people[:, 10]
@@ -202,34 +225,54 @@ def step_env(key, state, action, ghost_robot: bool = True):
     r_goal_row  = jnp.array([[state.goal_x, state.goal_y]])  # (1, 2)
     ext_goals_pre = jnp.concatenate([h_goals_pre, r_goal_row], axis=0)  # (N+1, 2)
 
-    r_state_row = jnp.array([[
-        hsfm_rx, hsfm_ry,
-        target_v * jnp.cos(new_theta),
-        target_v * jnp.sin(new_theta),
-        new_theta, target_w
-    ]])   # (1, 6)
-
     h_state_init   = state.people[:, :6]   # (N, 6)
-    ext_state_init = jnp.concatenate([h_state_init, r_state_row], axis=0)  # (N+1, 6)
+    
+    # Initialize ext_state with a dummy robot row; updated dynamically per-substep
+    # Initialize ext_state with a dummy robot row; updated dynamically per-substep
+    dummy_r_state = jnp.zeros((1, 6))
+    ext_state_init = jnp.concatenate([h_state_init, dummy_r_state], axis=0)
 
-    def _hsfm_substep(carry, _):
+    # Precompute dummy mask outside the loop to save inner-loop FLOPs
+    is_dummy_sub = state.people[:, 10] < 0.0
+
+    def _hsfm_substep(carry, step_idx):
         ext_state = carry
+        # Interpolate robot position for fluid physics over the 0.15s window
+        alpha = (step_idx + 1) / N_SUBSTEPS
+        interp_x = state.x + alpha * (new_x - state.x)
+        interp_y = state.y + alpha * (new_y - state.y)
+        
+        hsfm_rx = jnp.where(state.is_ghost, _GHOST_POS, interp_x)
+        hsfm_ry = jnp.where(state.is_ghost, _GHOST_POS, interp_y)
+
+        r_state_row = jnp.array([
+            hsfm_rx, hsfm_ry,
+            target_v * jnp.cos(new_theta),
+            target_v * jnp.sin(new_theta),
+            new_theta, target_w
+        ])
+        
+        # Inject accurate real-time robot state into ext_state before stepping
+        ext_state = ext_state.at[-1].set(r_state_row)
+
         # Goals are constant across substeps — pass pre-built ext_goals_pre
         next_ext  = hsfm_step(ext_state, ext_goals_pre, hsfm_params, static_obstacles, HSFM_DT)
 
-        # Do not clamp dummy humans — they live at -999 intentionally
+        # Extract human state to apply clamping
         next_h       = next_ext[:-1]
-        is_dummy_sub = state.people[:, 10] < 0.0
+
+        # Clamping: do not clamp dummy humans, keep them at -999
         clamped_x    = jnp.where(is_dummy_sub, next_h[:, 0],
                                  jnp.clip(next_h[:, 0], 0.1, ROOM_W - 0.1))
         clamped_y    = jnp.where(is_dummy_sub, next_h[:, 1],
-                                 jnp.clip(next_h[:, 1], 0.1, ROOM_H - 0.1))
+                                 jnp.clip(next_h[:, 1], 0.1, state.room_h - 0.1))
+                                 
         # Preserve robot row unchanged; only humans are clamped
         clamped_ext  = next_ext.at[:-1, 0].set(clamped_x).at[:-1, 1].set(clamped_y)
         return clamped_ext, None
 
     final_ext, _ = jax.lax.scan(
-        _hsfm_substep, ext_state_init, None, length=N_SUBSTEPS
+        _hsfm_substep, ext_state_init, jnp.arange(N_SUBSTEPS)
     )
     new_h_state = final_ext[:-1]   # (N, 6) — drop robot row
  
@@ -271,7 +314,10 @@ def step_env(key, state, action, ghost_robot: bool = True):
     rand_x_prl = jnp.where(is_wall_walker, g1x, rand_x_corr)
     rand_x = jnp.where(is_parallel, rand_x_prl, rand_x_full)
     
-    rand_y = jnp.full((NUM_PEOPLE,), ROOM_H - 0.2)
+    is_long = state.room_h > 20.0
+    k_respawn_y, _ = jax.random.split(k_respawn2)
+    rand_y_long = jax.random.uniform(k_respawn_y, (NUM_PEOPLE,), minval=20.7, maxval=state.room_h - 0.2)
+    rand_y = jnp.where(is_long, rand_y_long, jnp.full((NUM_PEOPLE,), state.room_h - 0.2))
 
     new_idx = jnp.where(needs_respawn, 0.0, new_idx)
 
@@ -291,8 +337,11 @@ def step_env(key, state, action, ghost_robot: bool = True):
         new_h_state[:, 4], new_h_state[:, 5]   # theta, omega unchanged
     ], axis=-1)
 
+    new_g1x = jnp.where(needs_respawn & is_long, final_px, state.people[:, 6])
+    new_g2x = jnp.where(needs_respawn & is_long, final_px, state.people[:, 8])
+
     new_people = jnp.concatenate(
-        [respawned_h_state, state.people[:, 6:10], new_idx[:, None]], axis=-1
+        [respawned_h_state, new_g1x[:, None], state.people[:, 7:8], new_g2x[:, None], state.people[:, 9:10], new_idx[:, None]], axis=-1
     )
 
     # ── Human stop-and-go ──────────────────────────────────────────────────────
@@ -309,18 +358,29 @@ def step_env(key, state, action, ghost_robot: bool = True):
     prev_timers  = state.human_stop_timers
     in_stop      = prev_timers > 0
     new_timers   = jnp.where(in_stop, prev_timers - 1, 0)
-    start_stop   = ~in_stop & (stop_roll < P_HUMAN_STOP)
+    # Disable stop-and-go in the long parallel corridor (room_h > 12 m) so
+    # pedestrians maintain a continuous flow without freezing mid-corridor.
+    allow_stop   = state.room_h <= jnp.float32(12.0)
+    start_stop   = ~in_stop & (stop_roll < P_HUMAN_STOP) & allow_stop
     new_timers   = jnp.where(start_stop, stop_dur, new_timers)
     is_stopped_h = new_timers > 0
 
     # Only freeze active (non-dummy) humans; never freeze respawned ones
     active_mask_stop = (new_people[:, 10] >= 0.0) & ~needs_respawn
-    freeze           = is_stopped_h & active_mask_stop
+
+    # Detect static_groups scenario: g1 == g2 for all humans (no waypoints to walk toward).
+    # In this case force ALL active humans frozen so the robot learns to avoid static people.
+    g1x_sg = state.people[:, 6]
+    g1y_sg = state.people[:, 7]
+    g2x_sg = state.people[:, 8]
+    g2y_sg = state.people[:, 9]
+    is_static_groups = jnp.all((g1x_sg == g2x_sg) & (g1y_sg == g2y_sg))
+
+    freeze = (is_stopped_h | is_static_groups) & active_mask_stop
 
     # Clamp px=0,1 vx=2, vy=3, omega=5 for stopped humans
-    new_people = new_people.at[:, 2].set(jnp.where(freeze, 0.0, new_people[:, 2]))
-    new_people = new_people.at[:, 3].set(jnp.where(freeze, 0.0, new_people[:, 3]))
-    new_people = new_people.at[:, 5].set(jnp.where(freeze, 0.0, new_people[:, 5]))
+    frozen_people = state.people.at[:, 2:4].set(0.0).at[:, 5].set(0.0)
+    new_people = jnp.where(freeze[:, None], frozen_people, new_people)
 
     # 1. Advance the continuous gait phase for everyone
     advanced_foot_state = advance_feet(state.foot_state, new_people, DT)
@@ -379,7 +439,9 @@ def step_env(key, state, action, ghost_robot: bool = True):
     # ── 5. Collision Detection ───────────────────────────────────────────────────
 
     heading_dot  = dx_p * jnp.cos(new_theta) + dy_p * jnp.sin(new_theta)
-    in_fwd_fov   = heading_dot > 0.0       # human is ahead of the robot
+    heading_angle = jnp.arctan2(dy_p, dx_p)
+    rel_angle = (heading_angle - new_theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
+    in_fwd_fov   = jnp.abs(rel_angle) < (jnp.pi / 2.0)   # human within ±90° forward cone
     in_prox      = dists_p_active < 1.5    # within 1.5 m
     robot_moving = target_v >= 0.1         # robot is moving
 
@@ -421,11 +483,6 @@ def step_env(key, state, action, ghost_robot: bool = True):
     static_obs_collision = (closest_cir < ROBOT_RADIUS) | (closest_box < ROBOT_RADIUS)
 
     # ── 5c. Shoe-box collisions (USE_LEGS=True only, resolved at trace time) ───
-    # When USE_LEGS=True the shoe AABB is the primary human contact surface.
-    # Each shoe contact is classified active/passive with the same logic as body
-    # contacts: active if robot was moving toward the shoe's owner and v >= 0.1.
-    # When USE_LEGS=False these flags are all False — collision uses the body
-    # circle threshold from 5a instead.
     if USE_LEGS:
         shoe_boxes = get_shoe_boxes(new_people, new_foot_state)   # (2*N, 4)
 
@@ -469,37 +526,35 @@ def step_env(key, state, action, ghost_robot: bool = True):
 
     # ── 6. Reward ───────────────────────────────────────────────────────────────
 
-    # — 6a. Comfort penalty (spazio personale spaziale)
-    comfort_violations = jnp.maximum(0.0, 1.0 - dists_p_active / _COMFORT_DIST)
-    comfort_pen = -_COMFORT_COEF * jnp.sum(comfort_violations)
+    # # — 6a. Comfort penalty (spazio personale spaziale)
+    # comfort_violations = jnp.maximum(0.0, 1.0 - dists_p_active / _COMFORT_DIST)
+    # comfort_pen = -_COMFORT_COEF * jnp.sum(comfort_violations)
 
-    # — 6b. NEW: Yield Penalty (Gradiente di Frenata Dinamica)
-    # Recuperato e riadattato da jax_env.py per forzare l'agente a rallentare
-    human_angles = jnp.arctan2(dy_p, dx_p)
-    rel_angles   = (human_angles - new_theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
 
-    YIELD_DIST = 1.5
-    YIELD_FOV  = 2*jnp.pi
+    # — --- 6b. NEW: Yield Penalty Dynamical Brake Gradient
+    yield_linear = jnp.maximum(0.0, 1.0 - dists_p_active/_YIELD_DIST)
+    yield_weight = yield_linear ** 2  # quadratic: gentle at edge, steep when close
+    yield_weight = yield_weight * in_fwd_fov.astype(jnp.float32)  # only consider humans in front
+    yield_pressure = jnp.max(yield_weight) # focus on the most critical human for yielding
+    yield_pen = -_YIELD_COEF * target_v * yield_pressure  # stronger penalty for moving fast when close to a human in front
 
-    in_yield_zone = (dists_p_active < YIELD_DIST) & (jnp.abs(rel_angles) < YIELD_FOV) & active_mask
-    is_yield_situation = jnp.any(in_yield_zone)
-
-    closest_yield_dist = jnp.min(jnp.where(in_yield_zone, dists_p_active, 100.0))
-    urgency = jnp.where(is_yield_situation, (YIELD_DIST - closest_yield_dist) / YIELD_DIST, 0.0)
-
-    # Penalità massiccia se il robot tiene il gas premuto verso un umano.
-    # Il -2.0 compensa abbondantemente il reward di progresso (+0.15/step),
-    # rendendo la frenata (target_v = 0) l'unica azione matematicamente vantaggiosa.
-    yield_penalty = -0.4 * urgency * target_v  # /10 from -4.0
-
+    
     # — 6c. Dense shaping ─────────────────────────────────────────────────
     progress         = prev_dist - new_dist
-    social_progress  = _PROGRESS_COEF * progress
+    progress_reward  = _PROGRESS_COEF * progress
     step_pen         = _STEP_PEN
-    jerk_pen         = -_JERK_WEIGHT * (target_w - state.w) ** 2
+
+    # FIX Bug#4: _SMOOTH_WEIGHT era definito (0.08) ma non usato.
+    # Il coeff fisso -0.5 era 6× troppo alto → robot spaventato di girare → stagnazione.
+    smooth_pen       = -_SMOOTH_WEIGHT * (target_w - state.w)**2
+    # Quadratic penalty on rotation magnitude (encourages driving straight)
+    rot_pen          = -_ROT_WEIGHT * (target_w ** 2)
+    # Destroy the local minimum of spinning in place when blocked
+    spin_in_place_pen = jnp.where(target_v < 0.1, -0.5 * (target_w ** 2), 0.0)
+
+    # Minimal baseline + smoothness
+    dense_reward     = progress_reward + step_pen + smooth_pen + rot_pen + spin_in_place_pen + yield_pen
     
-    # Aggiungiamo la yield_penalty al totale
-    dense_reward     = social_progress + step_pen + jerk_pen + comfort_pen + yield_penalty
 
     # — 6d. Terminal cascades ─────────────────────────────────────────────
     reward = dense_reward
@@ -516,15 +571,14 @@ def step_env(key, state, action, ghost_robot: bool = True):
         people=new_people,
         time_step=state.time_step + 1,
         foot_state=new_foot_state,
-        time_stopped=jnp.int32(0),    # unused in new reward; kept for compat
+        time_stopped=jnp.int32(0),    
         human_stop_timers=new_timers,
-        escape_timer=jnp.int32(0),    # unused in new reward; kept for compat
+        escape_timer=jnp.int32(0),    
     )
 
     obs, sp_mask = get_obs(new_state, k_obs)
     new_state = new_state.replace(sp_mask=sp_mask)
 
- 
     instant_col = collision & (state.time_step == 0)
 
     info = {
@@ -534,14 +588,17 @@ def step_env(key, state, action, ghost_robot: bool = True):
         "passive_col":   passive_col,
         "active_col":    active_col,
         "closest_human": closest_human,
+        "closest_shoe_surface": closest_shoe_surface,
         "sp_mask":       sp_mask,
         "timeout":       timeout,
         "instant_col":   instant_col,
-        "rew_yield":     yield_penalty,
-        # ── NEW: Export reward components for debugging ──
-        "rew_prog":      social_progress,
+        # Per-step reward components for eval panel
+        "rew_progress":  progress_reward,
         "rew_step":      jnp.array(step_pen),
-        "rew_jerk":      jerk_pen,
-        "rew_comf":      comfort_pen,
+        "rew_smooth":    smooth_pen,
+        "rew_speed":     jnp.array(0.0),  # removed: was redundant with progress
+        "rew_heading":   jnp.array(0.0),  # not in multi env
+        "rew_comfort":   jnp.array(0.0),  # commented out above
+        "rew_yield":     yield_pen,
     }
     return obs, new_state, reward, done, info

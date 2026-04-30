@@ -22,7 +22,7 @@ class Simple2DEnv:
             room_width: float = 12.0,
             room_height: float = 12.0,
             robot_radius: float = 0.2, 
-            num_rays: int = 108,
+            num_rays: int = 216,
             max_lidar_distance: float = 15.0,
             num_people: int = 10,
             people_radius: float = 0.2,

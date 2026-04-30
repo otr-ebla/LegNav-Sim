@@ -1,5 +1,11 @@
 """
 jax_humans.py — Stable Social Force Model for dt=0.15s
+
+This script implements the Social Force Model (SFM) for simulating 
+the movement of humans in a 2D environment. Instead of the JHSFM 
+
+
+
 =======================================================
 The previous HSFM implementation oscillated because the original force
 magnitudes (Ai=2000 N, k1=120000 N/m) are tuned for dt≈0.01s. At dt=0.15s

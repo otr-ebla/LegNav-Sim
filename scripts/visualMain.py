@@ -16,7 +16,7 @@ env_cfg = StaticConfig(
     max_lin_vel=1.0,
     max_ang_vel=2.0,
     robot_radius=0.3,
-    num_rays=108,
+    num_rays=216,
     max_lidar_distance=10.0,
     num_people=3,
     people_radius=0.3,
@@ -95,7 +95,7 @@ if __name__ == "__main__":
     rng_keys, env_states, env_obs, obst, rects = reset_vmap(env_keys, env_cfg)
     
     dummy_goal = jnp.zeros((BATCH_SIZE, 1, 2))
-    dummy_lidar = jnp.zeros((BATCH_SIZE, 1, 108))
+    dummy_lidar = jnp.zeros((BATCH_SIZE, 1, 216))
     dummy_action = jnp.zeros((BATCH_SIZE, 1, 2))
     
     agent = Dreamer()
