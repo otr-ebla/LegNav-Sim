@@ -15,7 +15,7 @@ import os
 import time
 import warnings
 
-os.environ["JAX_PLATFORMS"] = "cuda"
+os.environ["JAX_PLATFORMS"] = "cuda,cpu"
 os.environ["XLA_FLAGS"] = "--xla_gpu_enable_triton_gemm=true"
 os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
 os.environ["SDL_VIDEODRIVER"] = "dummy"

@@ -1,287 +1,315 @@
-'''
-AAreal_tb4.py
-ROS2 Node for Patrolling the real Turtlebot4 between two waypoints using a JAX-trained PPO model.
+"""
+AAreal_tb4.py — Real-robot deploy node for LegNav PPO policy on TurtleBot4
+===========================================================================
+"""
 
-'''
-
-
-#!/usr/bin/env python3
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import LaserScan
-from geometry_msgs.msg import Twist
-from nav_msgs.msg import Odometry
-import numpy as np
 import math
-from collections import deque
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 import sys
-import os
 
+import numpy as np
 import jax
 import jax.numpy as jnp
 import flax.serialization
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+from collections import deque
+from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
 
-# --- IMPORT JAX TRAINING MODULES ---
 try:
-    from jax_env import EnvState, get_obs, ROOM_W, ROOM_H, ROBOT_RADIUS, NUM_RAYS, MAX_LIDAR_DIST, FOV
     from jax_network import EndToEndActorCritic, scale_action_to_env
 except ImportError as e:
-    raise ImportError(f"Missing JAX environment modules: {e}. Make sure this script is in the same folder as jax_env.py and jax_network.py")
+    raise ImportError(f"Missing JAX modules: {e}. Ensure jax_network.py is available.")
 
-# --- CONFIGURATION ---
-MODEL_PATH = "checkpoints/ppo_model_best.msgpack"
 
-# Environment parameters (MUST MATCH TRAINING)
-MAX_LIN_VEL = 0.46     # Max linear speed requested
-STACK_DIM = 3          # Network trained with 3 frames
-POSE_SIZE = 3
+# ── Constants (must match jax_env.py / config.py) ─────────────────────────────
+ROBOT_RADIUS   = 0.17
+NUM_RAYS       = 216
+MAX_LIDAR_DIST = 12.0
+FOV            = 2.0 * math.pi          # full 360° — same as jax_env.py
+
+MODEL_PATH     = "checkpoints/ppo_attn_final.msgpack"
+
+# FIX 2: use a single DEPLOY_MAX_V that encodes the curriculum stage correctly.
+# Set this to the max_v value you want the robot to target at deploy time.
+# 0.46 m/s = TB4 safe indoor speed; change to e.g. 1.2 if the checkpoint was
+# trained at higher speeds and you want more aggressive navigation.
+DEPLOY_MAX_V   = 0.46
+
+STACK_DIM      = 3
+POSE_SIZE      = 3
 STATE_VEC_SIZE = 5
+MAX_GOAL_DIST  = math.hypot(12.0, 12.0)   # diagonal of 12×12 m room
 
-# --- PATROL PARAMETERS (Real World Coordinates) ---
-WAYPOINT_A = (4.0, 0.0)   # Example: 4 meters straight ahead
-WAYPOINT_B = (0.0, 0.0)   # Return to origin
+# Patrol waypoints in odom frame (metres). Origin = robot start position.
+WAYPOINT_A = (6.0, 0.0)
+WAYPOINT_B = (0.0, 0.0)
 
-TRAINING_DT = 0.1         # 10 Hz control loop
-GOAL_THRESHOLD = 0.3      # Distance to consider waypoint reached
+TRAINING_DT    = 0.1    # control loop period — must match RobotConfig.DT
+GOAL_THRESHOLD = 0.3    # metres — same as GOAL_RADIUS in jax_env.py
+
+# ── Sim LiDAR angle grid (matches compute_lidar in jax_physics.py) ────────────
+# angles = theta - FOV/2 + arange(NUM_RAYS) * (FOV / (NUM_RAYS - 1))
+# At theta=0: ray 0 → -π (LEFT), ray 108 → 0 (FORWARD), ray 215 → +π (LEFT again)
+# We store the offset from theta=0, i.e. the per-ray angular offsets.
+_SIM_RAY_OFFSETS = -FOV * 0.5 + np.arange(NUM_RAYS) * (FOV / (NUM_RAYS - 1))
+# shape: (216,), range [-π, +π], counter-clockwise, ray 0 = robot LEFT
 
 
 class PatrolNodeJAX(Node):
     def __init__(self):
-        super().__init__('patrol_node_jax')
+        super().__init__("patrol_node_jax")
 
-        # Internal State
-        self.lidar_stack = deque(maxlen=STACK_DIM)
-        self.pose_stack = deque(maxlen=STACK_DIM)
-        
-        self.x = 0.0
-        self.y = 0.0
+        # ── Robot state ───────────────────────────────────────────────────────
+        self.x     = 0.0
+        self.y     = 0.0
         self.theta = 0.0
         self.last_v = 0.0
         self.last_w = 0.0
-        
-        # Goal Management
+
+        # ── Observation stacks ────────────────────────────────────────────────
+        self.lidar_stack = deque(maxlen=STACK_DIM)
+        self.pose_stack  = deque(maxlen=STACK_DIM)
+        self.latest_scan_normalized = np.zeros(NUM_RAYS, dtype=np.float32)
+
+        # ── Patrol state ──────────────────────────────────────────────────────
         self.current_target_name = "A"
         self.goal_x = WAYPOINT_A[0]
         self.goal_y = WAYPOINT_A[1]
-        
-        self.step_counter = 0
+        self.step_counter = 0   # FIX 4: initialise here, not lazily
+
+        # ── Sensor ready flags ────────────────────────────────────────────────
         self.first_scan_received = False
         self.first_odom_received = False
-        self.latest_scan_normalized = np.zeros(NUM_RAYS, dtype=np.float32)
 
-        # PRNG Key for JAX operations
+        # ── JAX network setup ─────────────────────────────────────────────────
+        self.get_logger().info(f"Loading JAX model from {MODEL_PATH}")
         self.rng = jax.random.PRNGKey(0)
 
-        # --- 1. LOAD JAX MODEL ---
-        self.get_logger().info(f"🧠 Loading JAX PPO model from: {MODEL_PATH}")
-        
-        # Initialize network architecture
-        # OBS_SIZE is 662: (3 * 3) + 5 + (216 * 3)
-        self.obs_size = (POSE_SIZE * STACK_DIM) + STATE_VEC_SIZE + (NUM_RAYS * STACK_DIM)
+        obs_size = POSE_SIZE * STACK_DIM + STATE_VEC_SIZE + NUM_RAYS * STACK_DIM  # 662
         self.network = EndToEndActorCritic(action_dim=2, stack_dim=STACK_DIM, num_rays=NUM_RAYS)
-        
-        # Initialize dummy parameters to get the exact structure expected by flax
-        dummy_obs = jnp.zeros((1, self.obs_size))
+
+        dummy_obs = jnp.zeros((1, obs_size))
         self.rng, init_rng = jax.random.split(self.rng)
         self.params = self.network.init(init_rng, dummy_obs)["params"]
 
         try:
             with open(MODEL_PATH, "rb") as f:
-                raw_bytes = f.read()
-            # Msgpack restore fills the initialized params structure
-            bundle = flax.serialization.msgpack_restore(raw_bytes)
+                bundle = flax.serialization.msgpack_restore(f.read())
             self.params = bundle["params"]
-            self.get_logger().info("✅ JAX Model loaded successfully.")
+            self.get_logger().info("JAX model loaded successfully.")
         except Exception as e:
-            self.get_logger().error(f"❌ Error loading model: {e}")
+            self.get_logger().error(f"Failed to load model: {e}")
             sys.exit(1)
-        
-        # JIT compile the inference step for maximum speed
+
+        # JIT-compile inference (runs once on first call, then cached)
         @jax.jit
         def _fast_inference(p, o):
             mean, _, _ = self.network.apply({"params": p}, o)
-            return scale_action_to_env(jnp.squeeze(mean, axis=0), MAX_LIN_VEL)
+            return scale_action_to_env(jnp.squeeze(mean, axis=0), DEPLOY_MAX_V)
         self.fast_inference = _fast_inference
 
-        # --- 2. ROS 2 SETUP ---
-        qos = QoSProfile(depth=10, reliability=QoSReliabilityPolicy.BEST_EFFORT, history=QoSHistoryPolicy.KEEP_LAST)
-        
-        # Subscriptions
-        self.create_subscription(LaserScan, '/scan', self.scan_callback, qos)
-        self.create_subscription(Odometry, '/odom', self.odom_callback, qos)
-        
-        # Publisher
-        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        # ── ROS2 subscriptions & publishers ───────────────────────────────────
+        qos = QoSProfile(
+            depth=1,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+        )
+        self.create_subscription(LaserScan, "/turtlebot1/scan",  self.scan_callback, qos)
+        self.create_subscription(Odometry,  "/turtlebot1/odom",  self.odom_callback, qos)
 
-        # Control Loop Timer (10Hz)
+        self.cmd_vel_pub = self.create_publisher(Twist, "/turtlebot1/cmd_vel", 1)
         self.create_timer(TRAINING_DT, self.control_loop)
-        
-        self.get_logger().info(f"🚀 PATROL ACTIVE. Initial target: {self.current_target_name} ({self.goal_x}, {self.goal_y})")
+
+        self.get_logger().info(
+            f"Patrol ACTIVE | target: {self.current_target_name} | "
+            f"max_v: {DEPLOY_MAX_V} m/s"
+        )
+
+    # ── Callbacks ─────────────────────────────────────────────────────────────
 
     def odom_callback(self, msg):
         self.first_odom_received = True
         self.x = msg.pose.pose.position.x
         self.y = msg.pose.pose.position.y
-        
-        # Quaternion to Euler (Yaw)
         q = msg.pose.pose.orientation
-        siny_cosp = 2 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+        siny_cosp  = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp  = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self.theta = math.atan2(siny_cosp, cosy_cosp)
 
     def scan_callback(self, msg):
-        """
-        Interpolates the real LiDAR scan down to the 216 rays expected by the network,
-        covering the specific FOV used during training.
-        """
-        raw_ranges = np.array(msg.ranges)
-        real_angles = np.linspace(msg.angle_min, msg.angle_max, len(raw_ranges))
-        
-        # Target angles based on the training environment's FOV
-        target_angles = np.linspace(-FOV / 2.0, FOV / 2.0, NUM_RAYS)
-        
-        # 1. Clean Inf/Nan/Zeros
-        cleaned = np.nan_to_num(raw_ranges, nan=MAX_LIDAR_DIST, posinf=MAX_LIDAR_DIST, neginf=MAX_LIDAR_DIST)
-        cleaned[cleaned < 0.05] = MAX_LIDAR_DIST 
+        raw = np.array(msg.ranges, dtype=np.float32)
+
+        # ── Clean invalid readings ─────────────────────────────────────────
+        cleaned = np.where(np.isfinite(raw), raw, MAX_LIDAR_DIST)
+        cleaned = np.where(cleaned < 0.12,   MAX_LIDAR_DIST, cleaned)
         cleaned = np.clip(cleaned, 0.0, MAX_LIDAR_DIST)
 
-        # 2. Resample to 216 rays over the trained FOV
-        resampled = np.interp(target_angles, real_angles, cleaned, left=MAX_LIDAR_DIST, right=MAX_LIDAR_DIST)
+        # ── FIX 1: angle-aware resampling to match sim ray convention ─────
+        # Real sensor angles (world-frame offsets from robot heading = 0).
+        # ROS REP-103: angle_min = right side (negative), increases CCW.
+        n_real = len(cleaned)
+        real_angles = np.linspace(msg.angle_min, msg.angle_max, n_real)
 
-        # 3. Normalize matching jax_eval_multi.py logic
-        # network receives: (MAX_LIDAR_DIST - raw_lidar) / (MAX_LIDAR_DIST - ROBOT_RADIUS)
-        normalized_scan = (MAX_LIDAR_DIST - resampled) / (MAX_LIDAR_DIST - ROBOT_RADIUS)
-        self.latest_scan_normalized = np.clip(normalized_scan, 0.0, 1.0).astype(np.float32)
-        
-        self.first_scan_received = True
-
-    def _get_base_obs(self):
-        """
-        Constructs a dummy EnvState with real robot variables, calls the training
-        get_obs function to guarantee exact math parity for pose and state_vec.
-        """
-        # Create a dummy array for 12 humans (all set to -1.0 sentinel to mask them out)
-        dummy_people = jnp.zeros((12, 11))
-        dummy_people = dummy_people.at[:, 10].set(-1.0) 
-
-        dummy_state = EnvState(
-            x=self.x, 
-            y=self.y, 
-            theta=self.theta, 
-            v=self.last_v, 
-            w=self.last_w,
-            goal_x=self.goal_x, 
-            goal_y=self.goal_y, 
-            max_v=MAX_LIN_VEL,
-            people=dummy_people,
-            obs_circles=jnp.zeros((6, 3)),
-            obs_boxes=jnp.zeros((6, 4)),
-            time_step=0,
-            foot_state=jnp.zeros((12, 10)),
-            time_stopped=0,
-            sp_mask=jnp.zeros(NUM_RAYS, dtype=jnp.bool_)
+        # Simulation target angles: _SIM_RAY_OFFSETS are robot-relative offsets.
+        # At theta=0 these are absolute world angles → we sample the real scan
+        # at these same robot-relative angles.
+        # np.interp with period=2π handles the circular wraparound correctly
+        # regardless of where angle_min/angle_max fall.
+        downsampled = np.interp(
+            _SIM_RAY_OFFSETS,   # target: sim ray angles (robot frame, θ=0)
+            real_angles,        # xp: real sensor angles (robot frame)
+            cleaned,            # fp: measured distances
+            period=2.0 * math.pi,
         )
 
-        self.rng, obs_key = jax.random.split(self.rng)
-        
-        # We only care about base_obs; we ignore the returned mask
-        base_obs, _ = get_obs(dummy_state, obs_key)
-        return np.array(base_obs)
+        # Invert + normalise: 0 = max_dist (free), 1 = robot surface (obstacle)
+        inv_lidar = (MAX_LIDAR_DIST - downsampled) / (MAX_LIDAR_DIST - ROBOT_RADIUS)
+        self.latest_scan_normalized = np.clip(inv_lidar, 0.0, 1.0).astype(np.float32)
+        self.first_scan_received = True
 
-    def get_stacked_obs(self):
-        """Builds the flattened observation vector with temporal stacks."""
-        base_obs = self._get_base_obs()
-        
-        # Extract features (ignoring the simulated LiDAR at the end of base_obs)
-        current_pose = base_obs[0:POSE_SIZE]
-        current_state_vec = base_obs[POSE_SIZE : POSE_SIZE + STATE_VEC_SIZE]
-        
-        # First step initialization
+    # ── Observation builder ───────────────────────────────────────────────────
+
+    def get_stacked_obs(self) -> jnp.ndarray:
+        """
+        Builds the 662-dim stacked observation, identical to:
+          jax_env.get_obs()  +  jax_wrappers.make_stacked_env.step_stacked()
+
+        Layout: [pose_stack(9) | state_vec(5) | lidar_stack(648)]
+        """
+        dx = self.goal_x - self.x
+        dy = self.goal_y - self.y
+
+        # Ego-frame goal projection — identical to jax_env.get_obs()
+        cos_t   = math.cos(-self.theta)
+        sin_t   = math.sin(-self.theta)
+        gdx_ego = dx * cos_t - dy * sin_t
+        gdy_ego = dx * sin_t + dy * cos_t
+
+        goal_dist  = math.hypot(dx, dy)
+        goal_angle = math.atan2(dy, dx)
+        goal_align = (goal_angle - self.theta + math.pi) % (2.0 * math.pi) - math.pi
+
+        # pose_vec: [gdx_ego/D, gdy_ego/D, theta/π]
+        current_pose = np.array([
+            gdx_ego / MAX_GOAL_DIST,
+            gdy_ego / MAX_GOAL_DIST,
+            self.theta / math.pi,
+        ], dtype=np.float32)
+
+        # FIX 2: state_vec uses DEPLOY_MAX_V consistently for indices 0 and 2
+        # state_vec: [v/max_v, w, (max_v-0.2)/1.8, goal_dist/D, goal_align/π]
+        current_state_vec = np.array([
+            self.last_v / max(DEPLOY_MAX_V, 1e-3),
+            self.last_w,
+            (DEPLOY_MAX_V - 0.2) / 1.8,
+            goal_dist / MAX_GOAL_DIST,
+            goal_align / math.pi,
+        ], dtype=np.float32)
+
+        # Cold-start: tile current frame (identical to reset_stacked tile)
         if len(self.pose_stack) == 0:
             for _ in range(STACK_DIM):
-                self.pose_stack.append(current_pose)
-                self.lidar_stack.append(self.latest_scan_normalized)
+                self.pose_stack.append(current_pose.copy())
+                self.lidar_stack.append(self.latest_scan_normalized.copy())
         else:
             self.pose_stack.append(current_pose)
             self.lidar_stack.append(self.latest_scan_normalized)
 
-        # Flatten stacks: oldest to newest
-        pose_stack_flat = np.concatenate(list(self.pose_stack), axis=0)
-        lidar_stack_flat = np.concatenate(list(self.lidar_stack), axis=0)
+        pose_stack_flat  = np.concatenate(list(self.pose_stack))   # (9,)
+        lidar_stack_flat = np.concatenate(list(self.lidar_stack))  # (648,)
 
-        # Final concatenation: [pose_stack(9) | state_vec(9) | lidar_stack(324)]
         obs_flat = np.concatenate([
-            pose_stack_flat, 
-            current_state_vec, 
-            lidar_stack_flat
-        ]).astype(np.float32)
-        
-        return jnp.array(obs_flat[None, :]) # Shape (1, 662)
+            pose_stack_flat,    # 9
+            current_state_vec,  # 5
+            lidar_stack_flat,   # 648
+        ]).astype(np.float32)   # total: 662
+
+        return jnp.array(obs_flat[None, :])  # (1, 662)
+
+    # ── Control loop ─────────────────────────────────────────────────────────
 
     def control_loop(self):
-        # Wait for sensors
         if not self.first_scan_received or not self.first_odom_received:
             return
 
-        # --- PATROL LOGIC ---
         dist_to_goal = math.hypot(self.goal_x - self.x, self.goal_y - self.y)
-        
+
+        # ── Waypoint switch ───────────────────────────────────────────────
         if dist_to_goal < GOAL_THRESHOLD:
-            self.get_logger().info(f"🏆 Checkpoint {self.current_target_name} reached! Reversing route.")
-            
+            self.get_logger().info(
+                f"Waypoint {self.current_target_name} reached! Switching target."
+            )
             if self.current_target_name == "A":
                 self.goal_x, self.goal_y = WAYPOINT_B
                 self.current_target_name = "B"
             else:
                 self.goal_x, self.goal_y = WAYPOINT_A
                 self.current_target_name = "A"
-            return # Pause for 1 tick to update state cleanly
+            self.last_v = 0.0
+            self.last_w = 0.0
+            # Reset stacks so the new episode starts clean (mirrors env reset)
+            self.pose_stack.clear()
+            self.lidar_stack.clear()
+            return
 
-        # --- INFERENCE ---
+        # ── NN Inference ──────────────────────────────────────────────────
         try:
-            # 1. Build observation vector
             stacked_obs = self.get_stacked_obs()
-            
-            # 2. JIT compiled forward pass + action scaling
-            env_action = self.fast_inference(self.params, stacked_obs)
-            
-            # 3. Extract actions
-            v = float(env_action[0])
-            w = float(env_action[1])
+            env_action  = self.fast_inference(self.params, stacked_obs)
 
-            # --- PUBLISH COMMAND ---
+            v = float(np.array(env_action[0]))
+            w = float(np.array(env_action[1]))
+
             cmd = Twist()
-            cmd.linear.x = v
+            cmd.linear.x  = v
             cmd.angular.z = w
             self.cmd_vel_pub.publish(cmd)
-            
-            # Update state for next step
+
             self.last_v = v
             self.last_w = w
-            
-            # Sporadic logging
             self.step_counter += 1
-            if self.step_counter % 20 == 0: # Every 2 seconds
-                self.get_logger().info(f"To {self.current_target_name} | Dist: {dist_to_goal:.2f}m | V: {v:.2f} | W: {w:.2f}")
+
+            if self.step_counter % 20 == 0:
+                self.get_logger().info(
+                    f"→ {self.current_target_name} | dist: {dist_to_goal:.2f} m | "
+                    f"v: {v:.2f} m/s | w: {w:.2f} rad/s"
+                )
 
         except Exception as e:
-            self.get_logger().error(f"Error in control loop: {e}")
+            self.get_logger().error(f"Control loop error: {e}")
+            self._publish_stop()
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _publish_stop(self):
+        self.cmd_vel_pub.publish(Twist())
+
+    def destroy_node(self):
+        """FIX 3: always stop the robot before ROS2 tears down the node."""
+        self.get_logger().info("Stopping robot (destroy_node).")
+        self._publish_stop()
+        super().destroy_node()
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main(args=None):
     rclpy.init(args=args)
     node = PatrolNodeJAX()
-    
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        # Emergency stop
-        stop = Twist()
-        node.cmd_vel_pub.publish(stop)
-        node.get_logger().info("🛑 Manual stop triggered.")
+        # FIX 3: reuse existing publisher (guaranteed to flush before shutdown)
+        node.get_logger().info("KeyboardInterrupt — stopping robot.")
+        node._publish_stop()
     finally:
         node.destroy_node()
         rclpy.shutdown()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
