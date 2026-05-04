@@ -34,7 +34,8 @@ POSE_SIZE      = 3
 STATE_VEC_SIZE = 5
 MAX_GOAL_DIST  = math.hypot(12.0, 12.0)
 
-WAYPOINT_A = (5.0, 0.0)
+# Patrol waypoints in odom frame (metres). Origin = robot start position.
+WAYPOINT_A = (6.0, 0.0)
 WAYPOINT_B = (0.0, 0.0)
 
 TRAINING_DT    = 0.1
@@ -126,12 +127,11 @@ class PatrolNodeJAX(Node):
         n_real = len(cleaned)
         real_angles = np.linspace(msg.angle_min, msg.angle_max, n_real)
 
-        real_angles = (real_angles - msg.angle_min) - (math.pi / 2.0)
-
-        if msg.angle_max < msg.angle_min:
-            real_angles = real_angles[::-1]
-            cleaned = cleaned[::-1]
-
+        # Simulation target angles: _SIM_RAY_OFFSETS are robot-relative offsets.
+        # At theta=0 these are absolute world angles → we sample the real scan
+        # at these same robot-relative angles.
+        # np.interp with period=2π handles the circular wraparound correctly
+        # regardless of where angle_min/angle_max fall.
         downsampled = np.interp(
             _SIM_RAY_OFFSETS,
             real_angles,
