@@ -19,28 +19,36 @@ except ImportError as e:
     raise ImportError(f"Missing JAX modules: {e}. Ensure jax_network.py is available.")
 
 
-# Constants
+# ── Constants (must match jax_env.py / config.py) ─────────────────────────────
 ROBOT_RADIUS   = 0.17
 NUM_RAYS       = 216
 MAX_LIDAR_DIST = 12.0
-FOV            = 2.0 * math.pi
+FOV            = 2.0 * math.pi          # full 360° — same as jax_env.py
 
 MODEL_PATH     = "checkpoints/ppo_attn_final.msgpack"
 
+# FIX 2: use a single DEPLOY_MAX_V that encodes the curriculum stage correctly.
+# Set this to the max_v value you want the robot to target at deploy time.
+# 0.46 m/s = TB4 safe indoor speed; change to e.g. 1.2 if the checkpoint was
+# trained at higher speeds and you want more aggressive navigation.
 DEPLOY_MAX_V   = 0.46
 
 STACK_DIM      = 3
 POSE_SIZE      = 3
 STATE_VEC_SIZE = 5
-MAX_GOAL_DIST  = math.hypot(12.0, 12.0)
+MAX_GOAL_DIST  = math.hypot(12.0, 12.0)   # diagonal of 12×12 m room
 
 # Patrol waypoints in odom frame (metres). Origin = robot start position.
 WAYPOINT_A = (6.0, 0.0)
 WAYPOINT_B = (0.0, 0.0)
 
-TRAINING_DT    = 0.1
-GOAL_THRESHOLD = 0.3
+TRAINING_DT    = 0.1    # control loop period — must match RobotConfig.DT
+GOAL_THRESHOLD = 0.3    # metres — same as GOAL_RADIUS in jax_env.py
 
+# ── Sim LiDAR angle grid (matches compute_lidar in jax_physics.py) ────────────
+# angles = theta - FOV/2 + arange(NUM_RAYS) * (FOV / (NUM_RAYS - 1))
+# At theta=0: ray 0 → -π (LEFT), ray 108 → 0 (FORWARD), ray 215 → +π (LEFT again)
+# We store the offset from theta=0, i.e. the per-ray angular offsets.
 _SIM_RAY_OFFSETS = -FOV * 0.5 + np.arange(NUM_RAYS) * (FOV / (NUM_RAYS - 1))
 
 
@@ -48,24 +56,29 @@ class PatrolNodeJAX(Node):
     def __init__(self):
         super().__init__("patrol_node_jax")
 
+        # ── Robot state ───────────────────────────────────────────────────────
         self.x     = 0.0
         self.y     = 0.0
         self.theta = 0.0
         self.last_v = 0.0
         self.last_w = 0.0
 
+        # ── Observation stacks ────────────────────────────────────────────────
         self.lidar_stack = deque(maxlen=STACK_DIM)
         self.pose_stack  = deque(maxlen=STACK_DIM)
         self.latest_scan_normalized = np.zeros(NUM_RAYS, dtype=np.float32)
 
+        # ── Patrol state ──────────────────────────────────────────────────────
         self.current_target_name = "A"
         self.goal_x = WAYPOINT_A[0]
         self.goal_y = WAYPOINT_A[1]
         self.step_counter = 0
 
+        # ── Sensor ready flags ────────────────────────────────────────────────
         self.first_scan_received = False
         self.first_odom_received = False
 
+        # ── JAX network setup ─────────────────────────────────────────────────
         self.get_logger().info(f"Loading JAX model from {MODEL_PATH}")
         self.rng = jax.random.PRNGKey(0)
 
@@ -85,12 +98,14 @@ class PatrolNodeJAX(Node):
             self.get_logger().error(f"Failed to load model: {e}")
             sys.exit(1)
 
+        # JIT-compile inference (runs once on first call, then cached)
         @jax.jit
         def _fast_inference(p, o):
             mean, _, _ = self.network.apply({"params": p}, o)
             return scale_action_to_env(jnp.squeeze(mean, axis=0), DEPLOY_MAX_V)
         self.fast_inference = _fast_inference
 
+        # ── ROS2 subscriptions & publishers ───────────────────────────────────
         qos = QoSProfile(
             depth=1,
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -107,6 +122,8 @@ class PatrolNodeJAX(Node):
             f"max_v: {DEPLOY_MAX_V} m/s"
         )
 
+    # ── Callbacks ─────────────────────────────────────────────────────────────
+
     def odom_callback(self, msg):
         self.first_odom_received = True
         self.x = msg.pose.pose.position.x
@@ -119,11 +136,15 @@ class PatrolNodeJAX(Node):
     def scan_callback(self, msg):
         raw = np.array(msg.ranges, dtype=np.float32)
 
+        # ── Clean invalid readings ─────────────────────────────────────────
         cleaned = np.where(np.isfinite(raw), raw, MAX_LIDAR_DIST)
         #cleaned = np.where(cleaned < 0.12,   MAX_LIDAR_DIST, cleaned)
         cleaned = np.where(cleaned < 0.16, MAX_LIDAR_DIST, cleaned)
         cleaned = np.clip(cleaned, 0.0, MAX_LIDAR_DIST)
 
+        # ── FIX 1: angle-aware resampling to match sim ray convention ─────
+        # Real sensor angles (world-frame offsets from robot heading = 0).
+        # ROS REP-103: angle_min = right side (negative), increases CCW.
         n_real = len(cleaned)
         real_angles = np.linspace(msg.angle_min, msg.angle_max, n_real)
 
@@ -162,6 +183,8 @@ class PatrolNodeJAX(Node):
             self.theta / math.pi,
         ], dtype=np.float32)
 
+        # FIX 2: state_vec uses DEPLOY_MAX_V consistently for indices 0 and 2
+        # state_vec: [v/max_v, w, (max_v-0.2)/1.8, goal_dist/D, goal_align/π]
         current_state_vec = np.array([
             self.last_v / max(DEPLOY_MAX_V, 1e-3),
             self.last_w,
@@ -170,6 +193,7 @@ class PatrolNodeJAX(Node):
             goal_align / math.pi,
         ], dtype=np.float32)
 
+        # Cold-start: tile current frame (identical to reset_stacked tile)
         if len(self.pose_stack) == 0:
             for _ in range(STACK_DIM):
                 self.pose_stack.append(current_pose.copy())
@@ -178,16 +202,18 @@ class PatrolNodeJAX(Node):
             self.pose_stack.append(current_pose)
             self.lidar_stack.append(self.latest_scan_normalized)
 
-        pose_stack_flat  = np.concatenate(list(self.pose_stack))
-        lidar_stack_flat = np.concatenate(list(self.lidar_stack))
+        pose_stack_flat  = np.concatenate(list(self.pose_stack))   # (9,)
+        lidar_stack_flat = np.concatenate(list(self.lidar_stack))  # (648,)
 
         obs_flat = np.concatenate([
-            pose_stack_flat,
-            current_state_vec,
-            lidar_stack_flat,
-        ]).astype(np.float32)
+            pose_stack_flat,    # 9
+            current_state_vec,  # 5
+            lidar_stack_flat,   # 648
+        ]).astype(np.float32)   # total: 662
 
-        return jnp.array(obs_flat[None, :])
+        return jnp.array(obs_flat[None, :])  # (1, 662)
+
+    # ── Control loop ─────────────────────────────────────────────────────────
 
     def control_loop(self):
         if not self.first_scan_received or not self.first_odom_received:
@@ -195,6 +221,7 @@ class PatrolNodeJAX(Node):
 
         dist_to_goal = math.hypot(self.goal_x - self.x, self.goal_y - self.y)
 
+        # ── Waypoint switch ───────────────────────────────────────────────
         if dist_to_goal < GOAL_THRESHOLD:
             self.get_logger().info(
                 f"Waypoint {self.current_target_name} reached! Switching target."
@@ -207,10 +234,12 @@ class PatrolNodeJAX(Node):
                 self.current_target_name = "A"
             self.last_v = 0.0
             self.last_w = 0.0
+            # Reset stacks so the new episode starts clean (mirrors env reset)
             self.pose_stack.clear()
             self.lidar_stack.clear()
             return
 
+        # ── NN Inference ──────────────────────────────────────────────────
         try:
             stacked_obs = self.get_stacked_obs()
             env_action  = self.fast_inference(self.params, stacked_obs)
@@ -237,14 +266,19 @@ class PatrolNodeJAX(Node):
             self.get_logger().error(f"Control loop error: {e}")
             self._publish_stop()
 
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
     def _publish_stop(self):
         self.cmd_vel_pub.publish(Twist())
 
     def destroy_node(self):
+        """FIX 3: always stop the robot before ROS2 tears down the node."""
         self.get_logger().info("Stopping robot (destroy_node).")
         self._publish_stop()
         super().destroy_node()
 
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main(args=None):
     rclpy.init(args=args)
@@ -253,6 +287,7 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
+        # FIX 3: reuse existing publisher (guaranteed to flush before shutdown)
         node.get_logger().info("KeyboardInterrupt — stopping robot.")
         node._publish_stop()
     finally:
