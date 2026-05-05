@@ -126,7 +126,7 @@ def main():
     if len(df_success) > 0:
         sns.kdeplot(
             data=df_success, x="min_dist", hue="v_max",
-            palette="viridis", fill=False, common_norm=False, ax=ax,
+            palette="viridis", fill=False, common_norm=True, ax=ax,
             linewidth=2, clip=(0.0, None)
         )
     ax.set_title("Minimum Shoe Distance Distribution", fontsize=13, fontweight='bold')

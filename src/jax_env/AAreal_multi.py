@@ -1,5 +1,5 @@
 """
-AAreal_tb4.py — ROS2 node for running the JAX-trained policy on a real TurtleBot4
+AAreal_multi.py — ROS2 node for running the JAX-trained policy on a real TurtleBot4
 """
 
 import math
@@ -35,16 +35,20 @@ STACK_DIM      = 3
 POSE_SIZE      = 3
 STATE_VEC_SIZE = 5
 MAX_GOAL_DIST  = math.hypot(12.0, 12.0)
+MODEL_PATH = "checkpoints/ppo_attn_final.msgpack"
 
-WAYPOINT_A = (50, 0.0)
-WAYPOINT_B = (3.6, -4.0)
-#WAYPOINT_B = (0.0, 0.0)
+# List of waypoints to visit sequentially in odom frame (metres).
+WAYPOINTS = [
+    (8.0, 0.0),
+    (8.0, -8.0),
+    (30.0, 0.0),
+    (20.5, -20.0)
+]
 
 TRAINING_DT    = 0.1
 GOAL_THRESHOLD = 0.3
 
 _SIM_RAY_OFFSETS = -FOV * 0.5 + np.arange(NUM_RAYS) * (FOV / (NUM_RAYS - 1))
-MODEL_PATH = "checkpoints/ppo_attn_final.msgpack"
 
 
 class PatrolNodeJAX(Node):
@@ -64,10 +68,11 @@ class PatrolNodeJAX(Node):
         self.latest_scan_normalized = np.zeros(NUM_RAYS, dtype=np.float32)
 
         # ── Patrol state ──────────────────────────────────────────────────────
-        self.current_target_name = "A"
-        self.goal_x = WAYPOINT_A[0]
-        self.goal_y = WAYPOINT_A[1]
+        self.current_wp_index = 0
+        self.goal_x = WAYPOINTS[0][0]
+        self.goal_y = WAYPOINTS[0][1]
         self.step_counter = 0
+        self.mission_completed = False
 
         # ── Sensor ready flags ────────────────────────────────────────────────
         self.first_scan_received = False
@@ -112,7 +117,7 @@ class PatrolNodeJAX(Node):
         self.create_timer(TRAINING_DT, self.control_loop)
 
         self.get_logger().info(
-            f"Patrol ACTIVE | target: {self.current_target_name} | "
+            f"Patrol ACTIVE | target: WP {self.current_wp_index} | "
             f"max_v: {DEPLOY_MAX_V} m/s"
         )
 
@@ -139,7 +144,6 @@ class PatrolNodeJAX(Node):
         real_angles = np.linspace(msg.angle_min, msg.angle_max, n_real)
 
         # Align LiDAR frame with base_link.
-        # Since the first ray is physically on the right, true angle is -90 degrees (-pi/2).
         real_angles = (real_angles - msg.angle_min) - (math.pi / 2.0)
 
         # np.interp strictly requires increasing x-coordinates. Reverse if decreasing.
@@ -207,21 +211,30 @@ class PatrolNodeJAX(Node):
     # ── Control loop ─────────────────────────────────────────────────────────
 
     def control_loop(self):
+        if self.mission_completed:
+            return
+
         if not self.first_scan_received or not self.first_odom_received:
             return
 
         dist_to_goal = math.hypot(self.goal_x - self.x, self.goal_y - self.y)
 
         if dist_to_goal < GOAL_THRESHOLD:
+            self.get_logger().info(f"Waypoint {self.current_wp_index} reached!")
+            self.current_wp_index += 1
+
+            if self.current_wp_index >= len(WAYPOINTS):
+                self.get_logger().info("All waypoints reached. Mission completed!")
+                self._publish_stop()
+                self.mission_completed = True
+                return
+
+            self.goal_x = WAYPOINTS[self.current_wp_index][0]
+            self.goal_y = WAYPOINTS[self.current_wp_index][1]
             self.get_logger().info(
-                f"Waypoint {self.current_target_name} reached! Switching target."
+                f"Switching target to WP {self.current_wp_index}: ({self.goal_x}, {self.goal_y})"
             )
-            if self.current_target_name == "A":
-                self.goal_x, self.goal_y = WAYPOINT_B
-                self.current_target_name = "B"
-            else:
-                self.goal_x, self.goal_y = WAYPOINT_A
-                self.current_target_name = "A"
+
             self.last_v = 0.0
             self.last_w = 0.0
             self.pose_stack.clear()
@@ -246,7 +259,7 @@ class PatrolNodeJAX(Node):
 
             if self.step_counter % 20 == 0:
                 self.get_logger().info(
-                    f"→ {self.current_target_name} | dist: {dist_to_goal:.2f} m | "
+                    f"→ WP {self.current_wp_index} | dist: {dist_to_goal:.2f} m | "
                     f"v: {v:.2f} m/s | w: {w:.2f} rad/s"
                 )
 
