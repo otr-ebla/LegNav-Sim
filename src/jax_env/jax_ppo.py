@@ -358,8 +358,8 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     opt_state   = optimizer.init(params)
     train_state = (params, opt_state)
 
-    ckpt_path       = "checkpoints/ppo_circles_best.msgpack"
-    final_ckpt_path = "checkpoints/ppo_circles_final.msgpack"
+    ckpt_path       = "checkpoints/ppo_tanh_fix_best.msgpack"
+    final_ckpt_path = "checkpoints/ppo_tanh_fix_final.msgpack"
 
     # Curriculum state
     cur_max_dist, cur_ghost, cur_ent, cur_max_scen = get_continuous_curriculum(0.0)

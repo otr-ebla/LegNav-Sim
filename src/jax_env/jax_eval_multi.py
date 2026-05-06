@@ -339,7 +339,7 @@ def _build_mppi():
 # ── Default checkpoint paths ───────────────────────────────────────────────────
 
 _DEFAULT_CKPT = {
-    "ppo":  "checkpoints/ppo_attn_final.msgpack",
+    "ppo":  "checkpoints/ppo_tanh_fix_final.msgpack", #"checkpoints/ppo_attn_final.msgpack",
     "ppo_circles": "checkpoints/ppo_circles_best.msgpack",
     "shac": "checkpoints/shac_best.msgpack",
     "sac":  "checkpoints_sac/sac_best.msgpack",

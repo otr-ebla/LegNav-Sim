@@ -193,9 +193,19 @@ class EndToEndActorCritic(nn.Module):
         )
 
         # ── Actor head ────────────────────────────────────────────────────────
-        actor_mean = nn.Dense(
+
+
+        # actor_mean = nn.Dense(
+        #     self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
+        # )(shared)
+        raw_mean = nn.Dense(
             self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
         )(shared)
+
+        # Squash directly inside the network to learn physical constraints
+        v_mean = jnp.tanh(raw_mean[..., 0]) * 0.5 + 0.5
+        w_mean = jnp.tanh(raw_mean[..., 1])
+        actor_mean = jnp.stack([v_mean, w_mean], axis=-1)
 
         logstd_param     = self.param('log_std', constant(-1.0), (self.action_dim,)) # state independent learnable log std
         actor_logstd_raw = jnp.broadcast_to(logstd_param, actor_mean.shape)
@@ -251,15 +261,19 @@ def scale_action_to_env(raw_action: jnp.ndarray, max_v: float) -> jnp.ndarray:
     # FIX Bug#1: sigmoid ∈ (0,1) → mai raggiunge max_v.
     # tanh rescalato ∈ (-1,1) → (0,1) via *0.5+0.5, asintoticamente tende a 1.
     # In alternativa, clamp diretto: jnp.clip(raw_action[...,0], 0.0, 1.0)*max_v
-    v = (jnp.tanh(raw_action[..., 0]) * 0.5 + 0.5) * max_v
-    w = jnp.tanh(raw_action[..., 1])
+    # v = (jnp.tanh(raw_action[..., 0]) * 0.5 + 0.5) * max_v
+    # w = jnp.tanh(raw_action[..., 1])
+    v = jnp.clip(raw_action[..., 0], 0.0, 1.0) * max_v
+    w = jnp.clip(raw_action[..., 1], -1.0, 1.0)
     return jnp.stack([v, w], axis=-1)
 
 
 def scale_actions_batched(raw_actions: jnp.ndarray, max_v: jnp.ndarray) -> jnp.ndarray:
     # FIX Bug#1: stesso fix applicato alla versione batched.
-    v = (jnp.tanh(raw_actions[:, 0]) * 0.5 + 0.5) * max_v
-    w = jnp.tanh(raw_actions[:, 1])
+    # v = (jnp.tanh(raw_actions[:, 0]) * 0.5 + 0.5) * max_v
+    # w = jnp.tanh(raw_actions[:, 1])
+    v = jnp.clip(raw_actions[..., 0], 0.0, 1.0) * max_v
+    w = jnp.clip(raw_actions[..., 1], -1.0, 1.0)
     return jnp.stack([v, w], axis=-1)
 
 

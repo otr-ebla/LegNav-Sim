@@ -48,7 +48,7 @@ def load_checkpoint(filepath, model, dummy_obs):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt", type=str, default="checkpoints/ppo_circles_best.msgpack", help="Percorso del checkpoint")
+    parser.add_argument("--ckpt", type=str, default="checkpoints/ppo_tanh_fix_final.msgpack", help="Percorso del checkpoint")
     parser.add_argument("--episodes", type=int, default=5000, help="Numero target di episodi di test da raccogliere")
     parser.add_argument("--max_dist", type=float, default=20.0, help="Distanza massima del goal")
     parser.add_argument("--v_max_plot", type=float, default=1.5, help="v_max fisso per simulare lo squashing nel plot")
@@ -167,7 +167,7 @@ def main():
     axes[1, 1].grid(alpha=0.3)
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    out_file = "gpu_random_test_action_distributions.png"
+    out_file = "tanh_test_action_distributions.png"
     plt.savefig(out_file, dpi=200)
     print(f"🎉 Finito! Grafico salvato come: {out_file}")
 
