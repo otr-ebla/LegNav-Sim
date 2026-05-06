@@ -28,9 +28,49 @@ try:
 except RuntimeError:
     print("❌ ERRORE CRITICO: JAX non vede la GPU CUDA e sta ripiegando su CPU!")
 
+
+import functools
 from jax_network import EndToEndActorCritic
 from jax_train import init_env_state, collect_rollouts, NUM_ENVS, ROLLOUT_STEPS, OBS_SIZE
 from jax_scenarios import TEST_SCENARIO_NAMES
+
+@functools.partial(jax.jit, static_argnums=(2, 3))
+def deterministic_collect_rollouts(
+    rng_key, params, apply_fn, vmap_step, env_state, env_obs,
+    max_goal_dist, scenario_idx, ghost_prob, max_scenario,
+):
+    """Come collect_rollouts ma usa unicamente la media per la policy."""
+    def _env_step(carry, _):
+        current_state, current_obs, current_rng = carry
+        current_rng, step_rng = jax.random.split(current_rng, 2)
+
+        # Forward pass
+        mean, logstd, values = apply_fn({"params": params}, current_obs)
+        max_v = current_state.env_state.max_v
+        
+        # --- FIX: AZIONE DETERMINISTICA ---
+        # Prendiamo direttamente l'uscita della rete senza aggiungere rumore
+        raw_actions = mean 
+        env_actions = scale_actions_batched(raw_actions, max_v)
+
+        step_keys = jax.random.split(step_rng, NUM_ENVS)
+        next_obs, next_state, rewards, dones, infos = vmap_step(
+            step_keys, current_state, env_actions, max_goal_dist, 
+            scenario_idx, ghost_prob, max_scenario
+        )
+
+        transition = {
+            "obs": current_obs,
+            "actions": raw_actions,  # Salviamo la media esatta
+            "dones": dones,
+        }
+        return (next_state, next_obs, current_rng), transition
+
+    (new_state, new_obs, _), rollout_history = jax.lax.scan(
+        _env_step, (env_state, env_obs, rng_key), None, length=ROLLOUT_STEPS
+    )
+
+    return rollout_history, new_state, new_obs
 
 def load_checkpoint(filepath, model, dummy_obs):
     """Carica i parametri della rete."""
@@ -93,7 +133,7 @@ def main():
             t_chunk_start = time.time()
             
             # Esecuzione JIT su GPU
-            rollout_history, env_state, env_obs, _ = collect_rollouts(
+            rollout_history, env_state, env_obs = deterministic_collect_rollouts(
                 run_rng,
                 params,
                 network.apply,
