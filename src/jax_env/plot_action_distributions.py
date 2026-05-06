@@ -73,21 +73,23 @@ def main():
     t_start = time.time()
 
     # 2. Ciclo di raccolta veloce
-    while collected_dones < args.episodes:
-        scen_idx = int(np.random.choice(test_scenarios))
+    # 2. Ciclo di raccolta equo per tutti gli scenari
+    episodes_per_scenario = args.episodes // len(test_scenarios)
+    
+    for scen_idx in test_scenarios:
         scen_name = TEST_SCENARIO_NAMES.get(scen_idx, f"Sconosciuto ({scen_idx})")
+        scen_collected = 0
         
         rng, env_rng = jax.random.split(rng)
         
-        # Init vettorizzato direttamente su memoria GPU
+        # Inizializza 1024 ambienti paralleli per QUESTO specifico scenario
         env_obs, env_state, vmap_step = init_env_state(
             env_rng, max_goal_dist=args.max_dist, ghost_prob=0.0, scenario_idx=scen_idx
         )
         
-        # 4 chunk di rollouts (512 step totali) per garantire che l'episodio finisca (MAX_STEPS=400)
-        for _ in range(4):
+        # Continua a raccogliere finché non raggiungiamo la quota per questo scenario
+        while scen_collected < episodes_per_scenario:
             rng, run_rng = jax.random.split(rng)
-            
             t_chunk_start = time.time()
             
             # Esecuzione JIT su GPU
@@ -104,7 +106,6 @@ def main():
                 max_scenario=jnp.int32(12) 
             )
             
-            # Estrazione asincrona su CPU solo dei dati che ci servono
             raw_actions = np.array(rollout_history["actions"]) 
             dones = np.array(rollout_history["dones"])
             
@@ -112,13 +113,11 @@ def main():
             all_raw_w.append(raw_actions[..., 1].flatten())
             
             chunk_dones = int(dones.sum())
+            scen_collected += chunk_dones
             collected_dones += chunk_dones
             
             fps = (NUM_ENVS * ROLLOUT_STEPS) / (time.time() - t_chunk_start)
-            print(f"  ⚡ Scenario {scen_idx} | Raccolti {chunk_dones} ep | Tot: {collected_dones}/{args.episodes} | FPS: {fps:,.0f}")
-            
-            if collected_dones >= args.episodes:
-                break
+            print(f"  ⚡ {scen_name} ({scen_idx}) | Raccolti {chunk_dones} | Tot Scen: {scen_collected}/{episodes_per_scenario} | Tot Gen: {collected_dones}/{args.episodes}")
 
     tot_time = time.time() - t_start
     print(f"\n✅ Target raggiunto in {tot_time:.1f} secondi!")
@@ -127,8 +126,10 @@ def main():
     raw_v_total = np.concatenate(all_raw_v)
     raw_w_total = np.concatenate(all_raw_w)
     
-    squashed_v_total = (np.tanh(raw_v_total) * 0.5 + 0.5) * args.v_max_plot
-    squashed_w_total = np.tanh(raw_w_total)
+    #squashed_v_total = (np.tanh(raw_v_total) * 0.5 + 0.5) * args.v_max_plot
+    #squashed_w_total = np.tanh(raw_w_total)
+    squashed_v_total = np.clip(raw_v_total, 0.0, 1.0) * args.v_max_plot
+    squashed_w_total = np.clip(raw_w_total, -1.0, 1.0)
 
     print(f"📊 Generazione dei grafici con {len(raw_v_total):,} sample totali...")
     
