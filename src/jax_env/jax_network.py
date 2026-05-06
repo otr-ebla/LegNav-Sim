@@ -138,6 +138,7 @@ class EndToEndActorCritic(nn.Module):
     action_dim: int
     stack_dim:  int = 3
     num_rays:   int = 216
+    tanh_inside: bool = True
 
     @nn.compact
     def __call__(
@@ -202,10 +203,14 @@ class EndToEndActorCritic(nn.Module):
             self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
         )(shared)
 
-        # Squash directly inside the network to learn physical constraints
-        v_mean = jnp.tanh(raw_mean[..., 0]) * 0.5 + 0.5
-        w_mean = jnp.tanh(raw_mean[..., 1])
-        actor_mean = jnp.stack([v_mean, w_mean], axis=-1)
+        if self.tanh_inside:
+            # Variante 1 (Nuova): Squash dentro la rete
+            v_mean = jnp.tanh(raw_mean[..., 0]) * 0.5 + 0.5
+            w_mean = jnp.tanh(raw_mean[..., 1])
+            actor_mean = jnp.stack([v_mean, w_mean], axis=-1)
+        else:
+            # Variante 2 (Originale): Uscita lineare
+            actor_mean = raw_mean
 
         logstd_param     = self.param('log_std', constant(-1.0), (self.action_dim,)) # state independent learnable log std
         actor_logstd_raw = jnp.broadcast_to(logstd_param, actor_mean.shape)
