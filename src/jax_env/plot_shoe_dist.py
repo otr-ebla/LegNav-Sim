@@ -38,10 +38,10 @@ from paper_comparison_eval import (
 
 # 2. Hyper-Optimized Rollout
 @partial(jax.jit, static_argnums=(0, 1))
-def rollout_fixed_vmax(act_vmap, n_envs, rng_key, scenario_idx, v_max_val):
+def rollout_random_vmax(act_vmap, n_envs, rng_key, scenario_idx):
     rng_key, rng_v = jax.random.split(rng_key)
-    # Passed dynamically so we don't re-JIT per speed
-    v_max_batch = jnp.full((n_envs,), v_max_val, dtype=jnp.float32)
+    # It samples a random linear v_max for each environment in the batch, uniformly from 0.2 to 2.0 m/s.
+    v_max_batch = jax.random.uniform(rng_v, shape=(n_envs,), minval=0.2, maxval=2.0)
     
     reset_keys = jax.random.split(rng_key, n_envs)
     obs, state = jax.vmap(_reset_stacked, in_axes=(0, 0, None))(
@@ -80,7 +80,7 @@ def rollout_fixed_vmax(act_vmap, n_envs, rng_key, scenario_idx, v_max_val):
     ep_col = cols.any(axis=0)
     success = ep_goal & ~ep_col
 
-    return final_mhd, success, ep_col
+    return final_mhd, success, ep_col, v_max_batch
 
 def main():
     parser = argparse.ArgumentParser()
@@ -91,33 +91,31 @@ def main():
     print(f"Loading PPO checkpoint: {ckpt}")
     act_vmap = _build_ppo_act_vmap(ckpt)
 
-    v_max_list = [0.5, 1.0, 2.0]
     scenarios = [7, 8, 9, 10, 11, 12]
     rng = jax.random.PRNGKey(42)
     results = []
 
-    print("Evaluating PPO over testing scenarios...")
-    for v in v_max_list:
-        v_jax = jnp.float32(v)
-        for scen in scenarios:
-            print(f" -> v_max={v:^4} m/s | Scenario={scen:^2} | Envs={args.envs}")
-            rng, k = jax.random.split(rng)
-            mhd, success, collision = jax.device_get(
-                rollout_fixed_vmax(act_vmap, args.envs, k, jnp.int32(scen), v_jax)
-            )
+    print("Evaluating PPO over testing scenarios with Random v_max [0.2 - 2.0]...")
+    for scen in scenarios:
+        print(f" -> Scenario={scen:^2} | Envs={args.envs}")
+        rng, k = jax.random.split(rng)
+        
+        # Ora riceviamo 4 valori, incluso l'array delle velocità campionate
+        mhd, success, collision, sampled_vmax = jax.device_get(
+            rollout_random_vmax(act_vmap, args.envs, k, jnp.int32(scen))
+        )
 
-            for i in range(args.envs):
-                results.append({
-                    "v_max": v,
-                    "scenario": scen,
-                    "min_dist": float(mhd[i]),
-                    "success": bool(success[i]),
-                    "collision": bool(collision[i])
-                })
+        for i in range(args.envs):
+            results.append({
+                "v_max": float(sampled_vmax[i]), # Salviamo il valore esatto generato
+                "scenario": scen,
+                "min_dist": float(mhd[i]),
+                "success": bool(success[i]),
+                "collision": bool(collision[i])
+            })
 
     df = pd.DataFrame(results)
 
-    # 3. Plotting the reality
     # 3. Plotting the distribution
     sns.set_theme(style="whitegrid")
     fig, ax = plt.subplots(figsize=(8, 6))
@@ -125,47 +123,38 @@ def main():
     df_success = df[df["success"] == True]
     if len(df_success) > 0:
         sns.kdeplot(
-            data=df_success, x="min_dist", hue="v_max",
-            palette="viridis", fill=False, common_norm=False, ax=ax,
-            linewidth=2
+            data=df_success, x="min_dist",
+            color="dodgerblue", fill=True, alpha=0.3, ax=ax,
+            linewidth=2, clip=(0.0, None)
         )
-    ax.set_title("Minimum Shoe Distance Distribution", fontsize=13, fontweight='bold')
+    ax.set_xlim(left=0.0)
+    ax.set_title("Minimum Shoe Distance Distribution (Random v_max 0.2 - 2.0 m/s)", fontsize=13, fontweight='bold')
     ax.set_xlabel("Surface-to-Surface Distance (m)", fontsize=12)
     ax.set_ylabel("Density", fontsize=12)
 
-    # --- Find peaks and draw vertical lines with staggered labels ---
-    peaks = []
-    # Seaborn adds the KDE curves to ax.lines. We extract the raw x,y data from them.
-    for line in ax.lines:
-        x_data = line.get_xdata()
-        y_data = line.get_ydata()
-        if len(x_data) > 0:
-            max_idx = np.argmax(y_data)
-            peaks.append((x_data[max_idx], y_data[max_idx], line.get_color()))
-
-    # Sort peaks left-to-right to reliably stagger the text
-    peaks.sort(key=lambda p: p[0])
-
-    y_min, y_max_axis = ax.get_ylim()
-    
-    for i, (x_max, y_max, color) in enumerate(peaks):
-        # Draw the vertical dashed line from the peak to the x-axis
-        ax.vlines(x=x_max, ymin=0, ymax=y_max, color=color, linestyle='--', linewidth=1.5, alpha=0.8)
-
-        # Stagger text heights to prevent overlap (pushes labels down in a staircase)
-        offset_multiplier = i + 1 
-        y_text = 0 - (offset_multiplier * 0.05 * y_max_axis)
-
-        # Annotate with a small connector line pointing to the exact x-axis location
+    # --- Calculate MEAN and draw vertical line ---
+    if len(df_success) > 0:
+        mean_x = df_success["min_dist"].mean()
+        color = "dodgerblue" # Colore fisso per coerenza con l'area
+        
+        y_min, y_max_axis = ax.get_ylim()
+        
+        # axvline disegna la linea da cima a fondo ignorando la geometria della curva
+        ax.axvline(x=mean_x, color=color, linestyle='--', linewidth=2.5, alpha=0.9)
+        
+        # Annota il valore della media appena sotto l'asse X
+        y_text = 0 - (0.05 * y_max_axis)
         ax.annotate(
-            f"{x_max:.2f}m",
-            xy=(x_max, 0),
-            xytext=(x_max, y_text),
+            f"Mean: {mean_x:.2f}m",
+            xy=(mean_x, 0),
+            xytext=(mean_x, y_text),
             color=color,
             ha="center", va="top",
             fontweight="bold",
+            fontsize=11,
             arrowprops=dict(arrowstyle="-", color=color, alpha=0.5, shrinkA=0, shrinkB=0)
         )
+    # ----------------------------------------------------------------
     # ----------------------------------------------------------------
 
     plt.tight_layout()

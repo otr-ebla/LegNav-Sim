@@ -174,7 +174,7 @@ def main():
     print(f"📊 Generazione dei grafici con {len(raw_v_total):,} sample totali...")
     
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle(f"Test Scenarios Action Distributions - {args.ckpt.split('/')[-1]}\n({collected_dones} Episodi Casuali)", fontsize=16)
+    fig.suptitle(f"Test Scenarios Action Distributions - {args.ckpt.split('/')[-1]}", fontsize=16)
 
     bins = 150
     alpha = 0.75
