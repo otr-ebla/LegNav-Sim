@@ -30,7 +30,7 @@ except RuntimeError:
 
 
 import functools
-from jax_network import EndToEndActorCritic
+from jax_network import EndToEndActorCritic, scale_actions_batched
 from jax_train import init_env_state, collect_rollouts, NUM_ENVS, ROLLOUT_STEPS, OBS_SIZE
 from jax_scenarios import TEST_SCENARIO_NAMES
 
