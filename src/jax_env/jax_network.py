@@ -138,7 +138,7 @@ class EndToEndActorCritic(nn.Module):
     action_dim: int
     stack_dim:  int = 3
     num_rays:   int = 216
-    tanh_inside: bool = True
+    tanh_inside: bool = False
 
     @nn.compact
     def __call__(

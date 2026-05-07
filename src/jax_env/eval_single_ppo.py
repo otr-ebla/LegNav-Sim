@@ -241,8 +241,11 @@ def main():
     # Pre-compute monolithic array of scenarios per env
     scen_batch = jnp.repeat(jnp.array(TEST_SCENARIOS, dtype=jnp.int32), N_ENVS)
 
+    # Estrae il nome del modello dal percorso (es. da "checkpoints/ppo_attn_final.msgpack" prende "ppo_attn_final")
+    model_name = os.path.splitext(os.path.basename(args.ckpt))[0]
+
     print(f"\n{'='*75}")
-    print(f"🚀 PPO Tanh-Fix Evaluation")
+    print(f"🚀 Evaluation: {model_name.upper()}")
     print(f"   Checkpoint : {args.ckpt}")
     print(f"   Scenarios  : {TEST_SCENARIOS}")
     print(f"   Envs/Scen  : {N_ENVS}")
@@ -256,7 +259,9 @@ def main():
     act_fn = _build_ppo_act_vmap(args.ckpt, args.tanh_outside)
 
     # 2. Run Rollout
-    rng, k = jax.random.split(rng)
+    for _ in range(6):
+        rng, k = jax.random.split(rng)
+        
     print(f"⚡ Esecuzione Rollout VMAP massivo su GPU (attendi JIT...)")
     raw_s = jax.device_get(jax.block_until_ready(_rollout_stateless(act_fn, tot_envs, k, scen_batch)))
     
@@ -288,7 +293,7 @@ def main():
     print(df_final[cols_to_print].to_string(index=False, float_format="%.2f"))
     print("="*105)
 
-    out_file = "ppo_tanh_fix_eval.csv"
+    out_file = f"{model_name}_eval.csv"
     df_final.to_csv(out_file, index=False, float_format="%.3f")
     print(f"\n📁 Risultati dettagliati salvati in: {out_file}")
 

@@ -380,11 +380,13 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
 
     best_suc = 55.0  # NEVER TOUCH THIS LINE
 
-    _LOG_PATH = "checkpoints/ppo_training_log.csv"
+    # CHANGE THIS NAME FOR YOUR SECOND RUN (e.g., "ppo_tanh_outside_log.csv")
+    _LOG_PATH = "checkpoints/ppo_tanh_outside_log.csv" 
     os.makedirs("checkpoints", exist_ok=True)
     _log_file = open(_LOG_PATH, "w", newline="")
     _log_writer = csv.writer(_log_file)
-    _log_writer.writerow(["step", "mean_ep_reward", "suc_pct", "acol_pct", "pcol_pct", "tmo_pct"])
+    # Added sigma_v and sigma_w to the tracked metrics
+    _log_writer.writerow(["step", "mean_ep_reward", "suc_pct", "acol_pct", "pcol_pct", "tmo_pct", "sigma_v", "sigma_w"])
 
     hdr = (f"{'Upd':>5} | {'EpRet':>7} | {'Suc%':>5} {'Obs%':>5} {'Acol%':>5} {'Pcol%':>5} {'Tmo%':>5} |"
            f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} {'KL':>6} {'ClpF':>5} | {'FPS':>7} {'#Ep':>6} {'LR':>8} | "
@@ -508,9 +510,15 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
                 )
 
             if n_ep > 0:
+                # Extract the current sigma at this specific update step
+                dummy_obs_for_log = jnp.zeros((1, OBS_SIZE))
+                _, curr_logstd, _ = network.apply({"params": train_state[0]}, dummy_obs_for_log)
+                curr_sigma = jax.device_get(jnp.exp(curr_logstd[0]))
+
                 _log_writer.writerow([update * BATCH_SIZE, round(mean_ret, 4),
                                        round(suc_pct, 2), round(acol_pct, 2),
-                                       round(pcol_pct, 2), round(tmo_pct, 2)])
+                                       round(pcol_pct, 2), round(tmo_pct, 2),
+                                       round(float(curr_sigma[0]), 5), round(float(curr_sigma[1]), 5)])
                 _log_file.flush()
 
             # Only save when curriculum is past the trivial phase (≥2 scenarios, goal ≥5m).
@@ -527,6 +535,20 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     print(f"\nDone! {elapsed/3600:.2f}h | Best success: {best_suc:.1f}%")
     save_checkpoint(train_state[0], train_state[1], final_ckpt_path)
 
+    # --- ADDITION: Extraction and printing of the estimated Sigma ---
+    # Pass a dummy observation to make the network compute the exact logstd
+    dummy_obs = jnp.zeros((1, OBS_SIZE))
+    _, final_logstd, _ = network.apply({"params": train_state[0]}, dummy_obs)
+    
+    # Calculate the standard deviation: sigma = exp(logstd)
+    final_sigma = jax.device_get(jnp.exp(final_logstd[0]))
+    
+    print("\n" + "="*55)
+    print(" 🔍 FINAL EXPLORATORY NOISE (SIGMA) ANALYSIS ")
+    print("="*55)
+    print(f" Linear Velocity Sigma (v)  : {final_sigma[0]:.5f}")
+    print(f" Angular Velocity Sigma (w) : {final_sigma[1]:.5f}")
+    print("="*55 + "\n")
 
 if __name__ == "__main__":
     train()
