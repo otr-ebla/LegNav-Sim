@@ -13,6 +13,7 @@ import numpy as np
 LOG_STD_MIN = -4.0
 LOG_STD_MAX =  0.0
 
+USE_TANH_INSIDE = False
 _STATE_VEC_SIZE = 5
 ATTN_HEADS      = 4    # numero di teste attention sul frame stack
 ATTN_HEAD_DIM   = 16   # dim per head → QKV dim = ATTN_HEADS * ATTN_HEAD_DIM = 64
@@ -138,7 +139,7 @@ class EndToEndActorCritic(nn.Module):
     action_dim: int
     stack_dim:  int = 3
     num_rays:   int = 216
-    tanh_inside: bool = False
+    tanh_inside: bool = USE_TANH_INSIDE
 
     @nn.compact
     def __call__(
@@ -249,7 +250,12 @@ def squash_corrected_log_prob(
     std = jnp.exp(logstd)
     z   = (raw_actions - mean) / (std + 1e-8)
     base_log_prob = jnp.sum(-0.5 * (z ** 2 + jnp.log(2.0 * jnp.pi)) - logstd, axis=-1)
-    return base_log_prob  # Removed _squash_log_jacobian for PPO stability
+    
+    if USE_TANH_INSIDE:
+        return base_log_prob  # Tanh is inside, noise is added outside, no jacobian needed.
+    else:
+        # Tanh is outside, applied AFTER noise. Must correct the log probability!
+        return base_log_prob - _squash_log_jacobian(raw_actions, max_v)
 
 
 def sample_action(
@@ -263,22 +269,22 @@ def sample_action(
 
 
 def scale_action_to_env(raw_action: jnp.ndarray, max_v: float) -> jnp.ndarray:
-    # FIX Bug#1: sigmoid ∈ (0,1) → mai raggiunge max_v.
-    # tanh rescalato ∈ (-1,1) → (0,1) via *0.5+0.5, asintoticamente tende a 1.
-    # In alternativa, clamp diretto: jnp.clip(raw_action[...,0], 0.0, 1.0)*max_v
-    # v = (jnp.tanh(raw_action[..., 0]) * 0.5 + 0.5) * max_v
-    # w = jnp.tanh(raw_action[..., 1])
-    v = jnp.clip(raw_action[..., 0], 0.0, 1.0) * max_v
-    w = jnp.clip(raw_action[..., 1], -1.0, 1.0)
+    if USE_TANH_INSIDE:
+        v = jnp.clip(raw_action[..., 0], 0.0, 1.0) * max_v
+        w = jnp.clip(raw_action[..., 1], -1.0, 1.0)
+    else:
+        v = (jnp.tanh(raw_action[..., 0]) * 0.5 + 0.5) * max_v
+        w = jnp.tanh(raw_action[..., 1])
     return jnp.stack([v, w], axis=-1)
 
 
 def scale_actions_batched(raw_actions: jnp.ndarray, max_v: jnp.ndarray) -> jnp.ndarray:
-    # FIX Bug#1: stesso fix applicato alla versione batched.
-    # v = (jnp.tanh(raw_actions[:, 0]) * 0.5 + 0.5) * max_v
-    # w = jnp.tanh(raw_actions[:, 1])
-    v = jnp.clip(raw_actions[..., 0], 0.0, 1.0) * max_v
-    w = jnp.clip(raw_actions[..., 1], -1.0, 1.0)
+    if USE_TANH_INSIDE:
+        v = jnp.clip(raw_actions[..., 0], 0.0, 1.0) * max_v
+        w = jnp.clip(raw_actions[..., 1], -1.0, 1.0)
+    else:
+        v = (jnp.tanh(raw_actions[..., 0]) * 0.5 + 0.5) * max_v
+        w = jnp.tanh(raw_actions[..., 1])
     return jnp.stack([v, w], axis=-1)
 
 
