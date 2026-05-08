@@ -25,7 +25,7 @@ import numpy as np
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-from jax_network import EndToEndActorCritic, squash_corrected_log_prob
+from jax_network import EndToEndActorCritic, squash_corrected_log_prob, USE_TANH_INSIDE
 from jax_train import (
     collect_rollouts, init_env_state, rebuild_vmap_step,
     NUM_ENVS, ROLLOUT_STEPS, OBS_SIZE,
@@ -358,8 +358,12 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     opt_state   = optimizer.init(params)
     train_state = (params, opt_state)
 
-    ckpt_path       = "checkpoints/ppo_tanh_outside_best.msgpack"
-    final_ckpt_path = "checkpoints/ppo_tanh_outside_final.msgpack"
+    if USE_TANH_INSIDE:
+        ckpt_path       = "checkpoints/ppo_tanh_inside_best.msgpack"
+        final_ckpt_path = "checkpoints/ppo_tanh_inside_final.msgpack"
+    else:
+        ckpt_path       = "checkpoints/ppo_tanh_outside_best.msgpack"
+        final_ckpt_path = "checkpoints/ppo_tanh_outside_final.msgpack"
 
     # Curriculum state
     cur_max_dist, cur_ghost, cur_ent, cur_max_scen = get_continuous_curriculum(0.0)
@@ -381,7 +385,10 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     best_suc = 55.0  # NEVER TOUCH THIS LINE
 
     # CHANGE THIS NAME FOR YOUR SECOND RUN (e.g., "ppo_tanh_outside_log.csv")
-    _LOG_PATH = "checkpoints/ppo_tanh_outside_log.csv" 
+    if USE_TANH_INSIDE:
+        _LOG_PATH = "checkpoints/ppo_tanh_inside_log.csv"
+    else:
+        _LOG_PATH = "checkpoints/ppo_tanh_outside_log.csv"
     os.makedirs("checkpoints", exist_ok=True)
     _log_file = open(_LOG_PATH, "w", newline="")
     _log_writer = csv.writer(_log_file)

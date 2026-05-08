@@ -13,7 +13,7 @@ import numpy as np
 LOG_STD_MIN = -4.0
 LOG_STD_MAX =  0.0
 
-USE_TANH_INSIDE = False
+USE_TANH_INSIDE = True
 _STATE_VEC_SIZE = 5
 ATTN_HEADS      = 4    # numero di teste attention sul frame stack
 ATTN_HEAD_DIM   = 16   # dim per head → QKV dim = ATTN_HEADS * ATTN_HEAD_DIM = 64
@@ -195,8 +195,6 @@ class EndToEndActorCritic(nn.Module):
         )
 
         # ── Actor head ────────────────────────────────────────────────────────
-
-
         # actor_mean = nn.Dense(
         #     self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
         # )(shared)
@@ -213,11 +211,10 @@ class EndToEndActorCritic(nn.Module):
             # Variante 2 (Originale): Uscita lineare
             actor_mean = raw_mean
 
-        logstd_param     = self.param('log_std', constant(-1.0), (self.action_dim,)) # state independent learnable log std
+        logstd_param     = self.param('log_std', constant(1.0), (self.action_dim,)) # state independent learnable log std
         actor_logstd_raw = jnp.broadcast_to(logstd_param, actor_mean.shape)
-        actor_logstd     = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (
-            jnp.tanh(actor_logstd_raw) + 1.0
-        )
+        actor_logstd     = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (jnp.tanh(actor_logstd_raw) + 1.0) 
+        #actor_logstd = jnp.clip(jnp.broadcast_to(logstd_param, actor_mean.shape), LOG_STD_MIN, LOG_STD_MAX)
 
         # ── Critic head ───────────────────────────────────────────────────────
         critic = nn.relu(
