@@ -443,13 +443,25 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray, **kwargs):
 
     obs_collision = (closest_cir < ROBOT_RADIUS) | (closest_box < ROBOT_RADIUS)
 
-    # ── Shoe-box collisions — USE_LEGS=True only ──────────────────────────────
-    # When USE_LEGS=True the shoe AABB is the primary human contact surface.
+    # ── Shoe OBB collisions — USE_LEGS=True only ─────────────────────────────
+    # When USE_LEGS=True the shoe OBB is the primary human contact surface.
     # Each shoe contact is classified active/passive with the same logic as
     # body contacts (owner heading dot-product + proximity + robot speed).
     if USE_LEGS:
-        shoe_boxes_step  = get_shoe_boxes(new_people, new_foot_state)   # (2N, 4)
-        shoe_dists_raw   = jax.vmap(_box_dist)(shoe_boxes_step)         # (2N,)
+        shoe_boxes_step  = get_shoe_boxes(new_people, new_foot_state)   # (2N, 5)
+
+        def _obb_shoe_dist(shoe):
+            """Point-to-OBB distance: rotate robot into shoe-local frame."""
+            scx, scy, half_L, half_W, stheta = shoe
+            dx, dy = new_x - scx, new_y - scy
+            cos_s, sin_s = jnp.cos(stheta), jnp.sin(stheta)
+            local_x =  cos_s * dx + sin_s * dy
+            local_y = -sin_s * dx + cos_s * dy
+            ddx = jnp.maximum(jnp.abs(local_x) - half_L, 0.0)
+            ddy = jnp.maximum(jnp.abs(local_y) - half_W, 0.0)
+            return jnp.sqrt(ddx**2 + ddy**2)
+
+        shoe_dists_raw   = jax.vmap(_obb_shoe_dist)(shoe_boxes_step)    # (2N,)
 
         # Map each shoe to its owner: left shoes 0..N-1, right shoes N..2N-1
         N_p            = new_people.shape[0]

@@ -222,31 +222,28 @@ def get_leg_circles(
         ], axis=-1)   # (N, 3)
 
 
-# ── Shoe AABB array ───────────────────────────────────────────────────────────
+# ── Shoe OBB array ────────────────────────────────────────────────────────────
 
 def get_shoe_boxes(
     people:     jnp.ndarray,   # (N, ≥5)  — provides heading theta
     foot_state: jnp.ndarray,   # (N, 10)
 ) -> jnp.ndarray:
     """
-    Return axis-aligned bounding boxes (AABBs) for all shoes.
+    Return oriented bounding box (OBB) parameters for all shoes.
 
     Each shoe is a rectangle of SHOE_LENGTH × SHOE_WIDTH centred at:
         shoe_centre = foot_xy + fwd * (SHOE_LENGTH / 2)
     oriented along the person's walking heading (theta).
 
-    Because jax_physics only supports AABBs, we compute the axis-aligned
-    bounding box of the rotated rectangle:
-        hw = |cos θ| * (L/2) + |sin θ| * (W/2)
-        hh = |sin θ| * (L/2) + |cos θ| * (W/2)
-
-    Returns (2N, 4)  [cx, cy, hw, hh]  — left shoes first, then right shoes.
+    Returns (2N, 5)  [cx, cy, half_L, half_W, theta]  — left shoes first,
+    then right shoes.  Callers use the rotation-aware obb_shoe_dist()
+    helper instead of axis-aligned _box_dist().
     """
     left_xy,  right_xy  = get_leg_positions(foot_state)   # (N, 2) each
 
     # Stack into (2N,) arrays directly
     all_xy    = jnp.concatenate([left_xy, right_xy], axis=0)         # (2N, 2)
-    
+
     # Left and right thetas are already correctly updated in the step logic
     all_theta = jnp.concatenate([foot_state[:, 10], foot_state[:, 11]], axis=0) # (2N,)
 
@@ -259,13 +256,10 @@ def get_shoe_boxes(
     # Shoe centres: planted position + forward offset of half the shoe length
     all_cx = all_xy + fwd * half_L                                 # (2N, 2)
 
-    # AABB half-extents using the independent foot angle
-    abs_cos = jnp.abs(jnp.cos(all_theta))                          # (2N,)
-    abs_sin = jnp.abs(jnp.sin(all_theta))                          # (2N,)
-    all_hw = abs_cos * half_L + abs_sin * half_W                   # (2N,)
-    all_hh = abs_sin * half_L + abs_cos * half_W                   # (2N,)
-
-    return jnp.stack([all_cx[:, 0], all_cx[:, 1], all_hw, all_hh], axis=-1)   # (2N, 4)
+    return jnp.stack([all_cx[:, 0], all_cx[:, 1],
+                      jnp.full(all_theta.shape, half_L),
+                      jnp.full(all_theta.shape, half_W),
+                      all_theta], axis=-1)   # (2N, 5)
 
 
 # ── Backward compatibility shim ───────────────────────────────────────────────

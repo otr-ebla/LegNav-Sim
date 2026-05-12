@@ -417,18 +417,23 @@ def step_env(key, state, action, ghost_robot: bool = True):
 
 
     if USE_LEGS:
-        shoe_boxes_cf = get_shoe_boxes(new_people, new_foot_state)   # (2N, 4)
+        shoe_boxes_cf = get_shoe_boxes(new_people, new_foot_state)   # (2N, 5)
         N_cf = NUM_PEOPLE
         owner_idx_cf   = jnp.concatenate([jnp.arange(N_cf), jnp.arange(N_cf)])  # (2N,)
         owner_active_cf = active_mask[owner_idx_cf]                              # (2N,)
 
-        def _shoe_dist_cf(box):
-            cx, cy, hw, hh = box
-            ddx = jnp.maximum(jnp.abs(new_x - cx) - hw, 0.0)
-            ddy = jnp.maximum(jnp.abs(new_y - cy) - hh, 0.0)
+        def _obb_shoe_dist_cf(shoe):
+            """Point-to-OBB distance: rotate robot into shoe-local frame."""
+            scx, scy, half_L, half_W, stheta = shoe
+            dx, dy = new_x - scx, new_y - scy
+            cos_s, sin_s = jnp.cos(stheta), jnp.sin(stheta)
+            local_x =  cos_s * dx + sin_s * dy
+            local_y = -sin_s * dx + cos_s * dy
+            ddx = jnp.maximum(jnp.abs(local_x) - half_L, 0.0)
+            ddy = jnp.maximum(jnp.abs(local_y) - half_W, 0.0)
             return jnp.sqrt(ddx**2 + ddy**2 + 1e-8)
 
-        shoe_dists_cf = jax.vmap(_shoe_dist_cf)(shoe_boxes_cf)          # (2N,)
+        shoe_dists_cf = jax.vmap(_obb_shoe_dist_cf)(shoe_boxes_cf)   # (2N,)
         shoe_dists_cf = jnp.where(owner_active_cf, shoe_dists_cf, _DUMMY_DIST)
         # Subtract ROBOT_RADIUS so we get surface-to-surface gap
         closest_shoe_surface = jnp.maximum(0.0, jnp.min(shoe_dists_cf) - ROBOT_RADIUS)
@@ -482,13 +487,23 @@ def step_env(key, state, action, ghost_robot: bool = True):
 
     static_obs_collision = (closest_cir < ROBOT_RADIUS) | (closest_box < ROBOT_RADIUS)
 
-    # ── 5c. Shoe-box collisions (USE_LEGS=True only, resolved at trace time) ───
+    # ── 5c. Shoe OBB collisions (USE_LEGS=True only, resolved at trace time) ───
     if USE_LEGS:
-        shoe_boxes = get_shoe_boxes(new_people, new_foot_state)   # (2*N, 4)
+        shoe_boxes = get_shoe_boxes(new_people, new_foot_state)   # (2*N, 5)
+
+        def _obb_shoe_dist(shoe):
+            """Point-to-OBB distance: rotate robot into shoe-local frame."""
+            scx, scy, half_L, half_W, stheta = shoe
+            dx, dy = new_x - scx, new_y - scy
+            cos_s, sin_s = jnp.cos(stheta), jnp.sin(stheta)
+            local_x =  cos_s * dx + sin_s * dy
+            local_y = -sin_s * dx + cos_s * dy
+            ddx = jnp.maximum(jnp.abs(local_x) - half_L, 0.0)
+            ddy = jnp.maximum(jnp.abs(local_y) - half_W, 0.0)
+            return jnp.hypot(ddx, ddy)
 
         # Per-shoe distances (2N shoes)
-        shoe_dists_raw = jax.vmap(_box_dist)(shoe_boxes)           # (2*N,)
-
+        shoe_dists_raw = jax.vmap(_obb_shoe_dist)(shoe_boxes)      # (2*N,)
         # Map each shoe back to its owner human index (left shoes: 0..N-1,
         # right shoes: N..2N-1) so we can apply the active_mask per owner.
         N = NUM_PEOPLE
