@@ -94,7 +94,7 @@ def init_env_state(rng_key, max_goal_dist: float = 1.5, ghost_prob: float = 0.0,
 
 
 # ── Shared Encoder + Actor/Critic Heads ──────────────────────────────────────
-from jax_network import SharedEncoder
+from jax_network import SharedEncoder, USE_TANH_INSIDE
 
 _orth_relu = nn.initializers.orthogonal(scale=jnp.sqrt(2.0))
 _orth_out  = nn.initializers.orthogonal(scale=0.01)
@@ -103,12 +103,23 @@ class SACActorHead(nn.Module):
     action_dim:  int   = ACTION_DIM
     LOG_STD_MIN: float = -5.0
     LOG_STD_MAX: float =  0.5
+    tanh_inside: bool  = USE_TANH_INSIDE
 
     @nn.compact
     def __call__(self, feat: jnp.ndarray):
-        mean    = nn.Dense(self.action_dim, kernel_init=_orth_out, name='mean')(feat)
-        log_std = nn.Dense(self.action_dim, kernel_init=_orth_out, name='log_std')(feat)
-        return mean, jnp.clip(log_std, self.LOG_STD_MIN, self.LOG_STD_MAX)
+        raw_mean = nn.Dense(self.action_dim, kernel_init=_orth_out, name='mean')(feat)
+        if self.tanh_inside:
+            v_mean = jnp.tanh(raw_mean[..., 0]) * 0.5 + 0.5
+            w_mean = jnp.tanh(raw_mean[..., 1])
+            actor_mean = jnp.stack([v_mean, w_mean], axis=-1)
+        else:
+            actor_mean = raw_mean
+
+        logstd_param = self.param('log_std', nn.initializers.constant(1.0), (self.action_dim,))
+        actor_logstd_raw = jnp.broadcast_to(logstd_param, actor_mean.shape)
+        actor_logstd = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (jnp.tanh(actor_logstd_raw) + 1.0)
+        
+        return actor_mean, actor_logstd
 
 class CriticBranch(nn.Module):
     @nn.compact
@@ -166,12 +177,16 @@ def sample_action_sac_batched(rng_key, mean, log_std, max_v):
     noise = jax.random.normal(rng_key, shape=mean.shape)
     u     = mean + noise * std
     lp_gauss = jnp.sum(-0.5 * (noise**2 + jnp.log(2.0 * jnp.pi)) - log_std, axis=-1)
-    tanh_u = jnp.tanh(u)
     
-    # Lo scaling consistente avviene qui: usato sia in iterazione che nella loss
-    a_v = (tanh_u[:, 0] + 1.0) * 0.5 * max_v
-    a_w = tanh_u[:, 1]
-    return jnp.stack([a_v, a_w], axis=-1), lp_gauss + _tanh_log_prob_correction(tanh_u, max_v)
+    if USE_TANH_INSIDE:
+        a_v = jnp.clip(u[..., 0], 0.0, 1.0) * max_v
+        a_w = jnp.clip(u[..., 1], -1.0, 1.0)
+        return jnp.stack([a_v, a_w], axis=-1), lp_gauss
+    else:
+        tanh_u = jnp.tanh(u)
+        a_v = (tanh_u[:, 0] + 1.0) * 0.5 * max_v
+        a_w = tanh_u[:, 1]
+        return jnp.stack([a_v, a_w], axis=-1), lp_gauss + _tanh_log_prob_correction(tanh_u, max_v)
 
 def extract_max_v(obs):
     return obs[..., MAX_V_OBS_IDX] * 2.0

@@ -197,10 +197,28 @@ def step_env(key, state, action, ghost_robot: bool = True):
     target_v = jnp.clip(action[0], 0.0, state.max_v)
     target_w = jnp.clip(action[1], -1.0, 1.0)
 
-    mid_theta = state.theta + 0.5 * target_w * DT
+    # Exact unicycle integration
+    is_curving = jnp.abs(target_w) > 1e-3
+    target_w_safe = jnp.where(is_curving, target_w, 1.0)
+    ratio = target_v / target_w_safe
+    
+    sin_new = jnp.sin(state.theta + target_w * DT)
+    sin_old = jnp.sin(state.theta)
+    cos_new = jnp.cos(state.theta + target_w * DT)
+    cos_old = jnp.cos(state.theta)
+    
+    raw_x_curve = state.x + ratio * (sin_new - sin_old)
+    raw_y_curve = state.y + ratio * (-cos_new + cos_old)
+    
+    cos_theta = jnp.cos(state.theta)
+    sin_theta = jnp.sin(state.theta)
+    raw_x_straight = state.x + target_v * cos_theta * DT
+    raw_y_straight = state.y + target_v * sin_theta * DT
+    
+    raw_x = jnp.where(is_curving, raw_x_curve, raw_x_straight)
+    raw_y = jnp.where(is_curving, raw_y_curve, raw_y_straight)
+    
     new_theta = (state.theta + target_w * DT + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
-    raw_x     = state.x + target_v * DT * jnp.cos(mid_theta)
-    raw_y     = state.y + target_v * DT * jnp.sin(mid_theta)
 
     # Boolean wall_collision for episode logic (stop_grad'd later)
     wall_collision = (raw_x < ROBOT_RADIUS) | (raw_x > ROOM_W - ROBOT_RADIUS) | \
