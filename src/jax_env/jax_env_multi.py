@@ -29,33 +29,27 @@ except ImportError:
 
 __all__ = ["reset_env", "step_env", "EnvState", "get_obs"]
 
-HSFM_DT    = 0.01
+HSFM_DT    = 0.03
 
 
 
-# Terminal rewards (all /10 from original to keep Q-values O(100) not O(1000)).
-# This ensures alpha*log_pi remains a meaningful fraction of the critic signal
-# so the entropy term actually shapes the policy during early training.
 _R_GOAL        =  30.0
-_R_OBS_COL     =  -30.0
-_R_WALL_COL    =  -30.0
+_R_OBS_COL     =  -20.0
+_R_WALL_COL    =  -20.0
 _R_ACTIVE_COL  =  -50.0
 
-_R_PASSIVE_COL =  -3.5
+_R_PASSIVE_COL =  -15
 _R_TIMEOUT     =  -9.0
 
 
 _PROGRESS_COEF =  2.0
 
-# ---- Reward shaping constants for social navigation ----
 
-# Step penalty — small constant cost per timestep, encourages efficiency.
-# Step penalty — small constant cost per timestep, encourages efficiency.
 _STEP_PEN      =  -0.075   # Drastically increased. Standing still is no longer a safe haven.
 
 # Smoothness & Rotation penalties (Lowered to unblock exploration)
 _SMOOTH_WEIGHT =   0.08    # Reduced to stop paralyzing the agent's steering
-_ROT_WEIGHT    =   0.03   # Low: allow steering around humans, only penalizes extreme spinning
+_ROT_WEIGHT    =   0.07   # Low: allow steering around humans, only penalizes extreme spinning
 
 _COMFORT_DIST  = 1.2   # m — personal space boundary
 _COMFORT_COEF  = 0.015 # base penalty at d=0 (before speed scaling) — /10 from 0.15
@@ -109,17 +103,24 @@ def build_hsfm_obstacles(obs_boxes, obs_circles, room_h=ROOM_H):
         return jnp.where(valid, pts, jnp.nan)
 
     def box_to_edges(box):
-        cx, cy, hw, hh = box
-        valid = hw > 0.0
-        p1 = jnp.array([cx - hw, cy - hh])
-        p2 = jnp.array([cx + hw, cy - hh])
-        p3 = jnp.array([cx + hw, cy + hh])
-        p4 = jnp.array([cx - hw, cy + hh])
+        # box is 8 floats: [x0,y0, x1,y1, x2,y2, x3,y3] (CCW vertices).
+        x0v, y0v = box[0], box[1]
+        x1v, y1v = box[2], box[3]
+        x2v, y2v = box[4], box[5]
+        x3v, y3v = box[6], box[7]
+        # Degenerate boxes (all-zero from jnp.zeros placeholders) have zero span.
+        span = jnp.maximum(jnp.abs(x0v - x2v), jnp.abs(y0v - y2v))
+        valid = span > 1e-6
+        p1 = jnp.stack([x0v, y0v])
+        p2 = jnp.stack([x1v, y1v])
+        p3 = jnp.stack([x2v, y2v])
+        p4 = jnp.stack([x3v, y3v])
         edges = jnp.stack([
             jnp.stack([p1, p2]), jnp.stack([p2, p3]),
             jnp.stack([p3, p4]), jnp.stack([p4, p1])
         ])
         return _nan_if_invalid(edges, valid)
+
 
     def circle_to_edges(circle):
         cx, cy, r = circle
@@ -142,11 +143,11 @@ def build_hsfm_obstacles(obs_boxes, obs_circles, room_h=ROOM_H):
 
 
 def reset_env(key: jax.Array, max_goal_dist: float = 3.0, scenario_idx: int = -1,
-              ghost_prob: float = 1.0, max_scenario: int = 6):
+              ghost_prob: float = 1.0, max_scenario: int = 6, min_goal_dist: float = 0.8):
     k_main, k_legs, k_obs, k_ghost = jax.random.split(key, 4)
 
     rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people, room_h = \
-        generate_scenario(k_main, max_goal_dist, scenario_idx, max_scenario)
+        generate_scenario(k_main, max_goal_dist, scenario_idx, max_scenario, min_goal_dist)
     
     #max_v = 0.8
 
@@ -194,8 +195,8 @@ def step_env(key, state, action, ghost_robot: bool = True):
     k_step, k_obs = jax.random.split(key)
 
     # ── 1. Robot Kinematics ───────────────────────────────────────────────────────
-    target_v = jnp.clip(action[0], 0.0, state.max_v)
-    target_w = jnp.clip(action[1], -1.0, 1.0)
+    target_v = action[0] #jnp.clip(action[0], 0.0, state.max_v)
+    target_w = action[1] #jnp.clip(action[1], -1.0, 1.0)
 
     # Exact unicycle integration
     is_curving = jnp.abs(target_w) > 1e-3
@@ -346,8 +347,16 @@ def step_env(key, state, action, ghost_robot: bool = True):
                jnp.where(needs_respawn, rand_x, new_h_state[:, 0]))
     final_py = jnp.where(is_dummy, dummy_y,
                jnp.where(needs_respawn, rand_y, new_h_state[:, 1]))
-    final_vx = jnp.where(needs_respawn, 0.0, new_h_state[:, 2])
-    final_vy = jnp.where(needs_respawn, 0.0, new_h_state[:, 3])
+    # Velocity preservation on teleport.
+    #   • Long parallel corridor (scenario 11, training): keep historical
+    #     behaviour of zeroing velocity so HSFM ramps people up from rest.
+    #   • Standard parallel teleport in a 12 m room (scenario 13, visual
+    #     treadmill): keep current velocity so the walker doesn't restart
+    #     from still after each wrap — gait stays continuous.
+    preserve_vel = needs_respawn & is_parallel & ~is_long
+    zero_vel     = needs_respawn & ~preserve_vel
+    final_vx = jnp.where(zero_vel, 0.0, new_h_state[:, 2])
+    final_vy = jnp.where(zero_vel, 0.0, new_h_state[:, 3])
 
     respawned_h_state = jnp.stack([
         final_px, final_py,
@@ -464,17 +473,11 @@ def step_env(key, state, action, ghost_robot: bool = True):
     heading_dot  = dx_p * jnp.cos(new_theta) + dy_p * jnp.sin(new_theta)
     heading_angle = jnp.arctan2(dy_p, dx_p)
     rel_angle = (heading_angle - new_theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
-    in_fwd_fov   = jnp.abs(rel_angle) < (jnp.pi / 2.0)   # human within ±90° forward cone
+    in_fwd_fov   = jnp.abs(rel_angle) < (jnp.pi / 4)   # human within ±45° of robot's forward axis
     in_prox      = dists_p_active < 1.5    # within 1.5 m
     robot_moving = target_v >= 0.1         # robot is moving
 
     # ── 5a. Human body collisions (active vs passive) ──────────────────────────
-    # USE_LEGS=False: circle-vs-circle model.
-    #   Threshold = ROBOT_RADIUS + PEOPLE_RADIUS (full body cylinders).
-    #
-    # USE_LEGS=True: shoe-box model is the primary contact surface (see 5c).
-    #   Body threshold is tightened to ROBOT_RADIUS + LEG_RADIUS to catch only
-    #   direct leg/torso contacts that slip past the shoe AABB.
     if USE_LEGS:
         body_thresh = ROBOT_RADIUS + _LEG_R
     else:
@@ -495,13 +498,33 @@ def step_env(key, state, action, ghost_robot: bool = True):
     dists_c = jnp.hypot(dx_c, dy_c)
     closest_cir = jnp.min(dists_c - state.obs_circles[:, 2])
 
-    def _box_dist(box):
-        cx, cy, hw, hh = box
-        ddx = jnp.maximum(jnp.abs(new_x - cx) - hw, 0.0)
-        ddy = jnp.maximum(jnp.abs(new_y - cy) - hh, 0.0)
-        return jnp.hypot(ddx, ddy)
+    def _quad_dist(b):
+        def nearest_on_seg(ax, ay, bx, by):
+            ex, ey = bx - ax, by - ay
+            t = jnp.clip(((new_x-ax)*ex + (new_y-ay)*ey) /
+                         jnp.maximum(ex*ex+ey*ey, 1e-12), 0.0, 1.0)
+            npx, npy = ax+t*ex, ay+t*ey
+            return jnp.sqrt((new_x-npx)**2 + (new_y-npy)**2)
+        d0 = nearest_on_seg(b[0],b[1],b[2],b[3])
+        d1 = nearest_on_seg(b[2],b[3],b[4],b[5])
+        d2 = nearest_on_seg(b[4],b[5],b[6],b[7])
+        d3 = nearest_on_seg(b[6],b[7],b[0],b[1])
+        # Inside check
+        def cs(i):
+            verts = jnp.array([[b[0],b[1]],[b[2],b[3]],[b[4],b[5]],[b[6],b[7]]])
+            ax, ay = verts[i,0], verts[i,1]
+            bx_, by_ = verts[(i+1)%4,0], verts[(i+1)%4,1]
+            return (bx_-ax)*(new_y-ay) - (by_-ay)*(new_x-ax)
+        inside = (cs(0)>=0) & (cs(1)>=0) & (cs(2)>=0) & (cs(3)>=0)
+        edge_dist = jnp.minimum(jnp.minimum(d0,d1), jnp.minimum(d2,d3))
+        # Skip degenerate placeholder boxes (all-zero) — they would otherwise
+        # report dist=0 because every cross-product is 0 ≥ 0 ⇒ "inside".
+        span = jnp.maximum(jnp.abs(b[0] - b[4]), jnp.abs(b[1] - b[5]))
+        valid = span > 1e-6
+        dist = jnp.where(inside, 0.0, edge_dist)
+        return jnp.where(valid, dist, 1e6)
 
-    closest_box = jnp.min(jax.vmap(_box_dist)(state.obs_boxes))
+    closest_box = jnp.min(jax.vmap(_quad_dist)(state.obs_boxes))
 
     static_obs_collision = (closest_cir < ROBOT_RADIUS) | (closest_box < ROBOT_RADIUS)
 
@@ -559,12 +582,8 @@ def step_env(key, state, action, ghost_robot: bool = True):
 
     # ── 6. Reward ───────────────────────────────────────────────────────────────
 
-    # # — 6a. Comfort penalty (spazio personale spaziale)
-    # comfort_violations = jnp.maximum(0.0, 1.0 - dists_p_active / _COMFORT_DIST)
-    # comfort_pen = -_COMFORT_COEF * jnp.sum(comfort_violations)
 
-
-    # — --- 6b. NEW: Yield Penalty Dynamical Brake Gradient
+    # — --- 6a. NEW: Yield Penalty Dynamical Brake Gradient
     yield_linear = jnp.maximum(0.0, 1.0 - dists_p_active/_YIELD_DIST)
     yield_weight = yield_linear ** 2  # quadratic: gentle at edge, steep when close
     yield_weight = yield_weight * in_fwd_fov.astype(jnp.float32)  # only consider humans in front
@@ -572,12 +591,11 @@ def step_env(key, state, action, ghost_robot: bool = True):
     yield_pen = -_YIELD_COEF * target_v * yield_pressure  # stronger penalty for moving fast when close to a human in front
 
     
-    # — 6c. Dense shaping ─────────────────────────────────────────────────
+    # — 6b. Dense shaping ─────────────────────────────────────────────────
     progress         = prev_dist - new_dist
     progress_reward  = _PROGRESS_COEF * progress
     step_pen         = _STEP_PEN
 
-    # FIX Bug#4: _SMOOTH_WEIGHT era definito (0.08) ma non usato.
     # Il coeff fisso -0.5 era 6× troppo alto → robot spaventato di girare → stagnazione.
     smooth_pen       = -_SMOOTH_WEIGHT * (target_w - state.w)**2
     # Quadratic penalty on rotation magnitude (encourages driving straight)
@@ -585,8 +603,12 @@ def step_env(key, state, action, ghost_robot: bool = True):
     # Destroy the local minimum of spinning in place when blocked
     spin_in_place_pen = jnp.where(target_v < 0.1, -0.5 * (target_w ** 2), 0.0)
 
+    # Destroy the local minimum of completely freezing in front of static obstacles
+    # If the robot is not moving and no human is forcing it to yield, heavily penalize it
+    unjustified_stop_pen = jnp.where((target_v < 0.1) & (yield_pressure < 0.1), -0.1, 0.0)
+
     # Minimal baseline + smoothness
-    dense_reward     = progress_reward + step_pen + smooth_pen + rot_pen + spin_in_place_pen + yield_pen
+    dense_reward     = progress_reward + step_pen + smooth_pen + rot_pen + spin_in_place_pen + unjustified_stop_pen + yield_pen
     
 
     # — 6d. Terminal cascades ─────────────────────────────────────────────

@@ -248,8 +248,19 @@ def draw_humans(surface, state, foot_state_np, show_arrows, use_legs):
             # Faint body centre ring (shows collision boundary)
             #pygame.draw.circle(surface, C_BODY_RING, (sx, sy), body_r, 1)
 
+            # Inset the visual leg circle by LEG_RADIUS along each foot's
+            # heading so it sits inside the shoe rectangle and aligns with
+            # the LiDAR collision shape produced by jax_legs.get_leg_circles.
+            left_theta_f  = float(foot_state_np[i, 10])
+            right_theta_f = float(foot_state_np[i, 11])
+            l_off_x = LEG_RADIUS * math.cos(left_theta_f)
+            l_off_y = LEG_RADIUS * math.sin(left_theta_f)
+            r_off_x = LEG_RADIUS * math.cos(right_theta_f)
+            r_off_y = LEG_RADIUS * math.sin(right_theta_f)
+
             # Left leg — tinted with person's shoe colour
-            lx, ly = W(float(left_legs_np[i, 0]), float(left_legs_np[i, 1]))
+            lx, ly = W(float(left_legs_np[i, 0]) + l_off_x,
+                       float(left_legs_np[i, 1]) + l_off_y)
             shoe_col, _ = _shoe_colour(i)
             # Brighten for left, slightly darken for right so they're distinguishable
             lc = tuple(min(255, int(c * 1.1)) for c in shoe_col) if not dist_ else C_LEG_DL
@@ -257,7 +268,8 @@ def draw_humans(surface, state, foot_state_np, show_arrows, use_legs):
             pygame.draw.circle(surface, (20, 20, 20), (lx, ly), leg_r, 1)
 
             # Right leg
-            rx_, ry_ = W(float(right_legs_np[i, 0]), float(right_legs_np[i, 1]))
+            rx_, ry_ = W(float(right_legs_np[i, 0]) + r_off_x,
+                         float(right_legs_np[i, 1]) + r_off_y)
             rc = tuple(max(0, int(c * 0.75)) for c in shoe_col) if not dist_ else C_LEG_DR
             pygame.draw.circle(surface, rc, (rx_, ry_), leg_r)
             pygame.draw.circle(surface, (20, 20, 20), (rx_, ry_), leg_r, 1)
@@ -394,12 +406,11 @@ def draw_scene(surface, state, raw_lidar, foot_state_np, show_lidar, show_arrows
     draw_lidar(surface, state, raw_lidar, show_lidar)
 
     for box in np.array(state.obs_boxes):
-        cx, cy, hw, hh = box
-        sx, sy = W(cx - hw, cy + hh)
-        pw = int(2 * hw * SCALE)
-        ph = int(2 * hh * SCALE)
-        pygame.draw.rect(surface, C_BOX,   (sx, sy, pw, ph))
-        pygame.draw.rect(surface, C_BOX_L, (sx, sy, pw, ph), 2)
+        x0, y0, x1, y1, x2, y2, x3, y3 = box
+        if max(x0, x1, x2, x3) - min(x0, x1, x2, x3) > 1e-5:
+            pts = [W(x0, y0), W(x1, y1), W(x2, y2), W(x3, y3)]
+            pygame.draw.polygon(surface, C_BOX,   pts)
+            pygame.draw.polygon(surface, C_BOX_L, pts, 2)
 
     for cir in np.array(state.obs_circles):
         cx, cy, r = cir

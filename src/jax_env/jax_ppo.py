@@ -25,7 +25,8 @@ import numpy as np
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-from jax_network import EndToEndActorCritic, squash_corrected_log_prob, USE_TANH_INSIDE
+from jax_network import EndToEndActorCritic, squash_corrected_log_prob
+import jax_env
 from jax_train import (
     collect_rollouts, init_env_state, rebuild_vmap_step,
     NUM_ENVS, ROLLOUT_STEPS, OBS_SIZE,
@@ -45,7 +46,7 @@ LR_END         = 1e-5
 LR_MIN         = 1e-5
 WARMUP_UPDATES = 5
 
-DEFAULT_TOTAL_ENV_STEPS = 70_000_000    # default budget; override via train(total_env_steps=...)
+DEFAULT_TOTAL_ENV_STEPS = 100_000_000    # default budget; override via train(total_env_steps=...)
 
 # ── Minibatch geometry ────────────────────────────────────────────────────────
 # Flat loss over (T*N) samples. Shuffle full batch then split into minibatches.
@@ -61,7 +62,7 @@ network = EndToEndActorCritic(action_dim=2)
 
 _SUC_ANCHORS  = np.array([0.0, 20.0, 35.0, 50.0, 60.0, 70.0, 82.0, 90.0, 100.0])
 _DIST_ANCHORS = np.array([1.5,  1.5,  2.5,  4.0,  6.0,  7.5,  9.0,  9.0,   9.0])
-_GHOST_ANCHORS= np.array([0.0,  0.0,  0.0,  0.0,  0.05, 0.15, 0.4,  0.7,   1.0])
+_GHOST_ANCHORS= np.array([0.0,  0.02, 0.05, 0.10, 0.20, 0.35, 0.55, 0.8,   1.0])
 _ENT_ANCHORS  = np.array([0.02, 0.02, 0.018, 0.015, 0.012, 0.01, 0.008, 0.006, 0.005])
 # Scenarios unlock one at a time, all visible by 60% rolling success.
 # Ghost probability ramps slower to avoid passive-collision feedback loop.
@@ -103,22 +104,11 @@ class RunningMeanStd:
 
 @jax.jit
 def normalize_batch_rewards(rewards, dones, running_ret, rms_state, gamma):
-    # FIX Bug#2: prima si stimava la varianza dei return cumulativi (scala ~1/(1-γ)≈100)
-    # e poi si dividevano i reward istantanei per quella std → reward sottoscalati di ~10x,
-    # segnale quasi piatto, policy stagnante.
-    # Fix: si normalizzano i reward istantanei con la running std dei reward istantanei.
-    # running_ret viene mantenuto per compatibilità firma ma non usato.
     new_rms_state = rms_state.update(rewards.flatten())
     normalized_rewards = rewards / jnp.sqrt(new_rms_state.var + 1e-8)
     normalized_rewards = jnp.clip(normalized_rewards, -10.0, 10.0)
     return normalized_rewards, running_ret, new_rms_state
 
-
-# `scheduler` and `optimizer` are (re)built inside `train()` once the actual
-# total env-step budget is known, since the LR schedule's decay length depends
-# on the number of optimizer steps. They are exposed at module scope so that
-# the @jax.jit'd `ppo_update_epoch` (which references `optimizer` as a free
-# variable) sees the rebuilt instance at trace time.
 scheduler = None
 optimizer = None
 
@@ -358,12 +348,12 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     opt_state   = optimizer.init(params)
     train_state = (params, opt_state)
 
-    if USE_TANH_INSIDE:
-        ckpt_path       = "checkpoints/ppo_tanh_inside_best.msgpack"
-        final_ckpt_path = "checkpoints/ppo_tanh_inside_final.msgpack"
+    if jax_env.USE_LEGS:
+        ckpt_path       = "checkpoints/ppo_legs_best.msgpack"
+        final_ckpt_path = "checkpoints/ppo_legs_final.msgpack"
     else:
-        ckpt_path       = "checkpoints/ppo_tanh_outside_best.msgpack"
-        final_ckpt_path = "checkpoints/ppo_tanh_outside_final.msgpack"
+        ckpt_path       = "checkpoints/ppo_circles_best.msgpack"
+        final_ckpt_path = "checkpoints/ppo_circles_final.msgpack"
 
     # Curriculum state
     cur_max_dist, cur_ghost, cur_ent, cur_max_scen = get_continuous_curriculum(0.0)
@@ -384,11 +374,10 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
 
     best_suc = 55.0  # NEVER TOUCH THIS LINE
 
-    # CHANGE THIS NAME FOR YOUR SECOND RUN (e.g., "ppo_tanh_outside_log.csv")
-    if USE_TANH_INSIDE:
-        _LOG_PATH = "checkpoints/ppo_tanh_inside_log.csv"
+    if jax_env.USE_LEGS:
+        _LOG_PATH = "checkpoints/ppo_legs_log.csv"
     else:
-        _LOG_PATH = "checkpoints/ppo_tanh_outside_log.csv"
+        _LOG_PATH = "checkpoints/ppo_circles_log.csv"
     os.makedirs("checkpoints", exist_ok=True)
     _log_file = open(_LOG_PATH, "w", newline="")
     _log_writer = csv.writer(_log_file)

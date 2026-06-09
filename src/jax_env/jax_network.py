@@ -1,6 +1,8 @@
 """
 jax_network.py — Actor-Critic Neural Network for PPO (CNN + Frame-Stack Attention)
 
+The network has been called C.A.L.F. (Convolutional Attention Leg Features)
+
 """
 
 import jax

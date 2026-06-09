@@ -45,9 +45,9 @@ class StackedEnvState:
 def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3,
                      num_rays: int = NUM_RAYS):
 
-    def reset_stacked(key, max_goal_dist: float = 3.0, ghost_prob: float = 1.0, scenario_idx: int = -1, **kwargs):
+    def reset_stacked(key, max_goal_dist: float = 3.0, ghost_prob: float = 1.0, scenario_idx: int = -1, min_goal_dist: float = 0.8, **kwargs):
         # Passes any extra dynamic args (like scenario_idx) gracefully down to the environment
-        base_obs, base_state = base_reset_fn(key, max_goal_dist=max_goal_dist, scenario_idx=scenario_idx, ghost_prob=ghost_prob, **kwargs)
+        base_obs, base_state = base_reset_fn(key, max_goal_dist=max_goal_dist, min_goal_dist=min_goal_dist, scenario_idx=scenario_idx, ghost_prob=ghost_prob, **kwargs)
         pose      = base_obs[0:POSE_SIZE]
         state_vec = base_obs[POSE_SIZE : POSE_SIZE + STATE_VEC_SIZE]
         lidar     = base_obs[POSE_SIZE + STATE_VEC_SIZE:]
@@ -91,15 +91,15 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3,
 
 
 def make_autoreset_env(reset_fn, step_fn):
-    def step_autoreset(key, state, action, max_goal_dist, scenario_idx, ghost_prob, max_scenario):
+    def step_autoreset(key, state, action, max_goal_dist, scenario_idx, ghost_prob, max_scenario, min_goal_dist=0.8):
         step_key, reset_key = jax.random.split(key)
         obs, next_state, reward, done, info = step_fn(step_key, state, action)
 
         # max_scenario flows via **kwargs through reset_stacked → reset_env → generate_scenario
         # so the random draw on reset is capped to [0, max_scenario] (curriculum range).
         reset_obs, reset_state = reset_fn(reset_key, max_goal_dist=max_goal_dist,
-                                          scenario_idx=scenario_idx, ghost_prob=ghost_prob,
-                                          max_scenario=max_scenario)
+                          scenario_idx=scenario_idx, ghost_prob=ghost_prob,
+                          max_scenario=max_scenario, min_goal_dist=min_goal_dist)
 
         def _select(reset_leaf, next_leaf):
             d = jnp.asarray(done)

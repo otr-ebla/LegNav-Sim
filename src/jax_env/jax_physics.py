@@ -1,6 +1,8 @@
 """
 jax_physics.py — Vectorized 2D Physics & LiDAR Engine
 ======================================================
+obs_boxes format: (K, 8) — four ordered 2D vertices stored flat as
+    [x0,y0, x1,y1, x2,y2, x3,y3] defining a convex quadrilateral.
 """
 
 import functools
@@ -90,41 +92,51 @@ def _get_ray_circles_intersections(x0, y0, dx, dy, circles):
 
 
 # ---------------------------------------------------------------------------
-# Box (AABB) Intersections — accepts pre-computed dx, dy
+# Convex-quad (4-vertex) Ray Intersections
 # ---------------------------------------------------------------------------
+# Each box is stored as 8 floats: [x0,y0, x1,y1, x2,y2, x3,y3]  (ordered CCW).
+# We intersect the ray against each of the 4 edges (segments) and take the
+# minimum positive hit distance.
 
-def _intersect_ray_aabb_scalar(x0, y0, dx, dy, bx, by, bw, bh):
-    """Slab method: single ray vs single axis-aligned box."""
-    eps = 1e-7
-    safe_dx = jnp.where(jnp.abs(dx) < eps, eps * jnp.sign(dx + 1e-8), dx)
-    safe_dy = jnp.where(jnp.abs(dy) < eps, eps * jnp.sign(dy + 1e-8), dy)
-    idx = 1.0 / safe_dx
-    idy = 1.0 / safe_dy
+def _intersect_ray_segment_scalar(rx, ry, dx, dy, ax, ay, bx, by):
+    """Ray-segment intersection: ray origin (rx,ry) + t*(dx,dy), segment A→B.
+    Returns smallest positive t or jnp.inf if no hit."""
+    # Parametric: ray: P = R + t*D,  segment: Q = A + s*(B-A), 0≤s≤1
+    # Solve: R + t*D = A + s*(B-A)
+    ex, ey = bx - ax, by - ay          # segment direction
+    # denom = D × E  (2D cross product)
+    denom = dx * ey - dy * ex
+    safe_denom = jnp.where(jnp.abs(denom) < 1e-10, 1e-10, denom)
+    # t and s from Cramer's rule
+    fx, fy = ax - rx, ay - ry
+    t = (fx * ey - fy * ex) / safe_denom
+    s = (fx * dy - fy * dx) / safe_denom
+    hit = (jnp.abs(denom) >= 1e-10) & (t > 1e-5) & (s >= 0.0) & (s <= 1.0)
+    return jnp.where(hit, t, jnp.inf)
 
-    tx1 = (bx - bw - x0) * idx
-    tx2 = (bx + bw - x0) * idx
-    ty1 = (by - bh - y0) * idy
-    ty2 = (by + bh - y0) * idy
 
-    tmin = jnp.maximum(jnp.minimum(tx1, tx2), jnp.minimum(ty1, ty2))
-    tmax = jnp.minimum(jnp.maximum(tx1, tx2), jnp.maximum(ty1, ty2))
-
-    hit = tmax >= jnp.maximum(tmin, 1e-5)
-    t   = jnp.where(tmin > 1e-5, tmin, tmax)
-    return jnp.where(hit & (t > 1e-5), t, jnp.inf)
+def _intersect_ray_quad_scalar(rx, ry, dxi, dyi, box):
+    """Single ray vs single convex quad (box: 8-float vertex array)."""
+    x0v, y0v = box[0], box[1]
+    x1v, y1v = box[2], box[3]
+    x2v, y2v = box[4], box[5]
+    x3v, y3v = box[6], box[7]
+    t0 = _intersect_ray_segment_scalar(rx, ry, dxi, dyi, x0v, y0v, x1v, y1v)
+    t1 = _intersect_ray_segment_scalar(rx, ry, dxi, dyi, x1v, y1v, x2v, y2v)
+    t2 = _intersect_ray_segment_scalar(rx, ry, dxi, dyi, x2v, y2v, x3v, y3v)
+    t3 = _intersect_ray_segment_scalar(rx, ry, dxi, dyi, x3v, y3v, x0v, y0v)
+    return jnp.minimum(jnp.minimum(t0, t1), jnp.minimum(t2, t3))
 
 
 def _get_ray_boxes_intersections(x0, y0, dx, dy, boxes):
-    """N rays vs K boxes."""
-    bx, by, bw, bh = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-
+    """N rays vs K convex quads.  boxes: (K, 8)."""
     def one_ray(dxi, dyi):
         return jax.vmap(
-            lambda bxi, byi, bwi, bhi: _intersect_ray_aabb_scalar(x0, y0, dxi, dyi, bxi, byi, bwi, bhi)
-        )(bx, by, bw, bh)
+            lambda b: _intersect_ray_quad_scalar(x0, y0, dxi, dyi, b)
+        )(boxes)
 
-    distances = jax.vmap(one_ray)(dx, dy)
-    return jnp.min(distances, axis=1)
+    distances = jax.vmap(one_ray)(dx, dy)   # (N, K)
+    return jnp.min(distances, axis=1)        # (N,)
 
 
 # ---------------------------------------------------------------------------

@@ -123,27 +123,67 @@ def _circle_force(px, py, vx, vy, circles):
     return jnp.sum(fxs), jnp.sum(fys)
 
 def _box_force(px, py, boxes):
-    """Repulsion from AABB boxes."""
+    """Repulsion from convex-quad obstacles.
+    boxes: (K, 8) — [x0,y0,x1,y1,x2,y2,x3,y3] ordered vertices."""
     def one(b):
-        cx, cy, hw, hh = b
-        cpx = jnp.clip(px, cx-hw, cx+hw)
-        cpy = jnp.clip(py, cy-hh, cy+hh)
-        dx, dy = px-cpx, py-cpy
+        # Extract the 4 vertices
+        verts = jnp.stack([b[0:2], b[2:4], b[4:6], b[6:8]])  # (4, 2)
+
+        def nearest_on_segment(ax, ay, bx_, by_):
+            """Closest point on segment A→B to (px,py)."""
+            ex, ey = bx_ - ax, by_ - ay
+            t = jnp.clip(((px - ax)*ex + (py - ay)*ey) /
+                         jnp.maximum(ex*ex + ey*ey, 1e-12), 0.0, 1.0)
+            return ax + t*ex, ay + t*ey
+
+        # Distances to each of the 4 edges
+        def edge_nearest(i):
+            ax, ay = verts[i, 0], verts[i, 1]
+            bx_, by_ = verts[(i+1) % 4, 0], verts[(i+1) % 4, 1]
+            npx, npy = nearest_on_segment(ax, ay, bx_, by_)
+            return npx, npy
+
+        np0x, np0y = edge_nearest(0)
+        np1x, np1y = edge_nearest(1)
+        np2x, np2y = edge_nearest(2)
+        np3x, np3y = edge_nearest(3)
+
+        d0 = jnp.sqrt((px-np0x)**2 + (py-np0y)**2 + _EPS)
+        d1 = jnp.sqrt((px-np1x)**2 + (py-np1y)**2 + _EPS)
+        d2 = jnp.sqrt((px-np2x)**2 + (py-np2y)**2 + _EPS)
+        d3 = jnp.sqrt((px-np3x)**2 + (py-np3y)**2 + _EPS)
+
+        dmin = jnp.minimum(jnp.minimum(d0, d1), jnp.minimum(d2, d3))
+        # Pick the nearest contact point
+        use0 = d0 <= dmin + 1e-8
+        use1 = (~use0) & (d1 <= jnp.minimum(d2, d3) + 1e-8)
+        use2 = (~use0) & (~use1) & (d2 <= d3 + 1e-8)
+
+        cpx = jnp.where(use0, np0x, jnp.where(use1, np1x, jnp.where(use2, np2x, np3x)))
+        cpy = jnp.where(use0, np0y, jnp.where(use1, np1y, jnp.where(use2, np2y, np3y)))
+
+        dx, dy = px - cpx, py - cpy
         dist, nx, ny = _n2(dx, dy)
-        # inside box: dist≈0, need strong push
-        inside = (jnp.abs(px-cx) < hw) & (jnp.abs(py-cy) < hh)
-        # direction when inside: push to nearest face
-        face_dx = hw - jnp.abs(px-cx)
-        face_dy = hh - jnp.abs(py-cy)
-        sign_x  = jnp.sign(px-cx)
-        sign_y  = jnp.sign(py-cy)
-        nx_in   = jnp.where(face_dx < face_dy, sign_x, 0.0)
-        ny_in   = jnp.where(face_dx < face_dy, 0.0, sign_y)
-        pen     = jnp.where(face_dx < face_dy, face_dx, face_dy)
-        nx_use  = jnp.where(inside, nx_in, nx)
-        ny_use  = jnp.where(inside, ny_in, ny)
-        mag     = A_OBS * jnp.exp(-dist / B_OBS) + OVERLAP_K * jnp.where(inside, pen, 0.0)
-        return mag*nx_use, mag*ny_use
+
+        # Point inside polygon: check winding-number sign via cross products
+        def cross_sign(i):
+            ax, ay = verts[i, 0], verts[i, 1]
+            bx_, by_ = verts[(i+1) % 4, 0], verts[(i+1) % 4, 1]
+            return (bx_ - ax)*(py - ay) - (by_ - ay)*(px - ax)
+        cs0, cs1, cs2, cs3 = cross_sign(0), cross_sign(1), cross_sign(2), cross_sign(3)
+        inside = (cs0 >= 0) & (cs1 >= 0) & (cs2 >= 0) & (cs3 >= 0)
+
+        # When inside, push outward along nearest edge normal (negate direction)
+        nx_use = jnp.where(inside, -nx, nx)
+        ny_use = jnp.where(inside, -ny, ny)
+        pen = jnp.where(inside, dmin, 0.0)
+
+        mag = A_OBS * jnp.exp(-dist / B_OBS) + OVERLAP_K * pen
+        # Mask zero-span placeholder boxes so they contribute no force.
+        span = jnp.maximum(jnp.abs(b[0] - b[4]), jnp.abs(b[1] - b[5]))
+        valid = span > 1e-6
+        return jnp.where(valid, mag * nx_use, 0.0), jnp.where(valid, mag * ny_use, 0.0)
+
     fxs, fys = jax.vmap(one)(boxes)
     return jnp.sum(fxs), jnp.sum(fys)
 
@@ -190,23 +230,66 @@ def _pushout_circles(px, py, r, circles):
     return px, py
 
 def _pushout_boxes(px, py, r, boxes):
+    """Hard push-out from convex-quad obstacles.
+    boxes: (K, 8) — [x0,y0,x1,y1,x2,y2,x3,y3]."""
     def one(carry, b):
         cpx, cpy = carry
-        cx, cy, hw, hh = b
-        inside = (jnp.abs(cpx-cx) < hw+r) & (jnp.abs(cpy-cy) < hh+r)
-        # expanded box: [cx-hw-r, cx+hw+r] x [cy-hh-r, cy+hh+r]
-        # push to nearest face of expanded box
-        face_dx = (hw+r) - jnp.abs(cpx-cx)
-        face_dy = (hh+r) - jnp.abs(cpy-cy)
-        sign_x  = jnp.sign(cpx-cx)
-        sign_y  = jnp.sign(cpy-cy)
-        # push along shortest axis
-        push_x  = face_dx * sign_x
-        push_y  = face_dy * sign_y
-        use_x   = face_dx < face_dy
-        dpx     = jnp.where(inside, jnp.where(use_x, push_x, 0.0), 0.0)
-        dpy     = jnp.where(inside, jnp.where(use_x, 0.0, push_y), 0.0)
+        verts = jnp.stack([b[0:2], b[2:4], b[4:6], b[6:8]])  # (4, 2)
+
+        # Is the point inside the quad? (signed cross products, CCW order)
+        def cross_sign(i):
+            ax, ay = verts[i, 0], verts[i, 1]
+            bx_, by_ = verts[(i+1) % 4, 0], verts[(i+1) % 4, 1]
+            return (bx_ - ax)*(cpy - ay) - (by_ - ay)*(cpx - ax)
+        cs0, cs1, cs2, cs3 = cross_sign(0), cross_sign(1), cross_sign(2), cross_sign(3)
+
+        # Nearest point on polygon perimeter
+        def nearest_on_segment(ax, ay, bx_, by_):
+            ex, ey = bx_ - ax, by_ - ay
+            t = jnp.clip(((cpx - ax)*ex + (cpy - ay)*ey) /
+                         jnp.maximum(ex*ex + ey*ey, 1e-12), 0.0, 1.0)
+            return ax + t*ex, ay + t*ey
+
+        def edge_nearest(i):
+            ax, ay = verts[i, 0], verts[i, 1]
+            bx_, by_ = verts[(i+1) % 4, 0], verts[(i+1) % 4, 1]
+            npx, npy = nearest_on_segment(ax, ay, bx_, by_)
+            dist2 = (cpx - npx)**2 + (cpy - npy)**2
+            return npx, npy, dist2
+
+        n0x, n0y, d0sq = edge_nearest(0)
+        n1x, n1y, d1sq = edge_nearest(1)
+        n2x, n2y, d2sq = edge_nearest(2)
+        n3x, n3y, d3sq = edge_nearest(3)
+
+        dmin_sq = jnp.minimum(jnp.minimum(d0sq, d1sq), jnp.minimum(d2sq, d3sq))
+        use0 = d0sq <= dmin_sq + 1e-16
+        use1 = (~use0) & (d1sq <= jnp.minimum(d2sq, d3sq) + 1e-16)
+        use2 = (~use0) & (~use1) & (d2sq <= d3sq + 1e-16)
+        npx = jnp.where(use0, n0x, jnp.where(use1, n1x, jnp.where(use2, n2x, n3x)))
+        npy = jnp.where(use0, n0y, jnp.where(use1, n1y, jnp.where(use2, n2y, n3y)))
+
+        ddx, ddy = cpx - npx, cpy - npy
+        dist = jnp.sqrt(ddx**2 + ddy**2 + 1e-12)
+
+        inside = (cs0 >= 0) & (cs1 >= 0) & (cs2 >= 0) & (cs3 >= 0)
+        # Outside: if within r of the surface, push outward
+        near = dist < r
+        push_out = (inside | near)
+
+        # Direction: outward from nearest surface point
+        nx_ = jnp.where(inside, -ddx / dist, ddx / dist)
+        ny_ = jnp.where(inside, -ddy / dist, ddy / dist)
+        # When inside, push by r + current dist (clear the expanded boundary)
+        push_mag = jnp.where(inside, dist + r + 1e-3, r - dist + 1e-3)
+
+        # Mask zero-span placeholder boxes — no push-out from them.
+        span = jnp.maximum(jnp.abs(b[0] - b[4]), jnp.abs(b[1] - b[5]))
+        valid = span > 1e-6
+        dpx = jnp.where(push_out & valid, nx_ * push_mag, 0.0)
+        dpy = jnp.where(push_out & valid, ny_ * push_mag, 0.0)
         return (cpx + dpx, cpy + dpy), None
+
     (px, py), _ = jax.lax.scan(one, (px, py), boxes)
     return px, py
 

@@ -1,5 +1,12 @@
 """
-paper_comparison_eval.py — Comparison Table for Paper (Maximal Parallelization)
+paper_comparison_eval.py — Comparison Table for Paper
+
+Evaluates each policy on test scenarios 7-12 with multi-waypoint chaining:
+multi-waypoint scenarios (7, 9, 11, 12) count as successful only if the robot
+reaches the LAST waypoint. The metric definitions and waypoint handling mirror
+benchmark_eval.py's dashboard so the table and the Evaluation_Dashboard figure
+are directly comparable (the only intended difference is v_max sampling — this
+script samples v_max ~ U[0.2, 2.0] per env, the dashboard sweeps a fixed grid).
 """
 
 import argparse
@@ -36,11 +43,12 @@ _jax_env.USE_LEGS     = not args.no_legs
 _jax_env.SENSOR_NOISE = True
 
 from jax_env import (ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS,
-                     DT, MAX_STEPS, STATE_VEC_SIZE as _SVS)
+                     DT, MAX_STEPS, STATE_VEC_SIZE as _SVS, get_obs)
 from jax_legs import LEG_RADIUS
 from jax_env_multi import reset_env, step_env
 from jax_wrappers import StackedEnvState
 from jax_network import SharedEncoder
+from jax_scenarios import TEST_ROBOT_WAYPOINTS, TEST_SCENARIO_NAMES
 
 OBS_SIZE   = 662
 ACTION_DIM = 2
@@ -53,7 +61,8 @@ V_MAX_MAX = 2.0
 N_ENVS      = args.envs
 N_ENVS_MPPI = args.envs_mppi
 YIELD_DIST = 1.5
-YIELD_FOV  = 0.785
+YIELD_FOV  = 0.785  # ±45° (90° cone), matches yielding reward in jax_env.py
+SPACE_COMP_DIST = 0.5  # min surface distance (m) for a "space-compliant" timestep
 
 @jax.jit
 def _reset_stacked(key, v_max, scenario_idx):
@@ -81,90 +90,118 @@ def _step_stacked(key, state: StackedEnvState, action):
     flat   = jnp.concatenate([new_ps.flatten(), new_sv, new_ls.flatten()])
     return flat, new_st, reward, done, info
 
-@partial(jax.jit, static_argnums=(0, 1))
-def _rollout_stateless(act_vmap, total_envs, rng_key, scenario_batch):
+# ── Waypoint-chained rollout (mirrors benchmark_eval.py test machinery) ───────
+# Each scenario is evaluated by running one MAX_STEPS *segment* per waypoint.
+# A segment never resets; it saves the arrival state at the first goal step so
+# the next segment can continue from there with the next goal. Multi-waypoint
+# scenarios (7, 9, 11, 12) are therefore successful only if the robot reaches
+# the LAST waypoint — identical definition to benchmark_eval.py's dashboard.
+
+
+def _reset_scenario(rng_key, n_envs, scenario_idx):
+    """Reset n_envs of a single scenario with per-env v_max ~ U[0.2, 2.0]."""
     rng_key, rng_v = jax.random.split(rng_key)
-    v_max_batch = jax.random.uniform(rng_v, (total_envs,), minval=V_MAX_MIN, maxval=V_MAX_MAX)
-    reset_keys  = jax.random.split(rng_key, total_envs)
-    # vmap dynamically across keys, v_maxes AND scenarios
-    obs, state  = jax.vmap(_reset_stacked, in_axes=(0, 0, 0))(reset_keys, v_max_batch, scenario_batch)
+    v_max_batch = jax.random.uniform(rng_v, (n_envs,), minval=V_MAX_MIN, maxval=V_MAX_MAX)
+    reset_keys  = jax.random.split(rng_key, n_envs)
+    return jax.vmap(_reset_stacked, in_axes=(0, 0, None))(
+        reset_keys, v_max_batch, jnp.int32(scenario_idx))
 
-    init_dist = jnp.sqrt((state.env_state.goal_x - state.env_state.x)**2 + (state.env_state.goal_y - state.env_state.y)**2)
-    carry0 = (state, obs, jnp.zeros(total_envs), jnp.full(total_envs, 100.0), jnp.zeros(total_envs), jnp.zeros(total_envs), jnp.zeros(total_envs), jnp.zeros(total_envs), jnp.ones(total_envs, dtype=jnp.bool_), jnp.zeros(total_envs), jnp.zeros(total_envs))
 
-    def _step(carry, step_idx):
-        (state, obs, pl, mhd, v_p, w_p, av_p, aw_p, active, yz, yc) = carry
-        k = jax.random.fold_in(rng_key, step_idx)
-        actions = act_vmap(obs)
-        step_keys = jax.random.split(k, total_envs)
-        next_obs, next_state, _, done, info = jax.vmap(_step_stacked)(step_keys, state, actions)
+@partial(jax.jit, static_argnums=(0,))
+def _advance_waypoint(n_envs, stacked_state, next_gx, next_gy, gr_flag, rng_key):
+    """Set the next goal (only where the previous goal was reached), reset the
+    time budget, recompute obs. Per-env max_v is preserved (unlike the dashboard,
+    this eval uses a continuous per-env v_max)."""
+    es = stacked_state.env_state.replace(
+        goal_x=jnp.where(gr_flag, next_gx, stacked_state.env_state.goal_x),
+        goal_y=jnp.where(gr_flag, next_gy, stacked_state.env_state.goal_y),
+        time_step=jnp.zeros(n_envs, dtype=jnp.int32),
+    )
+    obs_keys = jax.random.split(rng_key, n_envs)
+    new_base_obs, sp_mask = jax.vmap(get_obs)(es, obs_keys)
+    es = es.replace(sp_mask=sp_mask)
 
-        v, w = next_state.env_state.v, next_state.env_state.w
-        av, aw = (v - v_p) / DT, (w - w_p) / DT
-        pl = pl + jnp.where(active, v * DT, 0.0)
-        ch = info["closest_shoe_surface"]
-        mhd = jnp.where(active, jnp.minimum(mhd, ch), mhd)
+    new_pose      = new_base_obs[:, :POSE_SIZE]
+    new_state_vec = new_base_obs[:, POSE_SIZE:POSE_SIZE + _SVS]
+    new_lidar     = new_base_obs[:, POSE_SIZE + _SVS:]
+    new_pose_stack  = stacked_state.pose_stack.at[:, -1, :].set(new_pose)
+    new_lidar_stack = stacked_state.lidar_stack.at[:, -1, :].set(new_lidar)
+    new_state = StackedEnvState(env_state=es, lidar_stack=new_lidar_stack, pose_stack=new_pose_stack)
+    new_obs = jnp.concatenate([
+        new_pose_stack.reshape(n_envs, -1), new_state_vec, new_lidar_stack.reshape(n_envs, -1)
+    ], axis=1)
+    return new_obs, new_state
 
-        ppl = next_state.env_state.people
-        dp_x, dp_y = ppl[:, :, 0] - next_state.env_state.x[:, None], ppl[:, :, 1] - next_state.env_state.y[:, None]
-        dists_p = jnp.sqrt(dp_x**2 + dp_y**2 + 1e-8)
-        rel_ang = (jnp.arctan2(dp_y, dp_x) - next_state.env_state.theta[:, None] + jnp.pi) % (2*jnp.pi) - jnp.pi
-        in_yz = (dists_p < YIELD_DIST) & (jnp.abs(rel_ang) < YIELD_FOV) & (ppl[:, :, 10] >= 0.0)
-        any_yz = jnp.any(in_yz, axis=1)
-        yz = yz + jnp.where(active & any_yz, 1.0, 0.0)
-        yc = yc + jnp.where(active & any_yz & (v <= 0.1), 1.0, 0.0)
 
-        g, c = info["goal_reached"] & active, info["collision"] & active
-        ac, pc = info["active_col"] & active, info["passive_col"] & active
-        jv, jw = jnp.where(active, jnp.abs((av - av_p) / DT), 0.0), jnp.where(active, jnp.abs((aw - aw_p) / DT), 0.0)
-
-        next_active = active & ~done
-        return (next_state, next_obs, pl, mhd, v, w, av, aw, next_active, yz, yc), (active, g, c, ac, pc, jv + jw, v, ch)
-
-    final_carry, step_data = jax.lax.scan(_step, carry0, jnp.arange(MAX_STEPS, dtype=jnp.uint32))
-    (_, _, final_pl, final_mhd, _, _, _, _, _, final_yz, final_yc) = final_carry
-    active_mask, goals, cols, act_cols, pass_cols, jerks, step_vs, step_ch = step_data
-
+def _seg_metrics(active_mask, goals, cols, pcols, step_ch,
+                 final_pl, final_mhd, final_jw, final_yz, final_yc, init_dist):
     ep_lens = active_mask.sum(axis=0)
-    has_any_col = cols.any(axis=0)
-    ep_actcol = act_cols.any(axis=0)
-    ep_pscol = pass_cols.any(axis=0) & ~ep_actcol
-    ep_obscol = has_any_col & ~ep_actcol & ~ep_pscol
-    ep_goal = goals.any(axis=0) & ~has_any_col
-    ep_tmo = ~(ep_goal | has_any_col)
+    ep_goal = goals.any(axis=0)
+    ep_col  = cols.any(axis=0)
+    ep_pcol = pcols.any(axis=0)
+    act_col  = ep_col & ~ep_pcol & ~ep_goal          # active-human OR static-obstacle
+    pass_col = ep_pcol & ~ep_goal
+    tmo      = ~ep_goal & ~ep_col & ~ep_pcol
 
+    compliant = jnp.where(active_mask & (step_ch > SPACE_COMP_DIST), 1.0, 0.0)
+    sc = compliant.sum(axis=0) / jnp.maximum(active_mask.sum(axis=0), 1.0)
     return {
-        "success": ep_goal.astype(jnp.float32), "obs_col": ep_obscol.astype(jnp.float32),
-        "act_col": ep_actcol.astype(jnp.float32), "pass_col": ep_pscol.astype(jnp.float32),
-        "timeout": ep_tmo.astype(jnp.float32), "jerk": jerks.sum(axis=0) / jnp.maximum(ep_lens, 1),
-        "time_goal": jnp.where(ep_goal, ep_lens * DT, jnp.nan), "min_dist": final_mhd,
+        "goal_reached": ep_goal,
+        "act_col":  act_col.astype(jnp.float32),
+        "pass_col": pass_col.astype(jnp.float32),
+        "timeout":  tmo.astype(jnp.float32),
+        "spl":      ep_goal * (init_dist / jnp.maximum(final_pl, init_dist)),
+        "ttg":      jnp.where(ep_goal, ep_lens * DT, jnp.nan),
+        "min_dist": final_mhd,
+        "aj":       final_jw / jnp.maximum(ep_lens, 1.0),
         "yield_score": jnp.where(final_yz > 0, final_yc / final_yz, jnp.nan),
-        "spl": ep_goal * (init_dist / jnp.maximum(final_pl, init_dist)),
-        "step_ch": step_ch, "active_mask": active_mask, "ep_lens": ep_lens,
+        "space_compliance": sc,
     }
 
-@partial(jax.jit, static_argnums=(0, 1))
-def _rollout_mppi(mppi, total_envs, rng_key, scenario_batch):
-    rng_key, rng_v = jax.random.split(rng_key)
-    v_max_batch = jax.random.uniform(rng_v, (total_envs,), minval=V_MAX_MIN, maxval=V_MAX_MAX)
-    reset_keys = jax.random.split(rng_key, total_envs)
-    obs, state = jax.vmap(_reset_stacked, in_axes=(0, 0, 0))(reset_keys, v_max_batch, scenario_batch)
-    init_dist = jnp.sqrt((state.env_state.goal_x - state.env_state.x)**2 + (state.env_state.goal_y - state.env_state.y)**2)
-    u_mean_init = jnp.broadcast_to(mppi.init_u_mean(), (total_envs, mppi.horizon, 2))
 
-    carry0 = (state, obs, jnp.zeros(total_envs), jnp.full(total_envs, 100.0), jnp.zeros(total_envs), jnp.zeros(total_envs), jnp.zeros(total_envs), jnp.zeros(total_envs), jnp.ones(total_envs, dtype=jnp.bool_), jnp.zeros(total_envs), jnp.zeros(total_envs), u_mean_init)
+@partial(jax.jit, static_argnums=(0, 1))
+def _segment_stateless(act_vmap, n_envs, init_obs, init_state, rng_key, step_offset):
+    init_dist = jnp.sqrt((init_state.env_state.goal_x - init_state.env_state.x)**2 +
+                         (init_state.env_state.goal_y - init_state.env_state.y)**2)
+    carry0 = (init_state, init_obs,
+              jnp.zeros(n_envs), jnp.full(n_envs, 100.0),       # pl, mhd
+              jnp.zeros(n_envs), jnp.zeros(n_envs),             # w_p, aw_p
+              jnp.ones(n_envs, dtype=jnp.bool_),                # active
+              jnp.zeros(n_envs, dtype=jnp.bool_),               # gr_flag
+              init_state, init_obs,                             # gr_state, gr_obs
+              jnp.zeros(n_envs), jnp.zeros(n_envs))             # yz, yc
 
     def _step(carry, step_idx):
-        (state, obs, pl, mhd, v_p, w_p, av_p, aw_p, active, yz, yc, u_mean) = carry
-        k = jax.random.fold_in(rng_key, step_idx)
-        actions, new_u_mean = jax.vmap(mppi.act)(obs, u_mean, jax.random.split(k, total_envs))
-        next_obs, next_state, _, done, info = jax.vmap(_step_stacked)(jax.random.split(k, total_envs), state, actions)
+        (state, obs, pl, mhd, w_p, aw_p, active,
+         gr_flag, gr_state, gr_obs, yz, yc) = carry
+        k = jax.random.fold_in(rng_key, step_offset + step_idx)
+        actions = act_vmap(obs)
+        next_obs, next_state, _, done, info = jax.vmap(_step_stacked)(
+            jax.random.split(k, n_envs), state, actions)
 
         v, w = next_state.env_state.v, next_state.env_state.w
-        av, aw = (v - v_p) / DT, (w - w_p) / DT
+        aw = (w - w_p) / DT
+        jw = jnp.where(active, jnp.abs((aw - aw_p) / DT), 0.0)  # angular jerk (rad/s^3)
         pl = pl + jnp.where(active, v * DT, 0.0)
-        ch = info["closest_shoe_surface"]
+
+        if _jax_env.USE_LEGS:
+            ch = info["closest_shoe_surface"]
+        else:
+            ch = info["closest_human"] - ROBOT_RADIUS - PEOPLE_RADIUS
         mhd = jnp.where(active, jnp.minimum(mhd, ch), mhd)
+
+        g  = info["goal_reached"] & active
+        c  = info["collision"]    & active
+        pc = info["passive_col"]  & active
+
+        first_goal = g & ~gr_flag
+        def _sel(new_a, old_a):
+            if new_a.ndim == 1:
+                return jnp.where(first_goal, new_a, old_a)
+            return jnp.where(first_goal.reshape([-1] + [1] * (new_a.ndim - 1)), new_a, old_a)
+        new_gr_state = jax.tree_util.tree_map(_sel, state, gr_state)
+        new_gr_obs   = _sel(obs, gr_obs)
+        new_gr_flag  = gr_flag | g
 
         ppl = next_state.env_state.people
         dp_x, dp_y = ppl[:, :, 0] - next_state.env_state.x[:, None], ppl[:, :, 1] - next_state.env_state.y[:, None]
@@ -175,34 +212,147 @@ def _rollout_mppi(mppi, total_envs, rng_key, scenario_batch):
         yz = yz + jnp.where(active & any_yz, 1.0, 0.0)
         yc = yc + jnp.where(active & any_yz & (v <= 0.1), 1.0, 0.0)
 
-        g, c = info["goal_reached"] & active, info["collision"] & active
-        ac, pc = info["active_col"] & active, info["passive_col"] & active
-        jv, jw = jnp.where(active, jnp.abs((av - av_p) / DT), 0.0), jnp.where(active, jnp.abs((aw - aw_p) / DT), 0.0)
-        
-        new_u_mean = jnp.where(done[:, None, None], jnp.broadcast_to(mppi.init_u_mean(), new_u_mean.shape), new_u_mean)
         next_active = active & ~done
-        return (next_state, next_obs, pl, mhd, v, w, av, aw, next_active, yz, yc, new_u_mean), (active, g, c, ac, pc, jv + jw, v, ch)
+        return (next_state, next_obs, pl, mhd, w, aw, next_active,
+                new_gr_flag, new_gr_state, new_gr_obs, yz, yc), (active, g, c, pc, ch, jw)
 
     final_carry, step_data = jax.lax.scan(_step, carry0, jnp.arange(MAX_STEPS, dtype=jnp.uint32))
-    (_, _, final_pl, final_mhd, _, _, _, _, _, final_yz, final_yc, _) = final_carry
-    active_mask, goals, cols, act_cols, pass_cols, jerks, _, step_ch = step_data
+    (_, _, final_pl, final_mhd, _, _, _,
+     final_grflag, final_grstate, final_grobs, final_yz, final_yc) = final_carry
+    active_mask, goals, cols, pcols, step_ch, jerks = step_data
+    final_jw = jerks.sum(axis=0)
 
-    ep_lens = active_mask.sum(axis=0)
-    has_any_col = cols.any(axis=0)
-    ep_actcol = act_cols.any(axis=0)
-    ep_pscol = pass_cols.any(axis=0) & ~ep_actcol
-    ep_obscol = has_any_col & ~ep_actcol & ~ep_pscol
-    ep_goal = goals.any(axis=0) & ~has_any_col
-    ep_tmo = ~(ep_goal | has_any_col)
+    metrics = _seg_metrics(active_mask, goals, cols, pcols, step_ch,
+                           final_pl, final_mhd, final_jw, final_yz, final_yc, init_dist)
+    return metrics, final_grstate, final_grobs, final_grflag
 
+
+@partial(jax.jit, static_argnums=(0, 1))
+def _segment_mppi(mppi, n_envs, init_obs, init_state, rng_key, step_offset):
+    init_dist = jnp.sqrt((init_state.env_state.goal_x - init_state.env_state.x)**2 +
+                         (init_state.env_state.goal_y - init_state.env_state.y)**2)
+    u_mean_init = jnp.broadcast_to(mppi.init_u_mean(), (n_envs, mppi.horizon, 2))
+    carry0 = (init_state, init_obs,
+              jnp.zeros(n_envs), jnp.full(n_envs, 100.0),
+              jnp.zeros(n_envs), jnp.zeros(n_envs),
+              jnp.ones(n_envs, dtype=jnp.bool_),
+              jnp.zeros(n_envs, dtype=jnp.bool_),
+              init_state, init_obs,
+              jnp.zeros(n_envs), jnp.zeros(n_envs),
+              u_mean_init)
+
+    def _step(carry, step_idx):
+        (state, obs, pl, mhd, w_p, aw_p, active,
+         gr_flag, gr_state, gr_obs, yz, yc, u_mean) = carry
+        k = jax.random.fold_in(rng_key, step_offset + step_idx)
+        actions, new_u_mean = jax.vmap(mppi.act)(obs, u_mean, jax.random.split(k, n_envs))
+        next_obs, next_state, _, done, info = jax.vmap(_step_stacked)(
+            jax.random.split(k, n_envs), state, actions)
+
+        v, w = next_state.env_state.v, next_state.env_state.w
+        aw = (w - w_p) / DT
+        jw = jnp.where(active, jnp.abs((aw - aw_p) / DT), 0.0)  # angular jerk (rad/s^3)
+        pl = pl + jnp.where(active, v * DT, 0.0)
+
+        if _jax_env.USE_LEGS:
+            ch = info["closest_shoe_surface"]
+        else:
+            ch = info["closest_human"] - ROBOT_RADIUS - PEOPLE_RADIUS
+        mhd = jnp.where(active, jnp.minimum(mhd, ch), mhd)
+
+        g  = info["goal_reached"] & active
+        c  = info["collision"]    & active
+        pc = info["passive_col"]  & active
+
+        first_goal = g & ~gr_flag
+        def _sel(new_a, old_a):
+            if new_a.ndim == 1:
+                return jnp.where(first_goal, new_a, old_a)
+            return jnp.where(first_goal.reshape([-1] + [1] * (new_a.ndim - 1)), new_a, old_a)
+        new_gr_state = jax.tree_util.tree_map(_sel, state, gr_state)
+        new_gr_obs   = _sel(obs, gr_obs)
+        new_gr_flag  = gr_flag | g
+
+        ppl = next_state.env_state.people
+        dp_x, dp_y = ppl[:, :, 0] - next_state.env_state.x[:, None], ppl[:, :, 1] - next_state.env_state.y[:, None]
+        dists_p = jnp.sqrt(dp_x**2 + dp_y**2 + 1e-8)
+        rel_ang = (jnp.arctan2(dp_y, dp_x) - next_state.env_state.theta[:, None] + jnp.pi) % (2*jnp.pi) - jnp.pi
+        in_yz = (dists_p < YIELD_DIST) & (jnp.abs(rel_ang) < YIELD_FOV) & (ppl[:, :, 10] >= 0.0)
+        any_yz = jnp.any(in_yz, axis=1)
+        yz = yz + jnp.where(active & any_yz, 1.0, 0.0)
+        yc = yc + jnp.where(active & any_yz & (v <= 0.1), 1.0, 0.0)
+
+        new_u_mean = jnp.where(done[:, None, None],
+                               jnp.broadcast_to(mppi.init_u_mean(), new_u_mean.shape), new_u_mean)
+        next_active = active & ~done
+        return (next_state, next_obs, pl, mhd, w, aw, next_active,
+                new_gr_flag, new_gr_state, new_gr_obs, yz, yc, new_u_mean), \
+               (active, g, c, pc, ch, jw)
+
+    final_carry, step_data = jax.lax.scan(_step, carry0, jnp.arange(MAX_STEPS, dtype=jnp.uint32))
+    (_, _, final_pl, final_mhd, _, _, _,
+     final_grflag, final_grstate, final_grobs, final_yz, final_yc, _) = final_carry
+    active_mask, goals, cols, pcols, step_ch, jerks = step_data
+    final_jw = jerks.sum(axis=0)
+
+    metrics = _seg_metrics(active_mask, goals, cols, pcols, step_ch,
+                           final_pl, final_mhd, final_jw, final_yz, final_yc, init_dist)
+    return metrics, final_grstate, final_grobs, final_grflag
+
+# ── Python driver: chain waypoint segments for one scenario ───────────────────
+# Single-waypoint scenarios (8, 10) run one segment; multi-waypoint scenarios
+# (7, 9, 11, 12) chain segments, advancing the goal only for envs that reached
+# the previous waypoint. Success requires reaching the LAST waypoint. Collisions
+# accumulate across segments (while the env is still alive); secondary metrics
+# (SPL/TTG/MHD/AJ/SC/YS) come from the final segment — identical to the dashboard
+# in benchmark_eval.py so the table and figure stay directly comparable.
+
+def _run_scenario(seg_call, n_envs, scenario, waypoints, rng_key):
+    n_wp = len(waypoints)
+    obs, state = _reset_scenario(rng_key, n_envs, scenario)
+
+    still_alive  = np.ones(n_envs,  dtype=bool)
+    overall_col  = np.zeros(n_envs, dtype=bool)
+    overall_pcol = np.zeros(n_envs, dtype=bool)
+    metrics = None
+
+    for wp_idx in range(n_wp):
+        step_off = jnp.int32(wp_idx * MAX_STEPS)
+        metrics, gr_state, gr_obs, gr_flag = jax.device_get(
+            seg_call(obs, state, rng_key, step_off))
+
+        overall_col  |= np.asarray(metrics["act_col"]).astype(bool)  & still_alive
+        overall_pcol |= np.asarray(metrics["pass_col"]).astype(bool) & still_alive
+
+        if wp_idx < n_wp - 1:
+            next_gx, next_gy = waypoints[wp_idx + 1]
+            # Scenario 9 ("Sequential Rooms") encodes per-env door y-positions via
+            # sentinels: -1.0 -> door1_y, -2.0 -> door2_y (obs_boxes[w, 5] + 1.0).
+            if scenario == 9 and next_gy in (-1.0, -2.0):
+                wall_idx = 0 if next_gy == -1.0 else 2
+                next_gy = jnp.asarray(gr_state.env_state.obs_boxes[:, wall_idx, 5] + 1.0,
+                                      dtype=jnp.float32)
+                next_gx = jnp.float32(next_gx)
+            else:
+                next_gx = jnp.float32(next_gx)
+                next_gy = jnp.float32(next_gy)
+            adv_rng = jax.random.fold_in(rng_key, wp_idx + 1)
+            obs, state = _advance_waypoint(n_envs, gr_state, next_gx, next_gy, gr_flag, adv_rng)
+            still_alive = still_alive & np.asarray(metrics["goal_reached"]).astype(bool)
+
+    final_success = still_alive & np.asarray(metrics["goal_reached"]).astype(bool)
+    tmo = ~final_success & ~overall_col & ~overall_pcol
     return {
-        "success": ep_goal.astype(jnp.float32), "obs_col": ep_obscol.astype(jnp.float32),
-        "act_col": ep_actcol.astype(jnp.float32), "pass_col": ep_pscol.astype(jnp.float32),
-        "timeout": ep_tmo.astype(jnp.float32), "jerk": jerks.sum(axis=0) / jnp.maximum(ep_lens, 1),
-        "time_goal": jnp.where(ep_goal, ep_lens * DT, jnp.nan), "min_dist": final_mhd,
-        "yield_score": jnp.where(final_yz > 0, final_yc / final_yz, jnp.nan),
-        "spl": ep_goal * (init_dist / jnp.maximum(final_pl, init_dist)),
-        "step_ch": step_ch, "active_mask": active_mask, "ep_lens": ep_lens,
+        "success":          final_success.astype(np.float32),
+        "act_col":          overall_col.astype(np.float32),
+        "pass_col":         overall_pcol.astype(np.float32),
+        "timeout":          tmo.astype(np.float32),
+        "spl":              np.asarray(metrics["spl"]),
+        "time_goal":        np.where(final_success, np.asarray(metrics["ttg"]), np.nan),
+        "min_dist":         np.asarray(metrics["min_dist"]),
+        "jerk":             np.asarray(metrics["aj"]),
+        "yield_score":      np.asarray(metrics["yield_score"]),
+        "space_compliance": np.asarray(metrics["space_compliance"]),
     }
 
 def _obs_to_max_v(obs): return jnp.clip(obs[..., 11] * 1.8 + 0.2, 0.2, 2.0)
@@ -238,29 +388,49 @@ def _build_navrep_act_vmap(ckpt_path):
         return jax.vmap(_single)(obs_batch)
     return act_vmap
 
+# SAC/TQC actor heads must match SACjax/TQCjac/jax_eval_multi exactly: a 'mean'
+# Dense (named for SAC, unnamed for TQC), a 'log_std' parameter vector, and
+# tanh-inside squashing (USE_TANH_INSIDE). Squashing goes through
+# scale_action_to_env, identical to training.
 def _build_sac_act_vmap(ckpt_path):
+    from jax_network import USE_TANH_INSIDE, scale_action_to_env
     enc, bundle = SharedEncoder(), _load_raw(ckpt_path)
     class SACHead(nn.Module):
+        tanh_inside: bool = USE_TANH_INSIDE
         @nn.compact
-        def __call__(self, feat): return nn.Dense(ACTION_DIM)(feat), jnp.clip(nn.Dense(ACTION_DIM)(feat), -5.0, 2.0)
+        def __call__(self, feat):
+            raw_mean = nn.Dense(ACTION_DIM, name="mean")(feat)
+            if self.tanh_inside:
+                raw_mean = jnp.stack([jnp.tanh(raw_mean[..., 0]) * 0.5 + 0.5,
+                                      jnp.tanh(raw_mean[..., 1])], axis=-1)
+            self.param('log_std', nn.initializers.constant(1.0), (ACTION_DIM,))
+            return raw_mean
     head, enc_p, head_p = SACHead(), bundle["enc_params"], bundle["actor_head_params"]
     def act_vmap(obs_batch):
         def _single(obs):
-            mean = jnp.squeeze(head.apply({"params": head_p}, enc.apply({"params": enc_p}, obs[None]))[0], 0)
-            return jnp.stack([(jnp.tanh(mean[0]) + 1.0) * 0.5 * _obs_to_max_v(obs), jnp.tanh(mean[1])])
+            mean = jnp.squeeze(head.apply({"params": head_p}, enc.apply({"params": enc_p}, obs[None])), 0)
+            return scale_action_to_env(mean, _obs_to_max_v(obs))
         return jax.vmap(_single)(obs_batch)
     return act_vmap
 
 def _build_tqc_act_vmap(ckpt_path):
+    from jax_network import USE_TANH_INSIDE, scale_action_to_env
     enc, bundle = SharedEncoder(), _load_raw(ckpt_path)
     class TQCHead(nn.Module):
+        tanh_inside: bool = USE_TANH_INSIDE
         @nn.compact
-        def __call__(self, feat): return nn.Dense(ACTION_DIM)(feat).astype(jnp.float32), jnp.clip(nn.Dense(ACTION_DIM)(feat).astype(jnp.float32), -5.0, 0.5)
+        def __call__(self, feat):
+            raw_mean = nn.Dense(ACTION_DIM)(feat)
+            if self.tanh_inside:
+                raw_mean = jnp.stack([jnp.tanh(raw_mean[..., 0]) * 0.5 + 0.5,
+                                      jnp.tanh(raw_mean[..., 1])], axis=-1)
+            self.param('log_std', nn.initializers.constant(1.0), (ACTION_DIM,))
+            return raw_mean.astype(jnp.float32)
     head, enc_p, head_p = TQCHead(), bundle["enc_params"], bundle["actor_params"]
     def act_vmap(obs_batch):
         def _single(obs):
-            mean = jnp.squeeze(head.apply({"params": head_p}, enc.apply({"params": enc_p}, obs[None]))[0], 0)
-            return jnp.stack([(jnp.tanh(mean[0]) + 1.0) * 0.5 * _obs_to_max_v(obs), jnp.tanh(mean[1])])
+            mean = jnp.squeeze(head.apply({"params": head_p}, enc.apply({"params": enc_p}, obs[None])), 0)
+            return scale_action_to_env(mean, _obs_to_max_v(obs))
         return jax.vmap(_single)(obs_batch)
     return act_vmap
 
@@ -276,64 +446,73 @@ def _build_tagd_act_vmap(ckpt_path):
 POLICY_REGISTRY = [
     ("DWA",          "dwa",    None,                                           "Model-Based"),
     ("MPPI",         "mppi",   None,                                           "Model-Based"),
-    ("MLP",          "mlp",    "checkpoints_vanilla_ppo/ppo_mlp_best.msgpack", "RL"),
     ("NavRep",       "navrep", "checkpoints_navrep/navrep_best.msgpack",       "Unsup. Learning"),
-    ("PPO (circles)","ppo",    "checkpoints/ppo_circles_best.msgpack",         "End-to-end RL"),
-    ("PPO (legs)",   "ppo",    "checkpoints/ppo_attn_best.msgpack",            "End-to-end RL"),
-    ("SAC",          "sac",    "checkpoints_sac/sac_best.msgpack",             "End-to-end RL"),
-    ("TQC",          "tqc",    "checkpoints_tqc/tqc_best.msgpack",             "End-to-end RL"),
-    ("TAGD",         "tagd",   "checkpoints_tagd/tagd_best.msgpack",           "End-to-end RL"),
+    ("TAGD",         "tagd",   "checkpoints_tagd/tagd_best.msgpack",           "E2E RL"),
+    ("VanillaE2E",   "mlp",    "checkpoints_vanilla_ppo/ppo_mlp_best.msgpack", "E2E RL"),
+    ("PPO (circles)","ppo",    "checkpoints/ppo_circles_best.msgpack",         "E2E RL"),
+    ("PPO (legs)",   "ppo",    "checkpoints/ppo_tanh_inside_final.msgpack",    "E2E RL"),
+    ("SAC",          "sac",    "checkpoints_sac/sac_final.msgpack",             "E2E RL"),
+    ("TQC",          "tqc",    "checkpoints_tqc/tqc_final.msgpack",             "E2E RL"),
 ]
 
-def _compute_social_score(raw, nu=0.35, nu_prime=0.25, d_u=0.45):
-    suc, t_goal, act, epl = np.array(raw["success"], dtype=bool), np.array(raw["time_goal"]), np.array(raw["active_mask"]), np.array(raw["ep_lens"])
-    n_tot, K1 = len(suc), int(suc.sum())
-    F_time = max(0.0, min(1.0, 1.0 - float(np.mean((t_goal[suc] - float((epl * DT).min())) / max(float(t_goal[suc].max() if K1 else 1.0) - float((epl * DT).min()), 1.0))))) if K1 else 0.0
-    
-    ch_act = np.where(act, np.array(raw["step_ch"]), np.inf)
-    has_unc = (ch_act < d_u).any(axis=0)
-    K2 = int(has_unc.sum())
-    
-    if K2 == 0: F_scc = 1.0
-    else:
-        rat = d_u / np.maximum(np.where(act, np.array(raw["step_ch"]), 0.0).sum(axis=0), 1e-8)
-        F_scc = max(0.0, min(1.0, 1.0 - 0.5 * (float(np.mean(1.0 / (1.0 + np.exp(-(rat[has_unc] - 1.0))))) + (K2 / max(K1, 1)))))
-
-    F_F = -(int(np.array(raw["obs_col"]).sum() + np.array(raw["act_col"]).sum() + np.array(raw["pass_col"]).sum() + np.array(raw["timeout"]).sum())) / max(n_tot, 1)
-    return float(100.0 * (nu * F_time + (1.0 - nu) * F_scc + nu_prime * F_F))
-
-def _slice_raw(raw, start, end):
-    return {k: v[start:end] if v.ndim == 1 else v[:, start:end] for k, v in raw.items()}
-
 def _agg(r):
-    return {"N": len(r["success"]), "Success": float(np.mean(r["success"]))*100, "Obst. Col.": float(np.mean(r["obs_col"]))*100,
-            "Act. Col.": float(np.mean(r["act_col"]))*100, "Pass. Col.": float(np.mean(r["pass_col"]))*100, "Timeout": float(np.mean(r["timeout"]))*100,
-            "Yield Score": float(np.nanmean(r["yield_score"])), "Jerk": float(np.nanmean(r["jerk"])), "Time to Goal": float(np.nanmean(r["time_goal"])),
-            "Min Dist (m)": float(np.mean(r["min_dist"])), "Social Score": _compute_social_score(r)}
+    # Per-env scalar metrics from the waypoint-chained driver. ACR already lumps
+    # active-human and static-obstacle collisions. SPL/TTG are over successful
+    # episodes only (matches the dashboard's successful-only box-plots); MHD/AJ/
+    # SC/YS are over all episodes.
+    succ = r["success"] > 0.5
+    spl_succ = np.asarray(r["spl"])[succ]
+    return {"N": len(r["success"]),
+            "SR":  float(np.mean(r["success"])) * 100,
+            "ACR": float(np.mean(r["act_col"])) * 100,
+            "PCR": float(np.mean(r["pass_col"])) * 100,
+            "TR":  float(np.mean(r["timeout"])) * 100,
+            "SPL": float(np.mean(spl_succ)) if spl_succ.size else float("nan"),
+            "TTG": float(np.nanmean(r["time_goal"])) if succ.any() else float("nan"),
+            "MHD": float(np.mean(r["min_dist"])),
+            "AJ":  float(np.nanmean(r["jerk"])),       # angular jerk (rad/s^3)
+            "SC":  float(np.mean(r["space_compliance"])) * 100,
+            "YS":  float(np.nanmean(r["yield_score"])) * 100}
+
+_TABLE_COLS = ["Method", "Type", "SR", "ACR", "PCR", "TR", "SPL", "TTG", "MHD", "AJ", "SC", "YS"]
+
+_CITES = {"DWA": r"\cite{fox1997dynamic}", "MPPI": r"\cite{williams2017model}",
+          "NavRep": r"\cite{dugas2021navrep}", "TAGD": r"\cite{de2024spatiotemporal}"}
+
+def _latex_name(method):
+    for algo in ("PPO", "SAC", "TQC"):
+        if method == algo or method.startswith(algo + " "):
+            method = method.replace(algo, f"CALF$_{{{algo}}}$", 1)
+            break
+    return method.replace('(', r'\textit{(').replace(')', r')}')
 
 def _print_latex(rows):
-    print(r"\begin{table*}[t]"+"\n"+r"\centering"+"\n"+r"\caption{Comparison of Navigation Methods}"+"\n"+r"\label{tab:comp}"+"\n"+r"\footnotesize"+"\n"+r"\begin{tabular}{lccccccccccc}"+"\n"+r"\toprule"+"\n"+r"Method & Type & Success (\%) & Obst. Col. (\%) & Act. Col. (\%) & Pass. Col. (\%) & Timeout (\%) & Yield Score & Jerk & Time (s) & Min Dist (m) & $F_{SC}$ \\"+"\n"+r"\midrule")
-    for r in rows: print(f"{r['Method'].replace('(', r'\\textit{(').replace(')', r')}')} & {r['Type']} & {r['Success']:.1f} & {r['Obst. Col.']:.1f} & {r['Act. Col.']:.1f} & {r['Pass. Col.']:.1f} & {r['Timeout']:.1f} & {r['Yield Score']:.2f} & {r['Jerk']:.1f} & {r['Time to Goal']:.1f} & {r['Min Dist (m)']:.2f} & {r['Social Score']:.1f} \\\\")
-    print(r"\bottomrule"+"\n"+r"\end{tabular}"+"\n"+r"\end{table*}")
+    print(r"\begin{table*}[t]"+"\n"+r"\centering"
+          +"\n"+rf"\caption{{Comparison of Navigation Methods — Test Scenarios {TEST_SCENARIOS[0]}--{TEST_SCENARIOS[-1]}, $v_{{\max}} \sim \mathcal{{U}}[{V_MAX_MIN},\,{V_MAX_MAX}]$~m/s. The symbols $\uparrow$ and $\downarrow$ indicate metrics respectively to be maximized and minimized.}}"
+          +"\n"+r"\label{tab:comparison}"+"\n"+r"\footnotesize"
+          +"\n"+r"\resizebox{\textwidth}{!}{"
+          +"\n"+r"\begin{tabular}{lccccccccccc}"+"\n"+r"\toprule"
+          +"\n"+r"Method & Type & SR (\%) $\uparrow$ & ACR (\%) $\downarrow$ & PCR (\%) $\downarrow$ & TR (\%) $\downarrow$ & SPL $\uparrow$ & TTG (s) $\downarrow$ & MHD (m) $\uparrow$ & AJ (rad/s$^3$) $\downarrow$ & SC (\%) $\uparrow$ & YS (\%) $\uparrow$ \\"
+          +"\n"+r"\midrule")
+    for r in rows:
+        name = _latex_name(r['Method']) + _CITES.get(r['Method'], "")
+        print(f"{name} & {r['Type']} & {r['SR']:.1f} & {r['ACR']:.1f} & {r['PCR']:.1f} & {r['TR']:.1f} & {r['SPL']:.2f} & {r['TTG']:.1f} & {r['MHD']:.2f} & {r['AJ']:.1f} & {r['SC']:.1f} & {r['YS']:.1f} \\\\")
+    print(r"\bottomrule"+"\n"+r"\end{tabular}"+"\n"+r"}"+"\n"+r"\end{table*}")
 
 def main():
     rng = jax.random.PRNGKey(args.seed)
     rows, rows_scen = [], []
-    n_scen = len(TEST_SCENARIOS)
-    tot_envs, tot_envs_mppi = n_scen * N_ENVS, n_scen * N_ENVS_MPPI
-    
-    # ── Single pre-computed scenario batch for vmap ──
-    scen_batch      = jnp.repeat(jnp.array(TEST_SCENARIOS, dtype=jnp.int32), N_ENVS)
-    scen_batch_mppi = jnp.repeat(jnp.array(TEST_SCENARIOS, dtype=jnp.int32), N_ENVS_MPPI)
 
-    print(f"\n{'='*70}\nMax Parallelization Eval — scenarios={TEST_SCENARIOS} | envs/scen={N_ENVS}\n{'='*70}\n")
+    print(f"\n{'='*70}\nWaypoint-Chained Eval — scenarios={TEST_SCENARIOS} | "
+          f"envs/scen={N_ENVS} | v_max~U[{V_MAX_MIN},{V_MAX_MAX}]\n{'='*70}\n")
 
     for name, ptype, ckpt, cat in POLICY_REGISTRY:
         if ckpt and not os.path.exists(ckpt): continue
         t0 = time.time()
-        print(f"  [{name}] Dispatched completely in parallel...")
+        print(f"  [{name}] Running {len(TEST_SCENARIOS)} scenarios (waypoint-chained)...")
 
         try:
+            _mppi = None
             if ptype == "dwa": act_fn = _build_dwa_act_vmap()
             elif ptype == "mppi":
                 from comparison_policies.mppi_planner import MPPI
@@ -345,31 +524,34 @@ def main():
             elif ptype == "tqc": act_fn = _build_tqc_act_vmap(ckpt)
             elif ptype == "tagd": act_fn = _build_tagd_act_vmap(ckpt)
 
-            rng, k = jax.random.split(rng)
             if ptype == "mppi":
-                raw_s = jax.device_get(jax.block_until_ready(_rollout_mppi(_mppi, tot_envs_mppi, k, scen_batch_mppi)))
-                chk = N_ENVS_MPPI
+                n_envs = N_ENVS_MPPI
+                seg_call = lambda obs, st, rk, off, _m=_mppi, _n=n_envs: \
+                    _segment_mppi(_m, _n, obs, st, rk, off)
             else:
-                raw_s = jax.device_get(jax.block_until_ready(_rollout_stateless(act_fn, tot_envs, k, scen_batch)))
-                chk = N_ENVS
+                n_envs = N_ENVS
+                seg_call = lambda obs, st, rk, off, _a=act_fn, _n=n_envs: \
+                    _segment_stateless(_a, _n, obs, st, rk, off)
+
+            raw_scens = []
+            for scen in TEST_SCENARIOS:
+                rng, k = jax.random.split(rng)
+                r = _run_scenario(seg_call, n_envs, scen, TEST_ROBOT_WAYPOINTS[scen], k)
+                raw_scens.append(r)
+                rows_scen.append({"Method": name, "Type": cat, "Scenario": scen, **_agg(r)})
         except Exception as e:
-            print(f" ERROR: {e}"); continue
+            print(f"  ERROR: {e}"); continue
 
-        # Extract per-scenario stats from the monolithic batch
-        for i, scen in enumerate(TEST_SCENARIOS):
-            scen_raw = _slice_raw(raw_s, i * chk, (i + 1) * chk)
-            met = _agg(scen_raw)
-            rows_scen.append({"Method": name, "Type": cat, "Scenario": scen, **met})
-
-        met = _agg(raw_s)
+        raw_all = {key: np.concatenate([rs[key] for rs in raw_scens]) for key in raw_scens[0]}
+        met = _agg(raw_all)
         rows.append({"Method": name, "Type": cat, **met})
-        print(f"  [{name}] DONE ({time.time() - t0:.0f}s): Suc={met['Success']:.1f}% ObsCol={met['Obst. Col.']:.1f}% ActCol={met['Act. Col.']:.1f}% PasCol={met['Pass. Col.']:.1f}% Tmo={met['Timeout']:.1f}%\n")
+        print(f"  [{name}] DONE ({time.time() - t0:.0f}s): SR={met['SR']:.1f}% ACR={met['ACR']:.1f}% PCR={met['PCR']:.1f}% TR={met['TR']:.1f}%\n")
 
     pd.DataFrame(rows).to_csv("paper_comparison_table.csv", index=False, float_format="%.3f")
     pd.DataFrame(rows_scen).to_csv("paper_comparison_table_per_scen.csv", index=False, float_format="%.3f")
     
     print("\n" + "="*70 + "\nRESULTS TABLE\n" + "="*70)
-    print(pd.DataFrame(rows)[["Method", "Type", "Success", "Obst. Col.", "Act. Col.", "Pass. Col.", "Timeout", "Yield Score", "Jerk", "Time to Goal", "Min Dist (m)", "Social Score"]].to_string(index=False, float_format="%.2f"))
+    print(pd.DataFrame(rows)[_TABLE_COLS].to_string(index=False, float_format="%.2f"))
     print("\n" + "="*70 + "\nLaTeX\n" + "="*70)
     _print_latex(rows)
 

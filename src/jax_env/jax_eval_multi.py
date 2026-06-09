@@ -78,6 +78,12 @@ from jax_wrappers import make_stacked_env
 OBS_SIZE   = 662
 ACTION_DIM = 2
 
+# Yield-score constants — must match the yield reward cone in jax_env_multi.py
+# (_YIELD_DIST = 1.8 m, in_fwd_fov < pi/4 → ±45°)
+YIELD_DIST = 1.8
+YIELD_FOV  = math.pi / 4   # rad = ±45°
+YIELD_STOP_V = 0.1   # m/s threshold for "robot stopped"
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Network definitions (each algo has its own architecture)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -178,16 +184,30 @@ def _build_ppo_shac():
 # Checkpoint keys: "enc_params", "actor_head_params".
 
 class _SACActorHead(nn.Module):
+    action_dim:  int   = ACTION_DIM
+    LOG_STD_MIN: float = -5.0
+    LOG_STD_MAX: float =  0.5
+    tanh_inside: bool  = False  # set at build time from jax_network.USE_TANH_INSIDE
+
     @nn.compact
     def __call__(self, feat):
-        mean    = nn.Dense(ACTION_DIM, name="mean")(feat)
-        log_std = nn.Dense(ACTION_DIM, name="log_std")(feat)
-        return mean, jnp.clip(log_std, -5.0, 2.0)
+        raw_mean = nn.Dense(self.action_dim, name="mean")(feat)
+        if self.tanh_inside:
+            v_mean = jnp.tanh(raw_mean[..., 0]) * 0.5 + 0.5
+            w_mean = jnp.tanh(raw_mean[..., 1])
+            actor_mean = jnp.stack([v_mean, w_mean], axis=-1)
+        else:
+            actor_mean = raw_mean
+
+        logstd_param = self.param('log_std', nn.initializers.constant(1.0), (self.action_dim,))
+        actor_logstd_raw = jnp.broadcast_to(logstd_param, actor_mean.shape)
+        actor_logstd = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (jnp.tanh(actor_logstd_raw) + 1.0)
+        return actor_mean, actor_logstd
 
 def _build_sac():
-    from jax_network import SharedEncoder
+    from jax_network import SharedEncoder, USE_TANH_INSIDE, scale_action_to_env
     enc  = SharedEncoder()
-    head = _SACActorHead()
+    head = _SACActorHead(tanh_inside=USE_TANH_INSIDE)
     rng  = jax.random.PRNGKey(0)
     dummy_obs  = jnp.zeros((1, OBS_SIZE))
     enc_params  = enc.init(rng, dummy_obs)["params"]
@@ -205,11 +225,7 @@ def _build_sac():
         enc_p, head_p = params
         feat = enc.apply({"params": enc_p}, obs[None])
         mean, _ = head.apply({"params": head_p}, feat)
-        mean = jnp.squeeze(mean, 0)
-        tanh_mean = jnp.tanh(mean)
-        v = (tanh_mean[0] + 1.0) * 0.5 * float(max_v)
-        w = tanh_mean[1]
-        return jnp.stack([v, w])
+        return scale_action_to_env(jnp.squeeze(mean, 0), float(max_v))
 
     return init_params, load, infer
 
@@ -222,18 +238,27 @@ class _TQCActorHead(nn.Module):
     action_dim:  int   = ACTION_DIM
     LOG_STD_MIN: float = -5.0
     LOG_STD_MAX: float =  0.5
+    tanh_inside: bool  = False  # set at build time from jax_network.USE_TANH_INSIDE
 
     @nn.compact
     def __call__(self, feat):
-        mean    = nn.Dense(self.action_dim)(feat)
-        log_std = nn.Dense(self.action_dim)(feat)
-        return mean.astype(jnp.float32), jnp.clip(log_std.astype(jnp.float32),
-                                                   self.LOG_STD_MIN, self.LOG_STD_MAX)
+        raw_mean = nn.Dense(self.action_dim)(feat)
+        if self.tanh_inside:
+            v_mean = jnp.tanh(raw_mean[..., 0]) * 0.5 + 0.5
+            w_mean = jnp.tanh(raw_mean[..., 1])
+            actor_mean = jnp.stack([v_mean, w_mean], axis=-1)
+        else:
+            actor_mean = raw_mean
+
+        logstd_param = self.param('log_std', nn.initializers.constant(1.0), (self.action_dim,))
+        actor_logstd_raw = jnp.broadcast_to(logstd_param, actor_mean.shape)
+        actor_logstd = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (jnp.tanh(actor_logstd_raw) + 1.0)
+        return actor_mean.astype(jnp.float32), actor_logstd.astype(jnp.float32)
 
 def _build_tqc():
-    from jax_network import SharedEncoder
+    from jax_network import SharedEncoder, USE_TANH_INSIDE, scale_action_to_env
     enc  = SharedEncoder()
-    head = _TQCActorHead()
+    head = _TQCActorHead(tanh_inside=USE_TANH_INSIDE)
     rng  = jax.random.PRNGKey(0)
     dummy_obs   = jnp.zeros((1, OBS_SIZE))
     enc_params  = enc.init(rng, dummy_obs)["params"]
@@ -251,11 +276,7 @@ def _build_tqc():
         enc_p, head_p = params
         feat = enc.apply({"params": enc_p}, obs[None])
         mean, _ = head.apply({"params": head_p}, feat)
-        mean = jnp.squeeze(mean, 0)
-        tanh_mean = jnp.tanh(mean)
-        v = (tanh_mean[0] + 1.0) * 0.5 * float(max_v)
-        w = tanh_mean[1]
-        return jnp.stack([v, w])
+        return scale_action_to_env(jnp.squeeze(mean, 0), float(max_v))
 
     return init_params, load, infer
 
@@ -336,17 +357,35 @@ def _build_mppi():
     return None, load, infer, 0
 
 
+# ── DWA planner ────────────────────────────────────────────────────────────────
+# Stateless and deterministic — no checkpoint, no warm-start to reset.
+
+def _build_dwa():
+    from comparison_policies.dwa_planner import DWA
+
+    dwa = DWA()
+
+    def load(path):
+        return None
+
+    def infer(params, obs, max_v):
+        return dwa.act(obs)
+
+    return None, load, infer, 0
+
+
 # ── Default checkpoint paths ───────────────────────────────────────────────────
 
 _DEFAULT_CKPT = {
-    "ppo":  "checkpoints/ppo_tanh_fix_final.msgpack", #"checkpoints/ppo_attn_final.msgpack",
+    "ppo":  "checkpoints/ppo_tanh_inside_final.msgpack", #ppo_attn_final.msgpack",
     "ppo_circles": "checkpoints/ppo_circles_best.msgpack",
     "shac": "checkpoints/shac_best.msgpack",
     "sac":  "checkpoints_sac/sac_best.msgpack",
-    "tqc":  "checkpoints_tqc/tqc_best.msgpack",
+    "tqc":  "checkpoints_tqc/tqc_final.msgpack",
     "mlp":  "checkpoints_vanilla_ppo/ppo_mlp_best.msgpack",
     "hsfm": "", # No checkpoint needed
     "mppi": "", # No checkpoint needed
+    "dwa":  "", # No checkpoint needed
 }
 
 # ── Policy factory ─────────────────────────────────────────────────────────────
@@ -364,8 +403,10 @@ def build_policy(algo):
         return _build_hsfm()        # 4 elementi
     elif algo == "mppi":
         return _build_mppi()        # 4 elementi (infer_fn carries reset_hook attribute)
+    elif algo == "dwa":
+        return _build_dwa()         # 4 elementi
     else:
-        raise ValueError(f"Unknown algo: {algo}. Valid: ppo, ppo_circles, shac, sac, tqc, mlp, hsfm, mppi")
+        raise ValueError(f"Unknown algo: {algo}. Valid: ppo, ppo_circles, shac, sac, tqc, mlp, hsfm, mppi, dwa")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -383,6 +424,7 @@ FPS_IDX    = 0
 
 C_BG        = (28,  28,  34); C_FLOOR    = (44,  44,  52); C_GRID     = (56,  56,  66)
 C_WALL      = (190, 190, 205); C_ROBOT    = (60,  140, 255); C_ROBOT_H  = (170, 210, 255)
+C_TRAJ      = (100, 200, 255)
 C_GOAL      = (255, 210,  40); C_GOAL2    = (220, 150,  10)
 C_LEG_L     = (90,  220, 100); C_LEG_R    = (50,  170,  65)
 C_CIRCLE    = (140,  90,  60); C_CIRCLE_L = (180, 120,  80)
@@ -474,8 +516,14 @@ def draw_humans(surface, state, foot_state_np, show_arrows, use_legs, show_body,
 
         if show_body:
             sx, sy = W_(px, py)
-            pygame.draw.circle(surface, C_BODY_RING, (sx, sy),
-                                max(3, int(_jax_env.PEOPLE_RADIUS * scale)), 1)
+            body_r_px = max(3, int(_jax_env.PEOPLE_RADIUS * scale))
+            pygame.draw.circle(surface, C_BODY_RING, (sx, sy), body_r_px, 1)
+            ux, uy = math.cos(theta_h), math.sin(theta_h)
+            dot_x, dot_y = W_(px + ux * _jax_env.PEOPLE_RADIUS,
+                              py + uy * _jax_env.PEOPLE_RADIUS)
+            dot_r = max(2, int(body_r_px * 0.22))
+            pygame.draw.circle(surface, C_BODY_RING, (dot_x, dot_y), dot_r)
+            pygame.draw.circle(surface, (20, 60, 20), (dot_x, dot_y), dot_r, 1)
 
         if use_legs:
             left_theta  = float(foot_state_np[i, 10])
@@ -483,8 +531,15 @@ def draw_humans(surface, state, foot_state_np, show_arrows, use_legs, show_body,
             draw_shoe(surface, float(left_legs[i, 0]),  float(left_legs[i, 1]),  left_theta, col, border, scale, sim_h)
             draw_shoe(surface, float(right_legs[i, 0]), float(right_legs[i, 1]), right_theta, col, border, scale, sim_h)
             leg_r = max(2, int(LEG_RADIUS * scale))
-            lx, ly   = W_(float(left_legs[i, 0]),  float(left_legs[i, 1]))
-            rx_, ry_ = W_(float(right_legs[i, 0]), float(right_legs[i, 1]))
+            # Inset the leg circle forward by LEG_RADIUS so it lies entirely
+            # inside the shoe rectangle (matches the LiDAR collision shape
+            # produced by jax_legs.get_leg_circles).
+            l_off_x = LEG_RADIUS * math.cos(left_theta)
+            l_off_y = LEG_RADIUS * math.sin(left_theta)
+            r_off_x = LEG_RADIUS * math.cos(right_theta)
+            r_off_y = LEG_RADIUS * math.sin(right_theta)
+            lx, ly   = W_(float(left_legs[i, 0])  + l_off_x, float(left_legs[i, 1])  + l_off_y)
+            rx_, ry_ = W_(float(right_legs[i, 0]) + r_off_x, float(right_legs[i, 1]) + r_off_y)
             pygame.draw.circle(surface, tuple(min(255,int(c*1.1)) for c in col), (lx, ly), leg_r)
             pygame.draw.circle(surface, (20,20,20), (lx, ly), leg_r, 1)
             pygame.draw.circle(surface, tuple(max(0,int(c*0.75)) for c in col), (rx_, ry_), leg_r)
@@ -500,8 +555,42 @@ def draw_humans(surface, state, foot_state_np, show_arrows, use_legs, show_body,
                 pygame.draw.line(surface, (20,120,20), (sx,sy), (ax,ay), 2)
 
 
+def draw_dashed_polyline(surface, color, points, dash_len=8, gap_len=5, width=2):
+    """Draw a continuous dashed line through a sequence of pixel points."""
+    if len(points) < 2:
+        return
+    segs = []      # (start_xy, unit_dir, seg_len, cum_start)
+    cum = 0.0
+    for i in range(len(points) - 1):
+        x1, y1 = points[i]; x2, y2 = points[i + 1]
+        dx, dy = x2 - x1, y2 - y1
+        L = math.hypot(dx, dy)
+        if L < 1e-6:
+            continue
+        segs.append(((x1, y1), (dx / L, dy / L), L, cum))
+        cum += L
+    if not segs or cum < 1.0:
+        return
+
+    def point_at(s):
+        for (sxy, dxy, slen, cstart) in segs:
+            if s <= cstart + slen:
+                t = s - cstart
+                return (sxy[0] + dxy[0] * t, sxy[1] + dxy[1] * t)
+        last_xy, last_dir, last_len, last_cum = segs[-1]
+        return (last_xy[0] + last_dir[0] * last_len,
+                last_xy[1] + last_dir[1] * last_len)
+
+    step = dash_len + gap_len
+    s = 0.0
+    while s < cum:
+        e = min(s + dash_len, cum)
+        pygame.draw.line(surface, color, point_at(s), point_at(e), width)
+        s += step
+
+
 def draw_scene(surface, state, raw_lidar, foot_state_np, show_lidar, show_arrows, use_legs, show_body,
-               scale=SCALE, sim_h=SIM_SIZE):
+               scale=SCALE, sim_h=SIM_SIZE, trajectory=None):
     """Draw the simulation viewport.
 
     scale   — pixels per metre (default: module-level SCALE = SIM_SIZE/12).
@@ -523,11 +612,12 @@ def draw_scene(surface, state, raw_lidar, foot_state_np, show_lidar, show_arrows
     draw_lidar(surface, state, raw_lidar, show_lidar, scale, sim_h)
 
     for box in np.array(state.obs_boxes):
-        cx, cy, hw, hh = box
-        if hw > 0:
-            sx, sy = W_(cx - hw, cy + hh)
-            pygame.draw.rect(surface, C_BOX,   (sx, sy, int(2*hw*scale), int(2*hh*scale)))
-            pygame.draw.rect(surface, C_BOX_L, (sx, sy, int(2*hw*scale), int(2*hh*scale)), 2)
+        x0, y0, x1, y1, x2, y2, x3, y3 = box
+        # Skip degenerate (zero-span) boxes used as unused-slot padding.
+        if max(x0, x1, x2, x3) - min(x0, x1, x2, x3) > 1e-5:
+            pts = [W_(x0, y0), W_(x1, y1), W_(x2, y2), W_(x3, y3)]
+            pygame.draw.polygon(surface, C_BOX, pts)
+            pygame.draw.polygon(surface, C_BOX_L, pts, 2)
     for cir in np.array(state.obs_circles):
         cx, cy, r = cir
         if r > 0:
@@ -539,6 +629,13 @@ def draw_scene(surface, state, raw_lidar, foot_state_np, show_lidar, show_arrows
     draw_star(surface, gx, gy, int(0.30*scale), int(0.12*scale), 5, C_GOAL, C_GOAL2)
     draw_humans(surface, state, foot_state_np, show_arrows, use_legs, show_body, scale, sim_h)
 
+    if trajectory is not None and len(trajectory) >= 2:
+        traj_px = [W_(tx, ty) for (tx, ty, _v) in trajectory]
+        draw_dashed_polyline(surface, C_TRAJ, traj_px, dash_len=8, gap_len=5, width=2)
+        for (tx, ty, tv), (px, py) in zip(trajectory, traj_px):
+            if tv <= 0.1:
+                pygame.draw.circle(surface, (230, 60, 60), (px, py), 3)
+
     rx, ry = W_(float(state.x), float(state.y)); rr = max(4, int(ROBOT_RADIUS*scale))
     pygame.draw.circle(surface, C_ROBOT,   (rx, ry), rr)
     pygame.draw.circle(surface, C_ROBOT_H, (rx, ry), rr, 2)
@@ -549,8 +646,10 @@ def draw_scene(surface, state, raw_lidar, foot_state_np, show_lidar, show_arrows
 
 def draw_panel(surface, fonts, algo, ep, step, ep_ret, max_v, v, w,
                goal_dist, goal_align, ch, stats, banner, banner_t,
-               scen_idx, eval_mode, use_legs, raw_lidar, sp_mask, rew_acc, show_radar=True,
-               sim_x=SIM_SIZE, win_h=WINDOW_H):
+               scen_idx, eval_mode, use_legs, raw_lidar, sp_mask, rew_acc,
+               ep_yz_steps=0, ep_yc_steps=0,
+               session_yield_sum=0.0, session_yield_count=0,
+               show_radar=True, sim_x=SIM_SIZE, win_h=WINDOW_H):
     """Draw the stats panel to the right of the simulation area.
 
     sim_x  — x-pixel where the panel starts (= sim viewport width).
@@ -610,6 +709,21 @@ def draw_panel(surface, fonts, algo, ep, step, ep_ret, max_v, v, w,
     txt(f"  Collision{stats['col']:>5.1f}%",  C_COLLIDE)
     txt(f"  Pass.Col {stats['pcol']:>5.1f}%", (200,100,100))
     txt(f"  Timeout  {stats['tmo']:>5.1f}%",  C_TIMEOUT); sep()
+
+    txt("── Yield score ─", C_DIM, "small"); y += 2
+    if ep_yz_steps > 0:
+        cur_y = ep_yc_steps / ep_yz_steps
+        cur_col = C_SUCCESS if cur_y >= 0.5 else (C_COLLIDE if cur_y < 0.2 else C_TIMEOUT)
+        txt(f"  Cur ep   {cur_y:>5.3f}  ({ep_yc_steps}/{ep_yz_steps})", cur_col, "small")
+    else:
+        txt(f"  Cur ep     ---  (no yield-zone)", C_DIM, "small")
+    if session_yield_count > 0:
+        sess_y = session_yield_sum / session_yield_count
+        sess_col = C_SUCCESS if sess_y >= 0.5 else (C_COLLIDE if sess_y < 0.2 else C_TIMEOUT)
+        txt(f"  Session  {sess_y:>5.3f}  (n={session_yield_count})", sess_col, "small")
+    else:
+        txt(f"  Session    ---  (n=0)", C_DIM, "small")
+    sep()
     txt("0-6 lock  7 random  R reset", C_DIM, "tiny")
     txt("L lidar  H arrows  B body  Q quit", C_DIM, "tiny")
     txt("→ skip episode (no stats)", C_DIM, "tiny")
@@ -688,12 +802,13 @@ def main():
 
     MAX_EVAL_GOAL_DIST = 9.0   # corrisponde all'ultimo stage del curriculum
 
-    def build_fast_reset(scen_idx, max_goal_dist=MAX_EVAL_GOAL_DIST):
-        # Lambda invece di functools.partial: make_stacked_env passa max_goal_dist
-        # come argomento posizionale, quindi non deve essere già nel partial.
-        bound_reset = lambda key, max_goal_dist=3.0, scenario_idx=-1, **kw: reset_env(key, max_goal_dist, scenario_idx=scen_idx, **kw)
+    def build_fast_reset(scen_idx, max_goal_dist=MAX_EVAL_GOAL_DIST, min_goal_dist: float = 8.0):
+        # Lambda instead of functools.partial: make_stacked_env passes arguments
+        # positionally so defaults must match the reset_stacked signature.
+        bound_reset = lambda key, max_goal_dist=3.0, scenario_idx=-1, min_goal_dist=0.8, **kw: \
+            reset_env(key, max_goal_dist, scenario_idx=scen_idx, min_goal_dist=min_goal_dist, **kw)
         rs, ss = make_stacked_env(bound_reset, step_env, stack_dim=3)
-        jit_rs = jax.jit(lambda key: rs(key, max_goal_dist, ghost_prob=0.0))
+        jit_rs = jax.jit(lambda key: rs(key, max_goal_dist, ghost_prob=0.0, min_goal_dist=min_goal_dist))
         jit_ss = jax.jit(ss)
         return jit_rs, jit_ss
 
@@ -714,9 +829,20 @@ def main():
     obs, stacked_state = fast_reset(reset_rng)
     _policy_reset()
 
+    TRAJ_MIN_DIST = 0.05   # metres between recorded trajectory points
+    def _init_trajectory(ss):
+        es = jax.device_get(ss.env_state)
+        return [(float(es.x), float(es.y), float(es.v))]
+    trajectory = _init_trajectory(stacked_state)
+
     _REW_KEYS = ["rew_progress","rew_step","rew_smooth","rew_yield"]
     ep=0; ep_steps=0; ep_reward=0.0; ep_hist=[]
     rew_acc = {k: 0.0 for k in _REW_KEYS}
+    # Yield-score accounting (matches benchmark_eval.py)
+    ep_yz_steps = 0           # steps with a person in the yield zone (current ep)
+    ep_yc_steps = 0           # of those, steps where robot was stopped (v <= 0.1)
+    session_yield_sum = 0.0   # sum of per-episode yield_score over completed episodes that had any yield-zone step
+    session_yield_count = 0   # number of episodes that contributed (yz_steps > 0)
     paused=False; show_lidar=True; show_arrows=True; show_body=args.ghost_body; show_radar=True
     fps_idx=0; fps_speeds=[10, 20, 30]; current_fps=fps_speeds[fps_idx]
     banner=""; banner_t=0
@@ -750,6 +876,8 @@ def main():
                     obs, stacked_state = fast_reset(reset_rng)
                     _policy_reset()
                     ep_reward=0.0; ep_steps=0; banner_t=0
+                    ep_yz_steps=0; ep_yc_steps=0
+                    trajectory = _init_trajectory(stacked_state)
                 if k == pygame.K_7:
                     evaluation_mode  = "random"
                     current_scenario = random.randint(0, 6)
@@ -758,11 +886,15 @@ def main():
                     obs, stacked_state = fast_reset(reset_rng)
                     _policy_reset()
                     ep_reward=0.0; ep_steps=0; banner_t=0
+                    ep_yz_steps=0; ep_yc_steps=0
+                    trajectory = _init_trajectory(stacked_state)
                 if k == pygame.K_r:
                     rng, reset_rng = jax.random.split(rng)
                     obs, stacked_state = fast_reset(reset_rng)
                     _policy_reset()
                     ep_reward=0.0; ep_steps=0; banner_t=0
+                    ep_yz_steps=0; ep_yc_steps=0
+                    trajectory = _init_trajectory(stacked_state)
                 if k == pygame.K_RIGHT:
                     # Skip this episode — do NOT record it in ep_hist
                     if evaluation_mode == "random":
@@ -772,6 +904,8 @@ def main():
                     obs, stacked_state = fast_reset(reset_rng)
                     _policy_reset()
                     ep_reward=0.0; ep_steps=0
+                    ep_yz_steps=0; ep_yc_steps=0
+                    trajectory = _init_trajectory(stacked_state)
                     banner="skipped"; banner_t=FPS_TARGET
 
         if paused: clock.tick(10); continue
@@ -804,6 +938,26 @@ def main():
         foot_state_np = np.array(cpu_state.foot_state)
         sp_mask       = np.array(cpu_state.sp_mask)
 
+        cur_x, cur_y, cur_v = float(cpu_state.x), float(cpu_state.y), float(cpu_state.v)
+        if not trajectory or math.hypot(cur_x - trajectory[-1][0], cur_y - trajectory[-1][1]) >= TRAJ_MIN_DIST:
+            trajectory.append((cur_x, cur_y, cur_v))
+        elif cur_v <= 0.1 and trajectory[-1][2] > 0.1:
+            trajectory[-1] = (trajectory[-1][0], trajectory[-1][1], cur_v)
+
+        # Yield-score accounting — mirrors benchmark_eval._rollout_body
+        ppl_np = np.array(cpu_state.people)                    # (N, 11)
+        active_p = ppl_np[:, 10] >= 0.0
+        dpx = ppl_np[:, 0] - float(cpu_state.x)
+        dpy = ppl_np[:, 1] - float(cpu_state.y)
+        dists_p = np.hypot(dpx, dpy)
+        rel_ang = np.arctan2(dpy, dpx) - float(cpu_state.theta)
+        rel_ang = (rel_ang + math.pi) % (2.0 * math.pi) - math.pi
+        in_yz = (dists_p < YIELD_DIST) & (np.abs(rel_ang) < YIELD_FOV) & active_p
+        if bool(np.any(in_yz)):
+            ep_yz_steps += 1
+            if float(cpu_state.v) <= YIELD_STOP_V:
+                ep_yc_steps += 1
+
         dx = float(cpu_state.goal_x) - float(cpu_state.x)
         dy = float(cpu_state.goal_y) - float(cpu_state.y)
         gdist  = math.hypot(dx, dy)
@@ -812,11 +966,14 @@ def main():
 
         screen.fill(C_BG)
         draw_scene(screen, cpu_state, raw_lidar, foot_state_np,
-                   show_lidar, show_arrows, use_legs, show_body)
+                   show_lidar, show_arrows, use_legs, show_body,
+                   trajectory=trajectory)
         draw_panel(screen, fonts, algo, ep, ep_steps, ep_reward,
                    float(cpu_state.max_v), float(cpu_state.v), float(cpu_state.w),
                    gdist, galign, ch, get_stats(), banner, banner_t,
-                   current_scenario, evaluation_mode, use_legs, raw_lidar, sp_mask, rew_acc, show_radar)
+                   current_scenario, evaluation_mode, use_legs, raw_lidar, sp_mask, rew_acc,
+                   ep_yz_steps, ep_yc_steps,
+                   session_yield_sum, session_yield_count, show_radar)
 
         if banner_t > 0: banner_t -= 1
         pygame.display.flip(); clock.tick(current_fps)
@@ -834,6 +991,11 @@ def main():
                 current_scenario = random.randint(0, 6)
                 fast_reset, fast_step = build_fast_reset(current_scenario)
 
+            if ep_yz_steps > 0:
+                session_yield_sum += ep_yc_steps / ep_yz_steps
+                session_yield_count += 1
+            ep_yz_steps = 0; ep_yc_steps = 0
+
             ep+=1; ep_reward=0.0; ep_steps=0
             rew_acc = {k: 0.0 for k in _REW_KEYS}
 
@@ -849,6 +1011,7 @@ def main():
             rng, reset_rng = jax.random.split(rng)
             obs, stacked_state = fast_reset(reset_rng)
             _policy_reset()
+            trajectory = _init_trajectory(stacked_state)
 
 
 if __name__ == "__main__":

@@ -1,24 +1,45 @@
 """
-navrep_network.py — Faithful NavRep (V + M + C) for indoor-rl-nav.
+navrep_network.py — Faithful NavRep (V + M + C), paper-consistent.
 
-Modules:
-  V  LidarEncoder + LidarDecoder (VAE): 1D-CNN encoder → (z_mean, z_logvar),
-     ConvTranspose decoder → reconstructed 216-ray scan.
-  M  Causal 2-layer Transformer over z-sequences, trained with MSE(z_{t+1}).
-  C  2-layer MLP controller [64, 64] consuming [z_t, h_t, state_r(14)].
+Reference: Dugas, Nieto, Siegwart, Chung, "NavRep: Unsupervised Representations
+for Reinforcement Learning of Robot Navigation in Dynamic Human Environments",
+ICRA 2021.
 
-Pretraining:
-  V is trained on shuffled single-frame LiDARs (reconstruction + β·KL).
-  M is trained on per-env z-sequences with predictive MSE loss.
+Paper-faithful core
+-------------------
+  V (LiDAR encoding): a variational auto-encoder. 4-layer CNN encoder + 2-layer
+     FCN → (z_mean, z_logvar); 2-layer FCN + 4-layer ConvTranspose decoder
+     reconstructs the scan. Latent z has dimension 32.
+  M (prediction): a sequence-to-sequence predictive model. We use the paper's
+     Transformer variant — 8 causal-self-attention blocks, 8 heads each — over
+     the z-sequence. M emits two predictions per step: the next latent ẑ_{t+1}
+     and the next goal-velocity state ŝ_r,{t+1} (Eq. 2). Its hidden state h has
+     dimension 64.
+  C (controller): a 2-layer FCN consuming [z_t, h_t, s_r]. V and M are FROZEN;
+     only C is trained with PPO (stop_gradient on z_t / h_t in the forward pass).
 
-PPO (controller-only) training:
-  The forward pass applies stop_gradient to z_t and h_t so gradients flow
-  only through the controller parameters; V and M weights remain frozen.
+Training regime: JOINT V+M (the paper's recommended NavRep config). V and M are
+trained together to minimise reconstruction + KL + next-state-prediction loss;
+see pretrain_navrep.py. Then C is trained with PPO on the frozen features.
+
+Environment adaptations (kept on purpose; see request)
+------------------------------------------------------
+  * LiDAR is the env's 216-ray 1D scan (not 1080); reconstruction uses MSE, as
+    the paper does for its 1D variant.
+  * Temporal context is the env's 3-frame stack (stack_dim=3): M attends over
+    the 3 encoded frames rather than a long recurrent rollout.
+  * s_r (controller state) is the env's full pose_stack(9)+state_vec(5)=14-D
+    vector. M's auxiliary s_r-prediction target is the most-recent 8-D
+    [pose(3), state_vec(5)] slice (velocity + goal in the robot frame).
+  * Actions are the env's 2-D differential-drive [v, w].
+  * Because the env observation is stateless and carries no past actions, M is
+    conditioned on the latent sequence only (no action input). This is the one
+    necessary deviation from the paper's action-conditioned M.
 
 Obs layout (662D from make_stacked_env, stack_dim=3):
-  obs[:9]    pose_stack   (3 × 3)
+  obs[:9]    pose_stack   (3 × 3)   frame 0 = oldest, frame 2 = newest
   obs[9:14]  state_vec    (5)
-  obs[14:]   lidar_stack  (3 × 216)  frame 0 = oldest, frame 2 = newest
+  obs[14:]   lidar_stack  (3 × 216) frame 0 = oldest, frame 2 = newest
 """
 
 from typing import Tuple
@@ -37,9 +58,10 @@ _STATE_END      = 14
 NUM_RAYS        = 216
 STACK_DIM       = 3
 
-Z_DIM       = 32
-H_DIM       = 64
-STATE_R_DIM = 14
+Z_DIM       = 32     # paper: z latent features are of size 32
+H_DIM       = 64     # paper: h latent features are of size 64
+STATE_R_DIM = 14     # env adaptation: pose_stack(9) + state_vec(5)
+SR_DIM      = 8      # M's goal-velocity target: newest pose(3) + state_vec(5)
 
 # Dimensionality of the frozen V+M feature vector fed to the controller
 FEAT_DIM = Z_DIM + H_DIM + STATE_R_DIM   # 32 + 64 + 14 = 110
@@ -50,7 +72,8 @@ _VM_KEYS = frozenset({"encoder", "M"})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Module V — VAE
+# Module V — VAE (4-layer CNN encoder + 2-layer FCN ; 2-layer FCN + 4-layer
+#            ConvTranspose decoder)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class LidarEncoder(nn.Module):
@@ -60,25 +83,33 @@ class LidarEncoder(nn.Module):
     def __call__(self, lidar: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
         batch_shape = lidar.shape[:-1]
         x = lidar[..., None]                                      # (..., 216, 1)
-        x = nn.relu(nn.Conv(32, (8,), strides=(4,),
+        # 4-layer CNN encoder (SAME padding → out = ceil(in/stride))
+        x = nn.relu(nn.Conv(64, (8,), strides=(2,),
                             kernel_init=orthogonal(np.sqrt(2)),
-                            bias_init=constant(0.0))(x))          # (..., 53, 32)
-        x = nn.relu(nn.Conv(64, (4,), strides=(2,),
+                            bias_init=constant(0.0))(x))          # (..., 108, 64)
+        x = nn.relu(nn.Conv(128, (4,), strides=(2,),
                             kernel_init=orthogonal(np.sqrt(2)),
-                            bias_init=constant(0.0))(x))          # (..., 25, 64)
-        x = nn.relu(nn.Conv(64, (4,), strides=(2,),
+                            bias_init=constant(0.0))(x))          # (..., 54, 128)
+        x = nn.relu(nn.Conv(128, (4,), strides=(2,),
                             kernel_init=orthogonal(np.sqrt(2)),
-                            bias_init=constant(0.0))(x))          # (..., 11, 64)
-        x = x.reshape(*batch_shape, -1)                           # (..., 704)
-        h = nn.relu(nn.Dense(128,
+                            bias_init=constant(0.0))(x))          # (..., 27, 128)
+        x = nn.relu(nn.Conv(256, (3,), strides=(1,),
+                            kernel_init=orthogonal(np.sqrt(2)),
+                            bias_init=constant(0.0))(x))          # (..., 27, 256)
+        x = x.reshape(*batch_shape, -1)                           # (..., 6912)
+        # 2-layer FCN
+        x = nn.relu(nn.Dense(512,
+                             kernel_init=orthogonal(np.sqrt(2)),
+                             bias_init=constant(0.0))(x))
+        x = nn.relu(nn.Dense(256,
                              kernel_init=orthogonal(np.sqrt(2)),
                              bias_init=constant(0.0))(x))
         z_mean = nn.Dense(self.z_dim,
                           kernel_init=orthogonal(0.01),
-                          bias_init=constant(0.0), name="z_mean")(h)
+                          bias_init=constant(0.0), name="z_mean")(x)
         z_logvar = nn.Dense(self.z_dim,
                             kernel_init=orthogonal(0.01),
-                            bias_init=constant(0.0), name="z_logvar")(h)
+                            bias_init=constant(0.0), name="z_logvar")(x)
         return z_mean, z_logvar
 
 
@@ -88,43 +119,33 @@ class LidarDecoder(nn.Module):
     @nn.compact
     def __call__(self, z: jnp.ndarray) -> jnp.ndarray:
         batch_shape = z.shape[:-1]
-        x = nn.relu(nn.Dense(128,
+        # 2-layer FCN
+        x = nn.relu(nn.Dense(256,
                              kernel_init=orthogonal(np.sqrt(2)),
                              bias_init=constant(0.0))(z))
-        x = nn.relu(nn.Dense(27 * 32,
+        x = nn.relu(nn.Dense(27 * 128,
                              kernel_init=orthogonal(np.sqrt(2)),
                              bias_init=constant(0.0))(x))
-        x = x.reshape(*batch_shape, 27, 32)                       # (..., 27, 32)
-        x = nn.relu(nn.ConvTranspose(32, (4,), strides=(2,), padding='SAME',
+        x = x.reshape(*batch_shape, 27, 128)                      # (..., 27, 128)
+        # 4-layer ConvTranspose decoder (SAME → out = in*stride)
+        x = nn.relu(nn.ConvTranspose(128, (3,), strides=(1,), padding='SAME',
                                      kernel_init=orthogonal(np.sqrt(2)),
-                                     bias_init=constant(0.0))(x))  # (..., 54, 32)
-        x = nn.relu(nn.ConvTranspose(16, (4,), strides=(2,), padding='SAME',
+                                     bias_init=constant(0.0))(x))  # (..., 27, 128)
+        x = nn.relu(nn.ConvTranspose(128, (4,), strides=(2,), padding='SAME',
                                      kernel_init=orthogonal(np.sqrt(2)),
-                                     bias_init=constant(0.0))(x))  # (..., 108, 16)
+                                     bias_init=constant(0.0))(x))  # (..., 54, 128)
+        x = nn.relu(nn.ConvTranspose(64, (4,), strides=(2,), padding='SAME',
+                                     kernel_init=orthogonal(np.sqrt(2)),
+                                     bias_init=constant(0.0))(x))  # (..., 108, 64)
         x = nn.ConvTranspose(1, (4,), strides=(2,), padding='SAME',
                              kernel_init=orthogonal(0.01),
                              bias_init=constant(0.0))(x)           # (..., 216, 1)
-        x = nn.sigmoid(x)
+        x = nn.sigmoid(x)                  # inv_lidar is normalised to [0, 1]
         return x[..., 0]                                           # (..., 216)
 
 
-class VAE(nn.Module):
-    """Wraps LidarEncoder + LidarDecoder for pretraining Module V."""
-    z_dim: int = Z_DIM
-
-    @nn.compact
-    def __call__(self, lidar: jnp.ndarray, rng: jax.Array):
-        encoder = LidarEncoder(z_dim=self.z_dim, name="encoder")
-        decoder = LidarDecoder(name="decoder")
-        z_mean, z_logvar = encoder(lidar)
-        eps = jax.random.normal(rng, z_mean.shape)
-        z   = z_mean + jnp.exp(0.5 * z_logvar) * eps
-        recon = decoder(z)
-        return recon, z_mean, z_logvar
-
-
 # ══════════════════════════════════════════════════════════════════════════════
-# Module M — Causal Transformer over z-sequences
+# Module M — Causal Transformer over z-sequences (paper Transformer variant)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TransformerBlock(nn.Module):
@@ -154,15 +175,22 @@ class TransformerBlock(nn.Module):
 
 
 class TransformerM(nn.Module):
-    """Causal Transformer M: (..., T, Z) → next-z predictions + hidden states."""
+    """Causal Transformer M (paper: 8 blocks, 8 heads).
+
+    (..., T, Z) → (next_z (..., T, Z), sr_pred (..., T, SR), h (..., T, d_model))
+
+    Two prediction heads implement Eq. 2: the next latent ẑ_{t+1} and the next
+    goal-velocity state ŝ_r,{t+1}. The hidden state h feeds the controller.
+    """
     d_model:  int = H_DIM
-    n_layers: int = 2
-    n_heads:  int = 4
+    n_layers: int = 8
+    n_heads:  int = 8
     max_len:  int = 64
     z_dim:    int = Z_DIM
+    sr_dim:   int = SR_DIM
 
     @nn.compact
-    def __call__(self, z_seq: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    def __call__(self, z_seq: jnp.ndarray):
         T = z_seq.shape[-2]
 
         h = nn.Dense(self.d_model,
@@ -184,16 +212,50 @@ class TransformerM(nn.Module):
                           kernel_init=orthogonal(0.01),
                           bias_init=constant(0.0),
                           name="next_z_head")(h)
-        return next_z, h                       # (..., T, Z), (..., T, d_model)
+        sr_pred = nn.Dense(self.sr_dim,
+                           kernel_init=orthogonal(0.01),
+                           bias_init=constant(0.0),
+                           name="sr_head")(h)
+        return next_z, sr_pred, h          # (..,T,Z), (..,T,SR), (..,T,d_model)
 
 
-class MWrapper(nn.Module):
-    """Pretraining wrapper for M so saved params live under key 'M'."""
-    z_dim: int = Z_DIM
+# ══════════════════════════════════════════════════════════════════════════════
+# Joint world model (V + M) — used only for pretraining (pretrain_navrep.py)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class NavRepWorldModel(nn.Module):
+    """Joint V + M for JOINT pretraining.
+
+    Param keys: {"encoder", "decoder", "M"} — train_navrep.py loads "encoder"
+    and "M" into the actor-critic (the decoder is only needed at pretrain time).
+
+    forward(lidar_seq, rng):
+        lidar_seq : (B, T, NUM_RAYS)  per-env time-ordered LiDAR
+      returns
+        recon      : (B, T, NUM_RAYS)  reconstruction of the current frames
+        next_recon : (B, T, NUM_RAYS)  decoded next-state prediction V(ẑ_{t+1})
+        sr_pred    : (B, T, SR_DIM)    predicted next goal-velocity state
+        z_mean, z_logvar : (B, T, Z)   for the KL term
+    """
+    z_dim:  int = Z_DIM
+    sr_dim: int = SR_DIM
 
     @nn.compact
-    def __call__(self, z_seq: jnp.ndarray):
-        return TransformerM(z_dim=self.z_dim, name="M")(z_seq)
+    def __call__(self, lidar_seq: jnp.ndarray, rng: jax.Array):
+        encoder = LidarEncoder(z_dim=self.z_dim, name="encoder")
+        decoder = LidarDecoder(name="decoder")
+        M       = TransformerM(z_dim=self.z_dim, sr_dim=self.sr_dim, name="M")
+
+        z_mean, z_logvar = encoder(lidar_seq)                 # (B, T, Z)
+        eps = jax.random.normal(rng, z_mean.shape)
+        z   = z_mean + jnp.exp(0.5 * z_logvar) * eps          # sampled latent
+
+        recon = decoder(z)                                    # (B, T, R)
+
+        next_z, sr_pred, _h = M(z)                            # (B,T,Z),(B,T,SR)
+        next_recon = decoder(next_z)                          # (B, T, R)
+
+        return recon, next_recon, sr_pred, z_mean, z_logvar
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -204,6 +266,7 @@ class NavRepActorCritic(nn.Module):
     action_dim: int = 2
     hidden_dim: int = 64
     z_dim:      int = Z_DIM
+    freeze_vm:  bool = True   # canonical NavRep: V+M frozen, only C trained.
 
     @nn.compact
     def __call__(self, obs: jnp.ndarray):
@@ -218,15 +281,16 @@ class NavRepActorCritic(nn.Module):
         # V: encode each of 3 frames (deterministic: use z_mean) → (..., 3, Z)
         z_mean, _z_logvar = LidarEncoder(z_dim=self.z_dim, name="encoder")(lidar_stack)
 
-        # M: causal Transformer over 3 frames → (..., 3, d_model)
-        _next_z, h_seq = TransformerM(z_dim=self.z_dim, name="M")(z_mean)
+        # M: causal Transformer over 3 frames → hidden h (..., 3, d_model)
+        _next_z, _sr_pred, h_seq = TransformerM(z_dim=self.z_dim, name="M")(z_mean)
 
-        # Most recent latent / hidden, frozen
-        z_t = jax.lax.stop_gradient(z_mean[..., -1, :])            # (..., Z)
-        h_t = jax.lax.stop_gradient(h_seq[..., -1, :])             # (..., H)
+        # Most recent latent / hidden. Frozen (stop_gradient) when freeze_vm.
+        _freeze = jax.lax.stop_gradient if self.freeze_vm else (lambda x: x)
+        z_t = _freeze(z_mean[..., -1, :])                          # (..., Z)
+        h_t = _freeze(h_seq[..., -1, :])                           # (..., H)
 
         state_r = jnp.concatenate([pose_flat, state_vec], axis=-1) # (..., 14)
-        feat    = jnp.concatenate([z_t, h_t, state_r], axis=-1)    # (..., Z+H+14)
+        feat    = jnp.concatenate([z_t, h_t, state_r], axis=-1)    # (..., 110)
 
         # Controller (C): policy head
         pi = nn.tanh(nn.Dense(self.hidden_dim,
@@ -335,7 +399,7 @@ def navrep_extract_features(params: dict, obs: jnp.ndarray) -> jnp.ndarray:
     )                                                   # (..., 3, Z_DIM)
 
     # M — causal Transformer over z sequence
-    _, h_seq = TransformerM(z_dim=Z_DIM).apply(
+    _next_z, _sr_pred, h_seq = TransformerM(z_dim=Z_DIM).apply(
         {"params": params["M"]}, z_mean
     )                                                   # (..., 3, H_DIM)
 

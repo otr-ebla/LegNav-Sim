@@ -19,8 +19,10 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
 os.environ.setdefault("TF_GPU_ALLOCATOR",            "cuda_malloc_async")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES",        "0")
 
-# Set TQC_BFLOAT16=1 in the environment to enable bfloat16 mixed precision.
-_USE_BFLOAT16 = os.environ.get("TQC_BFLOAT16", "0") == "1"
+# Default to bfloat16: engages Ampere Tensor Cores (RTX 3080) for ~2x throughput
+# on encoder/critic matmuls and halves activation memory. Set TQC_BFLOAT16=0 to
+# fall back to fp32 if numerical issues arise.
+_USE_BFLOAT16 = os.environ.get("TQC_BFLOAT16", "1") == "1"
 
 import time
 import warnings
@@ -34,12 +36,21 @@ import flax.serialization
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
+# ── Human model / sensor config — MUST be set before importing jax_env_multi ──
+# jax_env_multi does `from jax_env import USE_LEGS`, binding its own name at import
+# time, so we flip the flag on jax_env *first*. Training now matches the eval
+# default (leg-pair human model + salt&pepper LiDAR noise).
+import jax_env as _jax_env
+_jax_env.USE_LEGS    = True
+_jax_env.SENSOR_NOISE = True
+
+from jax_env import MAX_STEPS
 from jax_env_multi import reset_env, step_env
 from jax_wrappers import make_stacked_env, make_autoreset_env
 
 OBS_SIZE       = 662
 ACTION_DIM     = 2
-N_ENVS         = 2048
+N_ENVS         = 4096
 BUFFER_CAP     = 300_000    # 300K — ~1.5 GB for obs+next_obs (fits 8GB VRAM)
 BATCH_SIZE     = 512
 G_UPDATES      = 20
@@ -50,7 +61,7 @@ LR             = 3e-4
 MAX_GRAD_NORM  = 10.0
 TARGET_ENTROPY = -2.0
 ACTOR_ENC_GRAD_SCALE = 0.1
-DEFAULT_TOTAL_ENV_STEPS = 20_000_000   # default budget; override via train(total_env_steps=...)
+DEFAULT_TOTAL_ENV_STEPS = 70_000_000   # default budget; override via train(total_env_steps=...)
 LOG_EVERY      = 50
 SAVE_EVERY     = 5000
 
@@ -59,6 +70,13 @@ N_ATOMS          = 25
 N_TOP_ATOMS_DROP = 3
 N_TARGET_ATOMS   = N_CRITICS * N_ATOMS - N_TOP_ATOMS_DROP
 HUBER_KAPPA      = 1.0
+
+# ── Prioritized Experience Replay ──────────────────────────────────────────
+# Priorities are |TD-error|+ε; sampling prob ∝ p^α; IS weight ∝ (N·P)^(-β).
+PER_ALPHA      = 0.6   # priority exponent (0 = uniform, 1 = fully prioritized)
+PER_BETA_START = 0.4   # IS exponent at training start
+PER_BETA_END   = 1.0   # IS exponent at training end (linearly annealed)
+PER_EPS        = 1e-6  # priority floor
 
 MAX_V_OBS_IDX = 11  # stacked obs: pose_stack(9) + state_vec[v_norm, w, max_v_norm, ...] → idx 9+2=11
 LOG_STD_EPS   = 1e-6
@@ -100,7 +118,7 @@ def init_env_state(rng_key, min_goal_dist: float = 1.5, ghost_prob: float = 0.0,
     env_obs, env_state = _vmap_reset(reset_keys, jnp.float32(min_goal_dist), jnp.float32(ghost_prob), jnp.int32(scenario_idx))
     return env_obs, env_state, vmap_step
 
-from jax_network import SharedEncoder, USE_TANH_INSIDE
+from jax_network import SharedEncoder
 
 @jax.custom_vjp
 def scale_gradient(x, scale): return x
@@ -109,26 +127,32 @@ def _scale_gradient_bwd(scale, g): return g * scale, None
 scale_gradient.defvjp(_scale_gradient_fwd, _scale_gradient_bwd)
 
 class TQCActorHead(nn.Module):
+    """Proper SAC squashed-Gaussian actor head.
+
+    Outputs the RAW (pre-tanh) Gaussian mean. The tanh squashing is applied in
+    `sample_action` *after* the noise, with the matching log-prob Jacobian
+    correction — this is the only correct SAC parameterisation.
+
+    Loadability note: the eval heads (jax_eval_multi._TQCActorHead,
+    benchmark_eval._TQCActorHead, …) run with `tanh_inside=True`, i.e. they apply
+    `tanh` to this exact same `Dense_0` output. So the deterministic action they
+    reconstruct, `tanh(raw_mean)` mapped to the env, is identical to this policy's
+    mode. No eval-side change is needed; the checkpoint param tree is unchanged
+    ({Dense_0/kernel, Dense_0/bias, log_std}).
+    """
     action_dim:  int   = ACTION_DIM
     LOG_STD_MIN: float = -5.0
     LOG_STD_MAX: float =  0.5
-    tanh_inside: bool  = USE_TANH_INSIDE
 
     @nn.compact
     def __call__(self, feat):
-        raw_mean = nn.Dense(self.action_dim)(feat)
-        if self.tanh_inside:
-            v_mean = jnp.tanh(raw_mean[..., 0]) * 0.5 + 0.5
-            w_mean = jnp.tanh(raw_mean[..., 1])
-            actor_mean = jnp.stack([v_mean, w_mean], axis=-1)
-        else:
-            actor_mean = raw_mean
+        raw_mean = nn.Dense(self.action_dim)(feat)   # pre-tanh mean (unbounded)
 
         logstd_param = self.param('log_std', nn.initializers.constant(1.0), (self.action_dim,))
-        actor_logstd_raw = jnp.broadcast_to(logstd_param, actor_mean.shape)
+        actor_logstd_raw = jnp.broadcast_to(logstd_param, raw_mean.shape)
         actor_logstd = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (jnp.tanh(actor_logstd_raw) + 1.0)
-        
-        return actor_mean.astype(jnp.float32), actor_logstd.astype(jnp.float32)
+
+        return raw_mean.astype(jnp.float32), actor_logstd.astype(jnp.float32)
 
 class QuantileCriticBranch(nn.Module):
     n_atoms: int = N_ATOMS
@@ -161,31 +185,70 @@ shared_enc = SharedEncoder()
 actor_head = TQCActorHead()
 critic_net = TQCCriticEnsemble()
 
-enc_opt    = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
-actor_opt  = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
-critic_opt = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR, eps=1e-5))
+# Linearly decay LR to 10% over the run. Adam runs too hot in the late phase here:
+# success peaks then drifts down (Qmean bleeds, collisions spike). The schedule
+# steps once per gradient update; total updates = chunks × G_UPDATES × LOG_EVERY.
+_TOTAL_UPDATES = (DEFAULT_TOTAL_ENV_STEPS // (N_ENVS * LOG_EVERY)) * (G_UPDATES * LOG_EVERY)
+_lr_sched  = optax.linear_schedule(LR, LR * 0.1, _TOTAL_UPDATES)
+enc_opt    = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(_lr_sched, eps=1e-5))
+actor_opt  = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(_lr_sched, eps=1e-5))
+critic_opt = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(_lr_sched, eps=1e-5))
 ALPHA_LR   = 1e-4
 alpha_opt  = optax.adam(ALPHA_LR, eps=1e-5)
 
-def _tanh_log_prob_correction(tanh_u, max_v):
-    corr_v = jnp.log(max_v * 0.5 + LOG_STD_EPS) + jnp.log(1.0 - tanh_u[..., 0] ** 2 + LOG_STD_EPS)
-    return -(corr_v + jnp.log(1.0 - tanh_u[..., 1] ** 2 + LOG_STD_EPS))
+def _log1m_tanh2_stable(u):
+    """Numerically stable log(1 - tanh^2(u)).
+
+    Derivation: 1 - tanh^2(u) = sech^2(u) = 4 / (e^u + e^-u)^2, so
+    log(1 - tanh^2(u)) = 2 * log(2) - 2 * log(e^u + e^-u)
+                      = 2 * (log(2) - u - softplus(-2u)).
+
+    The naive form `log(1 - tanh(u)**2 + eps)` underflows to log(eps) once
+    |u| ≳ 8; the softplus form stays exact across the whole range.
+    """
+    return 2.0 * (jnp.log(2.0) - u - jax.nn.softplus(-2.0 * u))
+
+
+def _tanh_log_prob_correction(u, max_v):
+    """log|det J| for u → action, where
+        v = (tanh(u_v) + 1) * 0.5 * max_v,  dv/du_v = 0.5 * max_v * sech^2(u_v)
+        w =  tanh(u_w),                     dw/du_w =          sech^2(u_w)
+
+    Sign convention: returned value is the NEGATIVE of log|J|, ready to be
+    added to the base Gaussian log-prob.
+    """
+    log_dv = jnp.log(max_v * 0.5 + LOG_STD_EPS) + _log1m_tanh2_stable(u[..., 0])
+    log_dw = _log1m_tanh2_stable(u[..., 1])
+    return -(log_dv + log_dw)
+
 
 def sample_action(rng_key, mean, log_std, max_v):
+    """Reparameterised tanh-squashed Gaussian sample with corrected log-prob.
+
+    `mean` is the RAW (pre-tanh) mean from TQCActorHead. Noise is injected in
+    the unbounded latent space (u = mean + noise * std), THEN tanh is applied
+    as the final step of the action pipeline — so the policy is natively
+    bounded in (-1, 1) (and v in (0, max_v)) and the squash log-Jacobian is a
+    valid change-of-variables correction. The entropy term properly
+    constrains the mean: no clip dead-zone, no saturation collapse.
+    """
     std = jnp.exp(log_std)
     noise = jax.random.normal(rng_key, shape=mean.shape)
     u = mean + noise * std
     lp_gauss = jnp.sum(-0.5 * (noise ** 2 + jnp.log(2.0 * jnp.pi)) - log_std, axis=-1)
-    
-    if USE_TANH_INSIDE:
-        a_v = jnp.clip(u[..., 0], 0.0, 1.0) * max_v
-        a_w = jnp.clip(u[..., 1], -1.0, 1.0)
-        env_action = jnp.stack([a_v, a_w], axis=-1)
-        return env_action, lp_gauss
-    else:
-        tanh_u = jnp.tanh(u)
-        env_action = jnp.stack([(tanh_u[..., 0] + 1.0) * 0.5 * max_v, tanh_u[..., 1]], axis=-1)
-        return env_action, lp_gauss + _tanh_log_prob_correction(tanh_u, max_v)
+
+    tanh_u = jnp.tanh(u)
+    env_action = jnp.stack([(tanh_u[..., 0] + 1.0) * 0.5 * max_v, tanh_u[..., 1]], axis=-1)
+    return env_action, lp_gauss + _tanh_log_prob_correction(u, max_v)
+
+
+def deterministic_action(mean, max_v):
+    """Policy mode used for evaluation / best-checkpoint selection.
+
+    Identical to what the eval heads reconstruct: tanh(raw_mean) mapped to env.
+    """
+    tanh_m = jnp.tanh(mean)
+    return jnp.stack([(tanh_m[..., 0] + 1.0) * 0.5 * max_v, tanh_m[..., 1]], axis=-1)
 
 @jax.jit
 def extract_max_v(obs):
@@ -193,17 +256,17 @@ def extract_max_v(obs):
     # Clamp to [0.2, 2.0] matching env range for safety
     return jnp.clip(obs[..., MAX_V_OBS_IDX] * 1.8 + 0.2, 0.2, 2.0)
 
-def quantile_huber_loss(atoms, targets, taus, kappa=HUBER_KAPPA):
+def quantile_huber_loss_per_sample(atoms, targets, taus, kappa=HUBER_KAPPA):
     # atoms:   (B, N_ATOMS)    — online quantile predictions
     # targets: (B, N_TARGET)   — truncated target atoms
     # taus:    (N_ATOMS,)
+    # Returns: (B,) per-sample loss — used for both IS-weighted training and TD priorities.
     u = targets[:, None, :] - atoms[:, :, None]   # (B, N_ATOMS, N_TARGET)
     abs_u = jnp.abs(u)
     huber = jnp.where(abs_u <= kappa, 0.5 * u ** 2, kappa * (abs_u - 0.5 * kappa))
     indicator = (u < 0.0).astype(jnp.float32)
     rho = jnp.abs(taus[None, :, None] - indicator) * huber / kappa
-    # Sum over target atoms, mean over quantile atoms, mean over batch
-    return jnp.mean(jnp.mean(jnp.sum(rho, axis=2), axis=1))
+    return jnp.mean(jnp.sum(rho, axis=2), axis=1)
 
 _BUF_OBS_DTYPE = jnp.bfloat16  # halves obs storage; cast back to float32 at sample time
 
@@ -214,6 +277,12 @@ def make_buffer(capacity):
         "reward": jnp.zeros((capacity,), jnp.float32),
         "next_obs": jnp.zeros((capacity, OBS_SIZE), _BUF_OBS_DTYPE),
         "done": jnp.zeros((capacity,), jnp.float32),
+        "priorities": jnp.zeros((capacity,), jnp.float32),
+        "max_priority": jnp.float32(1.0),
+        # Running sum of (priorities[i]+eps)^alpha over valid slots, maintained
+        # incrementally by buf_add / buf_update_priorities so buf_sample doesn't
+        # need to re-reduce the full priority array on every sample call.
+        "sum_p_alpha": jnp.float32(0.0),
         "ptr": jnp.int32(0), "size": jnp.int32(0),
     }
 
@@ -221,29 +290,75 @@ def make_buffer(capacity):
 def buf_add(buf, obs, action, reward, next_obs, done):
     cap = buf["obs"].shape[0]; N = obs.shape[0]
     idxs = (buf["ptr"] + jnp.arange(N)) % cap
+    # New transitions inherit current max priority so they are sampled at least once.
+    new_prio = jnp.broadcast_to(buf["max_priority"], (N,)).astype(jnp.float32)
+    # Incremental sum update: slot was previously valid iff idx < old size,
+    # in which case its prior contribution was (old_prio+eps)^alpha; otherwise 0.
+    was_valid = idxs < buf["size"]
+    old_pa = jnp.where(was_valid, (buf["priorities"][idxs] + PER_EPS) ** PER_ALPHA, 0.0)
+    new_pa = (new_prio + PER_EPS) ** PER_ALPHA
+    sum_p_alpha = buf["sum_p_alpha"] + jnp.sum(new_pa - old_pa)
     return {
         "obs": buf["obs"].at[idxs].set(obs.astype(_BUF_OBS_DTYPE)),
         "action": buf["action"].at[idxs].set(action),
         "reward": buf["reward"].at[idxs].set(reward),
         "next_obs": buf["next_obs"].at[idxs].set(next_obs.astype(_BUF_OBS_DTYPE)),
         "done": buf["done"].at[idxs].set(done),
+        "priorities": buf["priorities"].at[idxs].set(new_prio),
+        "max_priority": buf["max_priority"],
+        "sum_p_alpha": sum_p_alpha,
         "ptr": jnp.int32((buf["ptr"] + N) % cap),
         "size": jnp.minimum(jnp.int32(buf["size"] + N), jnp.int32(cap)),
     }
 
 
 @jax.jit(static_argnames=["batch_size"])
-def buf_sample(buf, rng_key, batch_size: int):
-    max_idx = jnp.maximum(1, buf["size"])
-    idxs = jax.random.randint(rng_key, (batch_size,), 0, max_idx)
-    return (buf["obs"][idxs].astype(jnp.float32), buf["action"][idxs], buf["reward"][idxs], buf["next_obs"][idxs].astype(jnp.float32), buf["done"][idxs])
+def buf_sample(buf, rng_key, batch_size: int, beta):
+    cap = buf["priorities"].shape[0]
+    valid_mask = jnp.arange(cap) < buf["size"]
+    p_alpha = (buf["priorities"] + PER_EPS) ** PER_ALPHA
+    p_alpha = jnp.where(valid_mask, p_alpha, 0.0)
+    # Use the incrementally maintained sum instead of reducing the 300K array.
+    # Drift from scatter-with-duplicates is a constant scaling factor on probs,
+    # which cancels in both the categorical softmax and the max-normalized
+    # IS weights below — so the sampling distribution and IS weights are exact.
+    probs = p_alpha / (buf["sum_p_alpha"] + 1e-10)
+    log_probs = jnp.log(probs + 1e-30)
+    idxs = jax.random.categorical(rng_key, log_probs, shape=(batch_size,))
+    sample_probs = probs[idxs]
+    N = jnp.maximum(buf["size"], 1).astype(jnp.float32)
+    weights = (N * sample_probs + 1e-10) ** (-beta)
+    weights = weights / (jnp.max(weights) + 1e-10)
+    return (
+        buf["obs"][idxs].astype(jnp.float32),
+        buf["action"][idxs],
+        buf["reward"][idxs],
+        buf["next_obs"][idxs].astype(jnp.float32),
+        buf["done"][idxs],
+        idxs,
+        weights,
+    )
+
+@jax.jit
+def buf_update_priorities(buf, idxs, td_errors):
+    new_prio = jnp.abs(td_errors) + PER_EPS
+    # Idxs come from sampling, so the slots are always valid (within [0, size)).
+    old_pa = (buf["priorities"][idxs] + PER_EPS) ** PER_ALPHA
+    new_pa = (new_prio + PER_EPS) ** PER_ALPHA
+    sum_p_alpha = buf["sum_p_alpha"] + jnp.sum(new_pa - old_pa)
+    return {
+        **buf,
+        "priorities": buf["priorities"].at[idxs].set(new_prio),
+        "max_priority": jnp.maximum(buf["max_priority"], jnp.max(new_prio)),
+        "sum_p_alpha": sum_p_alpha,
+    }
 
 @jax.jit
 def soft_update(target, online):
     return jax.tree_util.tree_map(lambda t, o: TAU * o + (1.0 - TAU) * t, target, online)
 
 @jax.jit
-def critic_loss_fn(cp, tp, ap, sep, tsep, log_alpha, obs, action, reward, next_obs, done, rng_key):
+def critic_loss_fn(cp, tp, ap, sep, tsep, log_alpha, obs, action, reward, next_obs, done, is_weights, rng_key):
     alpha = jnp.exp(log_alpha)
 
     feat_next_critic = jax.lax.stop_gradient(shared_enc.apply({"params": tsep}, next_obs.astype(NET_DTYPE)))
@@ -259,11 +374,15 @@ def critic_loss_fn(cp, tp, ap, sep, tsep, log_alpha, obs, action, reward, next_o
     feat_obs = shared_enc.apply({"params": sep}, obs.astype(NET_DTYPE))
     online_atoms = critic_net.apply({"params": cp}, feat_obs, action.astype(NET_DTYPE))
 
-    total_loss, q_sum = jnp.float32(0.0), jnp.float32(0.0)
+    per_sample = jnp.zeros((obs.shape[0],), jnp.float32)
+    q_sum = jnp.float32(0.0)
     for i in range(N_CRITICS):
-        total_loss += quantile_huber_loss(online_atoms[:, i, :], backup, _TAUS)
+        per_sample = per_sample + quantile_huber_loss_per_sample(online_atoms[:, i, :], backup, _TAUS)
         q_sum += jnp.mean(online_atoms[:, i, :])
-    return total_loss / N_CRITICS, q_sum / N_CRITICS
+    per_sample = per_sample / N_CRITICS
+    weighted_loss = jnp.mean(is_weights * per_sample)
+    td_error = jax.lax.stop_gradient(per_sample)
+    return weighted_loss, (q_sum / N_CRITICS, td_error)
 
 @jax.jit
 def actor_loss_fn(ap, cp, sep, log_alpha, obs, rng_key):
@@ -277,12 +396,12 @@ def actor_loss_fn(ap, cp, sep, log_alpha, obs, rng_key):
     return jnp.mean(jnp.exp(log_alpha) * log_pi) - jnp.mean(q_atoms), jnp.mean(log_pi)
 
 @jax.jit
-def tqc_update(ap, aos, cp, cos, tp, sep, eos, tsep, la, laos, obs, action, reward, next_obs, done, rng_key):
+def tqc_update(ap, aos, cp, cos, tp, sep, eos, tsep, la, laos, obs, action, reward, next_obs, done, is_weights, rng_key):
     rng_c, rng_a = jax.random.split(rng_key)
 
-    (c_loss, q_mean), (c_grads_cp, c_grads_sep) = jax.value_and_grad(
+    (c_loss, (q_mean, td_error)), (c_grads_cp, c_grads_sep) = jax.value_and_grad(
         critic_loss_fn, argnums=(0, 3), has_aux=True
-    )(cp, tp, ap, sep, tsep, la, obs, action, reward, next_obs, done, rng_c)
+    )(cp, tp, ap, sep, tsep, la, obs, action, reward, next_obs, done, is_weights, rng_c)
     c_upd, new_cos = critic_opt.update(c_grads_cp, cos, cp)
     new_cp = optax.apply_updates(cp, c_upd)
 
@@ -298,9 +417,14 @@ def tqc_update(ap, aos, cp, cos, tp, sep, eos, tsep, la, laos, obs, action, rewa
 
     al_loss, al_grad = jax.value_and_grad(lambda a, lp: -jnp.exp(a) * (lp + TARGET_ENTROPY))(la, jax.lax.stop_gradient(log_pi_mean))
     al_upd, new_laos = alpha_opt.update(al_grad, laos)
+    # Cap log_alpha to prevent late-training entropy-coefficient runaway. In the
+    # healthy regime α sits around 0.03–0.09; capping at 0.2 leaves plenty of
+    # headroom but kills the runaway feedback loop where α explodes, Q-targets
+    # blow up, and the policy collapses.
+    new_la = jnp.minimum(optax.apply_updates(la, al_upd), jnp.log(0.2))
 
-    metrics = {"critic_loss": c_loss, "actor_loss": a_loss, "alpha": jnp.exp(optax.apply_updates(la, al_upd)), "log_pi": log_pi_mean, "q_mean": q_mean}
-    return new_ap, new_aos, new_cp, new_cos, soft_update(tp, new_cp), new_sep, new_eos, soft_update(tsep, new_sep), optax.apply_updates(la, al_upd), new_laos, metrics
+    metrics = {"critic_loss": c_loss, "actor_loss": a_loss, "alpha": jnp.exp(new_la), "log_pi": log_pi_mean, "q_mean": q_mean}
+    return new_ap, new_aos, new_cp, new_cos, soft_update(tp, new_cp), new_sep, new_eos, soft_update(tsep, new_sep), new_la, new_laos, td_error, metrics
 
 @functools.partial(jax.jit, static_argnums=(5,))
 def collect_step(sep, ap, env_state, env_obs, rng_key, vmap_step, min_goal_dist, scenario_idx, ghost_prob, max_scenario):
@@ -311,8 +435,32 @@ def collect_step(sep, ap, env_state, env_obs, rng_key, vmap_step, min_goal_dist,
     new_obs, new_state, reward, done, info = vmap_step(step_keys, env_state, env_action, min_goal_dist, scenario_idx, ghost_prob, max_scenario)
     return new_obs, new_state, env_obs, env_action, reward, done, info
 
-@functools.partial(jax.jit, static_argnums=(11,), donate_argnums=(10, 15, 16))
-def train_chunk(ap, aos, cp, cos, tp, sep, eos, tsep, la, laos, buf, vmap_step, min_goal_dist, scenario_idx, ghost_prob, es, eo, key, max_scenario):
+EVAL_HORIZON = 2 * MAX_STEPS   # steps per deterministic eval (autoreset → many episodes)
+
+@functools.partial(jax.jit, static_argnums=(5, 10))
+def deterministic_eval(sep, ap, env_state, env_obs, rng_key, vmap_step,
+                       min_goal_dist, scenario_idx, ghost_prob, max_scenario, horizon):
+    """Roll out the policy MODE (no exploration noise) and return per-step outcome
+    arrays — the same quantities collect_episode_outcomes consumes. This measures
+    exactly what jax_eval_multi / benchmark_eval see at load time."""
+    def _body(carry, _):
+        es_, eo_, key_ = carry
+        feat = shared_enc.apply({"params": sep}, eo_.astype(NET_DTYPE))
+        mean, _ = actor_head.apply({"params": ap}, feat)
+        env_action = jax.vmap(deterministic_action)(mean, extract_max_v(eo_))
+        key_, k_step = jax.random.split(key_)
+        step_keys = jax.random.split(k_step, N_ENVS)
+        new_eo, new_es, rew, done, info = vmap_step(step_keys, es_, env_action, min_goal_dist, scenario_idx, ghost_prob, max_scenario)
+        return (new_es, new_eo, key_), (rew, done, info["goal_reached"], info["collision"], info["passive_col"])
+    _, step_data = jax.lax.scan(_body, (env_state, env_obs, rng_key), None, length=horizon)
+    return step_data
+
+# Donate network params (ap, cp, tp, sep, tsep), optimizer states (aos, cos, eos, laos),
+# log_alpha (la), the replay buffer, and env state/obs. All are rebound from new_carry
+# after the call, so XLA can reuse their device buffers in place instead of allocating
+# fresh copies on every chunk — meaningful in a 10GB VRAM budget.
+@functools.partial(jax.jit, static_argnums=(11,), donate_argnums=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 16))
+def train_chunk(ap, aos, cp, cos, tp, sep, eos, tsep, la, laos, buf, vmap_step, min_goal_dist, scenario_idx, ghost_prob, es, eo, key, max_scenario, beta_per):
     def _collect_body(carry, _):
         es_, eo_, buf_, key_ = carry
         key_, k_col = jax.random.split(key_)
@@ -327,20 +475,21 @@ def train_chunk(ap, aos, cp, cos, tp, sep, eos, tsep, la, laos, buf, vmap_step, 
     )
 
     def _update_step(update_carry, upd_idx):
-        ap_, aos_, cp_, cos_, tp_, sep_, eos_, tsep_, la_, laos_, key_ = update_carry
+        ap_, aos_, cp_, cos_, tp_, sep_, eos_, tsep_, la_, laos_, buf_, key_ = update_carry
         k_samp = jax.random.fold_in(key_, upd_idx * 2)
         k_upd  = jax.random.fold_in(key_, upd_idx * 2 + 1)
-        b_obs, b_act, b_rew, b_next, b_done = buf_sample(new_buf, k_samp, BATCH_SIZE)
-        new_ap_, new_aos_, new_cp_, new_cos_, new_tp_, new_sep_, new_eos_, new_tsep_, new_la_, new_laos_, metrics_ = \
-            tqc_update(ap_, aos_, cp_, cos_, tp_, sep_, eos_, tsep_, la_, laos_, b_obs, b_act, b_rew, b_next, b_done, k_upd)
-        return (new_ap_, new_aos_, new_cp_, new_cos_, new_tp_, new_sep_, new_eos_, new_tsep_, new_la_, new_laos_, key_), metrics_
+        b_obs, b_act, b_rew, b_next, b_done, idxs, weights = buf_sample(buf_, k_samp, BATCH_SIZE, beta_per)
+        new_ap_, new_aos_, new_cp_, new_cos_, new_tp_, new_sep_, new_eos_, new_tsep_, new_la_, new_laos_, td_err_, metrics_ = \
+            tqc_update(ap_, aos_, cp_, cos_, tp_, sep_, eos_, tsep_, la_, laos_, b_obs, b_act, b_rew, b_next, b_done, weights, k_upd)
+        new_buf_ = buf_update_priorities(buf_, idxs, td_err_)
+        return (new_ap_, new_aos_, new_cp_, new_cos_, new_tp_, new_sep_, new_eos_, new_tsep_, new_la_, new_laos_, new_buf_, key_), metrics_
 
-    update_carry_init = (ap, aos, cp, cos, tp, sep, eos, tsep, la, laos, key)
-    (new_ap, new_aos, new_cp, new_cos, new_tp, new_sep, new_eos, new_tsep, new_la, new_laos, key), all_metrics = jax.lax.scan(
+    update_carry_init = (ap, aos, cp, cos, tp, sep, eos, tsep, la, laos, new_buf, key)
+    (new_ap, new_aos, new_cp, new_cos, new_tp, new_sep, new_eos, new_tsep, new_la, new_laos, new_buf2, key), all_metrics = jax.lax.scan(
         _update_step, update_carry_init, jnp.arange(G_UPDATES * LOG_EVERY)
     )
 
-    new_carry = (new_ap, new_aos, new_cp, new_cos, new_tp, new_sep, new_eos, new_tsep, new_la, new_laos, new_buf, new_es, new_eo, key)
+    new_carry = (new_ap, new_aos, new_cp, new_cos, new_tp, new_sep, new_eos, new_tsep, new_la, new_laos, new_buf2, new_es, new_eo, key)
     return new_carry, all_step_data, all_metrics
 
 @jax.jit
@@ -447,7 +596,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     _c, _sd, _m = train_chunk(
         ap, aos, cp, cos, tp, sep, eos, tsep, la, laos,
         replay_buf, vmap_step, jnp.float32(cur_max_dist), jnp.int32(cur_scenario), jnp.float32(cur_ghost),
-        env_state, env_obs, rng, jnp.int32(cur_max_scen)
+        env_state, env_obs, rng, jnp.int32(cur_max_scen), jnp.float32(PER_BETA_START)
     )
     jax.block_until_ready(_c)
     ap, aos, cp, cos, tp, sep, eos, tsep, la, laos, replay_buf, env_state, env_obs, rng = _c
@@ -464,6 +613,12 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     PRINT_EVERY_CHUNKS = 5   # print every 5th chunk (1/5 of previous frequency)
     chunk_idx = 0
 
+    # Divergence early-stop: kill training if the critic blows up, or if two
+    # deterministic evals in a row come in ≥20 points below best.
+    DIVERGENCE_CRIT_LOSS = 200.0
+    DIVERGENCE_SUC_DROP  = 20.0
+    bad_evals = 0
+
     t_start = time.time()
 
     _LOG_PATH = "checkpoints_tqc/tqc_training_log.csv"
@@ -477,10 +632,14 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     while total_steps < total_env_steps:
         t0 = time.time()
 
+        # Linearly anneal PER IS-weight exponent β from PER_BETA_START → PER_BETA_END.
+        frac = min(1.0, total_steps / max(1, total_env_steps))
+        beta_per = PER_BETA_START + frac * (PER_BETA_END - PER_BETA_START)
+
         new_carry, all_step_data, all_metrics = train_chunk(
             ap, aos, cp, cos, tp, sep, eos, tsep, la, laos,
             replay_buf, vmap_step, jnp.float32(cur_max_dist), jnp.int32(cur_scenario), jnp.float32(cur_ghost),
-            env_state, env_obs, rng, jnp.int32(cur_max_scen)
+            env_state, env_obs, rng, jnp.int32(cur_max_scen), jnp.float32(beta_per)
         )
 
         ap, aos, cp, cos, tp, sep, eos, tsep, la, laos, replay_buf, env_state, env_obs, rng = new_carry
@@ -523,18 +682,19 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
                                round(pcol_pct, 4), round(tmo_pct, 4), n_ep])
         _log_file.flush()
 
+        if m_crit > DIVERGENCE_CRIT_LOSS:
+            print(f"  !! Critic loss {m_crit:.1f} > {DIVERGENCE_CRIT_LOSS:.0f} — training diverged, stopping early.")
+            break
+
         if n_ep > 0:
             # ── Monotonic curriculum ──────────────────────────────────────
-            # Once a level is passed it can never be unlearned: both the
-            # tracking signal (`highest_rolling_suc`) and the per-dimension
-            # curriculum state are strictly non-decreasing.
-            rolling_suc         = 0.90 * rolling_suc + 0.10 * suc_pct
+            rolling_suc         = 0.80 * rolling_suc + 0.20 * suc_pct
             highest_rolling_suc = max(highest_rolling_suc, rolling_suc)
 
             new_max_dist, new_ghost, _, new_max_scen = get_continuous_curriculum(highest_rolling_suc)
 
             if new_max_dist > cur_max_dist:
-                cur_max_dist = min(cur_max_dist + 0.2, new_max_dist)
+                cur_max_dist = new_max_dist
             if new_ghost > cur_ghost:
                 cur_ghost = new_ghost
             if new_max_scen > cur_max_scen:
@@ -543,16 +703,43 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
             # Always sample scenario uniformly from [0, cur_max_scen] at each reset.
             cur_scenario = -1
 
-        # Only save when curriculum is past the trivial phase (≥2 scenarios, goal ≥5m).
+        # ── Deterministic best-checkpoint selection ───────────────────────────
+        
         curriculum_mature = cur_max_scen >= 1 and cur_max_dist >= 5.0
-        if suc_pct > best_suc and curriculum_mature:
-            best_suc = suc_pct
-            save_checkpoint(sep, tsep, ap, cp, tp, eos, aos, cos, la, laos, n_updates)
+        if curriculum_mature and (chunk_idx == 1 or chunk_idx % PRINT_EVERY_CHUNKS == 0):
+            rng, k_evr, k_ev = jax.random.split(rng, 3)
+            eval_keys = jax.random.split(k_evr, N_ENVS)
+            eo_obs, eo_state = _vmap_reset(eval_keys, jnp.float32(cur_max_dist),
+                                           jnp.float32(cur_ghost), jnp.int32(cur_scenario))
+            ev_data = deterministic_eval(
+                sep, ap, eo_state, eo_obs, k_ev, vmap_step,
+                jnp.float32(cur_max_dist), jnp.int32(cur_scenario), jnp.float32(cur_ghost),
+                jnp.int32(cur_max_scen), EVAL_HORIZON)
+            _, ev_suc, _, _, _, ev_msk = collect_episode_outcomes(*ev_data)
+            n_ev = float(ev_msk.sum())
+            det_suc = float((ev_suc * ev_msk).sum() / n_ev) * 100.0 if n_ev > 0 else 0.0
+            print(f"    [det-eval] mode success {det_suc:5.1f}%  (n={int(n_ev)} ep)  best={best_suc:.1f}%")
+            if det_suc > best_suc:
+                best_suc = det_suc
+                save_checkpoint(sep, tsep, ap, cp, tp, eos, aos, cos, la, laos, n_updates)
+                bad_evals = 0
+            elif det_suc < best_suc - DIVERGENCE_SUC_DROP:
+                bad_evals += 1
+                if bad_evals >= 2:
+                    print(f"  !! Two consecutive evals ≥{DIVERGENCE_SUC_DROP:.0f}% below best ({best_suc:.1f}%) — stopping early.")
+                    break
+            else:
+                bad_evals = 0
 
-    # Always save a final checkpoint so training work is never lost
-    save_checkpoint(sep, tsep, ap, cp, tp, eos, aos, cos, la, laos, n_updates,
-                    filepath="checkpoints_tqc/tqc_final.msgpack")
-    print(f"  Final checkpoint -> checkpoints_tqc/tqc_final.msgpack")
+    # Final checkpoint == best checkpoint. 
+    import shutil
+    if os.path.exists(CKPT_PATH):
+        shutil.copyfile(CKPT_PATH, "checkpoints_tqc/tqc_final.msgpack")
+        print(f"  Final checkpoint -> checkpoints_tqc/tqc_final.msgpack (copied from best, {best_suc:.1f}%)")
+    else:
+        save_checkpoint(sep, tsep, ap, cp, tp, eos, aos, cos, la, laos, n_updates,
+                        filepath="checkpoints_tqc/tqc_final.msgpack")
+        print(f"  Final checkpoint -> checkpoints_tqc/tqc_final.msgpack (no best found, saved current)")
 
     print(f"\nTQC done! {(time.time() - t_start)/3600:.2f}h | Best success: {best_suc:.1f}%")
     _log_file.close()

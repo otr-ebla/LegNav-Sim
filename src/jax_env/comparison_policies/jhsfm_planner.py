@@ -1,10 +1,14 @@
 """
-jhsfm_planner.py — Exact JHSFM planner for NavRep pretraining
-=================================================================
+jhsfm_planner.py — Exact JHSFM planner (robot driven as a pedestrian)
+=====================================================================
 
-Replaces the DWA expert with a Social Force Model (SFM) controller that moves
-the robot toward the goal exactly like a pedestrian in jax_humans.py, using
-the exact same absolute global state of the environment and force functions.
+Drives the robot with the **exact same** Headed Social Force Model that moves
+the pedestrians inside ``step_env`` (``jhsfm.hsfm.step``) — not a re-implementation.
+The robot is inserted as one more headed agent in the crowd: a human circle with
+the **robot's radius**, sharing the humans' force/torque parameters, reacting to
+the other people and the static obstacles (walls, boxes, circles) in identical
+fashion. Its resulting human-like motion over one env timestep is then mapped to
+the robot's unicycle command ``[v, w]``.
 
 Interface:
     pilot = HumanPilot()
@@ -32,19 +36,21 @@ for _p in (_JAX_ENV_DIR, _SRC_DIR, _ROOT_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from jax_env import ROBOT_RADIUS, PEOPLE_RADIUS, ROOM_W, ROOM_H, DT, GOAL_RADIUS
-from jax_humans import (
-    _goal_force,
-    _human_force,
-    _wall_force,
-    _circle_force,
-    _box_force,
-    MAX_SPEED,
-    _EPS,
-)
+from jax_env import ROBOT_RADIUS, DT
+from jax_env_multi import build_hsfm_obstacles, N_SUBSTEPS, HSFM_DT, NUM_PEOPLE
 
-_W_GAIN = 2.0
-_W_MAX  = 1.0
+try:
+    from src.jhsfm_utils.JHSFM.jhsfm.hsfm import step as hsfm_step
+    from src.jhsfm_utils.JHSFM.jhsfm.utils import get_standard_humans_parameters
+except ImportError:
+    from src.jhsfm_utils.JHSFM.jhsfm.hsfm import step as hsfm_step
+    from jhsfm_utils.JHSFM.jhsfm.utils import get_standard_humans_parameters
+
+# JHSFM per-agent parameter layout (see jhsfm/utils.py):
+#   [radius, mass, v_max, tau, ...]
+_P_RADIUS = 0
+
+_W_MAX = 1.0
 
 
 class HumanPilot:
@@ -57,60 +63,42 @@ class HumanPilot:
         state,                      # EnvState (single or properly vmapped)
         _rng: jax.Array = None,     # unused
     ) -> jnp.ndarray:
-        # Extract robot state
-        px, py = state.x, state.y
-        theta = state.theta
-        vx = state.v * jnp.cos(theta)
-        vy = state.v * jnp.sin(theta)
-        
-        wp_x, wp_y = state.goal_x, state.goal_y
-        max_v = state.max_v
-        v_des = jnp.minimum(max_v, MAX_SPEED)
+        # ── Build the (N+1)-agent HSFM state: humans + robot as the last agent ──
+        # JHSFM agent state is [px, py, bvx, bvy, theta, omega] with body-frame
+        # velocity. A unicycle robot moving along its heading has bvx=v, bvy=0.
+        h_state   = state.people[:, :6]                                   # (N, 6)
+        robot_row = jnp.array([[state.x, state.y, state.v, 0.0,
+                                state.theta, state.w]])                   # (1, 6)
+        ext_state = jnp.concatenate([h_state, robot_row], axis=0)         # (N+1, 6)
 
-        # ── 1) Goal force ─────────────────────────────────────────────────────
-        gfx, gfy = _goal_force(px, py, vx, vy, wp_x, wp_y, v_des)
-        
-        # Stop force when already inside goal radius
-        goal_d = jnp.sqrt((wp_x - px)**2 + (wp_y - py)**2 + _EPS)
-        gfx = jnp.where(goal_d > GOAL_RADIUS, gfx, 0.0)
-        gfy = jnp.where(goal_d > GOAL_RADIUS, gfy, 0.0)
+        # Goals: each human's active waypoint (idx 0/1 → g1/g2); robot's goal last.
+        idx_h    = state.people[:, 10]
+        g1x, g1y = state.people[:, 6], state.people[:, 7]
+        g2x, g2y = state.people[:, 8], state.people[:, 9]
+        h_goals  = jnp.stack([jnp.where(idx_h == 0, g1x, g2x),
+                              jnp.where(idx_h == 0, g1y, g2y)], axis=-1)  # (N, 2)
+        ext_goals = jnp.concatenate(
+            [h_goals, jnp.array([[state.goal_x, state.goal_y]])], axis=0) # (N+1, 2)
 
-        # ── 2) Human-human forces ─────────────────────────────────────────────
-        # The robot computes forces exactly as if it were a human dodging other humans.
-        all_humans = state.people
-        N = all_humans.shape[0]
-        
-        # We approximate the contact interaction radius as the average or sum
-        # In jax_humans, `_human_force(..., r)` uses `2*r` for contact distance.
-        # Thus `r` should be `(ROBOT_RADIUS + PEOPLE_RADIUS) / 2`.
-        effective_r = (ROBOT_RADIUS + PEOPLE_RADIUS) / 2.0
-        
-        def hf(i):
-            opx, opy = all_humans[i,0], all_humans[i,1]
-            return _human_force(px, py, vx, vy, opx, opy, effective_r)
-        
-        hfxs, hfys = jax.vmap(hf)(jnp.arange(N))
-        hfx, hfy = jnp.sum(hfxs), jnp.sum(hfys)
+        # Same parameters and obstacles the env feeds the pedestrians. The only
+        # robot-specific override is the footprint: a human circle with the
+        # robot's radius. Desired walking speed and all force/torque coefficients
+        # stay identical to the humans (the robot's max_v is applied as a hard cap
+        # on the unicycle command below, not as the social-force desired speed).
+        params = get_standard_humans_parameters(NUM_PEOPLE + 1)
+        params = params.at[-1, _P_RADIUS].set(ROBOT_RADIUS)
+        obstacles = build_hsfm_obstacles(state.obs_boxes, state.obs_circles, state.room_h)
 
-        # ── 3) Obstacle + wall forces ──────────────────────────────────────────
-        wfx, wfy = _wall_force(px, py, ROOM_W, ROOM_H)
-        cfx, cfy = _circle_force(px, py, vx, vy, state.obs_circles)
-        bfx, bfy = _box_force(px, py, state.obs_boxes)
-        
-        # Sum acceleration (no robot force since this IS the robot)
-        ax = gfx + hfx + wfx + cfx + bfx
-        ay = gfy + hfy + wfy + cfy + bfy
+        # Evolve the crowd + robot together with the env's substep schedule, so the
+        # robot covers the same ground a pedestrian would over one env timestep.
+        def _sub(_, ext):
+            return hsfm_step(ext, ext_goals, params, obstacles, HSFM_DT)
+        final_ext = jax.lax.fori_loop(0, N_SUBSTEPS, _sub, ext_state)
+        r = final_ext[-1]   # robot's evolved HSFM state
 
-        # Convert to [v, w] control
-        fx, fy = ax, ay
-        
-        desired_theta = jnp.arctan2(fy, fx)
-        heading_err = (desired_theta - theta + jnp.pi) % (2 * jnp.pi) - jnp.pi
-        w_cmd = jnp.clip(_W_GAIN * heading_err, -_W_MAX, _W_MAX)
-        
-        goal_align = jnp.maximum(
-            jnp.cos(heading_err) * jnp.sqrt(jnp.minimum(goal_d / 2.0, 1.0)), 0.0
-        )
-        v_cmd = jnp.clip(v_des * goal_align, 0.0, max_v)
-        
+        # ── Map the human-like net pose change over DT to a unicycle [v, w] ──────
+        dtheta = (r[4] - state.theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
+        w_cmd  = jnp.clip(dtheta / DT, -_W_MAX, _W_MAX)
+        disp   = jnp.hypot(r[0] - state.x, r[1] - state.y)
+        v_cmd  = jnp.clip(disp / DT, 0.0, state.max_v)
         return jnp.array([v_cmd, w_cmd])

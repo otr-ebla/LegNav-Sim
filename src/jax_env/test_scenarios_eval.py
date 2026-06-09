@@ -2,15 +2,19 @@
 test_scenarios_eval.py — Evaluate trained policies on test scenarios (7-12)
 ==========================================================================
 Runs the 6 test scenarios (7-12) with multi-waypoint support for the robot.
-When the robot reaches a waypoint, the goal is updated to the next one
-and metrics (reward, steps) reset — as if a new episode started — but
-the environment state (people, obstacles, robot position) continues.
+When the robot reaches a waypoint, the goal is updated to the next one and
+the environment state (people, obstacles, robot position) continues. Headless
+mode reports the standard metrics (SR/ACR/PCR/TR/SPL/TTG/MHD/AJ/SC/YS),
+accumulated over the whole episode across all waypoint segments.
 
 Usage:
-  python3 test_scenarios_eval.py --algo sac  --ckpt checkpoints_sac/sac_best.msgpack
-  python3 test_scenarios_eval.py --algo tqc  --ckpt checkpoints_tqc/tqc_best.msgpack
-  python3 test_scenarios_eval.py --algo ppo  --ckpt checkpoints/ppo_attn_final.msgpack
+  python3 test_scenarios_eval.py --algo sac  --ckpt checkpoints_sac/sac_final.msgpack
+  python3 test_scenarios_eval.py --algo tqc  --ckpt checkpoints_tqc/tqc_final.msgpack
+  python3 test_scenarios_eval.py --algo ppo  --ckpt checkpoints/ppo_tanh_inside_final.msgpack
   python3 test_scenarios_eval.py --algo mlp  --ckpt checkpoints_vanilla_ppo/ppo_mlp_best.msgpack
+  python3 test_scenarios_eval.py --algo dwa   # Dynamic Window Approach (no checkpoint)
+  python3 test_scenarios_eval.py --algo mppi  # Model Predictive Path Integral (no checkpoint)
+  python3 test_scenarios_eval.py --algo hsfm  # HSFM: robot driven as a human circle (no checkpoint)
 
 Keys:
   7-9, 0(=10), -/'(=11), =(=12)   Select test scenario
@@ -39,7 +43,7 @@ import flax.serialization
 def _parse_args():
     p = argparse.ArgumentParser(description="Test Scenario Evaluation")
     p.add_argument("--algo", default="sac",
-                   choices=["ppo", "shac", "sac", "tqc", "mlp", "navrep", "tagd", "mppi", "ppo_circles"])
+                   choices=["ppo", "shac", "sac", "tqc", "mlp", "navrep", "tagd", "mppi", "dwa", "hsfm", "ppo_circles"])
     p.add_argument("--ckpt", default="")
     p.add_argument("--legs",    dest="use_legs", action="store_true",  default=True)
     p.add_argument("--no-legs", dest="use_legs", action="store_false")
@@ -150,12 +154,12 @@ use_legs   = args.use_legs
 MAX_EVAL_GOAL_DIST = 20.0   # large enough for all test scenarios
 
 
-def build_fast_reset(scen_idx):
+def build_fast_reset(scen_idx, min_goal_dist: float = 8.0):
     # ghost_prob is absorbed from the wrapper's kwargs and overridden to 0.0
-    bound_reset = lambda key, max_goal_dist=3.0, scenario_idx=-1, ghost_prob=0.0, **kw: \
-        reset_env(key, MAX_EVAL_GOAL_DIST, scenario_idx=scen_idx, ghost_prob=0.0, **kw)
+    bound_reset = lambda key, max_goal_dist=3.0, scenario_idx=-1, ghost_prob=0.0, min_goal_dist=0.8, **kw: \
+        reset_env(key, MAX_EVAL_GOAL_DIST, scenario_idx=scen_idx, ghost_prob=0.0, min_goal_dist=min_goal_dist, **kw)
     rs, ss = make_stacked_env(bound_reset, step_env, stack_dim=3)
-    jit_rs = jax.jit(lambda key: rs(key, MAX_EVAL_GOAL_DIST, ghost_prob=0.0))
+    jit_rs = jax.jit(lambda key: rs(key, MAX_EVAL_GOAL_DIST, ghost_prob=0.0, min_goal_dist=min_goal_dist))
     jit_ss = jax.jit(ss)
     return jit_rs, jit_ss
 
@@ -222,6 +226,14 @@ def run_interactive():
     wp_segment_steps = 0
     wp_results = []   # (wp_idx, reward, steps, outcome) per segment
 
+    # Trajectory recording (mirrors jax_eval_multi.py): list of (x, y, v) points;
+    # persists across waypoint segments so the full multi-wp path is visible.
+    TRAJ_MIN_DIST = 0.05
+    def _init_trajectory(ss):
+        es = jax.device_get(ss.env_state)
+        return [(float(es.x), float(es.y), float(es.v))]
+    trajectory = _init_trajectory(stacked_state)
+
     _REW_KEYS = ["rew_progress", "rew_step", "rew_smooth", "rew_yield"]
     ep = 0; ep_steps = 0; ep_reward = 0.0; ep_hist = []
     rew_acc = {k: 0.0 for k in _REW_KEYS}
@@ -239,7 +251,7 @@ def run_interactive():
 
     def reset_episode():
         nonlocal obs, stacked_state, wp_idx, wp_segment_reward, wp_segment_steps
-        nonlocal ep_reward, ep_steps, rew_acc, wp_results
+        nonlocal ep_reward, ep_steps, rew_acc, wp_results, trajectory
         nonlocal rng
         rng, reset_rng = jax.random.split(rng)
         obs, stacked_state = fast_reset(reset_rng)
@@ -251,6 +263,7 @@ def run_interactive():
         ep_reward = 0.0
         ep_steps = 0
         rew_acc = {k: 0.0 for k in _REW_KEYS}
+        trajectory = _init_trajectory(stacked_state)
 
     def advance_waypoint():
         """Advance to next robot waypoint. Returns True if there are more waypoints."""
@@ -268,12 +281,14 @@ def run_interactive():
         # --- INIZIO MODIFICA: Calcolo dinamico Y per lo scenario 9 ---
         if current_scenario == 9:
             obs_boxes = stacked_state.env_state.obs_boxes
+            # 8-vertex layout (CCW from bottom-left): index 5 is the top-right
+            # vertex's y, i.e. the wall's top edge (cy + hh).
             if next_gy == -1.0:
                 # Porta 1: Y basata sul muro inferiore 1
-                next_gy = obs_boxes[0, 1] + obs_boxes[0, 3] + 1.0
+                next_gy = obs_boxes[0, 5] + 1.0
             elif next_gy == -2.0:
                 # Porta 2: Y basata sul muro inferiore 2
-                next_gy = obs_boxes[2, 1] + obs_boxes[2, 3] + 1.0
+                next_gy = obs_boxes[2, 5] + 1.0
         # --- FINE MODIFICA ---
 
         env_state = stacked_state.env_state
@@ -386,7 +401,12 @@ def run_interactive():
             clock.tick(10); continue
 
         # ── Inference ────────────────────────────────────────────────────────
-        env_action = infer_fn(params, obs, stacked_state.env_state.max_v)
+        # HSFM drives the robot from the true env state (it overloads the 3rd arg
+        # to be the EnvState, not max_v) — same convention as jax_eval_multi.py.
+        if algo == "hsfm":
+            env_action = infer_fn(params, obs, stacked_state.env_state)
+        else:
+            env_action = infer_fn(params, obs, stacked_state.env_state.max_v)
 
         rng, step_rng = jax.random.split(rng)
         obs, stacked_state, reward, done, info = fast_step(step_rng, stacked_state, env_action)
@@ -401,6 +421,13 @@ def run_interactive():
                     (MAX_LIDAR_DIST - ROBOT_RADIUS)
         foot_state_np = np.array(cpu_state.foot_state)
         sp_mask = np.array(cpu_state.sp_mask)
+
+        # Append to trajectory (downsampled by TRAJ_MIN_DIST; refresh v if stopped)
+        cur_x, cur_y, cur_v = float(cpu_state.x), float(cpu_state.y), float(cpu_state.v)
+        if not trajectory or math.hypot(cur_x - trajectory[-1][0], cur_y - trajectory[-1][1]) >= TRAJ_MIN_DIST:
+            trajectory.append((cur_x, cur_y, cur_v))
+        elif cur_v <= 0.1 and trajectory[-1][2] > 0.1:
+            trajectory[-1] = (trajectory[-1][0], trajectory[-1][1], cur_v)
 
         dx = float(cpu_state.goal_x) - float(cpu_state.x)
         dy = float(cpu_state.goal_y) - float(cpu_state.y)
@@ -417,7 +444,7 @@ def run_interactive():
         screen.fill(C_BG)
         draw_scene(screen, cpu_state, raw_lidar, foot_state_np,
                    show_lidar, show_arrows, use_legs, show_body,
-                   scale=sc, sim_h=sh)
+                   scale=sc, sim_h=sh, trajectory=trajectory)
 
         # Overlay waypoint info on the panel
         wp_banner = f"WP {wp_idx+1}/{len(waypoints)}"
@@ -502,40 +529,94 @@ def run_headless():
     n_episodes = args.episodes
     rng = jax.random.PRNGKey(42)
 
-    print(f"\n{'Scenario':25s} | {'Success':>8s} | {'Collision':>10s} | {'Timeout':>8s} | "
-          f"{'Avg Reward':>11s} | {'Avg Steps':>10s} | {'WP Completed':>12s}")
-    print("-" * 105)
+    # Metric constants (aligned with benchmark_eval.py / paper_comparison_eval.py).
+    DT = _jax_env.DT
+    YIELD_DIST = 1.5
+    YIELD_FOV  = 0.785          # ±45° (90° cone), matches yielding reward
+    SPACE_COMP_DIST = 0.5       # surface distance (m) for a "space-compliant" step
+
+    hdr = (f"{'Scenario':21s} | {'SR%':>5s} | {'ACR%':>5s} | {'PCR%':>5s} | {'TR%':>5s} | "
+           f"{'SPL':>4s} | {'TTG':>5s} | {'MHD':>5s} | {'AJ':>6s} | {'SC':>4s} | {'YS':>4s}")
+    print("\n" + hdr)
+    print("-" * len(hdr))
 
     for scen_idx in range(7, 13):
         scen_name = TEST_SCENARIO_NAMES[scen_idx]
         waypoints = TEST_ROBOT_WAYPOINTS[scen_idx]
         fast_reset, fast_step = build_fast_reset(scen_idx)
 
-        successes = 0; collisions = 0; timeouts = 0
-        total_reward = 0.0; total_steps = 0; total_wp_completed = 0
+        # Per-episode metric samples.
+        m_sr, m_acr, m_pcr, m_tr = [], [], [], []
+        m_spl, m_ttg, m_mhd, m_aj, m_sc, m_ys = [], [], [], [], [], []
 
         for ep in range(n_episodes):
             rng, reset_rng = jax.random.split(rng)
             obs, stacked_state = fast_reset(reset_rng)
             _policy_reset()
             wp_idx = 0
-            ep_reward = 0.0; ep_steps = 0   # reset at start of every segment
             episode_done = False
 
+            # Whole-episode accumulators (persist across waypoint segments).
+            path_len = 0.0          # distance travelled (SPL denominator)
+            d_star   = 0.0          # sum of per-segment straight-line distances
+            mhd      = np.inf       # min human surface distance
+            jw_sum   = 0.0; n_jerk = 0     # angular jerk
+            sc_compliant = 0; sc_total = 0 # space compliance
+            yz_steps = 0; yc_steps = 0     # yield situations / compliant
+            prev_w   = 0.0; prev_aw = 0.0  # angular jerk history (reset per episode)
+            n_steps_ep = 0
+            outcome  = "tr"         # default outcome if budget exhausted
+
             while not episode_done:
-                # Each iteration of this while-loop is one waypoint segment.
-                # ep_steps / ep_reward reset to zero here, exactly as if a
-                # new episode had started.
-                ep_reward = 0.0
-                ep_steps  = 0
+                # Straight-line distance for this segment (shortest-path proxy).
+                es0 = stacked_state.env_state
+                d_star += float(jnp.sqrt(
+                    (es0.goal_x - es0.x) ** 2 + (es0.goal_y - es0.y) ** 2))
 
                 for step in range(MAX_STEPS):
-                    env_action = infer_fn(params, obs, stacked_state.env_state.max_v)
+                    # HSFM overloads the 3rd arg to be the EnvState (see jax_eval_multi.py).
+                    if algo == "hsfm":
+                        env_action = infer_fn(params, obs, stacked_state.env_state)
+                    else:
+                        env_action = infer_fn(params, obs, stacked_state.env_state.max_v)
                     rng, step_rng = jax.random.split(rng)
                     obs, stacked_state, reward, done, info = fast_step(
                         step_rng, stacked_state, env_action)
-                    ep_reward += float(reward)
-                    ep_steps += 1
+
+                    es = stacked_state.env_state
+                    v  = float(es.v); w = float(es.w)
+
+                    # ── Per-step metrics (state continues even on done) ──────────
+                    if _jax_env.USE_LEGS:
+                        ch = float(info["closest_shoe_surface"])
+                    else:
+                        ch = float(info["closest_human"]) - ROBOT_RADIUS - PEOPLE_RADIUS
+                    mhd = min(mhd, ch)
+                    sc_total += 1
+                    if ch > SPACE_COMP_DIST:
+                        sc_compliant += 1
+
+                    path_len += v * DT
+                    aw = (w - prev_w) / DT
+                    jw_sum += abs((aw - prev_aw) / DT)   # angular jerk (rad/s^3)
+                    n_jerk += 1
+                    prev_w, prev_aw = w, aw
+                    n_steps_ep += 1
+
+                    # Yield: a human in the frontal cone within YIELD_DIST means the
+                    # robot should stop (v <= 0.1 m/s).
+                    ppl = np.asarray(es.people)
+                    dpx = ppl[:, 0] - float(es.x)
+                    dpy = ppl[:, 1] - float(es.y)
+                    dists = np.sqrt(dpx**2 + dpy**2 + 1e-8)
+                    rel = np.arctan2(dpy, dpx) - float(es.theta)
+                    rel = (rel + np.pi) % (2*np.pi) - np.pi
+                    active_p = ppl[:, 10] >= 0.0
+                    in_yz = (dists < YIELD_DIST) & (np.abs(rel) < YIELD_FOV) & active_p
+                    if in_yz.any():
+                        yz_steps += 1
+                        if v <= 0.1:
+                            yc_steps += 1
 
                     if done:
                         goal = bool(info["goal_reached"])
@@ -545,16 +626,16 @@ def run_headless():
                             # Advance to next waypoint.
                             # Reset time_step so the 400-step budget is fresh per segment.
                             wp_idx += 1
-                            total_wp_completed += 1
                             next_gx, next_gy = waypoints[wp_idx]
-                            
+
                             # --- INIZIO MODIFICA: Calcolo dinamico Y per lo scenario 9 ---
                             if scen_idx == 9:
                                 obs_boxes = stacked_state.env_state.obs_boxes
+                                # 8-vertex layout: index 5 = top-right y = cy + hh
                                 if next_gy == -1.0:
-                                    next_gy = obs_boxes[0, 1] + obs_boxes[0, 3] + 1.0
+                                    next_gy = obs_boxes[0, 5] + 1.0
                                 elif next_gy == -2.0:
-                                    next_gy = obs_boxes[2, 1] + obs_boxes[2, 3] + 1.0
+                                    next_gy = obs_boxes[2, 5] + 1.0
                             # --- FINE MODIFICA ---
 
                             env_state = stacked_state.env_state
@@ -584,39 +665,56 @@ def run_headless():
                             ])
                             # Waypoint changed → drop stale warm-start plan.
                             _policy_reset()
-                            break  # break inner for-loop; while resets counters
+                            break  # break inner for-loop; while continues
                         elif goal:
-                            # All waypoints reached
-                            total_wp_completed += 1
-                            successes += 1
+                            outcome = "success"      # all waypoints reached
                             episode_done = True
                             break
                         else:
-                            # Collision or timeout
-                            if col:
-                                collisions += 1
+                            if bool(info["passive_col"]) and not bool(info["active_col"]):
+                                outcome = "pcr"
+                            elif col:
+                                outcome = "acr"      # active human or static obstacle
                             else:
-                                timeouts += 1
+                                outcome = "tr"
                             episode_done = True
                             break
                 else:
-                    # MAX_STEPS exhausted without done — timeout for this segment
-                    timeouts += 1
+                    # MAX_STEPS exhausted without done — timeout for the episode.
+                    outcome = "tr"
                     episode_done = True
 
-            total_reward += ep_reward
-            total_steps  += ep_steps
+            # ── Episode-level aggregation ───────────────────────────────────────
+            success = (outcome == "success")
+            m_sr.append(1.0 if success else 0.0)
+            m_acr.append(1.0 if outcome == "acr" else 0.0)
+            m_pcr.append(1.0 if outcome == "pcr" else 0.0)
+            m_tr.append(1.0 if outcome == "tr" else 0.0)
+            m_spl.append((d_star / max(path_len, d_star, 1e-8)) if success else 0.0)
+            if success:
+                m_ttg.append(n_steps_ep * DT)
+            if np.isfinite(mhd):
+                m_mhd.append(mhd)
+            m_aj.append(jw_sum / max(n_jerk, 1))
+            m_sc.append(sc_compliant / max(sc_total, 1))
+            if yz_steps > 0:
+                m_ys.append(yc_steps / yz_steps)
 
-        avg_reward = total_reward / n_episodes
-        avg_steps = total_steps / n_episodes
-        avg_wp = total_wp_completed / n_episodes
-        suc_pct = successes / n_episodes * 100
-        col_pct = collisions / n_episodes * 100
-        tmo_pct = timeouts / n_episodes * 100
+        # ── Scenario row ────────────────────────────────────────────────────────
+        sr  = np.mean(m_sr) * 100
+        acr = np.mean(m_acr) * 100
+        pcr = np.mean(m_pcr) * 100
+        tr  = np.mean(m_tr) * 100
+        spl = np.mean(m_spl)
+        ttg = np.mean(m_ttg) if m_ttg else float("nan")
+        mhd_v = np.mean(m_mhd) if m_mhd else float("nan")
+        aj  = np.mean(m_aj)
+        sc  = np.mean(m_sc)
+        ys  = np.mean(m_ys) if m_ys else float("nan")
 
-        print(f"{scen_idx:2d}. {scen_name:22s} | {suc_pct:7.1f}% | {col_pct:9.1f}% | "
-              f"{tmo_pct:7.1f}% | {avg_reward:10.1f} | {avg_steps:9.1f} | "
-              f"{avg_wp:5.1f}/{len(waypoints)}")
+        label = f"{scen_idx:2d}.{scen_name}"[:21]
+        print(f"{label:21s} | {sr:4.0f}% | {acr:4.0f}% | {pcr:4.0f}% | {tr:4.0f}% | "
+              f"{spl:4.2f} | {ttg:5.1f} | {mhd_v:5.2f} | {aj:6.1f} | {sc:4.2f} | {ys:4.2f}")
 
     print()
 

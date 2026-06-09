@@ -1,18 +1,24 @@
 """
-train_navrep.py — PPO-train NavRep's Controller (C) with V + M frozen.
+train_navrep.py — PPO-train NavRep's Controller (C) with V + M FROZEN.
 
-Architecture (faithful NavRep):
-  V : LidarEncoder (VAE)     — loaded from pretraining, frozen
-  M : causal Transformer      — loaded from pretraining, frozen
-  C : 2-layer MLP [64, 64]   — trained here with PPO
+Architecture (faithful NavRep, Dugas et al. ICRA 2021):
+  V : LidarEncoder (VAE)      — loaded from JOINT pretraining, frozen
+  M : causal Transformer       — loaded from JOINT pretraining, frozen
+  C : 2-layer MLP [64, 64]    — trained here with PPO
 
-Gradients are blocked inside the forward pass via `stop_gradient` on V and M
-outputs, so V and M parameters are not updated by the PPO optimiser (zero
-gradients → zero Adam updates starting from zero momentum).
+Only the controller is optimised. Each PPO update:
+  1. The frozen V+M run once over the rollout observations to produce the
+     feature vector feat = [z_t, h_t, s_r] (navrep_extract_features applies
+     stop_gradient to z_t / h_t).
+  2. PPO updates the controller (NavRepControllerOnly) on those features.
+V and M parameters never receive gradients, exactly as in canonical NavRep
+(the "unsupervised representations are frozen, only the controller learns" setup
+that defines the method). The full {V, M, C} params are saved so eval scripts
+can reconstruct NavRepActorCritic and run obs → action end-to-end.
 
 Pretraining step (must be run first):
     python comparison_policies/pretrain_navrep.py
-    → checkpoints_navrep/navrep_vm.msgpack
+    → checkpoints_navrep/navrep_vm.msgpack   (encoder + decoder + M)
 
 Saves:
     checkpoints_navrep/navrep_best.msgpack
@@ -75,8 +81,8 @@ from comparison_policies.navrep_network import (
     NavRepActorCritic,
     NavRepControllerOnly,
     navrep_extract_features,
-    _VM_KEYS,
     FEAT_DIM,
+    _VM_KEYS,
 )
 
 # ── Hyperparameters (identical to ppo_mlp_baseline.py) ────────────────────────
@@ -108,37 +114,66 @@ CKPT_FINAL = os.path.join(CKPT_DIR, "navrep_final.msgpack")
 VM_CKPT    = os.path.join(CKPT_DIR, "navrep_vm.msgpack")
 LOG_PATH   = os.path.join(CKPT_DIR, "navrep_training_log.csv")
 
-# Module-level network instances
-network         = NavRepActorCritic(action_dim=2, hidden_dim=64)
-controller_only = NavRepControllerOnly(action_dim=2, hidden_dim=64)
+# Full actor-critic (freeze_vm=True → V+M frozen via stop_gradient) is used for
+# rollout action selection. The controller-only module is used in the PPO loss,
+# operating on the frozen [z, h, s_r] features.
+network    = NavRepActorCritic(action_dim=2, hidden_dim=64, freeze_vm=True)
+controller = NavRepControllerOnly(action_dim=2, hidden_dim=64)
 
 scheduler = None
 optimizer = None
 
 
+def _split_ctrl(params):
+    """Controller subset of the full params dict (everything except V + M)."""
+    return {k: v for k, v in params.items() if k not in _VM_KEYS}
+
+
+def _merge_ctrl(full_params, ctrl_params):
+    """Reassemble full params from frozen V+M plus updated controller."""
+    merged = dict(full_params)
+    merged.update(ctrl_params)
+    return merged
+
+
 def _load_vm_into(params, vm_path=VM_CKPT):
-    """Overwrite params['encoder'] and params['M'] with the pretrained bundle."""
-    target = {"encoder": params["encoder"], "M": params["M"]}
+    """Overwrite params['encoder'] and params['M'] with the pretrained bundle.
+
+    The JOINT checkpoint holds {encoder, decoder, M}; only encoder and M are
+    needed by the actor-critic (the decoder is a pretraining-only artefact).
+    """
     with open(vm_path, "rb") as f:
         raw = f.read()
-    loaded = flax.serialization.from_bytes(target, raw)
+    loaded = flax.serialization.msgpack_restore(raw)
     new_params = dict(params)
-    new_params["encoder"] = loaded["encoder"]
-    new_params["M"]       = loaded["M"]
+    new_params["encoder"] = flax.serialization.from_state_dict(
+        params["encoder"], loaded["encoder"])
+    new_params["M"] = flax.serialization.from_state_dict(
+        params["M"], loaded["M"])
     return new_params
 
 
-# ── PPO loss (same logic as ppo_mlp_baseline.py, uses local `network`) ────────
+# ── Frozen feature extraction (V + M run once per rollout) ────────────────────
+
+@jax.jit
+def extract_features(params, obs_seq):
+    """feat = [z_t, h_t, s_r] for every obs; stop_gradient on z_t / h_t.
+
+    Mapped over the ROLLOUT_STEPS axis (one NUM_ENVS-sized slice at a time) so
+    the frozen V+M never run over the whole flattened batch at once — running
+    the 4-conv VAE + 8-block Transformer on all ROLLOUT_STEPS*NUM_ENVS obs in a
+    single call exhausts GPU memory.
+    """
+    return jax.lax.map(lambda o: navrep_extract_features(params, o), obs_seq)
+
+
+# ── PPO loss (controller-only, operates on frozen features) ───────────────────
 
 @jax.jit
 def ppo_loss_fn(ctrl_params, feat_mb, actions_mb, advantages_mb, returns_mb,
                 old_log_probs, max_v_mb, entropy_coef):
-    """PPO loss operating on pre-extracted V+M features.
-
-    Gradients flow only through ctrl_params (Dense_0..5 + log_std).
-    V and M are not touched — features are already frozen upstream.
-    """
-    mean, logstd, values = controller_only.apply({"params": ctrl_params}, feat_mb)
+    """PPO loss for the controller C on pre-extracted V+M features."""
+    mean, logstd, values = controller.apply({"params": ctrl_params}, feat_mb)
 
     log_prob    = squash_corrected_log_prob(actions_mb, mean, logstd, max_v_mb)
     ratio       = jnp.exp(log_prob - old_log_probs)
@@ -157,19 +192,18 @@ def ppo_loss_fn(ctrl_params, feat_mb, actions_mb, advantages_mb, returns_mb,
 
 
 @jax.jit
-def run_ppo_updates(train_state, obs_seq, actions_seq, adv_seq, ret_seq,
+def run_ppo_updates(train_state, feat_seq, actions_seq, adv_seq, ret_seq,
                     old_lp_seq, max_v_seq, rng_key, entropy_coef):
-    """Run PPO_EPOCHS × N_MINIBATCHES gradient steps.
+    """Run PPO_EPOCHS × N_MINIBATCHES controller gradient steps.
 
-    Key optimisation: V+M features are extracted ONCE for the whole batch
-    before the inner loops, so the frozen encoder + Transformer run only
-    1 forward pass per update instead of PPO_EPOCHS * N_MINIBATCHES = 48.
-    Gradients are computed only w.r.t. controller-C parameters.
+    Only the controller params are optimised; the frozen V+M live in
+    full_params and are passed through unchanged.
     """
-    params, ctrl_opt_state = train_state
+    full_params, opt_state = train_state
+    ctrl_params = _split_ctrl(full_params)
     TN = BATCH_SIZE
 
-    obs_flat     = obs_seq.reshape(TN, OBS_SIZE)
+    feat_flat    = feat_seq.reshape(TN, FEAT_DIM)
     actions_flat = actions_seq.reshape(TN, -1)
     max_v_flat   = max_v_seq.reshape(TN)
     old_lp_flat  = old_lp_seq.reshape(TN)
@@ -177,26 +211,13 @@ def run_ppo_updates(train_state, obs_seq, actions_seq, adv_seq, ret_seq,
     adv_flat     = (adv_flat - adv_flat.mean()) / (adv_flat.std() + 1e-8)
     ret_flat     = ret_seq.reshape(TN)
 
-    # ── Extract V+M features once, chunked to limit peak CNN memory ─────────
-    # Running the CNN on all TN=131072 samples at once would allocate ~2.7 GB
-    # of intermediates.  jax.lax.map processes one MINI_BATCH_SIZE chunk at a
-    # time (O(1) memory in f), cutting peak CNN memory to ~330 MB per chunk.
-    # V+M still runs only N_MINIBATCHES=8 times total (vs 48 before).
-    feat_flat = jax.lax.map(
-        lambda chunk: navrep_extract_features(params, chunk),
-        obs_flat.reshape(N_MINIBATCHES, MINI_BATCH_SIZE, OBS_SIZE),
-    ).reshape(TN, FEAT_DIM)                                # (TN, FEAT_DIM)
-
-    # ── Controller params only (what the optimizer tracks) ──────────────────
-    ctrl_p = {k: v for k, v in params.items() if k not in _VM_KEYS}
-
     # ── One permutation per epoch ────────────────────────────────────────────
     perms = jax.vmap(lambda k: jax.random.permutation(k, TN))(
         jax.random.split(rng_key, PPO_EPOCHS)
     )
 
     def _epoch(epoch_carry, perm):
-        cp, os_ = epoch_carry
+        p, os_ = epoch_carry
         feat_p    = feat_flat[perm]
         actions_p = actions_flat[perm]
         adv_p     = adv_flat[perm]
@@ -205,7 +226,7 @@ def run_ppo_updates(train_state, obs_seq, actions_seq, adv_seq, ret_seq,
         max_v_p   = max_v_flat[perm]
 
         def _mb(mb_carry, mb_i):
-            p, os2 = mb_carry
+            p2, os2 = mb_carry
             s          = mb_i * MINI_BATCH_SIZE
             mb_feat    = jax.lax.dynamic_slice_in_dim(feat_p,    s, MINI_BATCH_SIZE, 0)
             mb_actions = jax.lax.dynamic_slice_in_dim(actions_p, s, MINI_BATCH_SIZE, 0)
@@ -215,25 +236,23 @@ def run_ppo_updates(train_state, obs_seq, actions_seq, adv_seq, ret_seq,
             mb_max_v   = jax.lax.dynamic_slice_in_dim(max_v_p,   s, MINI_BATCH_SIZE, 0)
 
             (loss, aux), grads = jax.value_and_grad(ppo_loss_fn, has_aux=True)(
-                p, mb_feat, mb_actions, mb_adv, mb_ret, mb_old_lp, mb_max_v, entropy_coef
+                p2, mb_feat, mb_actions, mb_adv, mb_ret, mb_old_lp, mb_max_v, entropy_coef
             )
-            updates, new_os2 = optimizer.update(grads, os2, p)
-            return (optax.apply_updates(p, updates), new_os2), (loss, aux)
+            updates, new_os2 = optimizer.update(grads, os2, p2)
+            return (optax.apply_updates(p2, updates), new_os2), (loss, aux)
 
-        (new_cp, new_os), (losses, auxes) = jax.lax.scan(
-            _mb, (cp, os_), jnp.arange(N_MINIBATCHES)
+        (new_p, new_os), (losses, auxes) = jax.lax.scan(
+            _mb, (p, os_), jnp.arange(N_MINIBATCHES)
         )
-        return (new_cp, new_os), (losses, auxes)
+        return (new_p, new_os), (losses, auxes)
 
-    (new_ctrl_p, new_ctrl_os), (all_losses, all_auxes) = jax.lax.scan(
-        _epoch, (ctrl_p, ctrl_opt_state), perms
+    (new_ctrl, new_opt_state), (all_losses, all_auxes) = jax.lax.scan(
+        _epoch, (ctrl_params, opt_state), perms
     )
 
-    # Merge updated controller params back into full params
-    new_params = {**params, **new_ctrl_p}
-
+    new_full = _merge_ctrl(full_params, new_ctrl)
     last_aux = jax.tree_util.tree_map(lambda x: x[-1, -1], all_auxes)
-    return (new_params, new_ctrl_os), all_losses.mean(), last_aux
+    return (new_full, new_opt_state), all_losses.mean(), last_aux
 
 
 # ── Checkpoint helpers ─────────────────────────────────────────────────────────
@@ -263,10 +282,10 @@ LOG_EVERY = 1
 def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS,
           vm_ckpt_path: str = VM_CKPT):
     """
-    NavRep PPO training with 512 vectorised JAX envs.
+    NavRep PPO training with vectorised JAX envs.
 
-    Loads V + M weights from `vm_ckpt_path` and trains only the controller (C)
-    — V and M are frozen via stop_gradient in the forward pass.
+    Loads V + M weights from `vm_ckpt_path` and trains ONLY the controller (C);
+    V and M are frozen via stop_gradient in the forward pass.
 
     Checkpoints:   checkpoints_navrep/navrep_best.msgpack
                    checkpoints_navrep/navrep_final.msgpack
@@ -297,7 +316,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS,
         optax.adam(learning_rate=scheduler, eps=1e-5),
     )
 
-    print("PPO Training  [NavRep: V(VAE) + M(Transformer) + C(MLP[64,64])]")
+    print("PPO Training  [NavRep: V(VAE) + M(Transformer) FROZEN, C(MLP[64,64]) trained]")
     print(f"  V+M ckpt    : {vm_ckpt_path}")
     print(f"  Envs        : {NUM_ENVS}  x  steps {ROLLOUT_STEPS}  =  {BATCH_SIZE:,} batch")
     print(f"  Minibatches : {N_MINIBATCHES} x {MINI_BATCH_SIZE}  (flat T*N)")
@@ -315,22 +334,16 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS,
             f"Run pretrain_navrep.py first."
         )
     params = _load_vm_into(params, vm_ckpt_path)
-    print(f"  V + M       : loaded from {vm_ckpt_path} (frozen via stop_gradient)")
+    print(f"  V + M       : loaded from {vm_ckpt_path} (FROZEN)")
 
     n_total = sum(x.size for x in jax.tree_util.tree_leaves(params))
-    n_c = sum(
-        x.size
-        for k, sub in params.items() if k not in _VM_KEYS
-        for x in jax.tree_util.tree_leaves(sub)
-    )
-    print(f"  Parameters  : total={n_total:,}  controller={n_c:,}\n")
+    ctrl_params = _split_ctrl(params)
+    n_c = sum(x.size for x in jax.tree_util.tree_leaves(ctrl_params))
+    print(f"  Parameters  : total={n_total:,}  controller(trained)={n_c:,}\n")
 
-    # Optimizer only covers controller C — V and M are frozen.
-    # This avoids initialising Adam slots for the ~95% of params that never
-    # receive gradients, and eliminates the zero-gradient update overhead.
-    ctrl_params    = {k: v for k, v in params.items() if k not in _VM_KEYS}
-    ctrl_opt_state = optimizer.init(ctrl_params)
-    train_state    = (params, ctrl_opt_state)
+    # Optimizer tracks ONLY the controller params.
+    opt_state   = optimizer.init(ctrl_params)
+    train_state = (params, opt_state)
 
     cur_max_dist, cur_ghost, cur_ent, cur_max_scen = get_continuous_curriculum(0.0)
     rolling_suc         = 0.0
@@ -363,9 +376,6 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS,
     t_start = time.time()
 
     # ── Pre-dispatch the first rollout before the loop ────────────────────────
-    # This primes the pipeline: every iteration will find a rollout already
-    # queued on the GPU, eliminating the idle gap between PPO updates and the
-    # next rollout.
     rng, _init_rng = jax.random.split(rng)
     _pending_rollout = collect_rollouts(
         _init_rng, train_state[0], network.apply, vmap_step,
@@ -406,15 +416,14 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS,
 
             advantages, returns = compute_gae(rewards, values, dones, last_val)
 
+            # ── Frozen V+M → features, then controller-only PPO ──────────────
+            feat_seq = extract_features(train_state[0], obs_seq)
             train_state, loss, aux = run_ppo_updates(
-                train_state, obs_seq, acts_seq, advantages, returns,
+                train_state, feat_seq, acts_seq, advantages, returns,
                 lp_seq, max_v_seq, update_rng, jnp.array(cur_ent),
             )
 
             # ── Pre-dispatch NEXT rollout immediately (GPU pipeline stays full)
-            # env_state / env_obs / train_state[0] are JAX futures — XLA queues
-            # this computation right after run_ppo_updates, with no CPU stall.
-            # Curriculum values lag by 1 update (negligible for slow schedules).
             _pending_rollout = collect_rollouts(
                 next_rollout_rng, train_state[0], network.apply, vmap_step,
                 env_state, env_obs, cur_max_dist, jnp.int32(-1), cur_ghost,

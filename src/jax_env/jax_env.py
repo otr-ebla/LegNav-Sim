@@ -20,22 +20,15 @@ from config import SimConfig, RobotConfig, LidarConfig
 # Flip USE_LEGS to False for cylinder-model baseline/ablation training.
 # Eval scripts can override: import jax_env; jax_env.USE_LEGS = False
 USE_LEGS = True
-
-# DIFFERENTIABILITY: Set SENSOR_NOISE = False in SHAC training to get a
-# deterministic gradient path through the observation.  Noise adds variance to
-# BPTT gradients (the random gates are not differentiable) and can cause
-# spurious zero/NaN grad contributions.
-# Eval scripts should keep SENSOR_NOISE = True for realistic sensor simulation.
-# Override: import jax_env; jax_env.SENSOR_NOISE = False
 SENSOR_NOISE = True
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 DT             = RobotConfig.DT
 MAX_STEPS      = SimConfig.MAX_STEPS
 NUM_RAYS       = LidarConfig.NUM_RAYS
-NUM_PEOPLE     = 18
-NUM_OBS_CIR    = 7
-NUM_OBS_BOX    = 7
+NUM_PEOPLE     = SimConfig.JAX_NUM_PEOPLE
+NUM_OBS_CIR    = SimConfig.JAX_NUM_OBS_CIR
+NUM_OBS_BOX    = SimConfig.JAX_NUM_OBS_BOX
 ROOM_W         = 12.0
 ROOM_H         = 12.0
 ROBOT_RADIUS   = RobotConfig.RADIUS
@@ -76,7 +69,7 @@ class EnvState:
     max_v:       jnp.float32
     people:      jnp.ndarray   # (NUM_PEOPLE, 8)
     obs_circles: jnp.ndarray   # (NUM_OBS_CIR, 3)  [cx, cy, r]
-    obs_boxes:   jnp.ndarray   # (NUM_OBS_BOX, 4)  [cx, cy, hw, hh]
+    obs_boxes:   jnp.ndarray   # (NUM_OBS_BOX, 8)  [x0,y0,x1,y1,x2,y2,x3,y3] convex quad
     time_step:   jnp.int32
     # ── NEW: per-human gait phase ────────────────────────────────────────────
     foot_state:         jnp.ndarray
@@ -97,12 +90,34 @@ def _min_dist_to_circles(x, y, circles):
 
 
 def _min_dist_to_boxes(x, y, boxes):
-    def _box_dist(box):
-        cx, cy, hw, hh = box
-        ddx = jnp.maximum(jnp.abs(x - cx) - hw, 0.0)
-        ddy = jnp.maximum(jnp.abs(y - cy) - hh, 0.0)
-        return jnp.sqrt(ddx**2 + ddy**2)
-    return jnp.min(jax.vmap(_box_dist)(boxes))
+    """Point-to-convex-quad distance (boxes: (K,8) vertex arrays)."""
+    def _quad_dist(b):
+        # Find nearest point on each of the 4 edges
+        def nearest_on_seg(ax, ay, bx, by):
+            ex, ey = bx - ax, by - ay
+            t = jnp.clip(((x - ax)*ex + (y - ay)*ey) /
+                         jnp.maximum(ex*ex + ey*ey, 1e-12), 0.0, 1.0)
+            npx, npy = ax + t*ex, ay + t*ey
+            return jnp.sqrt((x - npx)**2 + (y - npy)**2)
+        d0 = nearest_on_seg(b[0], b[1], b[2], b[3])
+        d1 = nearest_on_seg(b[2], b[3], b[4], b[5])
+        d2 = nearest_on_seg(b[4], b[5], b[6], b[7])
+        d3 = nearest_on_seg(b[6], b[7], b[0], b[1])
+        # Check if point is inside quad via cross-products (CCW winding)
+        def cs(i):
+            verts = jnp.array([[b[0],b[1]],[b[2],b[3]],[b[4],b[5]],[b[6],b[7]]])
+            ax, ay = verts[i,0], verts[i,1]
+            bx_, by_ = verts[(i+1)%4,0], verts[(i+1)%4,1]
+            return (bx_-ax)*(y-ay) - (by_-ay)*(x-ax)
+        inside = (cs(0) >= 0) & (cs(1) >= 0) & (cs(2) >= 0) & (cs(3) >= 0)
+        edge_dist = jnp.minimum(jnp.minimum(d0, d1), jnp.minimum(d2, d3))
+        # Skip degenerate placeholder boxes (zero span) — every cross-product
+        # would be 0 ≥ 0 and they would falsely report the point as inside.
+        span = jnp.maximum(jnp.abs(b[0] - b[4]), jnp.abs(b[1] - b[5]))
+        valid = span > 1e-6
+        signed = jnp.where(inside, -edge_dist, edge_dist)
+        return jnp.where(valid, signed, 1e6)
+    return jnp.min(jax.vmap(_quad_dist)(boxes))
 
 
 def _is_safe(x, y, clearance, obs_circles, obs_boxes):
@@ -147,12 +162,11 @@ def get_obs(state: EnvState, key: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray
         k_gauss, k_sp = jax.random.split(key)
         # 1. Gaussian Noise (e.g., 0.05m standard deviation)
         gaussian = jax.random.normal(k_gauss, raw_lidar.shape) * 0.05
-        # 2. Salt & Pepper Noise (3% of rays)
+        # 2. Salt-only Noise (6% of rays) — pepper (drop-to-zero) removed
         sp_rand = jax.random.uniform(k_sp, raw_lidar.shape)
-        sp_mask = sp_rand < 0.03            # The 3% affected rays
-        is_max  = sp_rand < 0.015           # 1.5% drop to maximum
-        # Apply Gaussian first, then overwrite with Salt/Pepper extremes
-        noisy_lidar = jnp.where(sp_mask, jnp.where(is_max, MAX_LIDAR_DIST, 0.0), raw_lidar + gaussian)
+        sp_mask = sp_rand < 0.06            # 6% of rays → salt (max distance)
+        # Apply Gaussian first, then overwrite salt rays with max distance
+        noisy_lidar = jnp.where(sp_mask, MAX_LIDAR_DIST, raw_lidar + gaussian)
         noisy_lidar = jnp.clip(noisy_lidar, 0.0, MAX_LIDAR_DIST)
     else:
         # No noise: clean differentiable LiDAR for SHAC BPTT
@@ -213,16 +227,44 @@ def reset_env(key: jnp.ndarray, max_goal_dist: float = 3.0, **kwargs):
 
     obs_circles = jax.vmap(init_circle)(cir_keys)
 
-    # ── Rectangular obstacles ─────────────────────────────────────────────────
+    # ── Rectangular/quad obstacles ────────────────────────────────────────────
     box_keys = jax.random.split(k9, NUM_OBS_BOX)
 
     def init_box(bk):
-        b1, b2, b3, b4 = jax.random.split(bk, 4)
+        b1, b2, b3, b4, b5, b6, b7, b8, b9 = jax.random.split(bk, 9)
+        # Centre position
         cx = jax.random.uniform(b1, minval=1.5, maxval=ROOM_W - 1.5)
         cy = jax.random.uniform(b2, minval=1.5, maxval=ROOM_H - 1.5)
+        # Base half-extents
         hw = jax.random.uniform(b3, minval=0.20, maxval=0.70)
         hh = jax.random.uniform(b4, minval=0.20, maxval=0.70)
-        return jnp.array([cx, cy, hw, hh])
+        # Random orientation angle
+        angle = jax.random.uniform(b5, minval=0.0, maxval=jnp.pi)
+        cos_a, sin_a = jnp.cos(angle), jnp.sin(angle)
+        # Base rectangle corners (CCW order)
+        # c0 = (-hw,-hh), c1 = (+hw,-hh), c2 = (+hw,+hh), c3 = (-hw,+hh)
+        def rot(lx, ly):
+            return cx + cos_a*lx - sin_a*ly, cy + sin_a*lx + cos_a*ly
+        x0, y0 = rot(-hw, -hh)
+        x1, y1 = rot( hw, -hh)
+        x2, y2 = rot( hw,  hh)
+        x3, y3 = rot(-hw,  hh)
+        # Per-corner random radial perturbation (up to 30% of min half-extent)
+        max_sk = 0.30 * jnp.minimum(hw, hh)
+        sk0 = jax.random.uniform(b6, minval=-max_sk, maxval=max_sk)
+        sk1 = jax.random.uniform(b7, minval=-max_sk, maxval=max_sk)
+        sk2 = jax.random.uniform(b8, minval=-max_sk, maxval=max_sk)
+        sk3 = jax.random.uniform(b9, minval=-max_sk, maxval=max_sk)
+        # Apply perturbation radially outward from centroid
+        r0 = jnp.sqrt((x0-cx)**2 + (y0-cy)**2 + 1e-8)
+        r1 = jnp.sqrt((x1-cx)**2 + (y1-cy)**2 + 1e-8)
+        r2 = jnp.sqrt((x2-cx)**2 + (y2-cy)**2 + 1e-8)
+        r3 = jnp.sqrt((x3-cx)**2 + (y3-cy)**2 + 1e-8)
+        x0 += sk0 * (x0-cx)/r0;  y0 += sk0 * (y0-cy)/r0
+        x1 += sk1 * (x1-cx)/r1;  y1 += sk1 * (y1-cy)/r1
+        x2 += sk2 * (x2-cx)/r2;  y2 += sk2 * (y2-cy)/r2
+        x3 += sk3 * (x3-cx)/r3;  y3 += sk3 * (y3-cy)/r3
+        return jnp.array([x0, y0, x1, y1, x2, y2, x3, y3])
 
     obs_boxes = jax.vmap(init_box)(box_keys)
 
@@ -451,12 +493,31 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray, **kwargs):
     dy_c = state.obs_circles[:, 1] - new_y
     closest_cir = jnp.min(jnp.sqrt(dx_c**2 + dy_c**2) - state.obs_circles[:, 2])
 
-    def _box_dist(box):
-        cx, cy, hw, hh = box
-        ddx = jnp.maximum(jnp.abs(new_x - cx) - hw, 0.0)
-        ddy = jnp.maximum(jnp.abs(new_y - cy) - hh, 0.0)
-        return jnp.sqrt(ddx**2 + ddy**2)
-    closest_box = jnp.min(jax.vmap(_box_dist)(state.obs_boxes))
+    def _quad_dist(b):
+        def nearest_on_seg(ax, ay, bx, by):
+            ex, ey = bx - ax, by - ay
+            t = jnp.clip(((new_x-ax)*ex + (new_y-ay)*ey) /
+                         jnp.maximum(ex*ex+ey*ey, 1e-12), 0.0, 1.0)
+            npx, npy = ax+t*ex, ay+t*ey
+            return jnp.sqrt((new_x-npx)**2 + (new_y-npy)**2)
+        d0 = nearest_on_seg(b[0],b[1],b[2],b[3])
+        d1 = nearest_on_seg(b[2],b[3],b[4],b[5])
+        d2 = nearest_on_seg(b[4],b[5],b[6],b[7])
+        d3 = nearest_on_seg(b[6],b[7],b[0],b[1])
+        # Inside check
+        def cs(i):
+            verts = jnp.array([[b[0],b[1]],[b[2],b[3]],[b[4],b[5]],[b[6],b[7]]])
+            ax, ay = verts[i,0], verts[i,1]
+            bx_, by_ = verts[(i+1)%4,0], verts[(i+1)%4,1]
+            return (bx_-ax)*(new_y-ay) - (by_-ay)*(new_x-ax)
+        inside = (cs(0)>=0) & (cs(1)>=0) & (cs(2)>=0) & (cs(3)>=0)
+        edge_dist = jnp.minimum(jnp.minimum(d0,d1), jnp.minimum(d2,d3))
+        # Skip degenerate placeholder boxes (zero span).
+        span = jnp.maximum(jnp.abs(b[0] - b[4]), jnp.abs(b[1] - b[5]))
+        valid = span > 1e-6
+        dist = jnp.where(inside, 0.0, edge_dist)
+        return jnp.where(valid, dist, 1e6)
+    closest_box = jnp.min(jax.vmap(_quad_dist)(state.obs_boxes))
 
     obs_collision = (closest_cir < ROBOT_RADIUS) | (closest_box < ROBOT_RADIUS)
 
@@ -540,8 +601,8 @@ def step_env(key: jnp.ndarray, state: EnvState, action: jnp.ndarray, **kwargs):
         jnp.maximum(0.0, 1.0 - dists_p / COMFORT_DIST)
     ) * (1.0 + target_v / jnp.maximum(state.max_v, 1e-3))
 
-    YIELD_DIST = 1.5   # aligned with benchmark_eval.py
-    YIELD_FOV  = 1.5708
+    YIELD_DIST = 1.5    # aligned with benchmark_eval.py
+    YIELD_FOV  = 0.785  # ±45° (90° cone), aligned with eval scripts
 
     in_yield_zone      = (dists_p < YIELD_DIST) & (jnp.abs(rel_angles) < YIELD_FOV)
     is_yield_situation = jnp.any(in_yield_zone)
