@@ -1,22 +1,25 @@
-# LegNav-Sim
+<h1>LegNav-Sim</h1>
 
-A fast, JAX-native 2D LiDAR simulation for training Deep RL agents to navigate a
-mobile robot through dynamic human crowds — modelled down to individual **legs and
-feet** for realistic LiDAR returns.
+Official implementation of
 
-This repository accompanies the paper **"Learning Robot Social Navigation among
-Human Legs"** by Alberto Vaglio, Andrea Garulli, Antonio Giannitrapani, Renato
-Quartullo, and Tommaso Van Der Meer (University of Siena & Uninettuno University).
-See [Citation](#citation) below.
+[Learning Robot Social Navigation among Human Legs](#) by
 
-<img src="assets/indoor_gif.gif" alt="Environment Demo" width="70%"/>
+[Alberto Vaglio](#), [Andrea Garulli](#), [Antonio Giannitrapani](#), [Renato Quartullo](#), [Tommaso Van Der Meer](#) (University of Siena & Uninettuno University)</br>
+
+<img src="assets/indoor_gif.gif" width="70%"></br>
+
+[[Paper]](#) [[Project Page]](#) [[Models]](#)
+
+----
 
 ## Overview
 
-**LegNav-Sim** solves dynamic-environment navigation from sparse sensor data. The
-agent perceives the world through a simulated 360° 2D LiDAR (ray-casts) and must
-reach target coordinates while avoiding static geometry (walls, obstacles) and
-moving pedestrians driven by a Headed Social Force Model (HSFM).
+**LegNav-Sim** is a fast, JAX-native 2D LiDAR simulation for training Deep RL
+agents to navigate a mobile robot through dynamic human crowds — modelled down to
+individual **legs and feet** for realistic LiDAR returns. The agent perceives the
+world through a simulated 360° 2D LiDAR (ray-casts) and must reach target
+coordinates while avoiding static geometry (walls, obstacles) and moving
+pedestrians driven by a Headed Social Force Model (HSFM).
 
 The core motivation is a sim-to-real gap that most social-navigation simulators
 ignore: ankle-height 2D LiDAR sensors (mounted 10–20 cm above the ground) never
