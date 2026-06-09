@@ -32,17 +32,23 @@ bin/
 include/
 share/
 
-# --- RL Data & Training Outputs (PESANTI) ---
+# --- RL Data & Training Outputs (heavy) ---
 logs/
 runs/
 wandb/
 ppo_*_tb/
-checkpoints/
 models/
 *.log
 *.csv
-# Se hai file di risultati specifici come quello visto nel tuo ls:
 fast_dwa_results.csv
+
+# Checkpoint scratch is ignored. The canonical model weights under checkpoints/
+# (e.g. checkpoints/sac/sac_best.msgpack) are committed explicitly; add new ones
+# with `git add -f checkpoints/<algo>/<name>.msgpack`.
+checkpoints/
+
+# Generated data artifacts (produced by evaluation scripts) stay out of git.
+data/
 
 # --- Jupyter Notebooks ---
 .ipynb_checkpoints

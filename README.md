@@ -1,70 +1,95 @@
-# Indoor RL Nav: 2D Simulation Environment for Mobile Robot LiDAR Navigation
+# LegNav-Sim
+
+A fast, JAX-native 2D LiDAR simulation for training Deep RL agents to navigate a
+mobile robot through dynamic human crowds — modelled down to individual **legs and
+feet** for realistic LiDAR returns.
 
 <img src="assets/indoor_gif.gif" alt="Environment Demo" width="70%"/>
 
 ## Overview
 
-**Indoor RL Nav** is a lightweight, high-performance 2D simulation environment designed specifically for training Deep Reinforcement Learning (DRL) agents to navigate mobile robots.
+**LegNav-Sim** solves dynamic-environment navigation from sparse sensor data. The
+agent perceives the world through a simulated 360° 2D LiDAR (ray-casts) and must
+reach target coordinates while avoiding static geometry (walls, obstacles) and
+moving pedestrians driven by a Headed Social Force Model (HSFM).
 
-The core focus of this repository is to solve the navigation in dynamic environments problem using sparse sensor data. Agents are equipped with simulated 2D LiDAR sensors (ray-casts) and must learn to reach target coordinates while avoiding both static geometry (walls) and moving dynamic obstacles (simulated pedestrians).
-
-Built on the standard **Gymnasium** interface, this environment allows for rapid prototyping and training of algorithms like **PPO (Proximal Policy Optimization)** and **SAC (Soft Actor-Critic)** to develop robust obstacle avoidance policies.
+The whole simulation — physics, LiDAR, crowd dynamics and the training loop — is
+written in **JAX**, so thousands of environments step in parallel on the GPU. The
+repository ships PPO, SAC and TQC implementations plus a suite of classical and
+learned baselines (DWA, MPPI, HSFM planner, NavRep, TAGD, vanilla-MLP PPO) for
+paper-grade comparison.
 
 ## Key Features
 
-- **2D LiDAR Perception**  
-  Agents perceive the world solely through sparse 2D ray-cast data (e.g., 108 rays), mimicking the limitations of real-world laser scanners found on platforms like Turtlebots.
-
-- **Dynamic Obstacle Avoidance**  
-  Unlike static mazes, this environment populates the world with moving entities, forcing the agent to learn predictive navigation rather than simple map memorization.
-
-- **Deep RL Ready**  
-  Fully compatible with **stable-baselines3**, allowing immediate integration with standard implementations of **PPO**, **SAC**, and **TQC**.
-
-- **Fast Simulation**  
-  Optimized for high-throughput training steps on standard CPUs, enabling efficient training of navigation policies without requiring heavy 3D rendering engines.
+- **Leg-level LiDAR perception** — pedestrians are simulated as moving legs/feet,
+  producing realistic sparse 2D scans (configurable ray count, default 216).
+- **Dynamic crowds** — pedestrians follow an HSFM social-force model, forcing
+  predictive rather than memorized navigation.
+- **Massively parallel** — fully vectorized JAX environment (`legnav.core`) for
+  high-throughput on-GPU training.
+- **Batteries included** — PPO / SAC / TQC trainers and a baseline zoo for
+  benchmarking and reproduction.
 
 ## Repository Structure
 
 ```text
 .
-├── assets/              # Visuals (gifs, images)
-├── checkpoints/         # Trained model weights (.zip, .msgpack)
-├── logs/                # Tensorboard logs and training metrics
-├── scripts/             # Executable scripts
-│   ├── train_ppo.py     # Main training loop for PPO/SAC agents
-│   ├── run_ppo.py       # Inference script to test/visualize trained agents
-│   └── visualMain.py    # Real-time visualization tool
-├── src/                 # Core library code
-│   ├── agents/          # Agent implementations and trainers
-│   └── envs/            # Gymnasium environment definitions
-│       ├── gym_nav_env.py    # Core simulation logic
-│       └── bouncing.py       # Dynamics for moving obstacles
-└── requirements.txt     # Project dependencies
+├── legnav/                 # Core installable package
+│   ├── config.py           # Global robot / sim / LiDAR configuration
+│   ├── paths.py            # Central path resolver (checkpoints / data / figures)
+│   ├── core/               # JAX simulation engine (env, physics, humans, legs, scenarios, network)
+│   ├── algorithms/         # Trainers: PPO, SAC, TQC, TAGD-DDPG
+│   ├── evaluation/         # Single/multi-env eval, benchmarks, paper comparisons
+│   ├── baselines/          # Comparison policies: DWA, MPPI, HSFM, NavRep, TAGD, vanilla-MLP
+│   ├── plotting/           # Plot & scenario-visualization scripts
+│   ├── deployment/         # Real-robot (TurtleBot4) inference scripts
+│   ├── dreamer/            # Experimental world-model agent
+│   └── jhsfm/              # Vendored JHSFM social-force utilities
+├── checkpoints/            # Trained weights, one subdir per algorithm (.msgpack)
+│   ├── ppo/  sac/  tqc/  tagd/  navrep/  vanilla_ppo/
+├── data/                   # Generated CSV result dumps (git-ignored)
+├── figures/                # Generated plots & dashboards
+├── assets/                 # README visuals
+├── legacy/                 # Older, non-JAX code (Gymnasium/SB3) — kept for reference
+└── requirements.txt
 ```
 
 ## Getting Started
-Create new python environment:
-```
+
+Create a virtual environment and install dependencies:
+
+```bash
 python3 -m venv 2drlenv
-```
-
-Install dependencies:
-```
-cd indoor-rl-nav
+source 2drlenv/bin/activate
 pip install -r requirements.txt
+pip install -e .            # install the `legnav` package
 ```
 
-Train a new Agent(PPO/SAC):
+All commands below are run from the repository root. Paths to checkpoints, data
+and figures are resolved automatically (via `legnav.paths`), so scripts work
+regardless of the current working directory.
+
+Train an agent (PPO / SAC / TQC):
+
+```bash
+python -m legnav.algorithms.jax_ppo      # PPO
+python -m legnav.algorithms.SACjax       # SAC
+python -m legnav.algorithms.TQCjac       # TQC
 ```
-python -m scripts.train_ppo
+
+Evaluate / visualize a trained policy:
+
+```bash
+python -m legnav.evaluation.jax_eval_multi --algo sac
+python -m legnav.evaluation.benchmark_eval
 ```
 
-Visualize a Pre-Trained Agent:
-```
-python -m scripts.run_ppo
+> **GPU required** for training and most evaluation scripts — they request the
+> JAX `gpu` backend at import time.
 
-```
+## Legacy code
 
-
-
+The `legacy/` directory holds the original, pre-JAX implementation
+(Gymnasium + stable-baselines3 environments and trainers, real-robot SB3 scripts,
+and plotting scratch). It is retained for reference and is **not** part of the
+`legnav` package.

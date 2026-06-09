@@ -3,8 +3,12 @@ requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "indoor-rl-nav"
+name = "legnav"
 version = "0.1.0"
+description = "LegNav-Sim: a fast JAX 2D LiDAR navigation environment for DRL in dynamic human (leg-level) crowds."
+requires-python = ">=3.10"
+readme = "README.md"
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
+include = ["legnav*"]
