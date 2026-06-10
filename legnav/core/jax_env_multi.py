@@ -48,8 +48,9 @@ _PROGRESS_COEF =  2.0
 _STEP_PEN      =  -0.075   # Drastically increased. Standing still is no longer a safe haven.
 
 # Smoothness & Rotation penalties (Lowered to unblock exploration)
-_SMOOTH_WEIGHT =   0.08    # Reduced to stop paralyzing the agent's steering
-_ROT_WEIGHT    =   0.07   # Low: allow steering around humans, only penalizes extreme spinning
+_SMOOTH_WEIGHT       =   0.08    # Reduced to stop paralyzing the agent's steering
+_ROT_WEIGHT          =   0.10    # Penalizes angular velocity magnitude; suppresses straight-corridor oscillation
+_HEADING_ALIGN_COEF  =   0.12    # Bonus for facing the goal while moving; breaks sinusoidal symmetry
 
 _COMFORT_DIST  = 1.2   # m — personal space boundary
 _COMFORT_COEF  = 0.015 # base penalty at d=0 (before speed scaling) — /10 from 0.15
@@ -72,7 +73,7 @@ _GHOST_POS = -999.0
 _CIRCLE_SIDES = 8   # octagon approximation (fits 2 groups of 4 edges)
 
 
-def build_hsfm_obstacles(obs_boxes, obs_circles, room_h=ROOM_H):
+def build_hsfm_obstacles(obs_boxes, obs_circles, room_h=ROOM_H, room_w=ROOM_W):
     """
     Build edge-based obstacle array for JHSFM.
 
@@ -82,11 +83,10 @@ def build_hsfm_obstacles(obs_boxes, obs_circles, room_h=ROOM_H):
     JHSFM step ignores them instead of producing fictitious origin forces.
 
     Returns shape (num_groups, 4, 2, 2): all agents share the same array.
-    room_h is dynamic to support non-standard room heights (e.g. 24 m for
-    the long parallel corridor test scenario).
+    room_h / room_w are dynamic to support non-standard room sizes.
     """
     rh = jnp.float32(room_h)
-    rw = jnp.float32(ROOM_W)
+    rw = jnp.float32(room_w)
     # Build room boundary edges with dynamic room_h
     p00 = jnp.stack([jnp.float32(0.0), jnp.float32(0.0)])
     pW0 = jnp.stack([rw,               jnp.float32(0.0)])
@@ -146,7 +146,7 @@ def reset_env(key: jax.Array, max_goal_dist: float = 3.0, scenario_idx: int = -1
               ghost_prob: float = 1.0, max_scenario: int = 6, min_goal_dist: float = 0.8):
     k_main, k_legs, k_obs, k_ghost = jax.random.split(key, 4)
 
-    rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people, room_h = \
+    rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people, room_h, room_w = \
         generate_scenario(k_main, max_goal_dist, scenario_idx, max_scenario, min_goal_dist)
     
     #max_v = 0.8
@@ -166,6 +166,7 @@ def reset_env(key: jax.Array, max_goal_dist: float = 3.0, scenario_idx: int = -1
         escape_timer=0,
         is_ghost=is_ghost,
         room_h=room_h,
+        room_w=room_w,
     )
 
     obs, sp_mask = get_obs(state, k_obs)
@@ -222,15 +223,15 @@ def step_env(key, state, action, ghost_robot: bool = True):
     new_theta = (state.theta + target_w * DT + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
 
     # Boolean wall_collision for episode logic (stop_grad'd later)
-    wall_collision = (raw_x < ROBOT_RADIUS) | (raw_x > ROOM_W - ROBOT_RADIUS) | \
+    wall_collision = (raw_x < ROBOT_RADIUS) | (raw_x > state.room_w - ROBOT_RADIUS) | \
                      (raw_y < ROBOT_RADIUS) | (raw_y > state.room_h - ROBOT_RADIUS)
 
-    new_x = jnp.clip(raw_x, ROBOT_RADIUS, ROOM_W - ROBOT_RADIUS)
+    new_x = jnp.clip(raw_x, ROBOT_RADIUS, state.room_w - ROBOT_RADIUS)
     new_y = jnp.clip(raw_y, ROBOT_RADIUS, state.room_h - ROBOT_RADIUS)
 
     # ── 2. JHSFM substeps ─────────────────────────────────────────────────────
     hsfm_params      = get_standard_humans_parameters(NUM_PEOPLE + 1)
-    static_obstacles = build_hsfm_obstacles(state.obs_boxes, state.obs_circles, state.room_h)
+    static_obstacles = build_hsfm_obstacles(state.obs_boxes, state.obs_circles, state.room_h, state.room_w)
 
     # Build goal arrays for humans using the active waypoint per human.
     idx_h    = state.people[:, 10]
@@ -282,7 +283,7 @@ def step_env(key, state, action, ghost_robot: bool = True):
 
         # Clamping: do not clamp dummy humans, keep them at -999
         clamped_x    = jnp.where(is_dummy_sub, next_h[:, 0],
-                                 jnp.clip(next_h[:, 0], 0.1, ROOM_W - 0.1))
+                                 jnp.clip(next_h[:, 0], 0.1, state.room_w - 0.1))
         clamped_y    = jnp.where(is_dummy_sub, next_h[:, 1],
                                  jnp.clip(next_h[:, 1], 0.1, state.room_h - 0.1))
                                  
@@ -324,7 +325,7 @@ def step_env(key, state, action, ghost_robot: bool = True):
 
     # Generate random X coordinates (narrowed for the middle lanes)
     rand_x_corr = jax.random.uniform(k_respawn1, (NUM_PEOPLE,), minval=4.8, maxval=7.2)
-    rand_x_full = jax.random.uniform(k_respawn1, (NUM_PEOPLE,), minval=1.0, maxval=ROOM_W - 1.0)
+    rand_x_full = jax.random.uniform(k_respawn1, (NUM_PEOPLE,), minval=1.0, maxval=state.room_w - 1.0)
     
     # Identify wall-walkers in the parallel scenario (spawned exactly at 4.5 or 7.5)
     is_wall_walker = (jnp.abs(g1x - 4.5) < 0.1) | (jnp.abs(g1x - 7.5) < 0.1)
@@ -607,8 +608,18 @@ def step_env(key, state, action, ghost_robot: bool = True):
     # If the robot is not moving and no human is forcing it to yield, heavily penalize it
     unjustified_stop_pen = jnp.where((target_v < 0.1) & (yield_pressure < 0.1), -0.1, 0.0)
 
+    # Heading alignment: reward facing the goal while moving.
+    # Breaks the sinusoidal symmetry in straight corridors: going straight is
+    # strictly better than oscillating ±θ because cos(θ) < 1 for any θ ≠ 0.
+    # Suppressed by yield_pressure so social manoeuvres are not penalised.
+    dx_goal = state.goal_x - new_x
+    dy_goal = state.goal_y - new_y
+    goal_angle   = jnp.arctan2(dy_goal, dx_goal)
+    heading_err  = (goal_angle - new_theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
+    heading_bonus = _HEADING_ALIGN_COEF * jnp.cos(heading_err) * target_v * jnp.maximum(0.0, 1.0 - yield_pressure)
+
     # Minimal baseline + smoothness
-    dense_reward     = progress_reward + step_pen + smooth_pen + rot_pen + spin_in_place_pen + unjustified_stop_pen + yield_pen
+    dense_reward     = progress_reward + step_pen + smooth_pen + rot_pen + spin_in_place_pen + unjustified_stop_pen + yield_pen + heading_bonus
     
 
     # — 6d. Terminal cascades ─────────────────────────────────────────────
@@ -652,7 +663,7 @@ def step_env(key, state, action, ghost_robot: bool = True):
         "rew_step":      jnp.array(step_pen),
         "rew_smooth":    smooth_pen,
         "rew_speed":     jnp.array(0.0),  # removed: was redundant with progress
-        "rew_heading":   jnp.array(0.0),  # not in multi env
+        "rew_heading":   heading_bonus,
         "rew_comfort":   jnp.array(0.0),  # commented out above
         "rew_yield":     yield_pen,
     }

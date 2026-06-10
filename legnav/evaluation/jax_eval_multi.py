@@ -25,6 +25,7 @@ Keys:
 """
 
 import argparse
+import pathlib
 import os
 from legnav import paths
 os.environ["JAX_PLATFORMS"] = "cpu"
@@ -443,6 +444,45 @@ _SHOE_PALETTE = [
     ( 60, 160, 160), (200, 140,  80), (130,  80, 200), (200,  60,  80),
 ]
 
+# ── Scenario-16 trueMap wall-point backdrop ───────────────────────────────────
+_MAP_NPZ_PATH = pathlib.Path(__file__).parent.parent / "map" / "map_obbs.npz"
+_map_true_pts: np.ndarray | None = None
+_map_bg_cache: dict = {}   # (sim_w_px, sim_h_px) → pygame.Surface
+
+def _load_true_map_pts():
+    global _map_true_pts
+    if _map_true_pts is not None:
+        return
+    try:
+        d = np.load(_MAP_NPZ_PATH)
+        if "true_map_local" in d:
+            _map_true_pts = np.array(d["true_map_local"], dtype=np.float32)
+    except Exception:
+        pass
+
+def _get_map_bg(scale: float, sim_w_px: int, sim_h_px: int) -> "pygame.Surface | None":
+    """Return a cached pygame Surface with trueMap wall points drawn on it."""
+    key = (sim_w_px, sim_h_px)
+    if key in _map_bg_cache:
+        return _map_bg_cache[key]
+    _load_true_map_pts()
+    if _map_true_pts is None:
+        return None
+    surf = pygame.Surface((sim_w_px, sim_h_px), pygame.SRCALPHA)
+    surf.fill((0, 0, 0, 0))
+    px = ((_map_true_pts[:, 0] * scale)).astype(np.int32)
+    py = ((sim_h_px - _map_true_pts[:, 1] * scale)).astype(np.int32)
+    mask = (px >= 0) & (px < sim_w_px) & (py >= 0) & (py < sim_h_px)
+    col = np.full((mask.sum(), 4), (145, 160, 180, 90), dtype=np.uint8)
+    arr = pygame.surfarray.pixels3d(surf)
+    alpha = pygame.surfarray.pixels_alpha(surf)
+    arr[px[mask], py[mask]] = col[:, :3]
+    alpha[px[mask], py[mask]] = col[:, 3]
+    del arr, alpha
+    _map_bg_cache[key] = surf
+    return surf
+
+
 def W(x, y): return int(x * SCALE), int(SIM_SIZE - y * SCALE)
 
 def _shoe_colour(i):
@@ -591,24 +631,29 @@ def draw_dashed_polyline(surface, color, points, dash_len=8, gap_len=5, width=2)
 
 
 def draw_scene(surface, state, raw_lidar, foot_state_np, show_lidar, show_arrows, use_legs, show_body,
-               scale=SCALE, sim_h=SIM_SIZE, trajectory=None):
+               scale=SCALE, sim_h=SIM_SIZE, trajectory=None, show_map_bg=False):
     """Draw the simulation viewport.
 
-    scale   — pixels per metre (default: module-level SCALE = SIM_SIZE/12).
-    sim_h   — pixel height of the sim area (default: SIM_SIZE).
-    For non-square rooms (e.g. 12×24 m) pass scale = SIM_SIZE/room_h and
-    sim_h = SIM_SIZE so the full corridor fits vertically.
+    scale       — pixels per metre (default: module-level SCALE = SIM_SIZE/12).
+    sim_h       — pixel height of the sim area (default: SIM_SIZE).
+    show_map_bg — overlay the trueMap wall-point cloud (scenario 16 only).
     """
     def W_(x, y): return int(x * scale), int(sim_h - y * scale)
     room_h_m = float(state.room_h)   # physical room height in metres
-    sim_w = int(ROOM_W * scale)      # pixel width of the sim area
+    room_w_m = float(state.room_w)   # physical room width  in metres
+    sim_w = int(room_w_m * scale)    # pixel width of the sim area
 
     pygame.draw.rect(surface, C_FLOOR, (0, 0, sim_w, sim_h))
-    for i in range(int(ROOM_W) + 1):
+    for i in range(int(room_w_m) + 1):
         sx, _ = W_(i, 0); pygame.draw.line(surface, C_GRID, (sx, 0), (sx, sim_h))
     for j in range(int(room_h_m) + 1):
         _, sy = W_(0, j); pygame.draw.line(surface, C_GRID, (0, sy), (sim_w, sy))
     pygame.draw.rect(surface, C_WALL, (0, 0, sim_w, sim_h), 3)
+
+    if show_map_bg:
+        bg = _get_map_bg(scale, sim_w, sim_h)
+        if bg is not None:
+            surface.blit(bg, (0, 0))
 
     draw_lidar(surface, state, raw_lidar, show_lidar, scale, sim_h)
 
@@ -854,7 +899,7 @@ def main():
         return {"suc":w[:,1].mean()*100,"col":w[:,2].mean()*100,
                 "tmo":w[:,3].mean()*100,"pcol":w[:,4].mean()*100}
 
-    print("🎮 Keys: 0-6 lock scenario | 7 random | R reset | → skip (no stats) | L lidar | H arrows | B body | Q quit")
+    print("🎮 Keys: 0-6 lock scenario | 7 random | M map (scen 16) | R reset | → skip | L lidar | H arrows | B body | Q quit")
     if args.watch: print(f"👀 WATCH MODE ENABLED: Polling {ckpt} for updates.")
 
     while True:
@@ -883,6 +928,16 @@ def main():
                     evaluation_mode  = "random"
                     current_scenario = random.randint(0, 6)
                     fast_reset, fast_step = build_fast_reset(current_scenario)
+                    rng, reset_rng = jax.random.split(rng)
+                    obs, stacked_state = fast_reset(reset_rng)
+                    _policy_reset()
+                    ep_reward=0.0; ep_steps=0; banner_t=0
+                    ep_yz_steps=0; ep_yc_steps=0
+                    trajectory = _init_trajectory(stacked_state)
+                if k == pygame.K_m:
+                    evaluation_mode  = "fixed"
+                    current_scenario = 16
+                    fast_reset, fast_step = build_fast_reset(16, max_goal_dist=25.0, min_goal_dist=15.0)
                     rng, reset_rng = jax.random.split(rng)
                     obs, stacked_state = fast_reset(reset_rng)
                     _policy_reset()
@@ -965,16 +1020,26 @@ def main():
         galign = (math.atan2(dy, dx) - float(cpu_state.theta) + math.pi) % (2*math.pi) - math.pi
         ch     = float(info["closest_human"]) - ROBOT_RADIUS - _jax_env.PEOPLE_RADIUS
 
+        dyn_scale = SIM_SIZE / max(float(cpu_state.room_w), float(cpu_state.room_h))
+        sim_w_px  = int(float(cpu_state.room_w) * dyn_scale)
+        sim_h_px  = int(float(cpu_state.room_h) * dyn_scale)
+        dyn_win_w = sim_w_px + PANEL_W
+        dyn_win_h = sim_h_px
+        if (dyn_win_w, dyn_win_h) != screen.get_size():
+            screen = pygame.display.set_mode((dyn_win_w, dyn_win_h))
+            _map_bg_cache.clear()
         screen.fill(C_BG)
         draw_scene(screen, cpu_state, raw_lidar, foot_state_np,
                    show_lidar, show_arrows, use_legs, show_body,
-                   trajectory=trajectory)
+                   scale=dyn_scale, sim_h=sim_h_px, trajectory=trajectory,
+                   show_map_bg=(current_scenario == 16))
         draw_panel(screen, fonts, algo, ep, ep_steps, ep_reward,
                    float(cpu_state.max_v), float(cpu_state.v), float(cpu_state.w),
                    gdist, galign, ch, get_stats(), banner, banner_t,
                    current_scenario, evaluation_mode, use_legs, raw_lidar, sp_mask, rew_acc,
                    ep_yz_steps, ep_yc_steps,
-                   session_yield_sum, session_yield_count, show_radar)
+                   session_yield_sum, session_yield_count, show_radar,
+                   sim_x=sim_w_px, win_h=sim_h_px)
 
         if banner_t > 0: banner_t -= 1
         pygame.display.flip(); clock.tick(current_fps)
