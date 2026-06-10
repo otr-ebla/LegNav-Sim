@@ -1,5 +1,7 @@
 # jax_scenarios.py
 import math
+import pathlib
+import numpy as np
 import jax
 import jax.numpy as jnp
 
@@ -13,9 +15,53 @@ GOAL_RADIUS = 0.3
 N_BASE_PEOPLE = 12   # people count for all scenarios except static_groups
 NUM_PEOPLE    = 24   # total slots; static_groups fills all, others pad with dummies
 NUM_OBS_CIR = 16
-NUM_OBS_BOX = 16
+NUM_OBS_BOX = 300
 
 N_GUESSES = 64
+
+# ── NPZ map (scenario 16) ─────────────────────────────────────────────────────
+_MAP_NPZ = pathlib.Path(__file__).parent.parent / "map" / "map_obbs.npz"
+
+def _load_map_data():
+    """Load pre-fitted OBBs from map_obbs.npz. Returns a dict of numpy arrays."""
+    if not _MAP_NPZ.exists():
+        raise FileNotFoundError(
+            f"Map OBBs not found: {_MAP_NPZ}\n"
+            "Run: python -m legnav.map.preprocess_map"
+        )
+    return np.load(_MAP_NPZ)
+
+_map_data = _load_map_data()
+MAP_ROOM_W  = float(_map_data["room_w"])
+MAP_ROOM_H  = float(_map_data["room_h"])
+_MAP_BOXES  = jnp.array(_map_data["obs_boxes"], dtype=jnp.float32)   # (N_KEEP, 8)
+_MAP_ROBOT_X = float(_map_data["robot_x"])
+_MAP_ROBOT_Y = float(_map_data["robot_y"])
+_MAP_GOAL_X  = float(_map_data["goal_x"])
+_MAP_GOAL_Y  = float(_map_data["goal_y"])
+
+# Pad to NUM_OBS_BOX columns so jax.lax.switch sees uniform shape
+if _MAP_BOXES.shape[0] < NUM_OBS_BOX:
+    _MAP_BOXES = jnp.concatenate(
+        [_MAP_BOXES, jnp.zeros((NUM_OBS_BOX - _MAP_BOXES.shape[0], 8), dtype=jnp.float32)],
+        axis=0,
+    )
+
+# ── CCW tour waypoints for floor training scenario (scenario 17) ─────────────
+# WP 0 = robot spawn; WP 1-10 = CCW tour targets.  10 training legs total.
+_FLOOR_CCW_WPS = jnp.array([
+    [_MAP_ROBOT_X, _MAP_ROBOT_Y],   # 0: robot spawn ≈ (13.26, 26.12)
+    [25.0, 26.0],                   # 1: bottom corridor mid
+    [37.0, 26.0],                   # 2: bottom corridor right
+    [37.5, 36.0],                   # 3: right corridor lower
+    [37.5, 47.0],                   # 4: right corridor upper
+    [37.5, 55.0],                   # 5: top corridor right
+    [25.0, 55.0],                   # 6: top corridor mid
+    [13.0, 55.0],                   # 7: top corridor left
+    [13.0, 49.0],                   # 8: left corridor upper
+    [13.0, 36.0],                   # 9: left corridor lower
+    [13.0, 29.0],                   # 10: back near spawn
+], dtype=jnp.float32)   # shape (11, 2)
 
 def _min_dist_to_circles(x, y, circles):
     dx = circles[:, 0] - x
@@ -76,9 +122,9 @@ def _min_dist_to_boxes(x, y, boxes):
         return jnp.where(span < 1e-6, 1e6, dist)
     return jnp.min(jax.vmap(_quad_dist)(boxes))
 
-def _is_safe(x, y, clearance, obs_circles, obs_boxes):
-    wall_ok = (x > clearance) & (x < ROOM_W - clearance) & \
-              (y > clearance) & (y < ROOM_H - clearance)
+def _is_safe(x, y, clearance, obs_circles, obs_boxes, room_w=ROOM_W, room_h=ROOM_H):
+    wall_ok = (x > clearance) & (x < room_w - clearance) & \
+              (y > clearance) & (y < room_h - clearance)
     cir_ok  = _min_dist_to_circles(x, y, obs_circles) > clearance
     box_ok  = _min_dist_to_boxes(x, y, obs_boxes) > clearance
     return wall_ok & cir_ok & box_ok
@@ -136,6 +182,11 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
     # If the caller pinned a specific scenario (>= 0), use it; else use the draw.
     idx = jnp.where(scenario_idx < 0, sampled_idx, jnp.int32(scenario_idx))
 
+    # Redirect visual-only scenarios (13-15, max_v=0) to scenario 0 when sampled
+    # randomly so they never appear as training episodes.  Pinned evals are unaffected.
+    visual_scen = ((idx == 13) | (idx == 14) | (idx == 15)) & (jnp.int32(scenario_idx) < 0)
+    idx = jnp.where(visual_scen, jnp.int32(0), idx)
+
     # Scenarios where enforcing a large minimum initial goal distance is
     # impractical: intersections and multi-waypoint test scenarios.
     # Include `bottleneck` (4) alongside intersections and multi-waypoint tests
@@ -162,21 +213,24 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
         max_v = jax.random.uniform(k1, minval=0.2, maxval=2.0)
         margin = ROBOT_RADIUS + 0.5
 
-        N_TOTAL = NUM_OBS_CIR + NUM_OBS_BOX
-        GRID_NX = max(1, int(math.ceil(math.sqrt(N_TOTAL))))
-        GRID_NY = max(1, int(math.ceil(N_TOTAL / GRID_NX)))
-        N_CELLS = GRID_NX * GRID_NY                        
+        # Sparse grid: ~10 obstacles in a 12×12 m room leaves ample space for
+        # 12 people and the robot.  4 circles + 6 boxes = 10 total.
+        N_RAND_CIR = 4
+        N_RAND_BOX = 6
+        N_RAND     = N_RAND_CIR + N_RAND_BOX   # 10
+        GRID_NX    = 4
+        GRID_NY    = 3
+        N_CELLS    = GRID_NX * GRID_NY          # 12 cells for 10 obstacles
 
-        INNER_LO, INNER_HI = 0.1, ROOM_W - 0.1
-        cell_w = (INNER_HI - INNER_LO) / GRID_NX
-        cell_h = (INNER_HI - INNER_LO) / GRID_NY
+        INNER_LO, INNER_HI = 0.8, ROOM_W - 0.8
+        cell_w = (INNER_HI - INNER_LO) / GRID_NX   # ~2.6 m
+        cell_h = (INNER_HI - INNER_LO) / GRID_NY   # ~3.5 m
         cell_id = jnp.arange(N_CELLS)
         cell_cx = INNER_LO + (cell_id %  GRID_NX + 0.5) * cell_w
         cell_cy = INNER_LO + (cell_id // GRID_NX + 0.5) * cell_h
         perm = jax.random.permutation(k_perm, N_CELLS)
         cell_cx = cell_cx[perm]
         cell_cy = cell_cy[perm]
-
 
         EDGE_MARGIN = PEOPLE_RADIUS + 0.15
         half_min = min(cell_w, cell_h) / 2.0
@@ -195,24 +249,33 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
             cy = cy0 + jax.random.uniform(c2, minval=-jit_y_c, maxval=jit_y_c)
             r  = jax.random.uniform(c3, minval=MIN_R, maxval=MAX_R)
             return jnp.array([cx, cy, r])
-        obs_circles = jax.vmap(init_circle)(
-            jax.random.split(k_circ, NUM_OBS_CIR),
-            cell_cx[:NUM_OBS_CIR], cell_cy[:NUM_OBS_CIR],
+        rand_circles = jax.vmap(init_circle)(
+            jax.random.split(k_circ, N_RAND_CIR),
+            cell_cx[:N_RAND_CIR], cell_cy[:N_RAND_CIR],
         )
+        # Pad to NUM_OBS_CIR
+        obs_circles = jnp.concatenate([
+            rand_circles,
+            jnp.zeros((NUM_OBS_CIR - N_RAND_CIR, 3), dtype=jnp.float32),
+        ], axis=0)
 
         def init_box(bk, cx0, cy0):
-            b1, b2, b3, b4, b5 = jax.random.split(bk, 5)
+            b1, b2, b3, b4 = jax.random.split(bk, 4)
             cx = cx0 + jax.random.uniform(b1, minval=-jit_x_b, maxval=jit_x_b)
             cy = cy0 + jax.random.uniform(b2, minval=-jit_y_b, maxval=jit_y_b)
             hw = jax.random.uniform(b3, minval=MIN_BHW, maxval=MAX_BHW)
             hh = jax.random.uniform(b4, minval=MIN_BHW, maxval=MAX_BHW)
-            theta = jax.random.uniform(b5, minval=-jnp.pi, maxval=jnp.pi)
-            return _rot_box(cx, cy, hw, hh, theta)
-        obs_boxes = jax.vmap(init_box)(
-            jax.random.split(k_box, NUM_OBS_BOX),
-            cell_cx[NUM_OBS_CIR:NUM_OBS_CIR + NUM_OBS_BOX],
-            cell_cy[NUM_OBS_CIR:NUM_OBS_CIR + NUM_OBS_BOX],
+            return _aabb_box(cx, cy, hw, hh)   # axis-aligned, no rotation
+        rand_boxes = jax.vmap(init_box)(
+            jax.random.split(k_box, N_RAND_BOX),
+            cell_cx[N_RAND_CIR:N_RAND_CIR + N_RAND_BOX],
+            cell_cy[N_RAND_CIR:N_RAND_CIR + N_RAND_BOX],
         )
+        # Pad to NUM_OBS_BOX
+        obs_boxes = jnp.concatenate([
+            rand_boxes,
+            jnp.zeros((NUM_OBS_BOX - N_RAND_BOX, 8), dtype=jnp.float32),
+        ], axis=0)
 
         # Vectorized Robot Spawn
         rx, ry = _batch_sample_safe_pos(k_robot, margin, obs_circles, obs_boxes, margin, ROOM_W-margin)
@@ -990,6 +1053,89 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
         people = jnp.concatenate([person, _make_dummies(NUM_PEOPLE - 1)], axis=0)
         return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
 
+    # ── 17: FLOOR TOUR CCW — random leg + patrol people (training) ───────────
+    def _floor_tour_scen(k):
+        """Random leg of the CCW floor tour on the real map, with 8 corridor patrollers.
+        Robot spawns at CCW waypoint i (+ small jitter), goal at CCW waypoint i+1.
+        Exercises long straight-corridor navigation with people present.
+        """
+        k1, k2, k3, k4, k5, k_theta, k_people = jax.random.split(k, 7)
+        max_v = jnp.float32(1.2)
+        obs_circles = jnp.zeros((NUM_OBS_CIR, 3), dtype=jnp.float32)
+        obs_boxes   = _MAP_BOXES
+
+        # 11 waypoints → 10 legs; pick one at random
+        N_LEGS = 10
+        leg_idx = jax.random.randint(k1, (), 0, N_LEGS)
+
+        # Robot: CCW[leg_idx] + small position jitter for spawn diversity
+        jitter_rx = jax.random.uniform(k2, minval=-0.5, maxval=0.5)
+        jitter_ry = jax.random.uniform(k3, minval=-0.5, maxval=0.5)
+        rx = jnp.clip(_FLOOR_CCW_WPS[leg_idx, 0] + jitter_rx,
+                      ROBOT_RADIUS + 0.1, MAP_ROOM_W - ROBOT_RADIUS - 0.1)
+        ry = jnp.clip(_FLOOR_CCW_WPS[leg_idx, 1] + jitter_ry,
+                      ROBOT_RADIUS + 0.1, MAP_ROOM_H - ROBOT_RADIUS - 0.1)
+
+        # Goal: CCW[leg_idx + 1] + small jitter
+        jitter_gx = jax.random.uniform(k4, minval=-0.5, maxval=0.5)
+        jitter_gy = jax.random.uniform(k5, minval=-0.5, maxval=0.5)
+        gx = jnp.clip(_FLOOR_CCW_WPS[leg_idx + 1, 0] + jitter_gx,
+                      GOAL_RADIUS + 0.1, MAP_ROOM_W - GOAL_RADIUS - 0.1)
+        gy = jnp.clip(_FLOOR_CCW_WPS[leg_idx + 1, 1] + jitter_gy,
+                      GOAL_RADIUS + 0.1, MAP_ROOM_H - GOAL_RADIUS - 0.1)
+
+        # Heading: face the goal with ±0.8 rad noise
+        rtheta = jnp.arctan2(gy - ry, gx - rx) + jax.random.uniform(k_theta, minval=-0.8, maxval=0.8)
+        rtheta = (rtheta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
+
+        # 8 patrol people: 2 per corridor (bottom/right/top/left)
+        # Format: [g1x, g1y, g2x, g2y, is_horizontal(1=h, 0=v)]
+        corridor_data = jnp.array([
+            [13.0, 26.0, 37.0, 26.0, 1.0],   # bottom, person 1
+            [13.0, 26.0, 37.0, 26.0, 1.0],   # bottom, person 2
+            [37.5, 26.0, 37.5, 55.0, 0.0],   # right,  person 3
+            [37.5, 26.0, 37.5, 55.0, 0.0],   # right,  person 4
+            [13.0, 55.0, 37.5, 55.0, 1.0],   # top,    person 5
+            [13.0, 55.0, 37.5, 55.0, 1.0],   # top,    person 6
+            [13.0, 26.0, 13.0, 55.0, 0.0],   # left,   person 7
+            [13.0, 26.0, 13.0, 55.0, 0.0],   # left,   person 8
+        ], dtype=jnp.float32)   # (8, 5)
+        N_PATROL = 8
+
+        def _init_patroller(pk, cd):
+            g1x, g1y, g2x, g2y, is_h = cd
+            k_t, k_wp = jax.random.split(pk)
+            t    = jax.random.uniform(k_t)
+            wp_i = jax.random.randint(k_wp, (), 0, 2).astype(jnp.float32)
+            # Position along the corridor
+            px = jnp.where(is_h > 0.5, g1x + t * (g2x - g1x), g1x)
+            py = jnp.where(is_h > 0.5, g1y, g1y + t * (g2y - g1y))
+            # Heading toward active waypoint
+            cur_gx = jnp.where(wp_i == 0, g1x, g2x)
+            cur_gy = jnp.where(wp_i == 0, g1y, g2y)
+            theta  = jnp.arctan2(cur_gy - py, cur_gx - px)
+            return jnp.array([px, py, 0.0, 0.0, theta, 0.0,
+                               g1x, g1y, g2x, g2y, wp_i], dtype=jnp.float32)
+
+        patrol_people = jax.vmap(_init_patroller)(
+            jax.random.split(k_people, N_PATROL), corridor_data
+        )
+        people = jnp.concatenate([patrol_people, _make_dummies(NUM_PEOPLE - N_PATROL)], axis=0)
+        return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
+
+    # --- 16: NPZ MAP (static real-world floor-plan) ---
+    def _npz_map_scen(_k):
+        rx       = jnp.float32(_MAP_ROBOT_X)
+        ry       = jnp.float32(_MAP_ROBOT_Y)
+        rtheta   = jnp.float32(0.0)
+        gx       = jnp.float32(_MAP_GOAL_X)
+        gy       = jnp.float32(_MAP_GOAL_Y)
+        max_v    = jnp.float32(1.0)
+        obs_circles = jnp.zeros((NUM_OBS_CIR, 3), dtype=jnp.float32)
+        obs_boxes   = _MAP_BOXES                                       # (NUM_OBS_BOX, 8)
+        people      = _make_dummies(NUM_PEOPLE)
+        return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
+
     branches = [
         _random_scen,
         _parallel_scen,
@@ -1007,14 +1153,18 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
         _gait_treadmill_scen,      # 13 — visual gait check (single walker)
         _gait_crossing_scen,       # 14 — visual gait check (two walkers crossing)
         _gait_circle_scen,         # 15 — visual gait check (single walker, circle)
+        _npz_map_scen,             # 16 — real-world floor-plan from NPZ map
+        _floor_tour_scen,          # 17 — CCW floor tour with corridor patrollers (training)
     ]
 
     # Compile all scenarios into the XLA switch statement
     raw_rx, raw_ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people = jax.lax.switch(idx, branches, k_branch)
 
-    # Room height: scenario 11 (Long Parallel Corridor) uses a 24 m room;
-    # all other scenarios use the standard 12 m room.
-    room_h = jnp.where(jnp.int32(idx) == 11, jnp.float32(24.0), jnp.float32(ROOM_H))
+    # Room dimensions: scenario 11 uses 24 m height; scenarios 16-17 use the NPZ map size.
+    _uses_map = (jnp.int32(idx) == 16) | (jnp.int32(idx) == 17)
+    room_h = jnp.where(jnp.int32(idx) == 11, jnp.float32(24.0),
+             jnp.where(_uses_map, jnp.float32(MAP_ROOM_H), jnp.float32(ROOM_H)))
+    room_w = jnp.where(_uses_map, jnp.float32(MAP_ROOM_W), jnp.float32(ROOM_W))
 
     # ── Universal Robot Safety Check (Vectorized) ──
     # Post-process: Guarantees the robot NEVER spawns directly on top of a human
@@ -1025,13 +1175,13 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
     off_x = jnp.concatenate([jnp.array([0.0]), jax.random.uniform(k_off_x, (N_GUESSES-1,), minval=-2.0, maxval=2.0)])
     off_y = jnp.concatenate([jnp.array([0.0]), jax.random.uniform(k_off_y, (N_GUESSES-1,), minval=-2.0, maxval=2.0)])
 
-    rx_guesses = jnp.clip(raw_rx + off_x, 1.0, ROOM_W - 1.0)
+    rx_guesses = jnp.clip(raw_rx + off_x, 1.0, room_w - 1.0)
     ry_guesses = jnp.clip(raw_ry + off_y, 1.0, room_h - 1.0)
 
     def check_post_safe(x, y):
         dist = jnp.sqrt((people[:, 0] - x)**2 + (people[:, 1] - y)**2)
         human_ok = jnp.min(dist) >= 1.0
-        wall_ok = _is_safe(x, y, ROBOT_RADIUS + 0.3, obs_circles, obs_boxes)
+        wall_ok = _is_safe(x, y, ROBOT_RADIUS + 0.3, obs_circles, obs_boxes, room_w, room_h)
         return human_ok & wall_ok
 
     safe_mask = jax.vmap(check_post_safe)(rx_guesses, ry_guesses)
@@ -1054,7 +1204,7 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
         safe_dir_y = jnp.where(dist > 1e-6, dy / dist, jnp.array(0.0, dtype=dy.dtype))
         ngx = rx_safe + safe_dir_x * min_req_global
         ngy = ry_safe + safe_dir_y * min_req_global
-        ngx = jnp.clip(ngx, 1.0, ROOM_W - 1.0)
+        ngx = jnp.clip(ngx, 1.0, room_w - 1.0)
         ngy = jnp.clip(ngy, 1.0, room_h - 1.0)
         return ngx, ngy
 
@@ -1068,11 +1218,11 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
     k_post = jax.random.split(k_branch)[0]
     GOAL_CLEARANCE = GOAL_RADIUS + 0.3
     gkx, gky = jax.random.split(k_post, 2)
-    rand_x = jax.random.uniform(gkx, (N_GUESSES,), minval=GOAL_CLEARANCE, maxval=ROOM_W-GOAL_CLEARANCE)
+    rand_x = jax.random.uniform(gkx, (N_GUESSES,), minval=GOAL_CLEARANCE, maxval=room_w-GOAL_CLEARANCE)
     # For bottleneck scenario (idx==4) sample x randomly within the gap
     half_gap = 1.4  # matches gap_size/2 used in _bottleneck_scen (gap_size=2.8)
-    minx = jnp.clip(gx - half_gap + GOAL_CLEARANCE, GOAL_CLEARANCE, ROOM_W - GOAL_CLEARANCE)
-    maxx = jnp.clip(gx + half_gap - GOAL_CLEARANCE, GOAL_CLEARANCE, ROOM_W - GOAL_CLEARANCE)
+    minx = jnp.clip(gx - half_gap + GOAL_CLEARANCE, GOAL_CLEARANCE, room_w - GOAL_CLEARANCE)
+    maxx = jnp.clip(gx + half_gap - GOAL_CLEARANCE, GOAL_CLEARANCE, room_w - GOAL_CLEARANCE)
     width = jnp.maximum(maxx - minx, 0.0)
     around_x = minx + jax.random.uniform(gkx, (N_GUESSES,)) * width
     # For parallel corridor scenarios prefer sampling x inside the corridor
@@ -1092,7 +1242,7 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
     g_guesses_y = jnp.where(jnp.int32(idx) == 4, btl_y, g_guesses_y)
 
     def _check_candidate(x, y):
-        safe_env = _is_safe(x, y, GOAL_CLEARANCE, obs_circles, obs_boxes)
+        safe_env = _is_safe(x, y, GOAL_CLEARANCE, obs_circles, obs_boxes, room_w, room_h)
         d_to_robot = jnp.hypot(x - rx_safe, y - ry_safe)
         dist_ok = (d_to_robot >= min_req_global) & (d_to_robot <= max_goal_dist)
         # Minimum clearance from any active person
@@ -1120,7 +1270,7 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
     # obstacle. People are *not* part of this check: a moving person that
     # happens to spawn on the goal must be nudged away instead of displacing
     # the goal, so the position specified in the scenario is preserved.
-    wall_ok = (new_gx > GOAL_CLEARANCE) & (new_gx < ROOM_W - GOAL_CLEARANCE) & \
+    wall_ok = (new_gx > GOAL_CLEARANCE) & (new_gx < room_w - GOAL_CLEARANCE) & \
               (new_gy > GOAL_CLEARANCE) & (new_gy < room_h - GOAL_CLEARANCE)
     cir_ok  = _min_dist_to_circles(new_gx, new_gy, obs_circles) > GOAL_CLEARANCE
     box_ok  = _min_dist_to_boxes(new_gx, new_gy, obs_boxes)   > GOAL_CLEARANCE
@@ -1148,11 +1298,11 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
     push_to = PERSON_GOAL_SAFE + 0.05
     new_px = jnp.where(needs_push, final_gx + ux * push_to, people[:, 0])
     new_py = jnp.where(needs_push, final_gy + uy * push_to, people[:, 1])
-    new_px = jnp.clip(new_px, 0.4, ROOM_W - 0.4)
+    new_px = jnp.clip(new_px, 0.4, room_w - 0.4)
     new_py = jnp.clip(new_py, 0.4, room_h - 0.4)
     people = people.at[:, 0].set(new_px).at[:, 1].set(new_py)
 
-    return rx_safe, ry_safe, rtheta, final_gx, final_gy, max_v, obs_circles, obs_boxes, people, room_h
+    return rx_safe, ry_safe, rtheta, final_gx, final_gy, max_v, obs_circles, obs_boxes, people, room_h, room_w
 
 
 # ── Robot waypoint sequences for test scenarios (used by eval scripts) ────────
