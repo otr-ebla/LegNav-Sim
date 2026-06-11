@@ -45,9 +45,10 @@ import flax.serialization
 def _parse_args():
     p = argparse.ArgumentParser(description="Universal JAX Evaluation")
     p.add_argument("--algo",     default="ppo",
-                   choices=["ppo", "shac", "sac", "tqc", "mlp", "hsfm", "mppi", "ppo_circles"],
+                   choices=["ppo", "shac", "sac", "tqc", "mlp", "hsfm", "mppi", "ppo_circles", "ppo_legs"],
                    help="Algorithm whose checkpoint to load. "
                         "'ppo_circles' = PPO model trained with circle humans. "
+                        "'ppo_legs' = PPO model trained with legged humans. "
                         "'mlp' = Vanilla 2×128 MLP baseline (ppo_mlp_baseline.py). "
                         "'hsfm' = JHSFM model-based planner. "
                         "'mppi' = Model Predictive Path Integral (no checkpoint).")
@@ -381,6 +382,7 @@ def _build_dwa():
 _DEFAULT_CKPT = {
     "ppo":  paths.checkpoint("ppo", "ppo_tanh_inside_final.msgpack"), #ppo_attn_final.msgpack",
     "ppo_circles": paths.checkpoint("ppo", "ppo_circles_best.msgpack"),
+    "ppo_legs":    paths.checkpoint("ppo", "ppo_legs_best.msgpack"),
     "shac": paths.checkpoint("ppo", "shac_best.msgpack"),
     "sac":  paths.checkpoint("sac", "sac_best.msgpack"),
     "tqc":  paths.checkpoint("tqc", "tqc_final.msgpack"),
@@ -393,7 +395,7 @@ _DEFAULT_CKPT = {
 # ── Policy factory ─────────────────────────────────────────────────────────────
 
 def build_policy(algo):
-    if algo in ("ppo", "shac", "ppo_circles"):
+    if algo in ("ppo", "shac", "ppo_circles", "ppo_legs"):
         return _build_ppo_shac()    # 4 elementi
     elif algo == "sac":
         return _build_sac() + (0,)  # 3 + 1 = 4 elementi
@@ -408,7 +410,7 @@ def build_policy(algo):
     elif algo == "dwa":
         return _build_dwa()         # 4 elementi
     else:
-        raise ValueError(f"Unknown algo: {algo}. Valid: ppo, ppo_circles, shac, sac, tqc, mlp, hsfm, mppi, dwa")
+        raise ValueError(f"Unknown algo: {algo}. Valid: ppo, ppo_legs, ppo_circles, shac, sac, tqc, mlp, hsfm, mppi, dwa")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

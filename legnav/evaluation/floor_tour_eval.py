@@ -44,7 +44,7 @@ import jax.numpy as jnp
 def _parse_args():
     p = argparse.ArgumentParser(description="Floor 16 Tour Evaluation")
     p.add_argument("--algo", default="ppo",
-                   choices=["ppo", "shac", "sac", "tqc", "mlp", "hsfm", "mppi", "dwa", "ppo_circles"])
+                   choices=["ppo", "shac", "sac", "tqc", "mlp", "hsfm", "mppi", "dwa", "ppo_circles", "ppo_legs"])
     p.add_argument("--ckpt", default="")
     p.add_argument("--legs",    dest="use_legs", action="store_true", default=True)
     p.add_argument("--no-legs", dest="use_legs", action="store_false")
@@ -59,6 +59,7 @@ args = _parse_args()
 import legnav.core.jax_env as _jax_env
 _jax_env.USE_LEGS     = args.use_legs
 _jax_env.SENSOR_NOISE = True
+_jax_env.PEOPLE_RADIUS = 0.25   # map floor scenario uses smaller people radius
 
 from legnav.core.jax_env import (ROBOT_RADIUS, PEOPLE_RADIUS,
                                   NUM_RAYS, MAX_LIDAR_DIST, FOV, MAX_STEPS)
@@ -101,10 +102,11 @@ MAX_GOAL_DIST = 80.0
 
 _CCW = [
     (25.0, 26.0),   # bottom corridor, mid
-    (37.0, 26.0),   # bottom corridor, right end
+    (35.0, 26.0),   # bottom corridor, right end
+    (37.5, 29.0),   # right corridor, lower
     (37.5, 36.0),   # right corridor, lower
     (37.5, 47.0),   # right corridor, upper
-    (37.5, 55.0),   # top corridor, right
+    (37.5, 54.0),   # top corridor, right
     (25.0, 55.0),   # top corridor, middle
     (13.0, 55.0),   # top corridor, left
     (13.0, 49.0),   # left corridor, upper
@@ -117,10 +119,11 @@ _CW = [
     (13.0, 49.0),   # left corridor, upper
     (13.0, 55.0),   # top corridor, left
     (25.0, 55.0),   # top corridor, middle
-    (37.5, 55.0),   # top corridor, right
+    (37.5, 54.0),   # top corridor, right
     (37.5, 47.0),   # right corridor, upper
     (37.5, 36.0),   # right corridor, lower
-    (37.0, 26.0),   # bottom corridor, right end
+    (37.5, 29.0),   # right corridor, lower
+    (35.0, 26.0),   # bottom corridor, right end
     (25.0, 26.0),   # bottom corridor, mid
     (13.0, 29.0),   # back near spawn
 ]

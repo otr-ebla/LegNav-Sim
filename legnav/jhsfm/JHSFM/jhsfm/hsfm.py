@@ -131,11 +131,11 @@ def single_update(idx: int, humans_state: jnp.ndarray, human_goal: jnp.ndarray, 
     # Social force
     social_force = jnp.sum(vectorized_pairwise_social_force(self_state, humans_state, self_parameters, parameters), axis=0)
     
-    # Obstacle force
+    # Obstacle force — summed, not averaged: exponential decay means only nearby
+    # obstacles contribute; dividing by total group count would dilute forces in
+    # maps with many OBBs (e.g. 300 real boxes → 300× too weak).
     closest_points = vectorized_compute_obstacle_closest_point(self_state[:2], obstacles)
-    num_real_obstacles = jnp.sum(~jnp.isnan(closest_points[:, 0]))
-    raw_obs_force = jnp.sum(vectorized_compute_obstacle_force(self_state, closest_points, self_parameters), axis=0)
-    obstacle_force = raw_obs_force / jnp.maximum(num_real_obstacles, 1.0)
+    obstacle_force = jnp.sum(vectorized_compute_obstacle_force(self_state, closest_points, self_parameters), axis=0)
     
     # Torque
     input_force = desired_force + social_force + obstacle_force
