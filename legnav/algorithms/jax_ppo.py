@@ -69,7 +69,8 @@ _ENT_ANCHORS  = np.array([0.02, 0.02, 0.018, 0.015, 0.012, 0.01, 0.008, 0.006, 0
 # Ghost probability ramps slower to avoid passive-collision feedback loop.
 #   20%→Parallel  35%→Perpend  50%→Circular  60%→Bottleneck+Intersect  70%→ALL(Groups)
 #   82%→harder test-style scenarios (7-12)   90%→floor CCW tour (17)
-# Visual-only scenarios 13-15 are automatically redirected to 0 inside generate_scenario.
+# Visual-only scenarios 13-15 and the static NPZ map (16) are automatically
+# redirected to 0 inside generate_scenario.
 _SCEN_ANCHORS = np.array([0,    1,    2,    3,    5,    6,    12,   17,    17])
 
 def get_continuous_curriculum(suc_pct: float):

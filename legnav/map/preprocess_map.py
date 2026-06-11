@@ -232,6 +232,20 @@ def main():
         tm_local_x -= shift_x
         tm_local_y -= shift_y
 
+    # ── Manual adjustment: widen the right corridor ───────────────────────────
+    # The large right-wall block (3 stacked AABBs at x≈[38.0, 39.6], y≈[24, 57])
+    # leaves only ~1.5 m between itself and the shelf-row ends (x≈36.5).
+    # Pull its left edge right so the corridor is ~2.3 m wide.
+    RW_OLD_LEFT, RW_NEW_LEFT = 38.04, 38.80
+    bx = obb_arr[:, [0, 2, 4, 6]]
+    by = obb_arr[:, [1, 3, 5, 7]]
+    sel = (np.abs(bx.min(1) - RW_OLD_LEFT) < 0.1) & (by.min(1) > 20.0) & (by.max(1) < 57.0)
+    for r in np.where(sel)[0]:
+        left = obb_arr[r, [0, 2, 4, 6]].min()
+        for k in (0, 2, 4, 6):
+            if abs(obb_arr[r, k] - left) < 1e-6:
+                obb_arr[r, k] = RW_NEW_LEFT
+
     room_w = float(np.ceil(max(obb_x.max(), tm_local_x.max()) + ROOM_PADDING))
     room_h = float(np.ceil(max(obb_y.max(), tm_local_y.max()) + ROOM_PADDING))
 

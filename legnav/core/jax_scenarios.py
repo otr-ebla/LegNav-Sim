@@ -182,10 +182,11 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
     # If the caller pinned a specific scenario (>= 0), use it; else use the draw.
     idx = jnp.where(scenario_idx < 0, sampled_idx, jnp.int32(scenario_idx))
 
-    # Redirect visual-only scenarios (13-15, max_v=0) to scenario 0 when sampled
-    # randomly so they never appear as training episodes.  Pinned evals are unaffected.
-    visual_scen = ((idx == 13) | (idx == 14) | (idx == 15)) & (jnp.int32(scenario_idx) < 0)
-    idx = jnp.where(visual_scen, jnp.int32(0), idx)
+    # Redirect visual-only scenarios (13-15, max_v=0) and the static NPZ map
+    # scenario (16) to scenario 0 when sampled randomly so they never appear
+    # as training episodes.  Pinned evals are unaffected.
+    non_train_scen = ((idx == 13) | (idx == 14) | (idx == 15) | (idx == 16)) & (jnp.int32(scenario_idx) < 0)
+    idx = jnp.where(non_train_scen, jnp.int32(0), idx)
 
     # Scenarios where enforcing a large minimum initial goal distance is
     # impractical: intersections and multi-waypoint test scenarios.
@@ -369,23 +370,34 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
     def _parallel_scen(k):
         N_PRL = 5
         (k1, k_gx, k_rx, k_x_guess, k_y_guess, k5,
-         k_mode, k_obs_x, k_obs_y) = jax.random.split(k, 9)
+         k_mode, k_obs_x, k_obs_y, k_w) = jax.random.split(k, 10)
 
-        corridor_width = 4.0
+        # Corridor gap randomized per episode: 1.2 m (barely passable) → 4.0 m.
+        corridor_width = jax.random.uniform(k_w, minval=1.2, maxval=4.0)
         wall_width = (ROOM_W - corridor_width) / 2.0
+        cx0  = ROOM_W / 2.0            # corridor centre line
+        half = corridor_width / 2.0
 
         obs_boxes = jnp.zeros((NUM_OBS_BOX, 8))
         obs_boxes = obs_boxes.at[0].set(_aabb_box(wall_width / 2.0, ROOM_H / 2.0, wall_width / 2.0, ROOM_H / 2.0))
         obs_boxes = obs_boxes.at[1].set(_aabb_box(ROOM_W - wall_width / 2.0, ROOM_H / 2.0, wall_width / 2.0, ROOM_H / 2.0))
-        rx, ry, rtheta = jax.random.uniform(k_rx, minval=4.8, maxval=7.2), 0.4, jnp.pi / 2.0
-        gx = jax.random.uniform(k_gx, minval=4.7, maxval=7.3)
+        # Spawn spans shrink with the gap (collapse to the centre line when narrow).
+        r_span = jnp.maximum(half - 0.8, 0.0)
+        g_span = jnp.maximum(half - 0.7, 0.0)
+        rx, ry, rtheta = cx0 + jax.random.uniform(k_rx, minval=-1.0, maxval=1.0) * r_span, 0.4, jnp.pi / 2.0
+        gx = cx0 + jax.random.uniform(k_gx, minval=-1.0, maxval=1.0) * g_span
         gy = ROOM_H - 0.6
         max_v = jax.random.uniform(k1, minval=0.5, maxval=1.5)
 
         # ── Humans variant: 5 pedestrians walking down the corridor ───────
         def _humans_branch(_):
-            px_walls = jnp.array([4.5, 7.5])
-            px_rand_guesses = jax.random.uniform(k_x_guess, (N_GUESSES, N_PRL - 2), minval=4.8, maxval=7.2)
+            # Wall-huggers stay 0.5 m off the walls; random walkers keep a 0.8 m
+            # margin. Both collapse toward the centre line as the gap narrows,
+            # so every human is always inside the corridor gap.
+            wall_off = jnp.maximum(half - 0.5, 0.0)
+            x_span   = jnp.maximum(half - 0.8, 0.0)
+            px_walls = jnp.array([cx0 - wall_off, cx0 + wall_off])
+            px_rand_guesses = cx0 + jax.random.uniform(k_x_guess, (N_GUESSES, N_PRL - 2), minval=-1.0, maxval=1.0) * x_span
             py_guesses = jax.random.uniform(k_y_guess, (N_GUESSES, N_PRL), minval=ry + 3.0, maxval=ROOM_H - 0.2)
 
             def check_parallel_safe(px_rand_guess, py_guess):
@@ -402,7 +414,7 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
             py = py_guesses[best_idx]
 
             g1x_walls = px_walls
-            g1x_random = jax.random.uniform(k5, (N_PRL - 2,), minval=4.8, maxval=7.2)
+            g1x_random = cx0 + jax.random.uniform(k5, (N_PRL - 2,), minval=-1.0, maxval=1.0) * x_span
             g1x = jnp.concatenate([g1x_walls, g1x_random])
             g1y = jnp.full((N_PRL,), 1.0)
 
@@ -429,7 +441,10 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
             i  = jnp.arange(N_OBS, dtype=jnp.float32)
             cy = y_lo + (i + 0.5) * band + jax.random.uniform(k_obs_y, (N_OBS,),
                                                               minval=-0.3, maxval=0.3)
-            x_base = jnp.where(i % 2 == 0, 5.3, 6.7)   # corridor centre is x=6
+            # Slalom amplitude scales with the gap (±0.7 at 4 m width, centred
+            # when narrow); jitter included, obstacles stay ≥1 m off the walls.
+            lateral = jnp.maximum(half - 1.3, 0.0)
+            x_base = jnp.where(i % 2 == 0, cx0 - lateral, cx0 + lateral)
             cx = x_base + jax.random.uniform(k_obs_x, (N_OBS,), minval=-0.3, maxval=0.3)
 
             # Even indices → circles, odd indices → rectangles.
@@ -445,7 +460,9 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
             people = _make_dummies(NUM_PEOPLE)
             return obs_circles, obs_boxes_out, people
 
-        use_static = jax.random.bernoulli(k_mode, 0.5)
+        # Static slalom only when the gap is wide enough to pass a centred
+        # obstacle (r≤0.4 + robot diameter); narrow corridors use humans only.
+        use_static = jax.random.bernoulli(k_mode, 0.5) & (corridor_width >= 2.5)
         obs_circles, obs_boxes, people = jax.lax.cond(
             use_static, _static_branch, _humans_branch, operand=None)
         return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
@@ -1226,10 +1243,15 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
     width = jnp.maximum(maxx - minx, 0.0)
     around_x = minx + jax.random.uniform(gkx, (N_GUESSES,)) * width
     # For parallel corridor scenarios prefer sampling x inside the corridor
-    # bounds (px between 4.5 and 7.5). This prevents candidate goals from
-    # jumping outside the corridor when the original goal gets rejected.
-    corridor_min = jnp.float32(4.5) + GOAL_CLEARANCE
-    corridor_max = jnp.float32(7.5) - GOAL_CLEARANCE
+    # bounds. The gap is randomized per episode, so derive it from the wall
+    # boxes (box 0 = left wall, box 1 = right wall) instead of hardcoding it.
+    # Clamp both bounds to the centre line so a gap narrower than
+    # 2*GOAL_CLEARANCE degenerates to centred candidates instead of inverting.
+    corridor_left  = jnp.max(obs_boxes[0, 0::2])
+    corridor_right = jnp.min(obs_boxes[1, 0::2])
+    corridor_mid   = 0.5 * (corridor_left + corridor_right)
+    corridor_min = jnp.minimum(corridor_left + GOAL_CLEARANCE, corridor_mid)
+    corridor_max = jnp.maximum(corridor_right - GOAL_CLEARANCE, corridor_mid)
     corridor_x = jax.random.uniform(gkx, (N_GUESSES,), minval=corridor_min, maxval=corridor_max)
     g_guesses_x = jnp.where(jnp.int32(idx) == 4, around_x,
                             jnp.where(jnp.int32(idx) == 1, corridor_x, rand_x))
