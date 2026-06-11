@@ -421,6 +421,13 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
             g2x = g1x
             g2y = jnp.full((N_PRL,), ROOM_H - 0.2)
             people_prl = pack_human(px, py, jnp.full((N_PRL,), -jnp.pi/2), g1x, g1y, g2x, g2y)
+            # Fewer pedestrians in tight gaps: <1.5 m → 2, <2.0 m → 3, else 5.
+            # Slots 0-1 are the wall-huggers, so they survive the cut first;
+            # excess slots are converted to dummies (shapes stay static for XLA).
+            n_active = jnp.where(corridor_width < 1.5, 2,
+                       jnp.where(corridor_width < 2.0, 3, N_PRL))
+            keep = jnp.arange(N_PRL) < n_active
+            people_prl = jnp.where(keep[:, None], people_prl, _make_dummies(N_PRL))
             people = jnp.concatenate([people_prl, _make_dummies(NUM_PEOPLE - N_PRL)], axis=0)
             obs_circles = jnp.zeros((NUM_OBS_CIR, 3))
             return obs_circles, obs_boxes, people
