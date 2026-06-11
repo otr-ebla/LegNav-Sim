@@ -458,18 +458,25 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
             cir_cx, cir_cy = cx[0::2], cy[0::2]        # 3 circles
             box_cx, box_cy = cx[1::2], cy[1::2]        # 3 rectangles
 
+            # A centred obstacle (r≤0.4) physically blocks a gap under ~2.5 m,
+            # so suppress the slalom there: the variant becomes an EMPTY narrow
+            # corridor. This decouples "narrow" from "occupied" so the policy
+            # doesn't learn to crawl through every tight passage preemptively.
+            wide = corridor_width >= 2.5
             circle_rows = jnp.stack([cir_cx, cir_cy, jnp.full((3,), CIR_R)], axis=-1)
+            circle_rows = jnp.where(wide, circle_rows, 0.0)
             obs_circles = jnp.zeros((NUM_OBS_CIR, 3)).at[:3].set(circle_rows)
 
             box_rows = jax.vmap(lambda bx, by: _aabb_box(bx, by, BOX_HW, BOX_HH))(box_cx, box_cy)
+            box_rows = jnp.where(wide, box_rows, 0.0)
             obs_boxes_out = obs_boxes.at[2:5].set(box_rows)   # walls at 0,1; boxes at 2,3,4
 
             people = _make_dummies(NUM_PEOPLE)
             return obs_circles, obs_boxes_out, people
 
-        # Static slalom only when the gap is wide enough to pass a centred
-        # obstacle (r≤0.4 + robot diameter); narrow corridors use humans only.
-        use_static = jax.random.bernoulli(k_mode, 0.5) & (corridor_width >= 2.5)
+        # 50/50 humans vs static at any width; in narrow gaps the static
+        # branch yields an empty corridor (slalom suppressed above).
+        use_static = jax.random.bernoulli(k_mode, 0.5)
         obs_circles, obs_boxes, people = jax.lax.cond(
             use_static, _static_branch, _humans_branch, operand=None)
         return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people

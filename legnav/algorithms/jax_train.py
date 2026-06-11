@@ -6,6 +6,12 @@ import os
 import functools
 import jax
 import jax.numpy as jnp
+
+# Persistent compilation cache: reset/train-step XLA compiles take minutes
+# (300-box map scenarios); cache them on disk so reruns start instantly.
+jax.config.update("jax_compilation_cache_dir",
+                  os.path.expanduser("~/.cache/jax_comp_cache"))
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 5)
 from legnav.core.jax_env_multi import reset_env, step_env
 from legnav.core.jax_wrappers import make_stacked_env, make_autoreset_env
 from legnav.core.jax_network import (
