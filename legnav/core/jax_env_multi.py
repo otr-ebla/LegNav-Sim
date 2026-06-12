@@ -48,8 +48,8 @@ _PROGRESS_COEF =  2.0
 _STEP_PEN      =  -0.075   # Drastically increased. Standing still is no longer a safe haven.
 
 # Smoothness & Rotation penalties (Lowered to unblock exploration)
-_SMOOTH_WEIGHT       =   0.08    # Reduced to stop paralyzing the agent's steering
-_ROT_WEIGHT          =   0.10    # Penalizes angular velocity magnitude; suppresses straight-corridor oscillation
+_SMOOTH_WEIGHT       =   0.3    # Reduced to stop paralyzing the agent's steering
+_ROT_WEIGHT          =   0.20    # Penalizes angular velocity magnitude; suppresses straight-corridor oscillation
 _HEADING_ALIGN_COEF  =   0.12    # Bonus for facing the goal while moving; breaks sinusoidal symmetry
 
 _COMFORT_DIST  = 1.2   # m — personal space boundary
