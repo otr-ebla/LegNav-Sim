@@ -62,7 +62,7 @@ MAX_V_OBS_IDX = 2     # kin_vec[v_norm, w, max_v_norm, ...] at obs head → idx 
 #   2. runs GRAD_UPDATES_PER_CHUNK gradient updates on BATCH_SIZE replay batches
 # The loop stops when TOTAL_ENV_STEPS collected env steps are reached (the
 # WARMUP_STEPS random-action steps that seed the buffer count toward the budget).
-TOTAL_ENV_STEPS        = 12_000_000
+TOTAL_ENV_STEPS        = 70_000_000
 N_ENVS                 = 2048
 COLLECT_STEPS          = 50
 GRAD_UPDATES_PER_CHUNK = 2_500

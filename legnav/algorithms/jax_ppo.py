@@ -38,7 +38,7 @@ from legnav.algorithms.jax_train import (
 # The loop runs  total_updates = total_env_steps // BATCH_SIZE  updates,
 # each doing PPO_EPOCHS × N_MINIBATCHES gradient steps.
 # NUM_ENVS and ROLLOUT_STEPS live in jax_train.py (shared with the baselines).
-DEFAULT_TOTAL_ENV_STEPS = 100_000_000            # env-step budget for the run
+DEFAULT_TOTAL_ENV_STEPS = 70_000_000             # env-step budget for the run
 
 BATCH_SIZE      = NUM_ENVS * ROLLOUT_STEPS       # 1024 × 128 = 131,072 steps/update
 N_MINIBATCHES   = 8
