@@ -3,6 +3,17 @@ jax_network.py — Actor-Critic Neural Network for PPO (CNN + Frame-Stack Attent
 
 The network has been called C.A.L.F. (Convolutional Attention Leg Features)
 
+Pipeline (see architecture figure):
+  LiDAR stack ×N ──► SE(2) scan reprojection (align t-k → t, ego-motion
+  compensation via per-frame deltas Δx, Δy, Δθ) ──► shared 1D-CNN per frame
+  ──► temporal self-attention over N tokens ──► ⊕ global state g_T ──► MLP
+  ──► actor / critic heads.
+
+Obs layout (stacked): [kin_vec(5) | goal_stack(2*stack_dim) | ego_deltas(3*stack_dim) | lidar_stack(num_rays*stack_dim)]
+  g_T = kin_vec ⊕ goal_stack_flat: kin_vec = [v_t, ω_t, v_max, d_t, ρ_t] (current
+  frame only, not stacked) and goal_stack = ego goal vec (g_x, g_y) over the last
+  stack_dim frames, flattened. The ego-motion deltas feed ONLY the
+  (parameter-free) reprojection block, not the fused trunk.
 """
 
 import jax
@@ -11,14 +22,56 @@ import flax.linen as nn
 from flax.linen.initializers import orthogonal, constant
 from typing import Tuple
 import numpy as np
+from legnav.core.jax_env import MAX_LIDAR_DIST, ROBOT_RADIUS
 
 LOG_STD_MIN = -4.0
 LOG_STD_MAX =  0.0
 
 USE_TANH_INSIDE = True
-_STATE_VEC_SIZE = 5
+_KIN_VEC_SIZE   = 5
+_GOAL_VEC_SIZE  = 2    # ego goal vector (g_x, g_y) per frame, stacked like lidar
+_EGO_DELTA_SIZE = 3    # (Δx, Δy, Δθ) of each frame w.r.t. the newest frame
 ATTN_HEADS      = 4    # numero di teste attention sul frame stack
 ATTN_HEAD_DIM   = 16   # dim per head → QKV dim = ATTN_HEADS * ATTN_HEAD_DIM = 64
+
+
+def se2_reproject_stack(lidar_frames: jnp.ndarray, deltas: jnp.ndarray,
+                        num_rays: int) -> jnp.ndarray:
+    """
+    Ego-motion compensation: reproject each LiDAR frame into the newest
+    sensor frame (SE(2) align t-k → t). Geometric, parameter-free.
+
+    lidar_frames: (..., S, num_rays) inverted/normalised ranges (env convention)
+    deltas:       (..., S, 3)        pose (Δx, Δy, Δθ) of frame t-k expressed
+                                     in the current robot frame (newest row = 0)
+    Returns:      (..., S, num_rays) aligned frames, same normalisation.
+
+    Max-range rays are treated as "no return" and are not reprojected;
+    output bins that receive no point stay at max range.
+    """
+    span = MAX_LIDAR_DIST - ROBOT_RADIUS
+    res  = 2.0 * jnp.pi / (num_rays - 1)
+    phi  = -jnp.pi + jnp.arange(num_rays) * res   # ray angles in the robot frame
+
+    def _one_frame(frame, delta):
+        rng = MAX_LIDAR_DIST - frame * span                      # back to metres
+        px  = rng * jnp.cos(phi)                                 # hit points in old frame
+        py  = rng * jnp.sin(phi)
+        c, s = jnp.cos(delta[2]), jnp.sin(delta[2])
+        qx  = c * px - s * py + delta[0]                         # points in current frame
+        qy  = s * px + c * py + delta[1]
+        r   = jnp.sqrt(qx**2 + qy**2 + 1e-12)
+        idx = jnp.clip(jnp.round((jnp.arctan2(qy, qx) + jnp.pi) / res).astype(jnp.int32),
+                       0, num_rays - 1)
+        r   = jnp.where(rng < MAX_LIDAR_DIST - 1e-3, r, jnp.inf)  # drop no-return rays
+        out = jnp.full((num_rays,), MAX_LIDAR_DIST).at[idx].min(r)
+        return jnp.clip((MAX_LIDAR_DIST - out) / span, 0.0, 1.0)
+
+    lead_shape = lidar_frames.shape[:-1]                          # (..., S)
+    flat_f = lidar_frames.reshape((-1, num_rays))
+    flat_d = deltas.reshape((-1, _EGO_DELTA_SIZE))
+    out = jax.vmap(_one_frame)(flat_f, flat_d)
+    return out.reshape((*lead_shape, num_rays))
 
 
 class LidarFrameCNN(nn.Module):
@@ -107,15 +160,21 @@ class SharedEncoder(nn.Module):
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        pose_size  = 3 * self.stack_dim
-        state_size = _STATE_VEC_SIZE
+        kin_size   = _KIN_VEC_SIZE
+        goal_size  = _GOAL_VEC_SIZE * self.stack_dim
+        delta_size = _EGO_DELTA_SIZE * self.stack_dim
 
-        pose_stack = x[..., :pose_size]
-        state_vec  = x[..., pose_size : pose_size + state_size]
-        lidar_flat = x[..., pose_size + state_size:]
+        kin_vec    = x[..., :kin_size]
+        goal_flat  = x[..., kin_size : kin_size + goal_size]
+        delta_flat = x[..., kin_size + goal_size : kin_size + goal_size + delta_size]
+        lidar_flat = x[..., kin_size + goal_size + delta_size:]
 
         batch_shape  = lidar_flat.shape[:-1]
         lidar_frames = lidar_flat.reshape((*batch_shape, self.stack_dim, self.num_rays))
+        delta_frames = delta_flat.reshape((*batch_shape, self.stack_dim, _EGO_DELTA_SIZE))
+
+        # Ego-motion compensation: align every frame to the newest one
+        lidar_frames = se2_reproject_stack(lidar_frames, delta_frames, self.num_rays)
 
         FRAME_FEAT  = 64
         cnn_encoder = LidarFrameCNN(frame_feat=FRAME_FEAT)
@@ -126,8 +185,8 @@ class SharedEncoder(nn.Module):
         attn_out  = FrameStackAttention()(frame_seq)
         attn_flat = attn_out.reshape((*batch_shape, self.stack_dim * FRAME_FEAT))  # (..., 192)
 
-        global_in = jnp.concatenate([pose_stack, state_vec], axis=-1)
-        fused     = jnp.concatenate([attn_flat, global_in], axis=-1)
+        # global state g_T = kin_vec [v, ω, v_max, d, ρ] ⊕ goal_stack flat
+        fused = jnp.concatenate([attn_flat, kin_vec, goal_flat], axis=-1)
 
         shared = nn.relu(
             nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(fused)
@@ -152,12 +211,14 @@ class EndToEndActorCritic(nn.Module):
         STATELESS: takes only the observation, returns (mean, logstd, value).
         No hidden state — compatible with flat forward pass over (T*N, D).
         """
-        pose_size  = 3 * self.stack_dim    # 9
-        state_size = _STATE_VEC_SIZE       # 5
+        kin_size   = _KIN_VEC_SIZE                       # 5
+        goal_size  = _GOAL_VEC_SIZE * self.stack_dim     # 6
+        delta_size = _EGO_DELTA_SIZE * self.stack_dim    # 9
 
-        pose_stack = x[..., :pose_size]
-        state_vec  = x[..., pose_size : pose_size + state_size]
-        lidar_flat = x[..., pose_size + state_size:]
+        kin_vec    = x[..., :kin_size]
+        goal_flat  = x[..., kin_size : kin_size + goal_size]
+        delta_flat = x[..., kin_size + goal_size : kin_size + goal_size + delta_size]
+        lidar_flat = x[..., kin_size + goal_size + delta_size:]
 
         # ── Per-frame CNN → sequence of temporal tokens ───────────────────────
         # LidarFrameCNN is instantiated ONCE: all 3 calls share the same
@@ -166,6 +227,12 @@ class EndToEndActorCritic(nn.Module):
 
         # (..., num_rays * stack_dim) → (..., stack_dim, num_rays)
         lidar_frames = lidar_flat.reshape((*batch_shape, self.stack_dim, self.num_rays))
+        delta_frames = delta_flat.reshape((*batch_shape, self.stack_dim, _EGO_DELTA_SIZE))
+
+        # ── SE(2) ego-motion compensation ─────────────────────────────────────
+        # Past scans are reprojected into the current sensor frame using the
+        # per-frame (Δx, Δy, Δθ) deltas — parameter-free geometric alignment.
+        lidar_frames = se2_reproject_stack(lidar_frames, delta_frames, self.num_rays)
 
         FRAME_FEAT = 64
         cnn_encoder = LidarFrameCNN(frame_feat=FRAME_FEAT)  # single instance → shared weights
@@ -184,11 +251,9 @@ class EndToEndActorCritic(nn.Module):
         attn_out  = FrameStackAttention()(frame_seq)                        # (..., 3, 64)
         attn_flat = attn_out.reshape((*batch_shape, self.stack_dim * FRAME_FEAT))  # (..., 192)
 
-        # ── Global state MLP ──────────────────────────────────────────────────
-        global_in = jnp.concatenate([pose_stack, state_vec], axis=-1)  # (..., 14)
-
         # ── Fused trunk ───────────────────────────────────────────────────────
-        fused = jnp.concatenate([attn_flat, global_in], axis=-1)       # (..., 206)
+        # global state g_T = kin_vec [v_t, ω_t, v_max, d_t, ρ_t] ⊕ goal_stack flat
+        fused = jnp.concatenate([attn_flat, kin_vec, goal_flat], axis=-1)  # (..., 203)
         shared = nn.relu(
             nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(fused)
         )

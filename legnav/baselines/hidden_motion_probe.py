@@ -65,7 +65,7 @@ R_MAX     = 3.0          # only probe human-motion when nearest human within thi
 RIDGE_LAM = 1.0
 VAL_FRAC  = 0.2
 
-_STATE_END = 14          # obs[:14] = pose_stack(9) + state_vec(5) = state_r
+_STATE_END = 11          # obs[:11] = goal_stack(6) + kin_vec(5) = state_r
 
 
 def ridge_r2(X, Y, tr, va, lam=RIDGE_LAM):

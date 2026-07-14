@@ -28,18 +28,18 @@ Environment adaptations (kept on purpose; see request)
     the paper does for its 1D variant.
   * Temporal context is the env's 3-frame stack (stack_dim=3): M attends over
     the 3 encoded frames rather than a long recurrent rollout.
-  * s_r (controller state) is the env's full pose_stack(9)+state_vec(5)=14-D
-    vector. M's auxiliary s_r-prediction target is the most-recent 8-D
-    [pose(3), state_vec(5)] slice (velocity + goal in the robot frame).
+  * s_r (controller state) is the env's full goal_stack(6)+kin_vec(5)=11-D
+    vector. M's auxiliary s_r-prediction target is the most-recent 7-D
+    [goal(2), kin_vec(5)] slice (velocity + goal in the robot frame).
   * Actions are the env's 2-D differential-drive [v, w].
   * Because the env observation is stateless and carries no past actions, M is
     conditioned on the latent sequence only (no action input). This is the one
     necessary deviation from the paper's action-conditioned M.
 
-Obs layout (662D from make_stacked_env, stack_dim=3):
-  obs[:9]    pose_stack   (3 × 3)   frame 0 = oldest, frame 2 = newest
-  obs[9:14]  state_vec    (5)
-  obs[14:]   lidar_stack  (3 × 216) frame 0 = oldest, frame 2 = newest
+Obs layout (659D from make_stacked_env, stack_dim=3):
+  obs[:6]    goal_stack   (3 × 2)   frame 0 = oldest, frame 2 = newest
+  obs[6:11]  kin_vec      (5)
+  obs[11:]   lidar_stack  (3 × 216) frame 0 = oldest, frame 2 = newest
 """
 
 from typing import Tuple
@@ -53,18 +53,18 @@ from flax.linen.initializers import orthogonal, constant
 LOG_STD_MIN = -4.0
 LOG_STD_MAX =  0.0
 
-_POSE_STACK_END = 9
-_STATE_END      = 14
+_GOAL_STACK_END = 6
+_KIN_END        = 11
 NUM_RAYS        = 216
 STACK_DIM       = 3
 
 Z_DIM       = 32     # paper: z latent features are of size 32
 H_DIM       = 64     # paper: h latent features are of size 64
-STATE_R_DIM = 14     # env adaptation: pose_stack(9) + state_vec(5)
-SR_DIM      = 8      # M's goal-velocity target: newest pose(3) + state_vec(5)
+STATE_R_DIM = 11     # env adaptation: goal_stack(6) + kin_vec(5)
+SR_DIM      = 7      # M's goal-velocity target: newest goal(2) + kin_vec(5)
 
 # Dimensionality of the frozen V+M feature vector fed to the controller
-FEAT_DIM = Z_DIM + H_DIM + STATE_R_DIM   # 32 + 64 + 14 = 110
+FEAT_DIM = Z_DIM + H_DIM + STATE_R_DIM   # 32 + 64 + 11 = 107
 
 # Keys in the flat params dict that belong to V (encoder) or M (Transformer).
 # Everything else belongs to controller C.
@@ -272,9 +272,9 @@ class NavRepActorCritic(nn.Module):
     def __call__(self, obs: jnp.ndarray):
         batch_shape = obs.shape[:-1]
 
-        pose_flat  = obs[..., :_POSE_STACK_END]
-        state_vec  = obs[..., _POSE_STACK_END:_STATE_END]
-        lidar_flat = obs[..., _STATE_END:]
+        goal_flat  = obs[..., :_GOAL_STACK_END]
+        kin_vec    = obs[..., _GOAL_STACK_END:_KIN_END]
+        lidar_flat = obs[..., _KIN_END:]
 
         lidar_stack = lidar_flat.reshape(*batch_shape, STACK_DIM, NUM_RAYS)
 
@@ -289,8 +289,8 @@ class NavRepActorCritic(nn.Module):
         z_t = _freeze(z_mean[..., -1, :])                          # (..., Z)
         h_t = _freeze(h_seq[..., -1, :])                           # (..., H)
 
-        state_r = jnp.concatenate([pose_flat, state_vec], axis=-1) # (..., 14)
-        feat    = jnp.concatenate([z_t, h_t, state_r], axis=-1)    # (..., 110)
+        state_r = jnp.concatenate([goal_flat, kin_vec], axis=-1)   # (..., 11)
+        feat    = jnp.concatenate([z_t, h_t, state_r], axis=-1)    # (..., 107)
 
         # Controller (C): policy head
         pi = nn.tanh(nn.Dense(self.hidden_dim,
@@ -329,7 +329,7 @@ class NavRepActorCritic(nn.Module):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class NavRepControllerOnly(nn.Module):
-    """Controller C operating on pre-extracted V+M features (FEAT_DIM = 110).
+    """Controller C operating on pre-extracted V+M features (FEAT_DIM = 107).
 
     Parameter names match the Dense_0..Dense_5 / log_std entries that Flax
     generates inside NavRepActorCritic, so you can pass the controller subset
@@ -385,12 +385,12 @@ def navrep_extract_features(params: dict, obs: jnp.ndarray) -> jnp.ndarray:
         obs:    (..., OBS_SIZE) observation array.
 
     Returns:
-        feat: (..., FEAT_DIM=110) — stop_gradient already applied to z_t / h_t.
+        feat: (..., FEAT_DIM=107) — stop_gradient already applied to z_t / h_t.
     """
     batch_shape = obs.shape[:-1]
-    pose_flat   = obs[..., :_POSE_STACK_END]            # (..., 9)
-    state_vec   = obs[..., _POSE_STACK_END:_STATE_END]  # (..., 5)
-    lidar_flat  = obs[..., _STATE_END:]                 # (..., 3*216)
+    goal_flat   = obs[..., :_GOAL_STACK_END]           # (..., 6)
+    kin_vec     = obs[..., _GOAL_STACK_END:_KIN_END]   # (..., 5)
+    lidar_flat  = obs[..., _KIN_END:]                  # (..., 3*216)
     lidar_stack = lidar_flat.reshape(*batch_shape, STACK_DIM, NUM_RAYS)
 
     # V — encode each of the 3 stacked frames
@@ -406,6 +406,6 @@ def navrep_extract_features(params: dict, obs: jnp.ndarray) -> jnp.ndarray:
     # Most-recent latent / hidden state, frozen
     z_t     = jax.lax.stop_gradient(z_mean[..., -1, :])   # (..., 32)
     h_t     = jax.lax.stop_gradient(h_seq[...,  -1, :])   # (..., 64)
-    state_r = jnp.concatenate([pose_flat, state_vec], axis=-1)  # (..., 14)
+    state_r = jnp.concatenate([goal_flat, kin_vec], axis=-1)  # (..., 11)
 
-    return jnp.concatenate([z_t, h_t, state_r], axis=-1)  # (..., 110)
+    return jnp.concatenate([z_t, h_t, state_r], axis=-1)  # (..., 107)

@@ -8,8 +8,8 @@ Adapted from the original implementation by Alberto's colleague (socialjym/Laser
 Key adaptations
 ---------------
 * Standalone module — no BasePolicy inheritance, no socialjym dependencies.
-* Decodes the **662-dim stacked observation** produced by ``make_stacked_env``
-  (layout: pose_stack 9 + state_vec 5 + lidar_stack 648 = 662 dims).
+* Decodes the **659-dim stacked observation** produced by ``make_stacked_env``
+  (layout: goal_stack 6 + kin_vec 5 + lidar_stack 648 = 659 dims).
 * Works entirely in the robot's **ego frame** (robot at origin, facing +x).
   No absolute world coordinates needed.
 * **Action space**: v ∈ [0, max_v], w ∈ [−1, +1] — rectangular grid,
@@ -29,9 +29,9 @@ Observation layout (from make_stacked_env, stack_dim=3)
 --------------------------------------------------------
 ::
 
-    obs[0:9]    = pose_stack.flatten()     # 3 frames × (gdx_ego/D, gdy_ego/D, θ/π)
-    obs[9:14]   = state_vec               # (v/vmax, w, (vmax−0.2)/1.8, d/D, align/π)
-    obs[14:662] = lidar_stack.flatten()   # 3 frames × 216 inverse-normalised rays
+    obs[0:6]    = goal_stack.flatten()     # 3 frames × (gdx_ego/D, gdy_ego/D)
+    obs[6:11]   = kin_vec                  # (v/vmax, w, (vmax−0.2)/1.8, d/D, align/π)
+    obs[11:659] = lidar_stack.flatten()   # 3 frames × 216 inverse-normalised rays
 
     Frame ordering within each block: index 0 = oldest, index 2 = most recent.
     D = sqrt(ROOM_W² + ROOM_H²) ≈ 16.97 m
@@ -43,7 +43,7 @@ Usage
     from legnav.baselines.dwa_planner import DWA
 
     dwa = DWA()
-    action = dwa.act(obs)           # obs: (662,) → action: (2,) [v, w]
+    action = dwa.act(obs)           # obs: (659,) → action: (2,) [v, w]
 
     # With cost diagnostics:
     action, costs = dwa.act_with_costs(obs)
@@ -51,7 +51,7 @@ Usage
     # Vectorised over N environments (JIT + vmap):
     import jax
     vmap_act = jax.jit(jax.vmap(dwa.act))
-    actions = vmap_act(obs_batch)   # obs_batch: (N, 662) → actions: (N, 2)
+    actions = vmap_act(obs_batch)   # obs_batch: (N, 659) → actions: (N, 2)
 """
 
 import math
@@ -94,12 +94,12 @@ from legnav.core.jax_env import (
 # Observation layout constants (must match jax_env.py + jax_wrappers.py)
 # ---------------------------------------------------------------------------
 _STACK_DIM    = 3               # number of stacked frames
-_POSE_SIZE    = 3               # (gdx_ego/D, gdy_ego/D, θ/π) per frame
-_STATE_VEC_SZ = 5               # (v/vmax, w, (vmax−0.2)/1.8, goal_dist/D, goal_align/π)
+_GOAL_SIZE    = 2               # (gdx_ego/D, gdy_ego/D) per frame
+_KIN_VEC_SZ   = 5               # (v/vmax, w, (vmax−0.2)/1.8, goal_dist/D, goal_align/π)
 
-_POSE_END     = _STACK_DIM * _POSE_SIZE     # 9
-_STATE_END    = _POSE_END + _STATE_VEC_SZ   # 14
-# lidar block: obs[14:662] → reshape to (_STACK_DIM, NUM_RAYS)
+_GOAL_END     = _STACK_DIM * _GOAL_SIZE     # 6
+_KIN_END      = _GOAL_END + _KIN_VEC_SZ     # 11
+# lidar block: obs[11:659] → reshape to (_STACK_DIM, NUM_RAYS)
 
 _MAX_GOAL_DIST = math.sqrt(ROOM_W ** 2 + ROOM_H ** 2)   # ≈ 16.97 m
 
@@ -412,16 +412,16 @@ class DWA:
     @partial(jit, static_argnames=("self",))
     def decode_obs(
         self,
-        obs: jnp.ndarray,   # (662,)
+        obs: jnp.ndarray,   # (659,)
     ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """
-        Extract all DWA inputs from the 662-dim stacked observation.
+        Extract all DWA inputs from the 659-dim stacked observation.
 
         Observation layout (matches make_stacked_env with stack_dim=3)::
 
-            obs[0:9]    pose_stack  — 3 × (gdx_ego/D, gdy_ego/D, θ/π)
-            obs[9:14]   state_vec   — (v/vmax, w, (vmax-0.2)/1.8, d/D, align/π)
-            obs[14:662] lidar_stack — 3 × 216 inverse-normalised readings
+            obs[0:6]    goal_stack  — 3 × (gdx_ego/D, gdy_ego/D)
+            obs[6:11]   kin_vec     — (v/vmax, w, (vmax-0.2)/1.8, d/D, align/π)
+            obs[11:659] lidar_stack — 3 × 216 inverse-normalised readings
 
         Frame ordering: index 0 = oldest, index 2 = most recent.
 
@@ -437,20 +437,20 @@ class DWA:
             (they are likely Salt-&-Pepper noise artefacts at d ≈ 0).
         """
         # ── Split observation ─────────────────────────────────────────────
-        pose_stack = obs[:_POSE_END].reshape(_STACK_DIM, _POSE_SIZE)
-        state_vec  = obs[_POSE_END:_STATE_END]
-        lidar_norm = obs[_STATE_END:].reshape(_STACK_DIM, self.num_rays)
+        goal_stack = obs[:_GOAL_END].reshape(_STACK_DIM, _GOAL_SIZE)
+        kin_vec    = obs[_GOAL_END:_KIN_END]
+        lidar_norm = obs[_KIN_END:].reshape(_STACK_DIM, self.num_rays)
 
         # ── Goal in ego frame (most recent frame = index 2) ───────────────
-        # pose_stack[2, 0] = gdx_ego / _MAX_GOAL_DIST
-        # pose_stack[2, 1] = gdy_ego / _MAX_GOAL_DIST
-        gdx_ego  = pose_stack[-1, 0] * _MAX_GOAL_DIST
-        gdy_ego  = pose_stack[-1, 1] * _MAX_GOAL_DIST
+        # goal_stack[2, 0] = gdx_ego / _MAX_GOAL_DIST
+        # goal_stack[2, 1] = gdy_ego / _MAX_GOAL_DIST
+        gdx_ego  = goal_stack[-1, 0] * _MAX_GOAL_DIST
+        gdy_ego  = goal_stack[-1, 1] * _MAX_GOAL_DIST
         goal_ego = jnp.array([gdx_ego, gdy_ego])
 
         # ── Max linear speed ──────────────────────────────────────────────
-        # state_vec[2] = (max_v − 0.2) / 1.8
-        max_v = state_vec[2] * 1.8 + 0.2
+        # kin_vec[2] = (max_v − 0.2) / 1.8
+        max_v = kin_vec[2] * 1.8 + 0.2
 
         # ── LiDAR → Cartesian point cloud in robot frame ──────────────────
         # lidar_norm[k] = inv_lidar = (MAX_LIDAR_DIST − raw_dist)/(MAX_LIDAR_DIST − ROBOT_RADIUS)
@@ -482,7 +482,7 @@ class DWA:
     @partial(jit, static_argnames=("self",))
     def act(
         self,
-        obs:  jnp.ndarray,          # (662,) stacked observation
+        obs:  jnp.ndarray,          # (659,) stacked observation
         _rng: jax.Array = None,     # unused — DWA is deterministic
     ) -> jnp.ndarray:
         """
@@ -495,7 +495,7 @@ class DWA:
 
         Parameters
         ----------
-        obs : (662,)
+        obs : (659,)
             Stacked observation from ``make_stacked_env``.
         _rng : jax.Array, optional
             Ignored (DWA is deterministic).

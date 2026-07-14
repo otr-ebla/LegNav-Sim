@@ -22,24 +22,52 @@ FIXES vs previous version:
     (driven by get_continuous_curriculum in jax_ppo.py), same as rebuilding
     for max_goal_dist. make_autoreset_env is ghost-agnostic (behaviour is locked in step_fn).
 
-Obs layout: [pose_stack(3*stack_dim=9) | state_vec(5) | lidar_stack(num_rays*stack_dim=648)]
-Total: 9 + 5 + 648 = 662
+  CHANGE — CALF ego-motion compensation obs layout:
+    goal_stack (ego goal vector g_x, g_y over the last stack_dim frames) is
+    kept in the flat obs, flattened next to kin_vec: together they form the
+    global state g_T. kin_vec is NOT stacked (current frame only).
+    A pose_stack (world [x, y, θ] at each frame time) is tracked as well and
+    converted each step into per-frame ego-motion deltas (Δx, Δy, Δθ): the
+    SE(2) pose of frame t-k expressed in the current robot frame. The network
+    uses them to reproject past scans into the current frame (align t-k → t).
+
+Obs layout: [kin_vec(5) | goal_stack(2*stack_dim=6) | ego_deltas(3*stack_dim=9) | lidar_stack(num_rays*stack_dim=648)]
+Total: 5 + 6 + 9 + 648 = 668
 """
 
 import jax
 import jax.numpy as jnp
 import random as _random
 from flax import struct
-from legnav.core.jax_env import EnvState, NUM_RAYS, SINGLE_OBS_SIZE, STATE_VEC_SIZE
+from legnav.core.jax_env import EnvState, NUM_RAYS, SINGLE_OBS_SIZE, KIN_VEC_SIZE, GOAL_VEC_SIZE
 
-POSE_SIZE = 3
+GOAL_SIZE      = GOAL_VEC_SIZE
+EGO_DELTA_SIZE = 3   # (Δx, Δy, Δθ) per frame, in the current robot frame
 
 
 @struct.dataclass
 class StackedEnvState:
     env_state:   EnvState
-    lidar_stack: jnp.ndarray   # (stack_dim, NUM_RAYS)
-    pose_stack:  jnp.ndarray   # (stack_dim, POSE_SIZE)
+    lidar_stack: jnp.ndarray        # (stack_dim, NUM_RAYS)
+    goal_stack:  jnp.ndarray        # (stack_dim, GOAL_SIZE) ego goal vec per frame, oldest first
+    pose_stack:  jnp.ndarray = None  # (stack_dim, 3) world pose [x, y, θ] at each frame time
+
+
+def _ego_deltas(pose_stack: jnp.ndarray) -> jnp.ndarray:
+    """
+    SE(2) pose of each stored frame expressed in the newest frame.
+
+    pose_stack: (stack_dim, 3) world poses [x, y, θ], oldest first.
+    Returns     (stack_dim, 3) [Δx, Δy, Δθ] per frame — newest row is zeros.
+    """
+    cur = pose_stack[-1]
+    dxw = pose_stack[:, 0] - cur[0]
+    dyw = pose_stack[:, 1] - cur[1]
+    c, s = jnp.cos(cur[2]), jnp.sin(cur[2])
+    dx  =  c * dxw + s * dyw
+    dy  = -s * dxw + c * dyw
+    dth = (pose_stack[:, 2] - cur[2] + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
+    return jnp.stack([dx, dy, dth], axis=-1)
 
 
 def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3,
@@ -48,20 +76,25 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3,
     def reset_stacked(key, max_goal_dist: float = 3.0, ghost_prob: float = 1.0, scenario_idx: int = -1, min_goal_dist: float = 0.8, **kwargs):
         # Passes any extra dynamic args (like scenario_idx) gracefully down to the environment
         base_obs, base_state = base_reset_fn(key, max_goal_dist=max_goal_dist, min_goal_dist=min_goal_dist, scenario_idx=scenario_idx, ghost_prob=ghost_prob, **kwargs)
-        pose      = base_obs[0:POSE_SIZE]
-        state_vec = base_obs[POSE_SIZE : POSE_SIZE + STATE_VEC_SIZE]
-        lidar     = base_obs[POSE_SIZE + STATE_VEC_SIZE:]
+        goal      = base_obs[0:GOAL_SIZE]
+        kin_vec   = base_obs[GOAL_SIZE : GOAL_SIZE + KIN_VEC_SIZE]
+        lidar     = base_obs[GOAL_SIZE + KIN_VEC_SIZE:]
 
         lidar_stack = jnp.tile(lidar[None, :], (stack_dim, 1))
-        pose_stack  = jnp.tile(pose[None,  :], (stack_dim, 1))
+        goal_stack  = jnp.tile(goal[None,  :], (stack_dim, 1))
+
+        pose       = jnp.array([base_state.x, base_state.y, base_state.theta])
+        pose_stack = jnp.tile(pose[None, :], (stack_dim, 1))
 
         stacked_state = StackedEnvState(
             env_state=base_state,
             lidar_stack=lidar_stack,
+            goal_stack=goal_stack,
             pose_stack=pose_stack
         )
         flat_obs = jnp.concatenate([
-            pose_stack.flatten(), state_vec, lidar_stack.flatten()
+            kin_vec, goal_stack.flatten(),
+            _ego_deltas(pose_stack).flatten(), lidar_stack.flatten()
         ])
         return flat_obs, stacked_state
 
@@ -70,20 +103,25 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3,
             key, state.env_state, action
         )
 
-        new_pose      = base_obs[0:POSE_SIZE]
-        new_state_vec = base_obs[POSE_SIZE : POSE_SIZE + STATE_VEC_SIZE]
-        new_lidar     = base_obs[POSE_SIZE + STATE_VEC_SIZE:]
+        new_goal      = base_obs[0:GOAL_SIZE]
+        new_kin_vec   = base_obs[GOAL_SIZE : GOAL_SIZE + KIN_VEC_SIZE]
+        new_lidar     = base_obs[GOAL_SIZE + KIN_VEC_SIZE:]
 
         new_lidar_stack = jnp.concatenate([state.lidar_stack[1:], new_lidar[None]], axis=0)
-        new_pose_stack  = jnp.concatenate([state.pose_stack[1:],  new_pose[None]],  axis=0)
+        new_goal_stack  = jnp.concatenate([state.goal_stack[1:],  new_goal[None]],  axis=0)
+
+        new_pose       = jnp.array([new_base_state.x, new_base_state.y, new_base_state.theta])
+        new_pose_stack = jnp.concatenate([state.pose_stack[1:], new_pose[None]], axis=0)
 
         new_stacked_state = StackedEnvState(
             env_state=new_base_state,
             lidar_stack=new_lidar_stack,
+            goal_stack=new_goal_stack,
             pose_stack=new_pose_stack
         )
         flat_obs = jnp.concatenate([
-            new_pose_stack.flatten(), new_state_vec, new_lidar_stack.flatten()
+            new_kin_vec, new_goal_stack.flatten(),
+            _ego_deltas(new_pose_stack).flatten(), new_lidar_stack.flatten()
         ])
         return flat_obs, new_stacked_state, reward, done, info
 

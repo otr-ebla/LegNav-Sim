@@ -33,8 +33,8 @@ FOV            = 2.0 * math.pi
 DEPLOY_MAX_V   = 0.46
 
 STACK_DIM      = 3
-POSE_SIZE      = 3
-STATE_VEC_SIZE = 5
+GOAL_SIZE      = 2
+KIN_VEC_SIZE   = 5
 MAX_GOAL_DIST  = math.hypot(12.0, 12.0)
 MODEL_PATH = paths.checkpoint("ppo", "ppo_attn_final.msgpack")
 
@@ -65,7 +65,7 @@ class PatrolNodeJAX(Node):
 
         # ── Observation stacks ────────────────────────────────────────────────
         self.lidar_stack = deque(maxlen=STACK_DIM)
-        self.pose_stack  = deque(maxlen=STACK_DIM)
+        self.goal_stack  = deque(maxlen=STACK_DIM)
         self.latest_scan_normalized = np.zeros(NUM_RAYS, dtype=np.float32)
 
         # ── Patrol state ──────────────────────────────────────────────────────
@@ -83,7 +83,7 @@ class PatrolNodeJAX(Node):
         self.get_logger().info(f"Loading JAX model from {MODEL_PATH}")
         self.rng = jax.random.PRNGKey(0)
 
-        obs_size = POSE_SIZE * STACK_DIM + STATE_VEC_SIZE + NUM_RAYS * STACK_DIM
+        obs_size = GOAL_SIZE * STACK_DIM + KIN_VEC_SIZE + NUM_RAYS * STACK_DIM
         self.network = EndToEndActorCritic(action_dim=2, stack_dim=STACK_DIM, num_rays=NUM_RAYS)
 
         dummy_obs = jnp.zeros((1, obs_size))
@@ -176,13 +176,12 @@ class PatrolNodeJAX(Node):
         goal_angle = math.atan2(dy, dx)
         goal_align = (goal_angle - self.theta + math.pi) % (2.0 * math.pi) - math.pi
 
-        current_pose = np.array([
+        current_goal = np.array([
             gdx_ego / MAX_GOAL_DIST,
             gdy_ego / MAX_GOAL_DIST,
-            self.theta / math.pi,
         ], dtype=np.float32)
 
-        current_state_vec = np.array([
+        current_kin_vec = np.array([
             self.last_v / max(DEPLOY_MAX_V, 1e-3),
             self.last_w,
             (DEPLOY_MAX_V - 0.2) / 1.8,
@@ -190,20 +189,20 @@ class PatrolNodeJAX(Node):
             goal_align / math.pi,
         ], dtype=np.float32)
 
-        if len(self.pose_stack) == 0:
+        if len(self.goal_stack) == 0:
             for _ in range(STACK_DIM):
-                self.pose_stack.append(current_pose.copy())
+                self.goal_stack.append(current_goal.copy())
                 self.lidar_stack.append(self.latest_scan_normalized.copy())
         else:
-            self.pose_stack.append(current_pose)
+            self.goal_stack.append(current_goal)
             self.lidar_stack.append(self.latest_scan_normalized)
 
-        pose_stack_flat  = np.concatenate(list(self.pose_stack))
+        goal_stack_flat  = np.concatenate(list(self.goal_stack))
         lidar_stack_flat = np.concatenate(list(self.lidar_stack))
 
         obs_flat = np.concatenate([
-            pose_stack_flat,
-            current_state_vec,
+            goal_stack_flat,
+            current_kin_vec,
             lidar_stack_flat,
         ]).astype(np.float32)
 
@@ -238,7 +237,7 @@ class PatrolNodeJAX(Node):
 
             self.last_v = 0.0
             self.last_w = 0.0
-            self.pose_stack.clear()
+            self.goal_stack.clear()
             self.lidar_stack.clear()
             return
 

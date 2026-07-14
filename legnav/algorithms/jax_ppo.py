@@ -1,13 +1,12 @@
 """
-jax_ppo.py
+jax_ppo.py — PPO (stateless actor-critic, flat loss, frame-stack attention)
 """
 
 import os
 import csv
 from legnav import paths
 
-# Use setdefault so an orchestrator script (or the user's shell) can pre-set
-# these before importing this module without being overwritten.
+# setdefault: an orchestrator script or the shell can pre-set these before import.
 os.environ.setdefault("CUDA_VISIBLE_DEVICES",           "0")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.88")
 os.environ.setdefault("TF_GPU_ALLOCATOR",               "cuda_malloc_async")
@@ -16,7 +15,6 @@ import time
 import warnings
 import jax
 import jax.numpy as jnp
-import functools
 
 jax.config.update("jax_default_device", jax.devices("cuda")[0])
 
@@ -27,6 +25,7 @@ import numpy as np
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 from legnav.core.jax_network import EndToEndActorCritic, squash_corrected_log_prob
+from legnav.core.precision import bf16_apply, PRECISION_STR
 import legnav.core.jax_env as jax_env
 from legnav.algorithms.jax_train import (
     collect_rollouts, init_env_state, rebuild_vmap_step,
@@ -34,43 +33,55 @@ from legnav.algorithms.jax_train import (
 )
 
 
-# ── Hyperparameters ───────────────────────────────────────────────────────────
-GAMMA          = 0.99
-GAE_LAMBDA     = 0.95
-CLIP_EPS       = 0.2
-VF_COEF        = 0.25
-ENTROPY_COEF   = 0.015   # initial value (suc=0) — continuously interpolated by curriculum
-MAX_GRAD_NORM  = 0.5
-PPO_EPOCHS     = 6
+# ══ Training length ═══════════════════════════════════════════════════════════
+# One update = one on-policy batch of NUM_ENVS × ROLLOUT_STEPS env steps.
+# The loop runs  total_updates = total_env_steps // BATCH_SIZE  updates,
+# each doing PPO_EPOCHS × N_MINIBATCHES gradient steps.
+# NUM_ENVS and ROLLOUT_STEPS live in jax_train.py (shared with the baselines).
+DEFAULT_TOTAL_ENV_STEPS = 100_000_000            # env-step budget for the run
+
+BATCH_SIZE      = NUM_ENVS * ROLLOUT_STEPS       # 1024 × 128 = 131,072 steps/update
+N_MINIBATCHES   = 8
+MINI_BATCH_SIZE = BATCH_SIZE // N_MINIBATCHES
+PPO_EPOCHS      = 6
+assert BATCH_SIZE % N_MINIBATCHES == 0
+
+_OPT_STEPS_PER_UPDATE = PPO_EPOCHS * N_MINIBATCHES   # gradient steps per update
+
+# ══ Optimisation ══════════════════════════════════════════════════════════════
+# LR: linear warm-up over the first WARMUP_UPDATES updates, then linear decay
+# to LR_END over the remainder of the budget (schedule built inside train()).
 LR_START       = 2.5e-4
 LR_END         = 1e-5
 LR_MIN         = 1e-5
 WARMUP_UPDATES = 5
+_WARMUP_OPT_STEPS = WARMUP_UPDATES * _OPT_STEPS_PER_UPDATE
+MAX_GRAD_NORM  = 0.5
 
-DEFAULT_TOTAL_ENV_STEPS = 100_000_000    # default budget; override via train(total_env_steps=...)
+# ══ PPO loss ══════════════════════════════════════════════════════════════════
+GAMMA        = 0.99
+GAE_LAMBDA   = 0.95
+CLIP_EPS     = 0.2
+VF_COEF      = 0.25
+ENTROPY_COEF = 0.015   # initial value (suc=0) — continuously interpolated by curriculum
 
-# ── Minibatch geometry ────────────────────────────────────────────────────────
-# Flat loss over (T*N) samples. Shuffle full batch then split into minibatches.
-BATCH_SIZE      = NUM_ENVS * ROLLOUT_STEPS          # 65_536
-N_MINIBATCHES   = 8
-assert BATCH_SIZE % N_MINIBATCHES == 0
-MINI_BATCH_SIZE = BATCH_SIZE // N_MINIBATCHES       # 8_192
+# ══ Logging ═══════════════════════════════════════════════════════════════════
+PRINT_EVERY = 5        # print a progress line every N updates (CSV logs every update)
 
-_OPT_STEPS_PER_UPDATE = PPO_EPOCHS * N_MINIBATCHES
-_WARMUP_OPT_STEPS     = WARMUP_UPDATES * _OPT_STEPS_PER_UPDATE
+network   = EndToEndActorCritic(action_dim=2)
+net_apply = bf16_apply(network.apply)   # bf16 forward, fp32 outputs/params
 
-network = EndToEndActorCritic(action_dim=2)
-
+# ══ Curriculum ════════════════════════════════════════════════════════════════
+# Each dimension is interpolated over rolling success %:
+#   goal distance, ghost probability, entropy coef, max unlocked scenario.
+#   20%→Parallel  35%→Perpend  50%→Circular  60%→Bottleneck+Intersect  70%→ALL(Groups)
+#   82%→harder test-style scenarios (7-12)   90%→floor CCW tour (17)
+# Visual-only scenarios 13-15 and the static NPZ map (16) are redirected to 0
+# inside generate_scenario.
 _SUC_ANCHORS  = np.array([0.0, 20.0, 35.0, 50.0, 60.0, 70.0, 82.0, 90.0, 100.0])
 _DIST_ANCHORS = np.array([1.5,  1.5,  2.5,  4.0,  6.0,  7.5,  9.0,  9.0,   9.0])
 _GHOST_ANCHORS= np.array([0.0,  0.02, 0.05, 0.10, 0.20, 0.35, 0.55, 0.8,   1.0])
 _ENT_ANCHORS  = np.array([0.02, 0.02, 0.018, 0.015, 0.012, 0.01, 0.008, 0.006, 0.005])
-# Scenarios unlock one at a time, all visible by 60% rolling success.
-# Ghost probability ramps slower to avoid passive-collision feedback loop.
-#   20%→Parallel  35%→Perpend  50%→Circular  60%→Bottleneck+Intersect  70%→ALL(Groups)
-#   82%→harder test-style scenarios (7-12)   90%→floor CCW tour (17)
-# Visual-only scenarios 13-15 and the static NPZ map (16) are automatically
-# redirected to 0 inside generate_scenario.
 _SCEN_ANCHORS = np.array([0,    1,    2,    3,    5,    6,    12,   17,    17])
 
 def get_continuous_curriculum(suc_pct: float):
@@ -116,8 +127,6 @@ def normalize_batch_rewards(rewards, dones, running_ret, rms_state, gamma):
 scheduler = None
 optimizer = None
 
-
-# ── Episode-outcome helpers (invariati) ───────────────────────────────────────
 
 @jax.jit
 def collect_episode_outcomes(rewards, dones, goal_reached, collision, passive_col, active_col):
@@ -170,8 +179,6 @@ def compute_gae(rewards, values, dones, last_val):
     return adv, returns
 
 
-# ── PPO loss — forward pass PIATTO su (T*N) sample ────────────────────────────
-
 @jax.jit
 def ppo_loss_fn(
     params,
@@ -183,11 +190,7 @@ def ppo_loss_fn(
     max_v_mb,       # (MB,)
     entropy_coef,   # () — JAX scalar, varies continuously with curriculum
 ):
-    """
-    Parallel forward pass over MB = MINI_BATCH_SIZE samples.
-    No lax.scan: fully vectorized in a single GPU kernel.
-    """
-    mean, logstd, values = network.apply({"params": params}, obs_mb)
+    mean, logstd, values = net_apply({"params": params}, obs_mb)
 
     log_prob    = squash_corrected_log_prob(actions_mb, mean, logstd, max_v_mb)
     ratio       = jnp.exp(log_prob - old_log_probs)
@@ -206,16 +209,11 @@ def ppo_loss_fn(
     return total_loss, (policy_loss, value_loss, entropy, kl_div, clip_frac)
 
 
-# ── Minibatch update — shuffle over (T*N), split into N_MINIBATCHES chunks ────
-
 @jax.jit
 def ppo_update_epoch(carry, perm):
-    """
-    perm: (BATCH_SIZE,) — permutation over all T*N samples.
-    """
+    """One epoch: shuffle all T*N samples with `perm`, then N_MINIBATCHES steps."""
     params, opt_state, obs_flat, actions_flat, adv_flat, ret_flat, old_lp_flat, max_v_flat, entropy_coef = carry
 
-    # Apply permutation
     obs_p     = obs_flat[perm]
     actions_p = actions_flat[perm]
     adv_p     = adv_flat[perm]
@@ -252,25 +250,19 @@ def ppo_update_epoch(carry, perm):
 @jax.jit
 def run_ppo_updates(train_state, obs_seq, actions_seq, adv_seq, ret_seq,
                     old_lp_seq, max_v_seq, rng_key, entropy_coef):
-    """
-    obs_seq: (T, N, OBS_SIZE) — reshaped to (T*N, OBS_SIZE) for flat loss.
-    entropy_coef: JAX scalar with the current curriculum entropy value.
-    """
+    """Flatten (T, N, ...) rollouts to (T*N, ...) and run PPO_EPOCHS epochs."""
     params, opt_state = train_state
 
-    # Flatten time × envs
     TN = BATCH_SIZE
     obs_flat     = obs_seq.reshape(TN, OBS_SIZE)
     actions_flat = actions_seq.reshape(TN, -1)
     max_v_flat   = max_v_seq.reshape(TN)
     old_lp_flat  = old_lp_seq.reshape(TN)
 
-    # Normalizza advantages sull'intero batch
     adv_flat = adv_seq.reshape(TN)
     adv_flat = (adv_flat - adv_flat.mean()) / (adv_flat.std() + 1e-8)
     ret_flat = ret_seq.reshape(TN)
 
-    # One permutation per epoch over all T*N samples
     perms = jax.vmap(lambda k: jax.random.permutation(k, TN))(
         jax.random.split(rng_key, PPO_EPOCHS)
     )
@@ -280,8 +272,6 @@ def run_ppo_updates(train_state, obs_seq, actions_seq, adv_seq, ret_seq,
     last_aux = jax.tree_util.tree_map(lambda x: x[-1, -1], all_auxes)
     return (carry[0], carry[1]), all_losses.mean(), last_aux
 
-
-# ── Checkpoint helpers (invariati) ────────────────────────────────────────────
 
 def save_checkpoint(params, opt_state, filepath=paths.checkpoint("ppo", "ppo_model_best.msgpack")):
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
@@ -303,13 +293,10 @@ def load_checkpoint(dummy_params, dummy_opt_state,
 
 # ── Main training loop ────────────────────────────────────────────────────────
 
-LOG_EVERY = 1
-
-
 def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     """Run PPO training for a fixed env-step budget.
 
-    The LR schedule and the loop length are derived from `total_env_steps`.
+    Both the loop length and the LR schedule are derived from `total_env_steps`.
     The module-level `optimizer` and `scheduler` globals are rebuilt here so
     that the @jax.jit-compiled `ppo_update_epoch` (which references
     `optimizer` as a free variable) traces against the freshly built one.
@@ -340,12 +327,12 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     print(f"  Minibatches : {N_MINIBATCHES} x {MINI_BATCH_SIZE} sample  (flat T*N)")
     print(f"  Budget      : {total_env_steps:,} env steps  →  {total_updates} updates")
     print(f"  VF_COEF={VF_COEF}  ENTROPY_COEF={ENTROPY_COEF}")
+    print(f"  Precision   : {PRECISION_STR} (GPU compute)")
     print(f"  Continuous curriculum anchors: suc={list(_SUC_ANCHORS)}\n")
 
     rng = jax.random.PRNGKey(42)
     rng, init_rng, env_rng = jax.random.split(rng, 3)
 
-    # Network init stateless
     dummy_obs = jnp.zeros((1, OBS_SIZE))
     params    = network.init(init_rng, dummy_obs)["params"]
 
@@ -359,7 +346,6 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
         ckpt_path       = paths.checkpoint("ppo", "ppo_circles_best.msgpack")
         final_ckpt_path = paths.checkpoint("ppo", "ppo_circles_final.msgpack")
 
-    # Curriculum state
     cur_max_dist, cur_ghost, cur_ent, cur_max_scen = get_continuous_curriculum(0.0)
     rolling_suc  = 0.0
     highest_rolling_suc = 0.0
@@ -385,7 +371,6 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     os.makedirs(str(paths.CHECKPOINTS_DIR), exist_ok=True)
     _log_file = open(_LOG_PATH, "w", newline="")
     _log_writer = csv.writer(_log_file)
-    # Added sigma_v and sigma_w to the tracked metrics
     _log_writer.writerow(["step", "mean_ep_reward", "suc_pct", "acol_pct", "pcol_pct", "tmo_pct", "sigma_v", "sigma_w"])
 
     hdr = (f"{'Upd':>5} | {'EpRet':>7} | {'Suc%':>5} {'Obs%':>5} {'Acol%':>5} {'Pcol%':>5} {'Tmo%':>5} |"
@@ -403,7 +388,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
             rng, rollout_rng, update_rng = jax.random.split(rng, 3)
 
             rollout_history, env_state, env_obs, last_val = collect_rollouts(
-                rollout_rng, train_state[0], network.apply, vmap_step,
+                rollout_rng, train_state[0], net_apply, vmap_step,
                 env_state, env_obs, cur_max_dist, jnp.int32(-1), cur_ghost,
                 jnp.int32(cur_max_scen)   # max_scenario: upper bound for random draw
             )
@@ -440,40 +425,33 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
             else:
                 mean_ret, suc_pct, obs_pct, acol_pct, pcol_pct, tmo_pct = 0., 0., 0., 0., 0., 0.
 
-            # ── Monotonic curriculum ──────────────────────────────────────
-            # Once a level is passed it can never be unlearned: both the
-            # tracking signal (`highest_rolling_suc`) and the per-dimension
-            # curriculum state (`cur_max_dist`, `cur_ghost`, `cur_max_scen`)
-            # are strictly non-decreasing.
+            # Monotonic curriculum: tracking signal and per-dimension state are
+            # strictly non-decreasing — a passed level is never unlearned.
             if n_ep > 0:
                 rolling_suc         = 0.9 * rolling_suc + 0.1 * suc_pct
                 highest_rolling_suc = max(highest_rolling_suc, rolling_suc)
 
             new_max_dist, new_ghost, new_ent, new_max_scen = get_continuous_curriculum(highest_rolling_suc)
 
-            # Salva la rappresentazione arrotondata per bloccare lo spam dei float
             old_print_dist = round(cur_max_dist, 1)
             old_print_ghost = round(cur_ghost, 2)
             old_print_scen = cur_max_scen
 
             if new_max_dist > cur_max_dist:
-                # smooth-step distance (0.2 m / update) — impedisce shock da salto di distanza
+                # smooth-step distance (0.2 m / update) to avoid difficulty shocks
                 cur_max_dist = min(cur_max_dist + 0.2, new_max_dist)
             if new_ghost > cur_ghost:
                 cur_ghost = new_ghost
             if new_max_scen > cur_max_scen:
                 cur_max_scen = new_max_scen
 
-            # Emetti il log solo se il delta è sufficientemente grande da cambiare l'output visibile
-            if (round(cur_max_dist, 1) > old_print_dist or 
-                round(cur_ghost, 2) > old_print_ghost or 
+            if (round(cur_max_dist, 1) > old_print_dist or
+                round(cur_ghost, 2) > old_print_ghost or
                 cur_max_scen > old_print_scen):
                 print(f"  -> Curriculum advanced: dist={cur_max_dist:.1f}m, "
                       f"ghost_prob={cur_ghost:.2f}, unlocked_scenarios=0-{cur_max_scen}")
 
-            # Always draw scenario_idx uniformly from [0, cur_max_scen] at each
-            # reset (done inside generate_scenario via jax.random.randint).
-            # Passing -1 here tells the env to use the random draw.
+            # scenario_idx = -1 → env draws uniformly from [0, cur_max_scen] at each reset
             cur_scenario = -1
             entropy_coef = jnp.array(new_ent)
 
@@ -493,7 +471,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
 
             fps = BATCH_SIZE / (time.time() - t0)
 
-            if update % 5 == 0:
+            if update % PRINT_EVERY == 0:
                 p_loss, v_loss, entropy, kl_div, clip_frac = aux
                 lr_now       = float(scheduler(update * _OPT_STEPS_PER_UPDATE))
                 ent_coef_now = float(entropy_coef)
@@ -510,7 +488,6 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
                 )
 
             if n_ep > 0:
-                # Extract the current sigma at this specific update step
                 dummy_obs_for_log = jnp.zeros((1, OBS_SIZE))
                 _, curr_logstd, _ = network.apply({"params": train_state[0]}, dummy_obs_for_log)
                 curr_sigma = jax.device_get(jnp.exp(curr_logstd[0]))
@@ -535,14 +512,10 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     print(f"\nDone! {elapsed/3600:.2f}h | Best success: {best_suc:.1f}%")
     save_checkpoint(train_state[0], train_state[1], final_ckpt_path)
 
-    # --- ADDITION: Extraction and printing of the estimated Sigma ---
-    # Pass a dummy observation to make the network compute the exact logstd
     dummy_obs = jnp.zeros((1, OBS_SIZE))
     _, final_logstd, _ = network.apply({"params": train_state[0]}, dummy_obs)
-    
-    # Calculate the standard deviation: sigma = exp(logstd)
     final_sigma = jax.device_get(jnp.exp(final_logstd[0]))
-    
+
     print("\n" + "="*55)
     print(" 🔍 FINAL EXPLORATORY NOISE (SIGMA) ANALYSIS ")
     print("="*55)

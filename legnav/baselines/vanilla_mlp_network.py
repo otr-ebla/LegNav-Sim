@@ -24,12 +24,12 @@ class VanillaMLPActorCritic(nn.Module):
     """
     Two-hidden-layer MLP actor-critic for navigation.
 
-    The full 662-dim stacked observation is fed directly into the first
+    The full 659-dim stacked observation is fed directly into the first
     linear layer — no CNN, no attention, no LiDAR-specific processing.
 
     Architecture::
 
-        obs (662,)
+        obs (659,)
           Dense(hidden_dim=128) → ReLU
           Dense(hidden_dim=128) → ReLU    ← shared trunk
           ├─ Dense(action_dim=2)                          → mean
@@ -52,7 +52,7 @@ class VanillaMLPActorCritic(nn.Module):
         """
         Parameters
         ----------
-        obs : (..., 662) float32
+        obs : (..., 659) float32
 
         Returns
         -------

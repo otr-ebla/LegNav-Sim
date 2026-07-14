@@ -4,7 +4,7 @@ navrep_jax_env.py — Gymnasium wrapper for the JAX indoor navigation environmen
 Exposes a NavRep-compatible observation structure:
   observation_space = Dict{
       "lidar":       Box(0, 1, shape=(216,))   — inverted lidar scan (1=free, 0=obstacle)
-      "robot_state": Box(-inf, inf, shape=(8,)) — [goal_dx, goal_dy, theta_norm,
+      "robot_state": Box(-inf, inf, shape=(7,)) — [goal_dx, goal_dy,
                                                     v_norm, w, max_v_norm, dist_norm, align_norm]
   }
   action_space = Box([0., -1.], [1., 1.]) for [v_raw, w_raw]
@@ -34,11 +34,11 @@ for _p in (_JAX_ENV_DIR, _SRC_DIR, _ROOT_DIR):
 from legnav.core.jax_env_multi import reset_env, step_env  # noqa: E402
 
 _LIDAR_DIM  = 216
-_ROBOT_DIM  = 8   # pose(3) + state_vec(5)
+_ROBOT_DIM  = 7   # goal_vec(2) + kin_vec(5)
 
 
 def _split_obs(obs_j) -> dict:
-    """Split flat 224-D JAX obs into NavRep-compatible numpy dict."""
+    """Split flat 223-D JAX obs into NavRep-compatible numpy dict."""
     obs = np.asarray(obs_j)
     return {
         "robot_state": obs[:_ROBOT_DIM].astype(np.float32),

@@ -44,16 +44,16 @@ _jax_env.USE_LEGS     = not args.no_legs
 _jax_env.SENSOR_NOISE = True
 
 from legnav.core.jax_env import (ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS,
-                     DT, MAX_STEPS, STATE_VEC_SIZE as _SVS, get_obs)
+                     DT, MAX_STEPS, KIN_VEC_SIZE as _SVS, get_obs)
 from legnav.core.jax_legs import LEG_RADIUS
 from legnav.core.jax_env_multi import reset_env, step_env
 from legnav.core.jax_wrappers import StackedEnvState
 from legnav.core.jax_network import SharedEncoder
 from legnav.core.jax_scenarios import TEST_ROBOT_WAYPOINTS, TEST_SCENARIO_NAMES
 
-OBS_SIZE   = 662
+OBS_SIZE   = 659
 ACTION_DIM = 2
-POSE_SIZE  = 3
+POSE_SIZE  = 2
 STACK_DIM  = 3
 
 TEST_SCENARIOS  = [7, 8, 9, 10, 11, 12]
@@ -68,26 +68,26 @@ SPACE_COMP_DIST = 0.5  # min surface distance (m) for a "space-compliant" timest
 @jax.jit
 def _reset_stacked(key, v_max, scenario_idx):
     base_obs, base_state = reset_env(key, 9.0, scenario_idx, 0.0)
-    pose      = base_obs[:POSE_SIZE]
-    state_vec = base_obs[POSE_SIZE: POSE_SIZE + _SVS]
+    goal      = base_obs[:POSE_SIZE]
+    kin_vec   = base_obs[POSE_SIZE: POSE_SIZE + _SVS]
     lidar     = base_obs[POSE_SIZE + _SVS:]
     base_state = base_state.replace(max_v=v_max)
-    new_sv = jnp.array([0.0, 0.0, (v_max - 0.2) / 1.8, state_vec[3], state_vec[4]])
+    new_sv = jnp.array([0.0, 0.0, (v_max - 0.2) / 1.8, kin_vec[3], kin_vec[4]])
     lidar_stack = jnp.tile(lidar[None, :], (STACK_DIM, 1))
-    pose_stack  = jnp.tile(pose[None, :],  (STACK_DIM, 1))
-    stacked = StackedEnvState(env_state=base_state, lidar_stack=lidar_stack, pose_stack=pose_stack)
-    flat = jnp.concatenate([pose_stack.flatten(), new_sv, lidar_stack.flatten()])
+    goal_stack  = jnp.tile(goal[None, :],  (STACK_DIM, 1))
+    stacked = StackedEnvState(env_state=base_state, lidar_stack=lidar_stack, goal_stack=goal_stack)
+    flat = jnp.concatenate([goal_stack.flatten(), new_sv, lidar_stack.flatten()])
     return flat, stacked
 
 @jax.jit
 def _step_stacked(key, state: StackedEnvState, action):
     base_obs, new_env, reward, done, info = step_env(key, state.env_state, action)
-    new_pose  = base_obs[:POSE_SIZE]
+    new_goal  = base_obs[:POSE_SIZE]
     new_sv    = base_obs[POSE_SIZE: POSE_SIZE + _SVS]
     new_lidar = base_obs[POSE_SIZE + _SVS:]
     new_ls = jnp.concatenate([state.lidar_stack[1:], new_lidar[None]], axis=0)
-    new_ps = jnp.concatenate([state.pose_stack[1:],  new_pose[None]],  axis=0)
-    new_st = StackedEnvState(env_state=new_env, lidar_stack=new_ls, pose_stack=new_ps)
+    new_ps = jnp.concatenate([state.goal_stack[1:],  new_goal[None]],  axis=0)
+    new_st = StackedEnvState(env_state=new_env, lidar_stack=new_ls, goal_stack=new_ps)
     flat   = jnp.concatenate([new_ps.flatten(), new_sv, new_ls.flatten()])
     return flat, new_st, reward, done, info
 
@@ -122,14 +122,14 @@ def _advance_waypoint(n_envs, stacked_state, next_gx, next_gy, gr_flag, rng_key)
     new_base_obs, sp_mask = jax.vmap(get_obs)(es, obs_keys)
     es = es.replace(sp_mask=sp_mask)
 
-    new_pose      = new_base_obs[:, :POSE_SIZE]
-    new_state_vec = new_base_obs[:, POSE_SIZE:POSE_SIZE + _SVS]
+    new_goal      = new_base_obs[:, :POSE_SIZE]
+    new_kin_vec   = new_base_obs[:, POSE_SIZE:POSE_SIZE + _SVS]
     new_lidar     = new_base_obs[:, POSE_SIZE + _SVS:]
-    new_pose_stack  = stacked_state.pose_stack.at[:, -1, :].set(new_pose)
+    new_goal_stack  = stacked_state.goal_stack.at[:, -1, :].set(new_goal)
     new_lidar_stack = stacked_state.lidar_stack.at[:, -1, :].set(new_lidar)
-    new_state = StackedEnvState(env_state=es, lidar_stack=new_lidar_stack, pose_stack=new_pose_stack)
+    new_state = StackedEnvState(env_state=es, lidar_stack=new_lidar_stack, goal_stack=new_goal_stack)
     new_obs = jnp.concatenate([
-        new_pose_stack.reshape(n_envs, -1), new_state_vec, new_lidar_stack.reshape(n_envs, -1)
+        new_goal_stack.reshape(n_envs, -1), new_kin_vec, new_lidar_stack.reshape(n_envs, -1)
     ], axis=1)
     return new_obs, new_state
 

@@ -3,8 +3,8 @@ jax_env.py — Core 2D Navigation Environment
 ============================================
 Previous fixes: A (LiDAR anchor), B (passive_col), C (resample cap),
                 D (no nested JIT), E (person spawn clearance).
-Obs layout (single frame): pose(3) + state_vec(5) + lidar(NUM_RAYS) = 224
-Stacked × 3: 9 + 5 + 648 = 662
+Obs layout (single frame): goal_vec(2) + kin_vec(5) + lidar(NUM_RAYS) = 223
+Stacked × 3: 6 + 5 + 648 = 659
 """
 
 import math
@@ -44,9 +44,10 @@ PROGRESS_COEF  = 1.0
 MAX_RESAMPLE_ITERS = 200
 DEFAULT_MIN_GOAL_DIST = 3.0
 
-STATE_VEC_SIZE  = 5   # v, w, max_v_norm, goal_dist, goal_align
+KIN_VEC_SIZE    = 5   # v, w, max_v_norm, goal_dist, goal_align
+GOAL_VEC_SIZE   = 2   # gdx_ego, gdy_ego (goal offset in robot frame)
 _MAX_GOAL_DIST  = math.sqrt(ROOM_W**2 + ROOM_H**2)
-SINGLE_OBS_SIZE = 3 + STATE_VEC_SIZE + NUM_RAYS   # 224
+SINGLE_OBS_SIZE = GOAL_VEC_SIZE + KIN_VEC_SIZE + NUM_RAYS   # 223
 
 # ── Human idle / stop-and-go behaviour ─────────────────────────────────────────────
 # Each step an active human has P_HUMAN_STOP probability of starting a stop.
@@ -141,7 +142,7 @@ def get_obs(state: EnvState, key: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray
       USE_LEGS=False → N_people + N_obs_circles     (cylinder model)
     compute_lidar handles variable circle counts via vmap, so this is fine.
 
-    OBS_SIZE = 662 — the output vector layout is identical.
+    OBS_SIZE = 659 — the output vector layout is identical.
     """
     # ── Build human geometry for LiDAR ───────────────────────────────────────
     # USE_LEGS is a Python bool → resolved at trace time, no conditional overhead
@@ -189,15 +190,13 @@ def get_obs(state: EnvState, key: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray
     goal_dist  = jnp.sqrt(dx**2 + dy**2)
     goal_angle = jnp.arctan2(dy, dx)
     goal_align = (goal_angle - state.theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
-    s_theta    = state.theta / jnp.pi
 
-    pose_vec = jnp.array([
+    goal_vec = jnp.array([
         gdx_ego / _MAX_GOAL_DIST,
         gdy_ego / _MAX_GOAL_DIST,
-        s_theta,
     ])
 
-    state_vec = jnp.array([
+    kin_vec = jnp.array([
         state.v / jnp.maximum(state.max_v, 1e-3),
         state.w,
         (state.max_v - 0.2) / 1.8,
@@ -205,7 +204,7 @@ def get_obs(state: EnvState, key: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray
         goal_align / jnp.pi,
     ])  # (5,)
 
-    return jnp.concatenate([pose_vec, state_vec, inv_lidar]), sp_mask  # 3+5+216 = 224
+    return jnp.concatenate([goal_vec, kin_vec, inv_lidar]), sp_mask  # 2+5+216 = 223
 
 
 # ── Reset ─────────────────────────────────────────────────────────────────────

@@ -34,11 +34,11 @@ jax_env.USE_LEGS = True
 
 from legnav.core.jax_env import ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS, DT, MAX_STEPS, get_obs
 from legnav.core.jax_env_multi import reset_env, step_env
-from legnav.core.jax_wrappers import StackedEnvState
+from legnav.core.jax_wrappers import StackedEnvState, _ego_deltas
 from legnav.core.jax_network import SharedEncoder, EndToEndActorCritic, scale_action_to_env, USE_TANH_INSIDE
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-OBS_SIZE   = 662
+OBS_SIZE   = 668   # kin(5) + goal_stack(2*3) + ego_deltas(3*3) + lidar_stack(216*3)
 ACTION_DIM = 2
 N_ENVS     = 4096
 
@@ -131,47 +131,59 @@ def _squash_action(mean, max_v):
 
 
 # ── Environment Wrappers ────────────────────────────────────────────────────
-from legnav.core.jax_env import STATE_VEC_SIZE as _SVS
+from legnav.core.jax_env import KIN_VEC_SIZE as _SVS
 
-POSE_SIZE  = 3
+POSE_SIZE  = 2
 STACK_DIM  = 3
 
 @jax.jit
 def dynamic_reset_stacked(key, min_dist, scen_idx, target_max_v):
     base_obs, base_state = reset_env(key, min_dist, scen_idx, 0.0)  # ghost_prob=0.0: pedestrians always avoid the robot (matches jax_eval_multi)
-    pose      = base_obs[0:POSE_SIZE]
-    state_vec = base_obs[POSE_SIZE : POSE_SIZE + _SVS]
+    goal      = base_obs[0:POSE_SIZE]
+    kin_vec   = base_obs[POSE_SIZE : POSE_SIZE + _SVS]
     lidar     = base_obs[POSE_SIZE + _SVS:]
 
     base_state = base_state.replace(max_v=target_max_v)
-    # state_vec layout: [v, w, max_v_norm, goal_dist, goal_align]
-    new_state_vec = jnp.array([
+    # kin_vec layout: [v, w, max_v_norm, goal_dist, goal_align]
+    new_kin_vec = jnp.array([
         0.0, 0.0, (target_max_v - 0.2) / 1.8,
-        state_vec[3], state_vec[4],
+        kin_vec[3], kin_vec[4],
     ])
 
     lidar_stack = jnp.tile(lidar[None, :], (STACK_DIM, 1))
-    pose_stack  = jnp.tile(pose[None, :],  (STACK_DIM, 1))
+    goal_stack  = jnp.tile(goal[None, :],  (STACK_DIM, 1))
+    pose        = jnp.array([base_state.x, base_state.y, base_state.theta])
+    pose_stack  = jnp.tile(pose[None, :], (STACK_DIM, 1))
     stacked_state = StackedEnvState(
-        env_state=base_state, lidar_stack=lidar_stack, pose_stack=pose_stack
+        env_state=base_state, lidar_stack=lidar_stack, goal_stack=goal_stack,
+        pose_stack=pose_stack
     )
-    flat_obs = jnp.concatenate([pose_stack.flatten(), new_state_vec, lidar_stack.flatten()])
+    flat_obs = jnp.concatenate([
+        new_kin_vec, goal_stack.flatten(),
+        _ego_deltas(pose_stack).flatten(), lidar_stack.flatten()
+    ])
     return flat_obs, stacked_state
 
 
 @jax.jit
 def step_stacked_headless(key, state: StackedEnvState, action):
     base_obs, new_base_state, reward, done, info = step_env(key, state.env_state, action)
-    new_pose      = base_obs[0:POSE_SIZE]
-    new_state_vec = base_obs[POSE_SIZE : POSE_SIZE + _SVS]
+    new_goal      = base_obs[0:POSE_SIZE]
+    new_kin_vec   = base_obs[POSE_SIZE : POSE_SIZE + _SVS]
     new_lidar     = base_obs[POSE_SIZE + _SVS:]
 
     new_lidar_stack = jnp.concatenate([state.lidar_stack[1:], new_lidar[None]], axis=0)
-    new_pose_stack  = jnp.concatenate([state.pose_stack[1:],  new_pose[None]],  axis=0)
+    new_goal_stack  = jnp.concatenate([state.goal_stack[1:],  new_goal[None]],  axis=0)
+    new_pose        = jnp.array([new_base_state.x, new_base_state.y, new_base_state.theta])
+    new_pose_stack  = jnp.concatenate([state.pose_stack[1:], new_pose[None]], axis=0)
     new_stacked_state = StackedEnvState(
-        env_state=new_base_state, lidar_stack=new_lidar_stack, pose_stack=new_pose_stack
+        env_state=new_base_state, lidar_stack=new_lidar_stack, goal_stack=new_goal_stack,
+        pose_stack=new_pose_stack
     )
-    flat_obs = jnp.concatenate([new_pose_stack.flatten(), new_state_vec, new_lidar_stack.flatten()])
+    flat_obs = jnp.concatenate([
+        new_kin_vec, new_goal_stack.flatten(),
+        _ego_deltas(new_pose_stack).flatten(), new_lidar_stack.flatten()
+    ])
     return flat_obs, new_stacked_state, reward, done, info
 
 
@@ -342,12 +354,23 @@ def load_tqc(path):
 
 
 _CKPT_PATHS = {
-    "PPO": paths.checkpoint("ppo", "ppo_tanh_inside_final.msgpack"),
+    "PPO": paths.checkpoint("ppo", "ppo_legs_best.msgpack"),  # ppo_tanh_inside_final = old 662-obs arch
     "SAC": paths.checkpoint("sac", "sac_final.msgpack"),
     "TQC": paths.checkpoint("tqc", "tqc_final.msgpack"),
 }
 
 _LOADERS = {"PPO": load_ppo, "SAC": load_sac, "TQC": load_tqc}
+
+
+def _check_arch(params):
+    """Reject pre-ego-delta checkpoints (fused trunk was 206 = attn 192 + pose 9 + state 5)."""
+    trunk = params.get("enc", params)
+    in_dim = trunk["Dense_0"]["kernel"].shape[0]
+    if in_dim != 203:
+        raise ValueError(
+            f"trunk input {in_dim} ≠ 203 — trained on the old 662-obs layout "
+            "(no ego-motion deltas), incompatible with the new SE(2) network"
+        )
 
 
 # ── Dashboard plotting ──────────────────────────────────────────────────────
@@ -720,8 +743,8 @@ def _advance_waypoint(stacked_state, next_gx, next_gy, gr_flag, v_max, rng_key):
     Updates goal_x/goal_y in env_state (only where the previous goal was
     reached), resets time_step=0 so each segment gets a fresh MAX_STEPS budget,
     then recomputes obs via get_obs and refreshes the last frame of
-    pose_stack / lidar_stack. Without this the next segment starts with stale
-    goal-relative pose/state_vec and an exhausted time budget, so multi-WP
+    goal_stack / lidar_stack. Without this the next segment starts with stale
+    goal-relative goal/kin_vec and an exhausted time budget, so multi-WP
     success rate is artificially low.
     """
     new_env_state = stacked_state.env_state.replace(
@@ -734,21 +757,23 @@ def _advance_waypoint(stacked_state, next_gx, next_gy, gr_flag, v_max, rng_key):
     new_base_obs, sp_mask = jax.vmap(get_obs)(new_env_state, obs_keys)
     new_env_state = new_env_state.replace(sp_mask=sp_mask)
 
-    new_pose      = new_base_obs[:, :POSE_SIZE]
-    new_state_vec = new_base_obs[:, POSE_SIZE:POSE_SIZE + _SVS]
+    new_goal      = new_base_obs[:, :POSE_SIZE]
+    new_kin_vec   = new_base_obs[:, POSE_SIZE:POSE_SIZE + _SVS]
     new_lidar     = new_base_obs[:, POSE_SIZE + _SVS:]
 
-    new_pose_stack  = stacked_state.pose_stack.at[:, -1, :].set(new_pose)
+    new_goal_stack  = stacked_state.goal_stack.at[:, -1, :].set(new_goal)
     new_lidar_stack = stacked_state.lidar_stack.at[:, -1, :].set(new_lidar)
 
     new_state = StackedEnvState(
         env_state=new_env_state,
         lidar_stack=new_lidar_stack,
-        pose_stack=new_pose_stack,
+        goal_stack=new_goal_stack,
+        pose_stack=stacked_state.pose_stack,
     )
     new_obs = jnp.concatenate([
-        new_pose_stack.reshape(N_TEST_ENVS, -1),
-        new_state_vec,
+        new_kin_vec,
+        new_goal_stack.reshape(N_TEST_ENVS, -1),
+        jax.vmap(_ego_deltas)(stacked_state.pose_stack).reshape(N_TEST_ENVS, -1),
         new_lidar_stack.reshape(N_TEST_ENVS, -1),
     ], axis=1)
     return new_obs, new_state
@@ -1058,6 +1083,7 @@ def main():
             continue
         try:
             params = _LOADERS[name](path)
+            _check_arch(params)
             policies[name] = jax.device_put(params, gpu)
             print(f"  {name}: loaded from {path}")
         except Exception as e:

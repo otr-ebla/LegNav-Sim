@@ -105,8 +105,8 @@ N_WAYPOINTS  = 5
 WP_STEP      = 0.3        # m — inter-waypoint spacing along goal direction
 COORD_NORM   = MAX_LIDAR_DIST  # normalise descriptor coords to ≈ [-1, 1]
 
-# obs index where max_v is encoded:  state_vec starts at 9, max_v_norm is [2]
-MAX_V_OBS_IDX = 11        # obs[11] = (max_v - 0.2) / 1.8
+# obs index where max_v is encoded:  kin_vec starts at 6, max_v_norm is [2]
+MAX_V_OBS_IDX = 8         # obs[8] = (max_v - 0.2) / 1.8
 
 # Lidar ray angles in ego frame (shared constant)
 _ANGLES_ALL  = jnp.linspace(-jnp.pi, jnp.pi, NUM_RAYS)   # all 216 rays used
@@ -344,16 +344,22 @@ class TAGDEncoder(nn.Module):
     @nn.compact
     def __call__(self, obs: jnp.ndarray) -> jnp.ndarray:
         # ── Decode observation ──────────────────────────────────────────────
-        # pose_stack: obs[0:9] = [frame0, frame1 (t-1), frame2 (t)] × 3 dims
-        pose_prev  = obs[3:6]   # (gdx/D, gdy/D, θ/π) at t−1
-        pose_curr  = obs[6:9]   # (gdx/D, gdy/D, θ/π) at t (newest)
-        goal_vec   = obs[6:8]   # (gdx/D, gdy/D) current frame — for waypoints
-        # Lidar frames (inv-normalised):
-        #   obs[14:230]   = frame 0 (oldest)
-        #   obs[230:446]  = frame 1  (t−1)
-        #   obs[446:662]  = frame 2  (t, newest)
-        lidar_prev = obs[14 + NUM_RAYS     : 14 + 2 * NUM_RAYS]  # frame 1  (t−1)
-        lidar_curr = obs[14 + 2 * NUM_RAYS : 14 + 3 * NUM_RAYS]  # frame 2  (t)
+        # goal_stack: obs[0:6] = [frame0, frame1 (t-1), frame2 (t)] × 2 dims
+        # FIXME(theta-removed): the global heading θ was dropped from the obs, so
+        # each goal frame is now 2-D (gdx/D, gdy/D) with no θ. _relative_odom_transform
+        # still expects a per-frame θ, so we pad θ=0 → the rigid-body rotation
+        # compensation is currently a NO-OP (Δθ=0). TAGD runs but its odometry
+        # alignment is DISABLED pending a Δθ source (e.g. w·DT from kin_vec).
+        _zero_theta = jnp.zeros((1,), obs.dtype)
+        pose_prev  = jnp.concatenate([obs[2:4], _zero_theta])  # (gdx/D, gdy/D, θ=0) t−1
+        pose_curr  = jnp.concatenate([obs[4:6], _zero_theta])  # (gdx/D, gdy/D, θ=0) t
+        goal_vec   = obs[4:6]   # (gdx/D, gdy/D) current frame — for waypoints
+        # Lidar frames (inv-normalised); lidar block starts at 11 = goal(6)+kin(5):
+        #   obs[11:227]   = frame 0 (oldest)
+        #   obs[227:443]  = frame 1  (t−1)
+        #   obs[443:659]  = frame 2  (t, newest)
+        lidar_prev = obs[11 + NUM_RAYS     : 11 + 2 * NUM_RAYS]  # frame 1  (t−1)
+        lidar_curr = obs[11 + 2 * NUM_RAYS : 11 + 3 * NUM_RAYS]  # frame 2  (t)
 
         # ── TAGD (odometry-compensated) ────────────────────────────────────
         tagd, curr_sec, _ = compute_tagd(lidar_prev, lidar_curr, pose_prev, pose_curr)

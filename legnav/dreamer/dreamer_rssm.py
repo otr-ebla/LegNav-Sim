@@ -237,12 +237,12 @@ class DreamerEncoder(nn.Module):
 
     @nn.compact
     def __call__(self, obs: jnp.ndarray) -> jnp.ndarray:
-        pose_size  = 3 * self.stack_dim
-        state_size = 5
+        goal_size  = 2 * self.stack_dim
+        kin_size   = 5
 
-        pose_stack = obs[..., :pose_size]
-        state_vec  = obs[..., pose_size : pose_size + state_size]
-        lidar_flat = obs[..., pose_size + state_size:]
+        goal_stack = obs[..., :goal_size]
+        kin_vec    = obs[..., goal_size : goal_size + kin_size]
+        lidar_flat = obs[..., goal_size + kin_size:]
 
         batch_shape = lidar_flat.shape[:-1]
         lidar_cnn   = lidar_flat.reshape((*batch_shape, self.num_rays, self.stack_dim))
@@ -253,7 +253,7 @@ class DreamerEncoder(nn.Module):
         cnn_feat = nn.RMSNorm()(cnn.reshape((*batch_shape, -1)))
 
         # V3: Vector inputs must be symlog transformed
-        global_in   = symlog(jnp.concatenate([pose_stack, state_vec], axis=-1))
+        global_in   = symlog(jnp.concatenate([goal_stack, kin_vec], axis=-1))
         global_feat = nn.swish(nn.Dense(128)(global_in))
 
         fused = jnp.concatenate([cnn_feat, global_feat], axis=-1)

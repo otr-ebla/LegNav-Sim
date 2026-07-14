@@ -64,7 +64,7 @@ _jax_env.SENSOR_NOISE = True
 from legnav.core.jax_env import (ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS,
                      NUM_RAYS, MAX_LIDAR_DIST, FOV, MAX_STEPS, GOAL_RADIUS)
 from legnav.core.jax_env_multi import reset_env, step_env
-from legnav.core.jax_wrappers import make_stacked_env
+from legnav.core.jax_wrappers import make_stacked_env, _ego_deltas
 from legnav.core.jax_scenarios import TEST_ROBOT_WAYPOINTS, TEST_SCENARIO_NAMES
 
 # --- INIZIO MODIFICA: Sovrascriviamo i waypoint dello scenario 9 ---
@@ -144,7 +144,7 @@ def _build_tagd():
 
 _DEFAULT_CKPT["tagd"] = paths.checkpoint("tagd", "tagd_best.msgpack")
 
-OBS_SIZE   = 662
+OBS_SIZE   = 668   # kin(5) + goal_stack(2*3) + ego_deltas(3*3) + lidar_stack(216*3)
 ACTION_DIM = 2
 use_legs   = args.use_legs
 
@@ -307,19 +307,21 @@ def run_interactive():
         env_state = env_state.replace(sp_mask=sp_mask)
         stacked_state = stacked_state.replace(env_state=env_state)
 
-        # Update the stacked observation's pose and state_vec (goal-relative)
-        pose = new_base_obs[:3]
-        state_vec = new_base_obs[3:8]
-        lidar = new_base_obs[8:]
-        new_pose_stack = stacked_state.pose_stack.at[-1].set(pose)
+        # Update the stacked observation's goal and kin_vec (goal-relative)
+        goal = new_base_obs[:2]
+        kin_vec = new_base_obs[2:7]
+        lidar = new_base_obs[7:]
+        new_goal_stack = stacked_state.goal_stack.at[-1].set(goal)
         new_lidar_stack = stacked_state.lidar_stack.at[-1].set(lidar)
         stacked_state = stacked_state.replace(
-            pose_stack=new_pose_stack,
+            goal_stack=new_goal_stack,
             lidar_stack=new_lidar_stack,
         )
-        # Rebuild flat obs
+        # Rebuild flat obs (new 668 layout: kin | goal_stack | ego_deltas | lidar_stack)
         obs = jnp.concatenate([
-            new_pose_stack.flatten(), state_vec, new_lidar_stack.flatten()
+            kin_vec, new_goal_stack.flatten(),
+            _ego_deltas(stacked_state.pose_stack).flatten(),
+            new_lidar_stack.flatten()
         ])
 
         # Waypoint change = goal change, so any stateful policy (MPPI) must
@@ -652,16 +654,17 @@ def run_headless():
                             new_base_obs, sp_mask = _get_obs(env_state, obs_key)
                             env_state = env_state.replace(sp_mask=sp_mask)
                             stacked_state = stacked_state.replace(env_state=env_state)
-                            pose = new_base_obs[:3]
-                            state_vec = new_base_obs[3:8]
-                            lidar = new_base_obs[8:]
+                            goal_vec = new_base_obs[:2]
+                            kin_vec = new_base_obs[2:7]
+                            lidar = new_base_obs[7:]
                             stacked_state = stacked_state.replace(
-                                pose_stack=stacked_state.pose_stack.at[-1].set(pose),
+                                goal_stack=stacked_state.goal_stack.at[-1].set(goal_vec),
                                 lidar_stack=stacked_state.lidar_stack.at[-1].set(lidar),
                             )
                             obs = jnp.concatenate([
-                                stacked_state.pose_stack.flatten(),
-                                state_vec,
+                                kin_vec,
+                                stacked_state.goal_stack.flatten(),
+                                _ego_deltas(stacked_state.pose_stack).flatten(),
                                 stacked_state.lidar_stack.flatten()
                             ])
                             # Waypoint changed → drop stale warm-start plan.

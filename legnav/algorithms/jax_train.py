@@ -39,7 +39,7 @@ GPU_DEVICE = _verify_gpu()
 # Config
 NUM_ENVS      = 1024
 ROLLOUT_STEPS = 128
-OBS_SIZE      = 3 * 3 + 5 + 216 * 3    # 662
+OBS_SIZE      = 5 + 2 * 3 + 3 * 3 + 216 * 3    # 668 = kin(5) + goal_stack(6) + ego_deltas(9) + lidar_stack(648)
 
 _VMAP_STEP_CACHE: dict = {}
 

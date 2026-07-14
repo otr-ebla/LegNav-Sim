@@ -68,6 +68,7 @@ from legnav.core.jax_env_multi import reset_env, step_env
 from legnav.core.jax_wrappers import make_stacked_env, make_autoreset_env
 from legnav.algorithms.jax_ppo import get_continuous_curriculum
 from legnav.baselines.tagd_network import TAGDActor, TAGDCritic
+from legnav.core.precision import bf16_apply, PRECISION_STR
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 def _parse():
@@ -82,7 +83,7 @@ def _parse():
 args = _parse()
 
 # ── Hyper-parameters ──────────────────────────────────────────────────────────
-OBS_SIZE       = 662
+OBS_SIZE       = 659
 ACTION_DIM     = 2
 N_ENVS         = args.envs
 TOTAL_STEPS    = args.steps
@@ -178,6 +179,11 @@ def buf_sample(buf, rng, bs: int):
 actor  = TAGDActor()
 critic = TAGDCritic()
 
+# bf16 forward passes (params + activations); outputs come back fp32 so the
+# Bellman math stays in full precision. See legnav.core.precision.
+actor_apply  = bf16_apply(actor.apply)
+critic_apply = bf16_apply(critic.apply)
+
 actor_opt  = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR_ACTOR))
 critic_opt = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(LR_CRITIC))
 
@@ -203,17 +209,17 @@ def critic_step(cp, cp_opt_state, ap_tgt, cp_tgt,
                 obs, act, rew, next_obs, done):
     def loss_fn(cp_):
         # Compute target actions using target actor
-        target_act = jax.vmap(lambda o: actor.apply({"params": ap_tgt}, o))(next_obs)
+        target_act = jax.vmap(lambda o: actor_apply({"params": ap_tgt}, o))(next_obs)
         target_act = jax.lax.stop_gradient(target_act)
 
         # Target Q
-        q_tgt = jax.vmap(lambda o, a: critic.apply({"params": cp_tgt}, o, a))(
+        q_tgt = jax.vmap(lambda o, a: critic_apply({"params": cp_tgt}, o, a))(
             next_obs, target_act)
         q_tgt = jax.lax.stop_gradient(q_tgt)
         backup = rew + GAMMA * (1.0 - done) * q_tgt  # (B,)
 
         # Online Q
-        q_online = jax.vmap(lambda o, a: critic.apply({"params": cp_}, o, a))(obs, act)
+        q_online = jax.vmap(lambda o, a: critic_apply({"params": cp_}, o, a))(obs, act)
 
         return jnp.mean((q_online - backup) ** 2), jnp.mean(q_online)
 
@@ -226,8 +232,8 @@ def critic_step(cp, cp_opt_state, ap_tgt, cp_tgt,
 @jax.jit
 def actor_step(ap, ap_opt_state, cp, obs):
     def loss_fn(ap_):
-        acts = jax.vmap(lambda o: actor.apply({"params": ap_}, o))(obs)
-        q    = jax.vmap(lambda o, a: critic.apply({"params": cp}, o, a))(obs, acts)
+        acts = jax.vmap(lambda o: actor_apply({"params": ap_}, o))(obs)
+        q    = jax.vmap(lambda o, a: critic_apply({"params": cp}, o, a))(obs, acts)
         return -jnp.mean(q)   # maximise Q
 
     a_loss, grads = jax.value_and_grad(loss_fn)(ap)
@@ -239,7 +245,7 @@ def actor_step(ap, ap_opt_state, cp, obs):
 @jax.jit
 def explore(ap, obs_batch, rng, noise_std):
     def _single(obs):
-        return actor.apply({"params": ap}, obs)
+        return actor_apply({"params": ap}, obs)
     acts  = jax.vmap(_single)(obs_batch)                  # (N, 2)
     noise = jax.random.normal(rng, acts.shape) * noise_std
     noisy = acts + noise
@@ -323,6 +329,7 @@ def train():
 
     print(f"\n{'='*70}")
     print(f"TAGD DDPG training  |  envs={N_ENVS}  steps={TOTAL_STEPS:,}")
+    print(f"precision={PRECISION_STR} (GPU compute)")
     print(f"buffer={BUFFER_CAP:,}  batch={BATCH_SIZE}  "
           f"G_updates/step={G_UPDATES}  warmup={WARMUP_STEPS:,}")
     print(f"{'='*70}\n")

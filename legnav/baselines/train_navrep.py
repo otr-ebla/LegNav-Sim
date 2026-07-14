@@ -58,7 +58,7 @@ import numpy as np
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-# Use TF32 (tensor-float32) for matmuls — free ~2× throughput on Ampere+.
+# TF32 for whatever still runs in fp32 (the bf16 path below covers the nets).
 jax.config.update("jax_default_matmul_precision", "tensorfloat32")
 
 # Persistent XLA compilation cache — avoids full recompile on every restart.
@@ -85,6 +85,7 @@ from legnav.baselines.navrep_network import (
     FEAT_DIM,
     _VM_KEYS,
 )
+from legnav.core.precision import bf16_apply, PRECISION_STR
 
 # ── Hyperparameters (identical to ppo_mlp_baseline.py) ────────────────────────
 GAMMA          = 0.99
@@ -120,6 +121,12 @@ LOG_PATH   = os.path.join(CKPT_DIR, "navrep_training_log.csv")
 # operating on the frozen [z, h, s_r] features.
 network    = NavRepActorCritic(action_dim=2, hidden_dim=64, freeze_vm=True)
 controller = NavRepControllerOnly(action_dim=2, hidden_dim=64)
+
+# bf16 forward passes (params + activations); outputs come back fp32 so the PPO
+# loss / GAE math stays in full precision. See legnav.core.precision.
+net_apply     = bf16_apply(network.apply)
+ctrl_apply    = bf16_apply(controller.apply)
+_extract_feat = bf16_apply(navrep_extract_features)   # frozen V+M forward
 
 scheduler = None
 optimizer = None
@@ -165,7 +172,7 @@ def extract_features(params, obs_seq):
     the 4-conv VAE + 8-block Transformer on all ROLLOUT_STEPS*NUM_ENVS obs in a
     single call exhausts GPU memory.
     """
-    return jax.lax.map(lambda o: navrep_extract_features(params, o), obs_seq)
+    return jax.lax.map(lambda o: _extract_feat(params, o), obs_seq)
 
 
 # ── PPO loss (controller-only, operates on frozen features) ───────────────────
@@ -174,7 +181,7 @@ def extract_features(params, obs_seq):
 def ppo_loss_fn(ctrl_params, feat_mb, actions_mb, advantages_mb, returns_mb,
                 old_log_probs, max_v_mb, entropy_coef):
     """PPO loss for the controller C on pre-extracted V+M features."""
-    mean, logstd, values = controller.apply({"params": ctrl_params}, feat_mb)
+    mean, logstd, values = ctrl_apply({"params": ctrl_params}, feat_mb)
 
     log_prob    = squash_corrected_log_prob(actions_mb, mean, logstd, max_v_mb)
     ratio       = jnp.exp(log_prob - old_log_probs)
@@ -321,7 +328,8 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS,
     print(f"  V+M ckpt    : {vm_ckpt_path}")
     print(f"  Envs        : {NUM_ENVS}  x  steps {ROLLOUT_STEPS}  =  {BATCH_SIZE:,} batch")
     print(f"  Minibatches : {N_MINIBATCHES} x {MINI_BATCH_SIZE}  (flat T*N)")
-    print(f"  Budget      : {total_env_steps:,} env steps  →  {total_updates} updates\n")
+    print(f"  Budget      : {total_env_steps:,} env steps  →  {total_updates} updates")
+    print(f"  Precision   : {PRECISION_STR} (GPU compute)\n")
 
     rng = jax.random.PRNGKey(42)
     rng, init_rng, env_rng = jax.random.split(rng, 3)
@@ -379,7 +387,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS,
     # ── Pre-dispatch the first rollout before the loop ────────────────────────
     rng, _init_rng = jax.random.split(rng)
     _pending_rollout = collect_rollouts(
-        _init_rng, train_state[0], network.apply, vmap_step,
+        _init_rng, train_state[0], net_apply, vmap_step,
         env_state, env_obs, cur_max_dist, jnp.int32(-1), cur_ghost,
         jnp.int32(cur_max_scen),
     )
@@ -426,7 +434,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS,
 
             # ── Pre-dispatch NEXT rollout immediately (GPU pipeline stays full)
             _pending_rollout = collect_rollouts(
-                next_rollout_rng, train_state[0], network.apply, vmap_step,
+                next_rollout_rng, train_state[0], net_apply, vmap_step,
                 env_state, env_obs, cur_max_dist, jnp.int32(-1), cur_ghost,
                 jnp.int32(cur_max_scen),
             )

@@ -17,8 +17,8 @@ Pipeline
 --------
 1. Roll out the HSFM expert (JHSFM Social Force Model toward goal) in the
    vectorised JAX environment (NUM_ENVS in parallel) and record, per step, the
-   newest LiDAR frame (216), the goal-velocity state s_r (8 = newest pose(3) +
-   state_vec(5)) and the done flag (autoreset boundary).
+   newest LiDAR frame (216), the goal-velocity state s_r (7 = newest goal(2) +
+   kin_vec(5)) and the done flag (autoreset boundary).
 2. JOINT-train NavRepWorldModel (encoder + decoder + Transformer M) on sampled
    sub-sequences of those trajectories with the combined loss above.
 3. Save {encoder, decoder, M} to checkpoints_navrep/navrep_vm.msgpack so
@@ -65,13 +65,14 @@ from legnav.baselines.jhsfm_planner import HumanPilot
 from legnav.baselines.navrep_network import (
     NavRepWorldModel, Z_DIM, SR_DIM, NUM_RAYS,
 )
+from legnav.core.precision import bf16_apply, PRECISION_STR
 
 assert ENV_NUM_RAYS == NUM_RAYS, "NUM_RAYS mismatch between env and navrep_network"
 
-# Stacked-obs slices (662D = pose_stack(9) | state_vec(5) | lidar_stack(3*216)).
-# Newest pose = obs[6:9]; state_vec = obs[9:14]; s_r = obs[6:14]; newest LiDAR
+# Stacked-obs slices (659D = goal_stack(6) | kin_vec(5) | lidar_stack(3*216)).
+# Newest goal = obs[4:6]; kin_vec = obs[6:11]; s_r = obs[4:11]; newest LiDAR
 # frame = obs[-216:].
-_SR_LO, _SR_HI = 6, 14
+_SR_LO, _SR_HI = 4, 11
 
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
@@ -164,7 +165,7 @@ def collect_expert_data(total_frames: int, start_rng: jax.Array):
             next_obs, next_state, reward, done, info = vmap_step(step_rngs, current_state, actions)
 
             lidar_frame = next_obs[:, -NUM_RAYS:]          # (N, 216)
-            sr_frame    = next_obs[:, _SR_LO:_SR_HI]       # (N, 8)
+            sr_frame    = next_obs[:, _SR_LO:_SR_HI]       # (N, 7)
             # done[t]=True ⇒ next_obs is the FIRST frame of a fresh episode
             # (scene teleports); the prediction into it must be masked.
             return (next_obs, next_state), (lidar_frame, sr_frame, done)
@@ -211,6 +212,9 @@ def train_joint(lidar_seq, sr_seq, done_seq, epochs: int,
     assert R == NUM_RAYS and sr_seq.shape[-1] == SR_DIM
 
     model = NavRepWorldModel(z_dim=Z_DIM, sr_dim=SR_DIM)
+    # bf16 forward (params + activations); outputs return fp32 so the VAE
+    # reconstruction / KL math stays in full precision.
+    model_apply = bf16_apply(model.apply)
     rng, init_rng, sample_rng = jax.random.split(rng, 3)
     dummy = jnp.zeros((1, SEQ_LEN, NUM_RAYS))
     params = model.init(init_rng, dummy, sample_rng)["params"]
@@ -245,7 +249,7 @@ def train_joint(lidar_seq, sr_seq, done_seq, epochs: int,
             lid_b, sr_b, d_b = jax.vmap(get_seq)(e_ids, s_ts)   # (B,L,216),(B,L,8),(B,L)
 
             def loss_fn(p_):
-                recon, next_recon, sr_pred, z_mean, z_logvar = model.apply(
+                recon, next_recon, sr_pred, z_mean, z_logvar = model_apply(
                     {"params": p_}, lid_b, b_rng
                 )
                 # Reconstruction of the current frames (every frame valid).
@@ -337,6 +341,7 @@ def main():
 
     print("NavRep Pretraining  —  JOINT V + M (paper-recommended)")
     print(f"  expert            : HumanPilot (JHSFM Social Force Model)")
+    print(f"  precision         : {PRECISION_STR} (GPU compute)")
     print(f"  frames            : {args.frames:,}")
     print(f"  epochs            : {args.epochs}")
     print(f"  batches/epoch     : {args.batches_per_epoch}")

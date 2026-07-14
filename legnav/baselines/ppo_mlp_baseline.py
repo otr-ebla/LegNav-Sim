@@ -16,7 +16,7 @@ Serves as an ablation / baseline for benchmarking:
 Differences from ``jax_ppo.py``
 --------------------------------
 * **Network**: ``VanillaMLPActorCritic`` instead of ``EndToEndActorCritic``.
-  The MLP receives the raw 662-dim stacked obs directly — no CNN, no
+  The MLP receives the raw 659-dim stacked obs directly — no CNN, no
   frame-stack attention, no LiDAR-specific feature extraction.
 * **Checkpoints**: saved under ``checkpoints_vanilla_ppo/``.
 * **Log file**: ``checkpoints_vanilla_ppo/ppo_mlp_training_log.csv``.
@@ -28,7 +28,7 @@ Architecture
 ------------
 ::
 
-    obs (662,)
+    obs (659,)
       ↓ Dense(128) → ReLU
       ↓ Dense(128) → ReLU
       ├─ Dense(2)          → action_mean      (actor head)
@@ -114,6 +114,7 @@ from legnav.algorithms.jax_ppo import (
 )
 # Network definition lives in its own lightweight module (safe to import on CPU)
 from legnav.baselines.vanilla_mlp_network import VanillaMLPActorCritic
+from legnav.core.precision import bf16_apply, PRECISION_STR
 
 
 # ── Hyperparameters (identical to jax_ppo.py) ──────────────────────────────
@@ -148,7 +149,8 @@ LOG_PATH        = os.path.join(CKPT_DIR, "ppo_mlp_training_log.csv")
 
 
 # Module-level singleton — referenced by the @jax.jit-compiled loss/update fns
-network = VanillaMLPActorCritic(action_dim=2, hidden_dim=128)
+network   = VanillaMLPActorCritic(action_dim=2, hidden_dim=128)
+net_apply = bf16_apply(network.apply)   # bf16 forward, fp32 outputs/params
 
 # Mutable globals rebuilt inside train()
 scheduler = None
@@ -176,7 +178,7 @@ def ppo_loss_fn(
     Uses the **vanilla MLP** instead of the CNN+Attention encoder.
     Everything else is identical to ``jax_ppo.ppo_loss_fn``.
     """
-    mean, logstd, values = network.apply({"params": params}, obs_mb)
+    mean, logstd, values = net_apply({"params": params}, obs_mb)
 
     log_prob    = squash_corrected_log_prob(actions_mb, mean, logstd, max_v_mb)
     ratio       = jnp.exp(log_prob - old_log_probs)
@@ -345,6 +347,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     print(f"  Minibatches : {N_MINIBATCHES} x {MINI_BATCH_SIZE} sample  (flat T*N)")
     print(f"  Budget      : {total_env_steps:,} env steps  →  {total_updates} updates")
     print(f"  VF_COEF={VF_COEF}  ENTROPY_COEF={ENTROPY_COEF}")
+    print(f"  Precision   : {PRECISION_STR} (GPU compute)")
     print(f"  Continuous curriculum anchors: suc={list(_SUC_ANCHORS)}\n")
 
     rng = jax.random.PRNGKey(42)
@@ -401,7 +404,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
             rng, rollout_rng, update_rng = jax.random.split(rng, 3)
 
             rollout_history, env_state, env_obs, last_val = collect_rollouts(
-                rollout_rng, train_state[0], network.apply, vmap_step,
+                rollout_rng, train_state[0], net_apply, vmap_step,
                 env_state, env_obs, cur_max_dist, jnp.int32(-1), cur_ghost,
                 jnp.int32(cur_max_scen),
             )

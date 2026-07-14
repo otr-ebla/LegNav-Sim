@@ -67,7 +67,7 @@ from legnav.core.jax_env import (ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS,
 from legnav.core.jax_env_multi import reset_env, step_env
 from legnav.core.jax_wrappers import make_stacked_env
 
-OBS_SIZE   = 662
+OBS_SIZE   = 659
 ACTION_DIM = 2
 
 # ── Borrow all rendering from jax_eval_multi (patch argv to silence its parser)

@@ -80,7 +80,7 @@ from legnav.evaluation.jax_eval_multi import (
 )
 _sys.argv = _saved_argv
 
-OBS_SIZE     = 662
+OBS_SIZE     = 659
 ACTION_DIM   = 2
 SCENARIO_IDX = 16
 # Goal-dist budget: diagonal of the 42×67 m floor ≈ 79 m; set a safe ceiling.
@@ -436,15 +436,15 @@ def main():
         new_base_obs, sp_mask = _get_obs(es, obs_key)
         es = es.replace(sp_mask=sp_mask)
         ss = ss.replace(env_state=es)
-        pose     = new_base_obs[:3]
-        state_vec = new_base_obs[3:8]
-        lidar    = new_base_obs[8:]
+        goal     = new_base_obs[:2]
+        kin_vec  = new_base_obs[2:7]
+        lidar    = new_base_obs[7:]
         ss = ss.replace(
-            pose_stack=ss.pose_stack.at[-1].set(pose),
+            goal_stack=ss.goal_stack.at[-1].set(goal),
             lidar_stack=ss.lidar_stack.at[-1].set(lidar),
         )
         obs = jnp.concatenate([
-            ss.pose_stack.flatten(), state_vec, ss.lidar_stack.flatten()
+            ss.goal_stack.flatten(), kin_vec, ss.lidar_stack.flatten()
         ])
         stacked_state = ss
 

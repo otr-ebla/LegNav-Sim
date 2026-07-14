@@ -78,7 +78,7 @@ from legnav.core.jax_env_multi import reset_env, step_env
 from legnav.core.jax_legs import LEG_RADIUS, SHOE_LENGTH, SHOE_WIDTH
 from legnav.core.jax_wrappers import make_stacked_env
 
-OBS_SIZE   = 662
+OBS_SIZE   = 668   # kin(5) + goal_stack(2*3) + ego_deltas(3*3) + lidar_stack(216*3)
 ACTION_DIM = 2
 
 # Yield-score constants — must match the yield reward cone in jax_env_multi.py
@@ -104,12 +104,12 @@ class _OldPPOActor(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        pose_size  = 3 * self.stack_dim
-        state_size = 5
+        goal_size  = 2 * self.stack_dim
+        kin_size   = 5
 
-        pose_stack = x[..., :pose_size]
-        state_vec  = x[..., pose_size : pose_size + state_size]
-        lidar_flat = x[..., pose_size + state_size:]
+        goal_stack = x[..., :goal_size]
+        kin_vec    = x[..., goal_size : goal_size + kin_size]
+        lidar_flat = x[..., goal_size + kin_size:]
 
         batch_shape = lidar_flat.shape[:-1]
         lidar_cnn   = lidar_flat.reshape((*batch_shape, self.num_rays, self.stack_dim))
@@ -121,7 +121,7 @@ class _OldPPOActor(nn.Module):
         cnn_feat = nn.LayerNorm()(cnn.reshape((*batch_shape, -1)))
 
         # MLP State branch
-        global_in   = jnp.concatenate([pose_stack, state_vec], axis=-1)
+        global_in   = jnp.concatenate([goal_stack, kin_vec], axis=-1)
         global_feat = nn.relu(nn.Dense(128)(global_in))
         global_feat = nn.relu(nn.Dense(64)(global_feat))
 
@@ -166,6 +166,15 @@ def _build_ppo_shac():
             raise RuntimeError(
                 "Checkpoint was trained with old 108-ray / state_vec=9 architecture. "
                 "Re-train with the new 216-ray / 360° FOV / state_vec=5 config."
+            )
+
+        # Detect pre-ego-delta checkpoints (fused was 206 = attn 192 + pose 9 + state 5)
+        is_pre_delta = ("Dense_0" in params and params["Dense_0"]["kernel"].shape == (206, 256))
+        if is_pre_delta:
+            raise RuntimeError(
+                "Checkpoint was trained with the old 662-obs layout (pose_stack, no "
+                "ego-motion deltas). Incompatible with the new SE(2) 668-obs network — "
+                "use a new-arch checkpoint (e.g. ppo_legs_best.msgpack) or re-train."
             )
 
         # Heuristic: old-style CNN (no attention) vs new EndToEndActorCritic
@@ -380,7 +389,7 @@ def _build_dwa():
 # ── Default checkpoint paths ───────────────────────────────────────────────────
 
 _DEFAULT_CKPT = {
-    "ppo":  paths.checkpoint("ppo", "ppo_tanh_inside_final.msgpack"), #ppo_attn_final.msgpack",
+    "ppo":  paths.checkpoint("ppo", "ppo_legs_best.msgpack"), #ppo_tanh_inside_final.msgpack (old 662-obs arch)",
     "ppo_circles": paths.checkpoint("ppo", "ppo_circles_best.msgpack"),
     "ppo_legs":    paths.checkpoint("ppo", "ppo_legs_best.msgpack"),
     "shac": paths.checkpoint("ppo", "shac_best.msgpack"),
