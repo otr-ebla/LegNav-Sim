@@ -465,7 +465,7 @@ def deterministic_eval(sep, ahp, env_state, env_obs, rng_key, vmap_step,
 # Donate params, optimizer states, buffer and env state so XLA reuses their
 # device buffers in place — meaningful when the buffer alone is ~3GB at 1M cap.
 @functools.partial(jax.jit, static_argnums=(13,),
-                   donate_argnums=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 22, 23, 24))
+                   donate_argnums=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16))
 def train_chunk(sep, eos, tsep, ahp, ahos,
                 q1p, q1os, q2p, q2os, tq1p, tq2p,
                 la, alo, vmap_step,
