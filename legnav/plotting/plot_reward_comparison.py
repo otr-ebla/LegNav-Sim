@@ -14,7 +14,7 @@ Usage:
 
 import os
 import sys
-import pandas as pd
+import csv
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
@@ -43,15 +43,24 @@ EMA_WEIGHT = 0.90       # smoothing factor (higher → smoother)
 ALPHA_RAW  = 0.20       # opacity for the raw curve behind the EMA
 
 
-def smooth_ema(series, weight=EMA_WEIGHT):
+def _read_csv_columns(filepath, col_step="step", col_reward="mean_ep_reward"):
+    """Read two columns from a CSV using only the stdlib csv module."""
+    steps, rewards = [], []
+    with open(filepath, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            steps.append(float(row[col_step]))
+            rewards.append(float(row[col_reward]))
+    return np.array(steps), np.array(rewards)
+
+
+def smooth_ema(values, weight=EMA_WEIGHT):
     """Exponential moving average, same style as TensorBoard."""
-    smoothed = []
-    last = series.iloc[0]
-    for val in series:
-        s = last * weight + (1 - weight) * val
-        smoothed.append(s)
-        last = s
-    return np.array(smoothed)
+    smoothed = np.empty_like(values)
+    smoothed[0] = values[0]
+    for i in range(1, len(values)):
+        smoothed[i] = smoothed[i - 1] * weight + (1 - weight) * values[i]
+    return smoothed
 
 
 def main():
@@ -86,14 +95,13 @@ def main():
             ax.grid(True, alpha=0.3)
             continue
 
-        df = pd.read_csv(log_path)
-        steps   = df["step"].values / 1e6          # → millions
-        rewards = df["mean_ep_reward"]
+        steps, rewards = _read_csv_columns(log_path)
+        steps_m = steps / 1e6                       # → millions
 
         # raw curve (faint)
-        ax.plot(steps, rewards, color=color, alpha=ALPHA_RAW, linewidth=0.8)
+        ax.plot(steps_m, rewards, color=color, alpha=ALPHA_RAW, linewidth=0.8)
         # EMA overlay
-        ax.plot(steps, smooth_ema(rewards), color=color, linewidth=2.2,
+        ax.plot(steps_m, smooth_ema(rewards), color=color, linewidth=2.2,
                 label=f"{name} (EMA {EMA_WEIGHT})")
 
         ax.set_ylabel("Episode Reward")
