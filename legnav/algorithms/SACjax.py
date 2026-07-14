@@ -63,9 +63,9 @@ MAX_V_OBS_IDX = 2     # kin_vec[v_norm, w, max_v_norm, ...] at obs head → idx 
 # The loop stops when TOTAL_ENV_STEPS collected env steps are reached (the
 # WARMUP_STEPS random-action steps that seed the buffer count toward the budget).
 TOTAL_ENV_STEPS        = 70_000_000
-N_ENVS                 = 2048
+N_ENVS                 = 4096
 COLLECT_STEPS          = 50
-GRAD_UPDATES_PER_CHUNK = 2_500
+GRAD_UPDATES_PER_CHUNK = 1_000
 WARMUP_STEPS           = 10_000
 
 STEPS_PER_CHUNK    = N_ENVS * COLLECT_STEPS                 # 102,400
@@ -73,7 +73,7 @@ TOTAL_CHUNKS       = TOTAL_ENV_STEPS // STEPS_PER_CHUNK     # ~117
 TOTAL_GRAD_UPDATES = TOTAL_CHUNKS * GRAD_UPDATES_PER_CHUNK  # LR-schedule horizon
 
 # ══ Replay buffer ═════════════════════════════════════════════════════════════
-BUFFER_CAP = 1_000_000
+BUFFER_CAP = 300_000
 BATCH_SIZE = 512
 
 # Prioritized Experience Replay: priorities are |TD-error|+ε; sampling
@@ -90,15 +90,15 @@ GAMMA          = 0.99
 TAU            = 0.005
 LR             = 3e-4       # decays linearly to LR*0.1 over TOTAL_GRAD_UPDATES
 ALPHA_LR       = 1e-4
-TARGET_ENTROPY = -1.0
+TARGET_ENTROPY = -2.0
 MAX_GRAD_NORM  = 10.0
 LOG_STD_EPS    = 1e-6
 # Fraction of the actor's gradient allowed into the shared encoder (matches TQCjac).
 ACTOR_ENC_GRAD_SCALE = 0.1
 
 # ══ Logging / eval / safety stops ═════════════════════════════════════════════
-PRINT_EVERY_CHUNKS   = 1     # progress line cadence (CSV logs every chunk)
-EVAL_EVERY_CHUNKS    = 10    # deterministic-eval / best-checkpoint cadence
+PRINT_EVERY_CHUNKS   = 5     # progress line cadence (CSV logs every chunk)
+EVAL_EVERY_CHUNKS    = 5     # deterministic-eval / best-checkpoint cadence
 DIVERGENCE_CRIT_LOSS = 200.0 # stop if mean critic loss exceeds this
 DIVERGENCE_SUC_DROP  = 20.0  # stop if rolling success sits this far below best for 2 chunks
 
@@ -799,13 +799,14 @@ def train():
         if m_crit > DIVERGENCE_CRIT_LOSS:
             print(f"  !! Critic loss {m_crit:.1f} > {DIVERGENCE_CRIT_LOSS:.0f} — training diverged, stopping early.")
             break
-        if n_ep > 0 and rolling_suc < highest_rolling_suc - DIVERGENCE_SUC_DROP:
-            bad_chunks += 1
-            if bad_chunks >= 2:
-                print(f"  !! Rolling success {rolling_suc:.1f}% is ≥{DIVERGENCE_SUC_DROP:.0f}pts below best ({highest_rolling_suc:.1f}%) for 2 chunks — stopping early.")
-                break
-        else:
-            bad_chunks = 0
+        # Early-stop on success collapse disabled — train for the full budget.
+        # if n_ep > 0 and rolling_suc < highest_rolling_suc - DIVERGENCE_SUC_DROP:
+        #     bad_chunks += 1
+        #     if bad_chunks >= 2:
+        #         print(f"  !! Rolling success {rolling_suc:.1f}% is ≥{DIVERGENCE_SUC_DROP:.0f}pts below best ({highest_rolling_suc:.1f}%) for 2 chunks — stopping early.")
+        #         break
+        # else:
+        #     bad_chunks = 0
 
         # Best-checkpoint selection: training suc% is measured under exploration
         # noise and understates the mode policy — evaluate tanh(mean) on fresh

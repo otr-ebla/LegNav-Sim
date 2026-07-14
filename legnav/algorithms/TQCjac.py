@@ -714,13 +714,14 @@ def train():
                 best_suc = det_suc
                 save_checkpoint(sep, tsep, ap, cp, tp, eos, aos, cos, la, laos, n_updates)
                 bad_evals = 0
-            elif det_suc < best_suc - DIVERGENCE_SUC_DROP:
-                bad_evals += 1
-                if bad_evals >= 2:
-                    print(f"  !! Two consecutive evals ≥{DIVERGENCE_SUC_DROP:.0f}% below best ({best_suc:.1f}%) — stopping early.")
-                    break
-            else:
-                bad_evals = 0
+            # Early-stop on success collapse disabled — train for the full budget.
+            # elif det_suc < best_suc - DIVERGENCE_SUC_DROP:
+            #     bad_evals += 1
+            #     if bad_evals >= 2:
+            #         print(f"  !! Two consecutive evals ≥{DIVERGENCE_SUC_DROP:.0f}% below best ({best_suc:.1f}%) — stopping early.")
+            #         break
+            # else:
+            #     bad_evals = 0
 
     # Final checkpoint == best checkpoint.
     import shutil
