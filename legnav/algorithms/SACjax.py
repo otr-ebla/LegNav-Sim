@@ -203,23 +203,7 @@ head_q1_opt    = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.ada
 head_q2_opt    = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(_lr_sched, eps=1e-5))
 alpha_opt      = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(ALPHA_LR, eps=1e-5))
 
-# ── Reward normalization (running RMS, Welford) ───────────────────────────────
-@jax.jit
-def update_reward_rms(mean, var, count, batch):
-    batch_mean = jnp.mean(batch)
-    batch_var = jnp.var(batch)
-    batch_count = batch.shape[0]
-
-    delta = batch_mean - mean
-    tot_count = count + batch_count
-
-    new_mean = mean + delta * batch_count / tot_count
-    m_a = var * count
-    m_b = batch_var * batch_count
-    M2 = m_a + m_b + jnp.square(delta) * count * batch_count / tot_count
-
-    new_var = jnp.where(tot_count > 0, M2 / tot_count, 1.0)
-    return new_mean, new_var, tot_count
+# Reward normalization removed (TQC does not use it, stabilizes Q-values for shared encoder)
 
 
 # ── Action squashing + exact log-prob ─────────────────────────────────────────
@@ -410,7 +394,7 @@ def sac_update(sep, eos, tsep, ahp, ahos, q1p, q1os, q2p, q2os,
 
     # 4. Alpha update
     log_pi_sg = jax.lax.stop_gradient(log_pi_mean)
-    al_grad   = jax.grad(lambda a: -a * (log_pi_sg + TARGET_ENTROPY))(la)
+    al_grad   = jax.grad(lambda a: -jnp.exp(a) * (log_pi_sg + TARGET_ENTROPY))(la)
     al_upd, new_alo = alpha_opt.update(al_grad, alo)
     # Cap α ≤ 0.2 to kill the late-training runaway (α explodes → Q-targets blow
     # up → policy collapses).
@@ -487,11 +471,11 @@ def train_chunk(sep, eos, tsep, ahp, ahos,
                 la, alo, vmap_step,
                 buf, es, eo, key,
                 max_goal_dist, scenario_idx, ghost_prob,
-                max_scenario, rmean, rvar, rcount, beta_per):
+                max_scenario, beta_per):
 
     # Phase 1: collect COLLECT_STEPS env steps, write to buffer
     def _collect_body(carry, _):
-        es_, eo_, buf_, key_, rm_, rv_, rc_ = carry
+        es_, eo_, buf_, key_ = carry
         key_, k_col = jax.random.split(key_)
         new_eo, new_es, obs_b, env_a, rew, done, info, max_v_cur = collect_step(
             sep, ahp, es_, eo_, k_col, vmap_step, max_goal_dist, scenario_idx, ghost_prob, max_scenario
@@ -500,13 +484,12 @@ def train_chunk(sep, eos, tsep, ahp, ahos,
         new_buf = buf_add(buf_, obs_b, env_a, rew, new_eo,
                           terminal.astype(jnp.float32), max_v_cur)
 
-        new_rm, new_rv, new_rc = update_reward_rms(rm_, rv_, rc_, rew)
-
+        # Reward normalization removed
         step_data = (rew, done, info["goal_reached"], info["collision"], info["passive_col"])
-        return (new_es, new_eo, new_buf, key_, new_rm, new_rv, new_rc), step_data
+        return (new_es, new_eo, new_buf, key_), step_data
 
-    (new_es, new_eo, new_buf, key, new_rmean, new_rvar, new_rcount), all_step_data = jax.lax.scan(
-        _collect_body, (es, eo, buf, key, rmean, rvar, rcount), None, length=COLLECT_STEPS
+    (new_es, new_eo, new_buf, key), all_step_data = jax.lax.scan(
+        _collect_body, (es, eo, buf, key), None, length=COLLECT_STEPS
     )
 
     # Phase 2: GRAD_UPDATES_PER_CHUNK gradient steps, PER sample + priority write-back
@@ -520,7 +503,7 @@ def train_chunk(sep, eos, tsep, ahp, ahos,
         )
         b_max_v_next = extract_max_v(b_next)
 
-        norm_b_rew = b_rew / jnp.sqrt(new_rvar + 1e-8)
+        norm_b_rew = b_rew # No normalization
 
         (new_sep_, new_eos_, new_tsep_, new_ahp_, new_ahos_,
          new_q1p_, new_q1os_, new_q2p_, new_q2os_,
@@ -544,8 +527,7 @@ def train_chunk(sep, eos, tsep, ahp, ahos,
 
     new_carry = (new_sep, new_eos, new_tsep, new_ahp, new_ahos,
                  new_q1p, new_q1os, new_q2p, new_q2os, new_tq1p, new_tq2p,
-                 new_la, new_alo, new_buf2, new_es, new_eo, key,
-                 new_rmean, new_rvar, new_rcount)
+                 new_la, new_alo, new_buf2, new_es, new_eo, key)
     return new_carry, all_step_data, all_metrics
 
 
@@ -664,9 +646,7 @@ def train():
     best_suc    = 49.5
     best_ret    = -1e9
 
-    r_mean  = jnp.zeros(())
-    r_var   = jnp.ones(())
-    r_count = jnp.zeros(())
+    # Reward tracking removed
 
     print("Warming up buffer with random actions...")
     # jit once outside the loop — jax.jit(vmap_step) inside the loop would
@@ -725,13 +705,11 @@ def train():
             la, alo, vmap_step,
             replay_buf, env_state, env_obs, train_rng,
             cur_max_dist, cur_scenario, cur_ghost,
-            jnp.int32(cur_max_scen), r_mean, r_var, r_count,
-            jnp.float32(beta_per)
+            jnp.int32(cur_max_scen), jnp.float32(beta_per)
         )
         (sep, eos, tsep, ahp, ahos,
          q1p, q1os, q2p, q2os, tq1p, tq2p,
-         la, alo, replay_buf, env_state, env_obs, train_rng,
-         r_mean, r_var, r_count) = new_carry
+         la, alo, replay_buf, env_state, env_obs, train_rng) = new_carry
 
         chunk       += 1
         n_updates   += GRAD_UPDATES_PER_CHUNK
