@@ -191,6 +191,36 @@ def _build_ppo_shac():
     return init_params, load, infer, 0
 
 
+# ── PPO Asymmetric ─────────────────────────────────────────────────────────────
+# Uses AsymmetricActorCritic from jax_network_asym.py.  The checkpoint contains
+# both actor and (privileged) critic params; at eval time we call .actor() only.
+
+def _build_ppo_asym():
+    from legnav.core.jax_network_asym import AsymmetricActorCritic
+    from legnav.core.jax_network import scale_action_to_env
+    from legnav.core.jax_privileged import PRIV_OBS_SIZE
+
+    net = AsymmetricActorCritic(action_dim=ACTION_DIM)
+    rng = jax.random.PRNGKey(0)
+
+    dummy_obs  = jnp.zeros((1, OBS_SIZE))
+    dummy_priv = jnp.zeros((1, PRIV_OBS_SIZE))
+    init_params = net.init(rng, dummy_obs, dummy_priv)["params"]
+
+    def load(path):
+        with open(path, "rb") as f:
+            raw = f.read()
+        bundle = flax.serialization.msgpack_restore(raw)
+        return bundle.get("params", bundle)
+
+    def infer(params, obs, max_v):
+        # Deploy path: actor only, no privileged input
+        mean, _ = net.apply({"params": params}, obs[None], method=AsymmetricActorCritic.actor)
+        return scale_action_to_env(jnp.squeeze(mean, 0), float(max_v))
+
+    return init_params, load, infer, 0
+
+
 # ── SAC ────────────────────────────────────────────────────────────────────────
 # Uses SharedEncoder (same trunk as PPO) + SACActorHead.
 # Checkpoint keys: "enc_params", "actor_head_params".
@@ -405,8 +435,10 @@ _DEFAULT_CKPT = {
 # ── Policy factory ─────────────────────────────────────────────────────────────
 
 def build_policy(algo):
-    if algo in ("ppo", "shac", "ppo_circles", "ppo_legs", "ppo_asym"):
+    if algo in ("ppo", "shac", "ppo_circles", "ppo_legs"):
         return _build_ppo_shac()    # 4 elementi
+    elif algo == "ppo_asym":
+        return _build_ppo_asym()    # 4 elementi
     elif algo == "sac":
         return _build_sac() + (0,)  # 3 + 1 = 4 elementi
     elif algo == "tqc":
