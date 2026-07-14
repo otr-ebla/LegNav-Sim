@@ -45,7 +45,7 @@ import flax.serialization
 def _parse_args():
     p = argparse.ArgumentParser(description="Universal JAX Evaluation")
     p.add_argument("--algo",     default="ppo",
-                   choices=["ppo", "shac", "sac", "tqc", "mlp", "hsfm", "mppi", "ppo_circles", "ppo_legs"],
+                   choices=["ppo", "shac", "sac", "tqc", "mlp", "hsfm", "mppi", "ppo_circles", "ppo_legs", "ppo_asym"],
                    help="Algorithm whose checkpoint to load. "
                         "'ppo_circles' = PPO model trained with circle humans. "
                         "'ppo_legs' = PPO model trained with legged humans. "
@@ -396,6 +396,7 @@ _DEFAULT_CKPT = {
     "sac":  paths.checkpoint("sac", "sac_best.msgpack"),
     "tqc":  paths.checkpoint("tqc", "tqc_final.msgpack"),
     "mlp":  paths.checkpoint("vanilla_ppo", "ppo_mlp_best.msgpack"),
+    "ppo_asym": paths.checkpoint("ppo_asym", "ppo_asym_legs_best.msgpack"),
     "hsfm": "", # No checkpoint needed
     "mppi": "", # No checkpoint needed
     "dwa":  "", # No checkpoint needed
@@ -404,7 +405,7 @@ _DEFAULT_CKPT = {
 # ── Policy factory ─────────────────────────────────────────────────────────────
 
 def build_policy(algo):
-    if algo in ("ppo", "shac", "ppo_circles", "ppo_legs"):
+    if algo in ("ppo", "shac", "ppo_circles", "ppo_legs", "ppo_asym"):
         return _build_ppo_shac()    # 4 elementi
     elif algo == "sac":
         return _build_sac() + (0,)  # 3 + 1 = 4 elementi
