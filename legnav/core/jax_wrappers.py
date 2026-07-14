@@ -147,6 +147,12 @@ def make_autoreset_env(reset_fn, step_fn):
         final_state = jax.tree_util.tree_map(_select, reset_state, next_state)
         final_obs   = jnp.where(done, reset_obs, obs)
 
+        # True successor obs of THIS transition: when done, final_obs is the NEW
+        # episode's first obs — off-policy learners must bootstrap timeout
+        # transitions (done, terminal=0) from the pre-reset obs, or the TD
+        # target is computed on the wrong state.
+        info = {**info, "final_obs": obs}
+
         return final_obs, final_state, reward, done, info
 
     return step_autoreset

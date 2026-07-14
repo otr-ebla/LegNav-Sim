@@ -64,12 +64,16 @@ MAX_V_OBS_IDX = 2     # kin_vec[v_norm, w, max_v_norm, ...] at obs head → idx 
 # WARMUP_STEPS random-action steps that seed the buffer count toward the budget).
 TOTAL_ENV_STEPS        = 70_000_000
 N_ENVS                 = 4096
-COLLECT_STEPS          = 50
+# COLLECT_STEPS 50 → 25: at 50 each chunk wrote 204,800 transitions into the
+# 300,000-slot buffer (replay depth ~1.5 chunks — effectively on-policy data
+# under off-policy machinery). Halving the chunk doubles both the buffer depth
+# in chunks (~3) and the update-to-data ratio for the same env-step budget.
+COLLECT_STEPS          = 25
 GRAD_UPDATES_PER_CHUNK = 1_000
 WARMUP_STEPS           = 10_000
 
 STEPS_PER_CHUNK    = N_ENVS * COLLECT_STEPS                 # 102,400
-TOTAL_CHUNKS       = TOTAL_ENV_STEPS // STEPS_PER_CHUNK     # ~117
+TOTAL_CHUNKS       = TOTAL_ENV_STEPS // STEPS_PER_CHUNK     # ~683
 TOTAL_GRAD_UPDATES = TOTAL_CHUNKS * GRAD_UPDATES_PER_CHUNK  # LR-schedule horizon
 
 # ══ Replay buffer ═════════════════════════════════════════════════════════════
@@ -89,8 +93,13 @@ _BUF_OBS_DTYPE = jnp.bfloat16  # halves obs storage; cast back to float32 at sam
 GAMMA          = 0.99
 TAU            = 0.005
 LR             = 3e-4       # decays linearly to LR*0.1 over TOTAL_GRAD_UPDATES
-ALPHA_LR       = 1e-4
-TARGET_ENTROPY = -2.0
+# Fixed entropy coefficient — auto-tuning removed. The H*=-2 target was
+# unreachable for this squashed policy (log_pi sits at +4..5 when the policy
+# performs), so α railed against its 0.2 cap and the backup's -α·log_pi term
+# baked ≈ -α·log_pi/(1-γ) ≈ -100 into Q; when log_pi finally dropped, α dived
+# off the cap and the resulting Q-target swings collapsed the run at ~115k upd.
+# A small constant α keeps the entropy bonus a mild regulariser instead.
+ALPHA_FIXED    = 0.05
 MAX_GRAD_NORM  = 10.0
 LOG_STD_EPS    = 1e-6
 # Fraction of the actor's gradient allowed into the shared encoder (matches TQCjac).
@@ -100,7 +109,6 @@ ACTOR_ENC_GRAD_SCALE = 0.1
 PRINT_EVERY_CHUNKS   = 5     # progress line cadence (CSV logs every chunk)
 EVAL_EVERY_CHUNKS    = 5     # deterministic-eval / best-checkpoint cadence
 DIVERGENCE_CRIT_LOSS = 200.0 # stop if mean critic loss exceeds this
-DIVERGENCE_SUC_DROP  = 20.0  # stop if rolling success sits this far below best for 2 chunks
 
 CKPT_DIR  = paths.checkpoint("sac")
 CKPT_PATH = f"{CKPT_DIR}/sac_best.msgpack"
@@ -201,7 +209,6 @@ enc_opt        = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.ada
 head_actor_opt = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(_lr_sched, eps=1e-5))
 head_q1_opt    = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(_lr_sched, eps=1e-5))
 head_q2_opt    = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(_lr_sched, eps=1e-5))
-alpha_opt      = optax.chain(optax.clip_by_global_norm(MAX_GRAD_NORM), optax.adam(ALPHA_LR, eps=1e-5))
 
 # Reward normalization removed (TQC does not use it, stabilizes Q-values for shared encoder)
 
@@ -332,14 +339,14 @@ scale_gradient.defvjp(_scale_gradient_fwd, _scale_gradient_bwd)
 
 @jax.jit
 def sac_update(sep, eos, tsep, ahp, ahos, q1p, q1os, q2p, q2os,
-               tq1p, tq2p, la, alo,
+               tq1p, tq2p,
                obs, action, reward, next_obs, terminal, max_v_obs, max_v_next, is_weights, rng_key):
 
     rng_c, rng_a = jax.random.split(rng_key)
+    alpha = ALPHA_FIXED
 
     # 1. Critic loss (IS-weighted; per-sample TD error returned for PER priorities)
     def _critic_loss(sep_, q1p_, q2p_):
-        alpha = jax.lax.stop_gradient(jnp.exp(la))
         feat_next = jax.lax.stop_gradient(enc_apply({"params": tsep}, next_obs.astype(NET_DTYPE)))
         mean_n, lgs_n = actor_apply({"params": ahp}, feat_next)
         next_act, next_lp = sample_action_sac_batched(rng_c, mean_n, lgs_n, max_v_next)
@@ -369,7 +376,6 @@ def sac_update(sep, eos, tsep, ahp, ahos, q1p, q1os, q2p, q2os,
 
     # 2. Actor loss
     def _actor_loss(ahp_, sep_):
-        alpha = jax.lax.stop_gradient(jnp.exp(la))
         feat_raw = enc_apply({"params": sep_}, obs.astype(NET_DTYPE))
         feat_f   = scale_gradient(feat_raw, ACTOR_ENC_GRAD_SCALE)
         mean, log_std = actor_apply({"params": ahp_}, feat_f)
@@ -392,15 +398,7 @@ def sac_update(sep, eos, tsep, ahp, ahos, q1p, q1os, q2p, q2os,
     enc_upd, new_eos = enc_opt.update(combined_enc_grads, eos, sep)
     new_sep = optax.apply_updates(sep, enc_upd)
 
-    # 4. Alpha update
-    log_pi_sg = jax.lax.stop_gradient(log_pi_mean)
-    al_grad   = jax.grad(lambda a: -jnp.exp(a) * (log_pi_sg + TARGET_ENTROPY))(la)
-    al_upd, new_alo = alpha_opt.update(al_grad, alo)
-    # Cap α ≤ 0.2 to kill the late-training runaway (α explodes → Q-targets blow
-    # up → policy collapses).
-    new_la = jnp.minimum(optax.apply_updates(la, al_upd), jnp.log(0.2))
-
-    # 5. Soft target update
+    # 4. Soft target update
     new_tsep = jax.tree_util.tree_map(lambda t, o: TAU * o + (1.0 - TAU) * t, tsep, new_sep)
     new_tq1p = jax.tree_util.tree_map(lambda t, o: TAU * o + (1.0 - TAU) * t, tq1p, new_q1p)
     new_tq2p = jax.tree_util.tree_map(lambda t, o: TAU * o + (1.0 - TAU) * t, tq2p, new_q2p)
@@ -408,13 +406,12 @@ def sac_update(sep, eos, tsep, ahp, ahos, q1p, q1os, q2p, q2os,
     metrics = {
         "critic_loss": c_loss,
         "actor_loss":  a_loss,
-        "alpha":       jnp.exp(new_la),
         "log_pi":      log_pi_mean,
         "q_mean":      q_mean,
     }
     return (new_sep, new_eos, new_tsep, new_ahp, new_ahos,
             new_q1p, new_q1os, new_q2p, new_q2os,
-            new_tq1p, new_tq2p, new_la, new_alo, td_error, metrics)
+            new_tq1p, new_tq2p, td_error, metrics)
 
 
 # ── Collection step ───────────────────────────────────────────────────────────
@@ -439,7 +436,11 @@ def deterministic_action(mean, max_v):
     tanh_m = jnp.tanh(mean)
     return jnp.stack([(tanh_m[..., 0] + 1.0) * 0.5 * max_v, tanh_m[..., 1]], axis=-1)
 
-EVAL_HORIZON = 2 * MAX_STEPS   # steps per deterministic eval (autoreset → many episodes)
+# Eval budget: 4096 envs × 2·MAX_STEPS cost ~2 chunks of training per eval
+# (every 5 chunks — ~35% overhead). 1024 envs × MAX_STEPS is 8× cheaper and
+# still completes thousands of episodes — plenty for checkpoint selection.
+EVAL_ENVS    = 1024
+EVAL_HORIZON = MAX_STEPS   # steps per deterministic eval (autoreset → many episodes)
 
 @functools.partial(jax.jit, static_argnums=(5, 10))
 def deterministic_eval(sep, ahp, env_state, env_obs, rng_key, vmap_step,
@@ -452,7 +453,7 @@ def deterministic_eval(sep, ahp, env_state, env_obs, rng_key, vmap_step,
         mean, _ = actor_apply({"params": ahp}, feat)
         env_action = deterministic_action(mean, extract_max_v(eo_))
         key_, k_step = jax.random.split(key_)
-        step_keys = jax.random.split(k_step, N_ENVS)
+        step_keys = jax.random.split(k_step, eo_.shape[0])
         new_eo, new_es, rew, done, info = vmap_step(
             step_keys, es_, env_action, max_goal_dist, scenario_idx, ghost_prob, max_scenario
         )
@@ -464,11 +465,11 @@ def deterministic_eval(sep, ahp, env_state, env_obs, rng_key, vmap_step,
 # ── Fused GPU train chunk ─────────────────────────────────────────────────────
 # Donate params, optimizer states, buffer and env state so XLA reuses their
 # device buffers in place — meaningful when the buffer alone is ~3GB at 1M cap.
-@functools.partial(jax.jit, static_argnums=(13,),
-                   donate_argnums=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16))
+@functools.partial(jax.jit, static_argnums=(11,),
+                   donate_argnums=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14))
 def train_chunk(sep, eos, tsep, ahp, ahos,
                 q1p, q1os, q2p, q2os, tq1p, tq2p,
-                la, alo, vmap_step,
+                vmap_step,
                 buf, es, eo, key,
                 max_goal_dist, scenario_idx, ghost_prob,
                 max_scenario, beta_per):
@@ -481,7 +482,10 @@ def train_chunk(sep, eos, tsep, ahp, ahos,
             sep, ahp, es_, eo_, k_col, vmap_step, max_goal_dist, scenario_idx, ghost_prob, max_scenario
         )
         terminal = done & ~info["timeout"]
-        new_buf = buf_add(buf_, obs_b, env_a, rew, new_eo,
+        # info["final_obs"] is the TRUE successor obs (pre-autoreset): new_eo is
+        # already the next episode's first obs on done, which poisons the
+        # bootstrap of timeout transitions (terminal=0 → V(next) is used).
+        new_buf = buf_add(buf_, obs_b, env_a, rew, info["final_obs"],
                           terminal.astype(jnp.float32), max_v_cur)
 
         # Reward normalization removed
@@ -495,7 +499,7 @@ def train_chunk(sep, eos, tsep, ahp, ahos,
     # Phase 2: GRAD_UPDATES_PER_CHUNK gradient steps, PER sample + priority write-back
     def _update_step(update_carry, upd_idx):
         (sep_, eos_, tsep_, ahp_, ahos_,
-         q1p_, q1os_, q2p_, q2os_, tq1p_, tq2p_, la_, alo_, buf_, key_) = update_carry
+         q1p_, q1os_, q2p_, q2os_, tq1p_, tq2p_, buf_, key_) = update_carry
         k_samp = jax.random.fold_in(key_, upd_idx * 2)
         k_upd  = jax.random.fold_in(key_, upd_idx * 2 + 1)
         b_obs, b_act, b_rew, b_next, b_terminal, b_max_v, idxs, weights = buf_sample(
@@ -503,31 +507,29 @@ def train_chunk(sep, eos, tsep, ahp, ahos,
         )
         b_max_v_next = extract_max_v(b_next)
 
-        norm_b_rew = b_rew # No normalization
-
         (new_sep_, new_eos_, new_tsep_, new_ahp_, new_ahos_,
          new_q1p_, new_q1os_, new_q2p_, new_q2os_,
-         new_tq1p_, new_tq2p_, new_la_, new_alo_, td_err_, metrics_) = sac_update(
+         new_tq1p_, new_tq2p_, td_err_, metrics_) = sac_update(
             sep_, eos_, tsep_, ahp_, ahos_,
-            q1p_, q1os_, q2p_, q2os_, tq1p_, tq2p_, la_, alo_,
-            b_obs, b_act, norm_b_rew, b_next, b_terminal, b_max_v, b_max_v_next, weights, k_upd
+            q1p_, q1os_, q2p_, q2os_, tq1p_, tq2p_,
+            b_obs, b_act, b_rew, b_next, b_terminal, b_max_v, b_max_v_next, weights, k_upd
         )
         new_buf_ = buf_update_priorities(buf_, idxs, td_err_)
         return (new_sep_, new_eos_, new_tsep_, new_ahp_, new_ahos_,
                 new_q1p_, new_q1os_, new_q2p_, new_q2os_,
-                new_tq1p_, new_tq2p_, new_la_, new_alo_, new_buf_, key_), metrics_
+                new_tq1p_, new_tq2p_, new_buf_, key_), metrics_
 
     update_carry_init = (sep, eos, tsep, ahp, ahos,
-                         q1p, q1os, q2p, q2os, tq1p, tq2p, la, alo, new_buf, key)
+                         q1p, q1os, q2p, q2os, tq1p, tq2p, new_buf, key)
     (new_sep, new_eos, new_tsep, new_ahp, new_ahos,
      new_q1p, new_q1os, new_q2p, new_q2os,
-     new_tq1p, new_tq2p, new_la, new_alo, new_buf2, key), all_metrics = jax.lax.scan(
+     new_tq1p, new_tq2p, new_buf2, key), all_metrics = jax.lax.scan(
         _update_step, update_carry_init, jnp.arange(GRAD_UPDATES_PER_CHUNK)
     )
 
     new_carry = (new_sep, new_eos, new_tsep, new_ahp, new_ahos,
                  new_q1p, new_q1os, new_q2p, new_q2os, new_tq1p, new_tq2p,
-                 new_la, new_alo, new_buf2, new_es, new_eo, key)
+                 new_buf2, new_es, new_eo, key)
     return new_carry, all_step_data, all_metrics
 
 
@@ -562,7 +564,7 @@ def collect_episode_outcomes(rewards, dones, goal_reached, collision, passive_co
 
 # ── Checkpoint ────────────────────────────────────────────────────────────────
 def save_checkpoint(sep, tsep, ahp, q1p, q2p, tq1p, tq2p,
-                    eos, ahos, q1os, q2os, la, alo, step,
+                    eos, ahos, q1os, q2os, step,
                     filepath=None):
     os.makedirs(CKPT_DIR, exist_ok=True)
     path = filepath or CKPT_PATH
@@ -578,8 +580,8 @@ def save_checkpoint(sep, tsep, ahp, q1p, q2p, tq1p, tq2p,
         "actor_head_opt":    jax.device_get(ahos),
         "q1_opt":            jax.device_get(q1os),
         "q2_opt":            jax.device_get(q2os),
-        "log_alpha":         jax.device_get(la),
-        "alpha_opt_state":   jax.device_get(alo),
+        # α is a fixed constant now; kept in the bundle for loader compatibility.
+        "log_alpha":         float(jnp.log(ALPHA_FIXED)),
         "step":              int(step),
     }
     with open(path, "wb") as f:
@@ -595,7 +597,7 @@ def train():
     same constants at import time, so change them there rather than here)."""
     print("SAC Training  (shared LidarCNN + decoupled Q1/Q2 branches)")
     print(f"  N_ENVS={N_ENVS}  BUFFER={BUFFER_CAP:,}  BATCH={BATCH_SIZE}")
-    print(f"  gamma={GAMMA}  tau={TAU}  lr={LR}  H*={TARGET_ENTROPY}")
+    print(f"  gamma={GAMMA}  tau={TAU}  lr={LR}  alpha={ALPHA_FIXED} (fixed)")
     print(f"  Precision: {PRECISION_STR} (GPU compute)")
     print(f"  Chunk: {STEPS_PER_CHUNK:,} env steps -> {GRAD_UPDATES_PER_CHUNK} grad updates")
     print(f"  Budget: {TOTAL_ENV_STEPS:,} env steps  ->  ~{TOTAL_CHUNKS} chunks\n")
@@ -625,14 +627,10 @@ def train():
     q1os = head_q1_opt.init(q1p)
     q2os = head_q2_opt.init(q2p)
 
-    la   = jnp.array(0.0, dtype=jnp.float32)
-    alo  = alpha_opt.init(la)
-
     from legnav.algorithms.jax_ppo import get_continuous_curriculum
     cur_max_dist, _, _, cur_max_scen = get_continuous_curriculum(0.0)
     cur_ghost = 0.0   # ghosts start disabled regardless of curriculum
     rolling_suc = 0.0
-    highest_rolling_suc = 0.0
     cur_scenario = 0
 
     print("Initialising environments...")
@@ -643,7 +641,7 @@ def train():
     total_steps = 0
     n_updates   = 0
     chunk       = 0
-    best_suc    = 49.5
+    best_suc    = 0.0
     best_ret    = -1e9
 
     # Reward tracking removed
@@ -653,11 +651,11 @@ def train():
     # create a fresh wrapper (and jit cache) per iteration, re-tracing each time.
     vmap_step_jit = jax.jit(vmap_step)
     for _ in range((WARMUP_STEPS // N_ENVS) + 1):
-        k_warmup, k_act, k_step = jax.random.split(k_warmup, 3)
+        k_warmup, k_v, k_w, k_step = jax.random.split(k_warmup, 4)
         obs_before = env_obs
         max_v      = extract_max_v(env_obs)
-        rand_v     = jax.random.uniform(k_act, (N_ENVS,)) * max_v
-        rand_w     = jax.random.uniform(k_act, (N_ENVS,), minval=-1.0, maxval=1.0)
+        rand_v     = jax.random.uniform(k_v, (N_ENVS,)) * max_v
+        rand_w     = jax.random.uniform(k_w, (N_ENVS,), minval=-1.0, maxval=1.0)
         env_action = jnp.stack([rand_v, rand_w], axis=-1)
         step_keys  = jax.random.split(k_step, N_ENVS)
         new_obs, env_state, reward, done, info = vmap_step_jit(
@@ -666,14 +664,14 @@ def train():
         )
         terminal   = done & ~info["timeout"].astype(jnp.bool_)
         replay_buf = buf_add(replay_buf, obs_before, env_action, reward,
-                             new_obs, terminal.astype(jnp.float32), max_v)
+                             info["final_obs"], terminal.astype(jnp.float32), max_v)
         env_obs     = new_obs
         total_steps += N_ENVS
     print("Warmup done. JIT compiling train_chunk (this may take ~5 min — nested scan)...")
 
     hdr = (f"{'Upd':>7} | {'Steps':>10} | {'EpRet':>7} | "
            f"{'Suc%':>5} {'ACo%':>5} {'PCo%':>5} {'Tmo%':>5} | "
-           f"{'CritL':>7} {'ActL':>7} {'Alpha':>6} {'LogPi':>6} {'Qmean':>7} | "
+           f"{'CritL':>7} {'ActL':>7} {'LogPi':>6} {'Qmean':>7} | "
            f"{'FPS':>7} | {'Time':>8} | {'Dist':>5} {'Scen':>4} {'Gst':>4}")
     print(hdr)
     print("─" * len(hdr))
@@ -688,10 +686,8 @@ def train():
                            "pcol_pct", "tmo_pct", "n_ep"])
     _log_file.flush()
 
-    # rolling_suc (training rollouts) is the smoothed early-stop signal;
+    # rolling_suc (training rollouts) drives the curriculum;
     # best-checkpoint selection uses the deterministic eval below.
-    bad_chunks = 0
-
     while total_steps < TOTAL_ENV_STEPS:
         t0 = time.time()
 
@@ -702,14 +698,14 @@ def train():
         new_carry, all_step_data, all_metrics = train_chunk(
             sep, eos, tsep, ahp, ahos,
             q1p, q1os, q2p, q2os, tq1p, tq2p,
-            la, alo, vmap_step,
+            vmap_step,
             replay_buf, env_state, env_obs, train_rng,
             cur_max_dist, cur_scenario, cur_ghost,
             jnp.int32(cur_max_scen), jnp.float32(beta_per)
         )
         (sep, eos, tsep, ahp, ahos,
          q1p, q1os, q2p, q2os, tq1p, tq2p,
-         la, alo, replay_buf, env_state, env_obs, train_rng) = new_carry
+         replay_buf, env_state, env_obs, train_rng) = new_carry
 
         chunk       += 1
         n_updates   += GRAD_UPDATES_PER_CHUNK
@@ -726,22 +722,28 @@ def train():
             pcol_pct = float((ep_pcol * ep_msk).sum() / n_ep) * 100.0
             tmo_pct  = float((ep_tmo  * ep_msk).sum() / n_ep) * 100.0
 
-            # Curriculum: gate on CURRENT rolling success (not the all-time high)
-            # so advancement pauses after each difficulty bump until the policy
-            # consolidates, and cap the per-chunk delta on each axis so a success
-            # spike can't slam dist+scen+ghost up at once. Difficulty itself
-            # never decreases — cur_* only ratchets up.
-            rolling_suc         = 0.80 * rolling_suc + 0.20 * suc_pct
-            highest_rolling_suc = max(highest_rolling_suc, rolling_suc)
+            # Curriculum: rate-limited tracking of the difficulty implied by
+            # CURRENT rolling success — in BOTH directions. The per-chunk delta
+            # cap means a success spike can't slam dist+scen+ghost up at once,
+            # and (unlike the old ratchet) a collapse eases difficulty back so
+            # the policy can recover instead of drowning in max-difficulty
+            # failure data.
+            rolling_suc = 0.80 * rolling_suc + 0.20 * suc_pct
 
             new_max_dist, new_ghost, _, new_max_scen = get_continuous_curriculum(rolling_suc)
 
             if new_max_dist > cur_max_dist:
                 cur_max_dist = min(new_max_dist, cur_max_dist + 0.3)
+            elif new_max_dist < cur_max_dist:
+                cur_max_dist = max(new_max_dist, cur_max_dist - 0.3)
             if new_ghost > cur_ghost:
                 cur_ghost = min(new_ghost, cur_ghost + 0.02)
+            elif new_ghost < cur_ghost:
+                cur_ghost = max(new_ghost, cur_ghost - 0.02)
             if new_max_scen > cur_max_scen:
                 cur_max_scen = min(new_max_scen, cur_max_scen + 1)
+            elif new_max_scen < cur_max_scen:
+                cur_max_scen = max(new_max_scen, cur_max_scen - 1)
 
             cur_scenario = -1
         else:
@@ -761,7 +763,6 @@ def train():
                 f"{suc_pct:>4.1f}% {col_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% | "
                 f"{m_crit:>7.4f} "
                 f"{float(all_metrics['actor_loss'].mean()):>7.4f} "
-                f"{float(all_metrics['alpha'].mean()):>6.4f} "
                 f"{float(all_metrics['log_pi'].mean()):>6.3f} "
                 f"{float(all_metrics['q_mean'].mean()):>7.3f} | "
                 f"{fps:>7,.0f} | "
@@ -777,14 +778,8 @@ def train():
         if m_crit > DIVERGENCE_CRIT_LOSS:
             print(f"  !! Critic loss {m_crit:.1f} > {DIVERGENCE_CRIT_LOSS:.0f} — training diverged, stopping early.")
             break
-        # Early-stop on success collapse disabled — train for the full budget.
-        # if n_ep > 0 and rolling_suc < highest_rolling_suc - DIVERGENCE_SUC_DROP:
-        #     bad_chunks += 1
-        #     if bad_chunks >= 2:
-        #         print(f"  !! Rolling success {rolling_suc:.1f}% is ≥{DIVERGENCE_SUC_DROP:.0f}pts below best ({highest_rolling_suc:.1f}%) for 2 chunks — stopping early.")
-        #         break
-        # else:
-        #     bad_chunks = 0
+        # Success-collapse early stop removed: the bidirectional curriculum above
+        # is the recovery mechanism now (difficulty eases when success drops).
 
         # Best-checkpoint selection: training suc% is measured under exploration
         # noise and understates the mode policy — evaluate tanh(mean) on fresh
@@ -792,7 +787,7 @@ def train():
         curriculum_mature = cur_max_scen >= 1 and cur_max_dist >= 5.0
         if curriculum_mature and (chunk == 1 or chunk % EVAL_EVERY_CHUNKS == 0):
             master_key, k_evr, k_ev = jax.random.split(master_key, 3)
-            ev_obs, ev_state = _vmap_reset(jax.random.split(k_evr, N_ENVS),
+            ev_obs, ev_state = _vmap_reset(jax.random.split(k_evr, EVAL_ENVS),
                                            jnp.float32(cur_max_dist),
                                            jnp.float32(cur_ghost),
                                            jnp.int32(cur_scenario))
@@ -808,7 +803,7 @@ def train():
                 best_suc = det_suc
                 best_ret = mean_ret
                 save_checkpoint(sep, tsep, ahp, q1p, q2p, tq1p, tq2p,
-                                eos, ahos, q1os, q2os, la, alo, n_updates)
+                                eos, ahos, q1os, q2os, n_updates)
 
     # Final checkpoint == best checkpoint: the tail of SAC training often
     # diverges, so the live params at the end can be worse than the best on disk.
@@ -818,7 +813,7 @@ def train():
         print(f"  Final checkpoint -> checkpoints_sac/sac_final.msgpack (copied from best, {best_suc:.1f}%)")
     else:
         save_checkpoint(sep, tsep, ahp, q1p, q2p, tq1p, tq2p,
-                        eos, ahos, q1os, q2os, la, alo, n_updates,
+                        eos, ahos, q1os, q2os, n_updates,
                         filepath=paths.checkpoint("sac", "sac_final.msgpack"))
         print(f"  Final checkpoint -> checkpoints_sac/sac_final.msgpack (no best found, saved current)")
 
