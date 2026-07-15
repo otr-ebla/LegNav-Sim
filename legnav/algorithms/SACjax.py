@@ -3,9 +3,22 @@ branches, prioritized replay, fully fused JIT train chunk."""
 
 import os
 import csv
+import socket
 import argparse
 
 from legnav import paths
+
+# Training is pinned to the `fermi` box (16 GB GPU). The buffer/batch sizes below
+# are tuned for its VRAM, so refuse to run anywhere else rather than OOM or run
+# an untuned config. Override with LEGNAV_ALLOW_ANY_HOST=1 if you know what you
+# are doing.
+_HOST = socket.gethostname().split(".")[0].lower()
+if _HOST != "fermi" and os.environ.get("LEGNAV_ALLOW_ANY_HOST") != "1":
+    raise RuntimeError(
+        f"SAC training is pinned to host 'fermi' but this is '{_HOST}'. "
+        f"Set LEGNAV_ALLOW_ANY_HOST=1 to override (buffer sizes are tuned for "
+        f"fermi's 16 GB GPU and may OOM elsewhere)."
+    )
 
 # GPU selection must happen before `import jax` (CUDA_VISIBLE_DEVICES is read
 # at import time).
@@ -53,7 +66,7 @@ MAX_V_OBS_IDX = 2     # kin_vec[v_norm, w, max_v_norm, ...] → max_v at idx 2
 # ══ Training length ═══════════════════════════════════════════════════════════
 # Training runs in fixed chunks (one fused train_chunk call each): collect
 # COLLECT_STEPS × N_ENVS transitions, then run GRAD_UPDATES_PER_CHUNK gradient
-# updates. With BUFFER_CAP = 600k the buffer holds ~6 chunks of history, so the
+# updates. With BUFFER_CAP = 1.5M the buffer holds ~15 chunks of history, so the
 # critic keeps an anchor of older data if the current policy degrades (at 300k
 # it held ~3 chunks — a collapse flushed all good data within 3 chunks).
 TOTAL_ENV_STEPS        = 70_000_000
@@ -67,10 +80,11 @@ TOTAL_CHUNKS       = TOTAL_ENV_STEPS // STEPS_PER_CHUNK     # ~683
 TOTAL_GRAD_UPDATES = TOTAL_CHUNKS * GRAD_UPDATES_PER_CHUNK  # LR-schedule horizon
 
 # ══ Replay buffer (prioritized: p = |TD|^α, IS weight ∝ (N·P)^-β) ═════════════
-# 600k ≈ 1.6 GB of bf16 obs arrays. XLA materialises the buffer TWICE inside
-# train_chunk (donated input + scan carry), so 1M (2.7 GB × 2) OOMs a 10 GB card
-# on top of the ~3.5 GB working set.
-BUFFER_CAP     = 600_000
+# fermi has a 16 GB GPU. XLA materialises the buffer TWICE inside train_chunk
+# (donated input + scan carry): 1.5M ≈ 4.0 GB of bf16 obs → ~8.1 GB doubled,
+# plus the ~3.5 GB working set ≈ ~11.6 GB peak, leaving ~4 GB headroom. (1M
+# OOMed the old 10 GB card at ~8.9 GB peak.)
+BUFFER_CAP     = 1_500_000
 BATCH_SIZE     = 512
 PER_ALPHA      = 0.6
 PER_BETA_START = 0.4
