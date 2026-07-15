@@ -23,7 +23,7 @@ from legnav import paths
 # ── Log file locations (must match the training scripts) ──────────────────────
 ALGOS = [
     {
-        "name":  "PPO (Legs)",
+        "name":  "PPO",
         "path":  paths.checkpoint("ppo", "ppo_training_log.csv"),
         "color": "#3B82F6",   # blue
     },
