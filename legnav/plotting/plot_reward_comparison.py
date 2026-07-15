@@ -81,9 +81,12 @@ def main():
         "ytick.labelsize": 15,
     })
 
+    # Independent x-axes (each panel autoscales to its own step range, so a
+    # 20M-step run fills the full panel width), but a shared y-axis so the
+    # reward scale is identical across all three algorithms.
     fig, axes = plt.subplots(
         nrows=3, ncols=1, figsize=(10, 9),
-        sharex=True, gridspec_kw={"hspace": 0.25},
+        sharex=False, sharey=True, gridspec_kw={"hspace": 0.35},
     )
 
     any_data = False
@@ -125,17 +128,18 @@ def main():
         # raw curve (faint)
         ax.plot(steps_m, rewards, color=color, alpha=ALPHA_RAW, linewidth=0.8)
         # EMA overlay
-        ax.plot(steps_m, smooth_ema(rewards), color=color, linewidth=2.2,
-                label=f"{name} (EMA {EMA_WEIGHT})")
+        ax.plot(steps_m, smooth_ema(rewards), color=color, linewidth=2.2)
 
         ax.set_ylabel("Episode Reward")
         ax.set_title(name)
-        ax.legend(loc="lower right", fontsize=10, framealpha=0.7)
         ax.grid(True, alpha=0.3)
         any_data = True
 
-    axes[-1].set_xlabel("Training Steps (M)")
-    axes[-1].xaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f"))
+    # Every panel gets its own x-label/ticks (independent x-axes).
+    for ax in axes:
+        ax.set_xlabel("Training Steps (M)")
+        ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f"))
+        ax.tick_params(labelbottom=True)
 
     if not any_data:
         print("⚠  No training logs found for any algorithm. Nothing to plot.")
