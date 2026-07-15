@@ -75,9 +75,6 @@ N_ENVS                 = 4096
 COLLECT_STEPS          = 25
 GRAD_UPDATES_PER_CHUNK = 1_000
 
-# Warm up long enough that every env completes multiple episodes before training.
-WARMUP_STEPS           = N_ENVS * MAX_STEPS * 2
-
 STEPS_PER_CHUNK    = N_ENVS * COLLECT_STEPS                 # 102,400
 TOTAL_CHUNKS       = TOTAL_ENV_STEPS // STEPS_PER_CHUNK     # ~683
 TOTAL_GRAD_UPDATES = TOTAL_CHUNKS * GRAD_UPDATES_PER_CHUNK  # LR-schedule horizon
@@ -90,6 +87,12 @@ PER_BETA_START = 0.4
 PER_BETA_END   = 1.0
 PER_EPS        = 1e-6
 _BUF_OBS_DTYPE = jnp.bfloat16   # halves obs storage; cast to f32 at sample time
+
+# Fill the buffer ~1.3× with random transitions before training. Warming past the
+# buffer capacity just overwrites random data with more random data, so this is
+# sized to BUFFER_CAP (not N_ENVS·MAX_STEPS) — otherwise the warmup runs ~13× more
+# env steps than the 300k buffer can even hold.
+WARMUP_STEPS   = int(BUFFER_CAP * 1.3)
 
 # ══ SAC hyperparameters ═══════════════════════════════════════════════════════
 GAMMA         = 0.99
@@ -574,8 +577,8 @@ def save_checkpoint(sep, tsep, ahp, q1p, q2p, tq1p, tq2p,
 def train():
     print("SAC Training  (shared LidarCNN + decoupled Q1/Q2 branches)")
     print(f"  N_ENVS={N_ENVS}  BUFFER={BUFFER_CAP:,}  BATCH={BATCH_SIZE}")
-    print(f"  gamma={GAMMA}  tau={TAU}  lr={LR}  alpha={ALPHA_FIXED} (fixed)")
-    print(f"  Precision: {PRECISION_STR} (GPU compute)")
+    #print(f"  gamma={GAMMA}  tau={TAU}  lr={LR}  alpha={ALPHA_FIXED} (fixed)")
+    #print(f"  Precision: {PRECISION_STR} (GPU compute)")
     print(f"  Chunk: {STEPS_PER_CHUNK:,} env steps -> {GRAD_UPDATES_PER_CHUNK} grad updates")
     print(f"  Budget: {TOTAL_ENV_STEPS:,} env steps  ->  ~{TOTAL_CHUNKS} chunks\n")
 
