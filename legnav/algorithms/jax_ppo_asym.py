@@ -12,6 +12,7 @@ branch is simply never called at inference time.
 import os
 import csv
 import argparse
+import functools
 from legnav import paths
 
 # GPU selection must happen before `import jax` (CUDA_VISIBLE_DEVICES is read
@@ -141,7 +142,10 @@ def ppo_update_epoch(carry, perm):
     return new_carry, (losses, auxes)
 
 
-@jax.jit
+# donate_argnums=(0,): train_state (params + Adam moments) is reassigned by the
+# caller every update, so let XLA alias its buffers input→output in place. On the
+# 16 GB A4000 this removes a full param+opt_state reallocation per update.
+@functools.partial(jax.jit, donate_argnums=(0,))
 def run_ppo_updates(train_state, obs_seq, priv_seq, actions_seq, adv_seq, ret_seq,
                     old_lp_seq, max_v_seq, rng_key, entropy_coef):
     params, opt_state = train_state
