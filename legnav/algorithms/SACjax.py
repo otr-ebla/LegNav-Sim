@@ -370,7 +370,10 @@ def sac_update(sep, eos, tsep, ahp, ahos, q1p, q1os, q2p, q2os, tq1p, tq2p,
         action_new, log_pi = sample_action(rng_a, mean, log_std, max_v_obs)
         q1 = q1_apply({"params": jax.lax.stop_gradient(new_q1p)}, feat, action_new.astype(NET_DTYPE))
         q2 = q2_apply({"params": jax.lax.stop_gradient(new_q2p)}, feat, action_new.astype(NET_DTYPE))
-        return jnp.mean(ALPHA_FIXED * log_pi - jnp.minimum(q1, q2)), jnp.mean(log_pi)
+        
+        action_reg = 1e-3 * jnp.mean(mean ** 2) # L2 reg of mean for avoiding drifting too far from zero
+        
+        return jnp.mean(ALPHA_FIXED * log_pi - jnp.minimum(q1, q2) + action_reg), jnp.mean(log_pi)
 
     (a_loss, log_pi_mean), (a_grads_head, a_grads_enc) = jax.value_and_grad(
         _actor_loss, argnums=(0, 1), has_aux=True
