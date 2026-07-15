@@ -75,7 +75,7 @@ N_ENVS                 = 4096
 COLLECT_STEPS          = 25
 GRAD_UPDATES_PER_CHUNK = 1_000
 
-# Fix 1: Ensure enough warmup steps so every environment completes multiple episodes
+# Warm up long enough that every env completes multiple episodes before training.
 WARMUP_STEPS           = N_ENVS * MAX_STEPS * 2
 
 STEPS_PER_CHUNK    = N_ENVS * COLLECT_STEPS                 # 102,400
@@ -95,10 +95,16 @@ _BUF_OBS_DTYPE = jnp.bfloat16   # halves obs storage; cast to f32 at sample time
 GAMMA         = 0.99
 TAU           = 0.005
 LR            = 3e-4    # decays linearly to LR*0.1 over the run
-ALPHA_FIXED   = 0.005
+# Fixed entropy coefficient == TQCjac. α relative to the (unscaled) reward scale
+# is the only thing that matters; TQC trains stably here, so match it exactly and
+# keep the entropy bonus a mild regulariser (a smaller α let the −α·log_π term in
+# the backup dominate Q and the policy collapsed to a narrow colliding mode).
+ALPHA_FIXED   = 0.05
 
-# Fix 3: Scale down Huber delta to match the new scaled reward magnitude
-HUBER_DELTA   = 0.8
+# Huber on the TD error: terminal rewards are ±200/-72, so squared error would let
+# those outliers dominate the critic gradient (and PER resamples them ∝|TD|^α on
+# top). Beyond HUBER_DELTA the per-sample gradient is capped at δ.
+HUBER_DELTA   = 10.0
 MAX_GRAD_NORM = 10.0
 LOG_STD_EPS   = 1e-6
 ACTOR_ENC_GRAD_SCALE = 0.1   # fraction of actor gradient let into the shared encoder
@@ -152,9 +158,12 @@ _orth_relu = nn.initializers.orthogonal(scale=jnp.sqrt(2.0))
 _orth_out  = nn.initializers.orthogonal(scale=0.01)
 
 class SACActorHead(nn.Module):
-    """Emits the RAW (pre-tanh) mean and a state-independent log-std. The tanh
-    squash happens after noise injection in sample_action, with the matching
-    log-Jacobian correction."""
+    """Emits the RAW (pre-tanh) mean and a STATE-DEPENDENT log-std (both from the
+    shared feature). The tanh squash happens after noise injection in
+    sample_action, with the matching log-Jacobian correction. A per-state log-std
+    lets the policy stay exploratory near obstacles while sharpening on easy
+    states — a single global log-std collapsed to LOG_STD_MIN and killed
+    exploration."""
     action_dim:  int   = ACTION_DIM
     LOG_STD_MIN: float = -5.0
     LOG_STD_MAX: float =  0.5
@@ -162,9 +171,14 @@ class SACActorHead(nn.Module):
     @nn.compact
     def __call__(self, feat):
         raw_mean = nn.Dense(self.action_dim, kernel_init=_orth_out, name="mean")(feat)
-        logstd_param = self.param("log_std", nn.initializers.constant(1.0), (self.action_dim,))
+        # Small kernel + bias≈1.0 so the pre-tanh log-std starts ~1.0 everywhere
+        # (std≈0.85 at init, matching the old global-param init) and only becomes
+        # state-dependent as the head trains.
+        logstd_pre = nn.Dense(self.action_dim, kernel_init=_orth_out,
+                              bias_init=nn.initializers.constant(1.0),
+                              name="log_std")(feat)
         log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) \
-                  * (jnp.tanh(jnp.broadcast_to(logstd_param, raw_mean.shape)) + 1.0)
+                  * (jnp.tanh(logstd_pre) + 1.0)
         # float32 out: sample / log-prob math stays full precision.
         return raw_mean.astype(jnp.float32), log_std.astype(jnp.float32)
 
@@ -456,12 +470,13 @@ def train_chunk(sep, eos, tsep, ahp, ahos, q1p, q1os, q2p, q2os, tq1p, tq2p,
             max_goal_dist, scenario_idx, ghost_prob, max_scenario
         )
         terminal = done & ~info["timeout"]
-        
-        # Fix 2: Scale the reward specifically prior to buffer insertion
-        new_buf = buf_add(buf_, obs_b, env_a, rew * 0.01, info["final_obs"],
+
+        # Rewards enter the buffer UNSCALED (== TQCjac): α and HUBER_DELTA are
+        # tuned to this ±200/-72 scale. Scaling reward here without rescaling
+        # both of those inverts the entropy/reward balance and collapses training.
+        new_buf = buf_add(buf_, obs_b, env_a, rew, info["final_obs"],
                           terminal.astype(jnp.float32), max_v)
-                          
-        # Original reward remains in `step_data` for correct training logging
+
         step_data = (rew, done, info["goal_reached"], info["collision"], info["passive_col"])
         return (new_es, new_eo, new_buf, key_), step_data
 
@@ -620,11 +635,11 @@ def train():
             jnp.int32(cur_max_scen)
         )
         terminal   = done & ~info["timeout"].astype(jnp.bool_)
-        
-        # Fix 2b: Apply the exact same reward scaling in the warmup phase
-        replay_buf = buf_add(replay_buf, obs_before, env_action, reward * 0.01,
+
+        # Unscaled reward, matching the collect phase.
+        replay_buf = buf_add(replay_buf, obs_before, env_action, reward,
                              info["final_obs"], terminal.astype(jnp.float32), max_v)
-                             
+
         env_obs     = new_obs
         total_steps += N_ENVS
     print("Warmup done. JIT compiling train_chunk (nested scan — can take minutes)...")
