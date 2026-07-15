@@ -66,25 +66,24 @@ MAX_V_OBS_IDX = 2     # kin_vec[v_norm, w, max_v_norm, ...] → max_v at idx 2
 # ══ Training length ═══════════════════════════════════════════════════════════
 # Training runs in fixed chunks (one fused train_chunk call each): collect
 # COLLECT_STEPS × N_ENVS transitions, then run GRAD_UPDATES_PER_CHUNK gradient
-# updates. With BUFFER_CAP = 1.5M the buffer holds ~15 chunks of history, so the
-# critic keeps an anchor of older data if the current policy degrades (at 300k
-# it held ~3 chunks — a collapse flushed all good data within 3 chunks).
+# updates. COLLECT_STEPS is kept small so the buffer holds ~3 chunks of history.
+# Buffer config is kept IDENTICAL to TQCjac (300k cap, max-priority insertion):
+# TQC trains stably on it, so it is not the cause of SAC's failure, and matching
+# it keeps SAC-vs-TQC a clean single-variable comparison (critic head only).
 TOTAL_ENV_STEPS        = 70_000_000
 N_ENVS                 = 4096
 COLLECT_STEPS          = 25
 GRAD_UPDATES_PER_CHUNK = 1_000
-WARMUP_STEPS           = 10_000
+
+# Fix 1: Ensure enough warmup steps so every environment completes multiple episodes
+WARMUP_STEPS           = N_ENVS * MAX_STEPS * 2
 
 STEPS_PER_CHUNK    = N_ENVS * COLLECT_STEPS                 # 102,400
 TOTAL_CHUNKS       = TOTAL_ENV_STEPS // STEPS_PER_CHUNK     # ~683
 TOTAL_GRAD_UPDATES = TOTAL_CHUNKS * GRAD_UPDATES_PER_CHUNK  # LR-schedule horizon
 
 # ══ Replay buffer (prioritized: p = |TD|^α, IS weight ∝ (N·P)^-β) ═════════════
-# fermi has a 16 GB GPU. XLA materialises the buffer TWICE inside train_chunk
-# (donated input + scan carry): 1.5M ≈ 4.0 GB of bf16 obs → ~8.1 GB doubled,
-# plus the ~3.5 GB working set ≈ ~11.6 GB peak, leaving ~4 GB headroom. (1M
-# OOMed the old 10 GB card at ~8.9 GB peak.)
-BUFFER_CAP     = 1_500_000
+BUFFER_CAP     = 300_000   # == TQCjac; fits fermi's 16 GB with wide margin
 BATCH_SIZE     = 512
 PER_ALPHA      = 0.6
 PER_BETA_START = 0.4
@@ -96,16 +95,10 @@ _BUF_OBS_DTYPE = jnp.bfloat16   # halves obs storage; cast to f32 at sample time
 GAMMA         = 0.99
 TAU           = 0.005
 LR            = 3e-4    # decays linearly to LR*0.1 over the run
-# Fixed entropy coefficient. Auto-tuning was removed: the -2.0 target was
-# unreachable (log_pi sits at +4..5 for a good policy), so α railed against its
-# cap and the -α·log_pi term in the backup dominated Q; α swings then collapsed
-# training. A small constant keeps the entropy bonus a mild regulariser.
 ALPHA_FIXED   = 0.05
-# Huber loss on the TD error instead of plain MSE: terminal rewards are ±200/-72,
-# so squared error makes those outlier transitions dominate the critic gradient —
-# and PER then resamples them ∝|TD|^α on top (effective |TD|^(1+α) weighting).
-# Beyond HUBER_DELTA the gradient magnitude is capped at δ per sample.
-HUBER_DELTA   = 10.0
+
+# Fix 3: Scale down Huber delta to match the new scaled reward magnitude
+HUBER_DELTA   = 0.8
 MAX_GRAD_NORM = 10.0
 LOG_STD_EPS   = 1e-6
 ACTOR_ENC_GRAD_SCALE = 0.1   # fraction of actor gradient let into the shared encoder
@@ -248,6 +241,7 @@ def make_buffer(capacity):
         "terminal":     jnp.zeros((capacity,),            jnp.float32),
         "max_v":        jnp.zeros((capacity,),            jnp.float32),
         "priorities":   jnp.zeros((capacity,),            jnp.float32),
+        "max_priority": jnp.float32(1.0),
         # (p+eps)^α per slot, maintained incrementally (0 for empty slots) so
         # buf_sample never re-exponentiates the whole array.
         "p_alpha":      jnp.zeros((capacity,), jnp.float32),
@@ -260,13 +254,10 @@ def buf_add(buf, obs, action, reward, next_obs, terminal, max_v):
     cap  = buf["obs"].shape[0]
     N    = obs.shape[0]
     idxs = (buf["ptr"] + jnp.arange(N)) % cap
-    # New transitions enter at the MEAN priority of the filled slots (1.0 while
-    # empty). The classic max-priority insert ratchets up on the first big |TD|
-    # spike (goal +200 / collision -72) and never decays, so every new chunk
-    # would dominate sampling — effectively on-policy replay with extra variance.
-    mean_prio = jnp.sum(buf["priorities"]) / jnp.maximum(buf["size"].astype(jnp.float32), 1.0)
-    new_prio  = jnp.broadcast_to(jnp.where(buf["size"] > 0, mean_prio, 1.0),
-                                 (N,)).astype(jnp.float32)
+    # New transitions get max priority so each is sampled at least once (matches
+    # TQCjac). This is what makes fresh collision/goal transitions propagate
+    # promptly — mean-priority insertion starved them early.
+    new_prio = jnp.broadcast_to(buf["max_priority"], (N,)).astype(jnp.float32)
     return {
         "obs":          buf["obs"].at[idxs].set(obs.astype(_BUF_OBS_DTYPE)),
         "action":       buf["action"].at[idxs].set(action),
@@ -275,6 +266,7 @@ def buf_add(buf, obs, action, reward, next_obs, terminal, max_v):
         "terminal":     buf["terminal"].at[idxs].set(terminal),
         "max_v":        buf["max_v"].at[idxs].set(max_v),
         "priorities":   buf["priorities"].at[idxs].set(new_prio),
+        "max_priority": buf["max_priority"],
         "p_alpha":      buf["p_alpha"].at[idxs].set((new_prio + PER_EPS) ** PER_ALPHA),
         "ptr":          jnp.int32((buf["ptr"] + N) % cap),
         "size":         jnp.minimum(jnp.int32(buf["size"] + N), jnp.int32(cap)),
@@ -309,6 +301,7 @@ def buf_update_priorities(buf, idxs, td_errors):
     return {
         **buf,
         "priorities":   buf["priorities"].at[idxs].set(new_prio),
+        "max_priority": jnp.maximum(buf["max_priority"], jnp.max(new_prio)),
         "p_alpha":      buf["p_alpha"].at[idxs].set((new_prio + PER_EPS) ** PER_ALPHA),
     }
 
@@ -460,11 +453,12 @@ def train_chunk(sep, eos, tsep, ahp, ahos, q1p, q1os, q2p, q2os, tq1p, tq2p,
             max_goal_dist, scenario_idx, ghost_prob, max_scenario
         )
         terminal = done & ~info["timeout"]
-        # Store info["final_obs"] (the pre-autoreset successor obs): on done,
-        # new_eo is already the NEXT episode's first obs, which would corrupt
-        # the bootstrap of timeout transitions.
-        new_buf = buf_add(buf_, obs_b, env_a, rew, info["final_obs"],
+        
+        # Fix 2: Scale the reward specifically prior to buffer insertion
+        new_buf = buf_add(buf_, obs_b, env_a, rew * 0.01, info["final_obs"],
                           terminal.astype(jnp.float32), max_v)
+                          
+        # Original reward remains in `step_data` for correct training logging
         step_data = (rew, done, info["goal_reached"], info["collision"], info["passive_col"])
         return (new_es, new_eo, new_buf, key_), step_data
 
@@ -623,8 +617,11 @@ def train():
             jnp.int32(cur_max_scen)
         )
         terminal   = done & ~info["timeout"].astype(jnp.bool_)
-        replay_buf = buf_add(replay_buf, obs_before, env_action, reward,
+        
+        # Fix 2b: Apply the exact same reward scaling in the warmup phase
+        replay_buf = buf_add(replay_buf, obs_before, env_action, reward * 0.01,
                              info["final_obs"], terminal.astype(jnp.float32), max_v)
+                             
         env_obs     = new_obs
         total_steps += N_ENVS
     print("Warmup done. JIT compiling train_chunk (nested scan — can take minutes)...")
