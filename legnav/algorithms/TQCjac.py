@@ -380,7 +380,11 @@ def actor_loss_fn(ap, cp, sep, obs, rng_key):
                           ACTOR_ENC_GRAD_SCALE)
     mean, log_std = actor_apply({"params": ap}, feat)
     action_new, log_pi = sample_action(rng_key, mean, log_std, extract_max_v(obs))
-    q_atoms = critic_apply({"params": jax.lax.stop_gradient(cp)}, feat, action_new.astype(NET_DTYPE))
+    
+    feat_detached = jax.lax.stop_gradient(feat) # FIX: Detach the feature vector to prevent adversarial state hallucination
+    
+    q_atoms = critic_apply({"params": jax.lax.stop_gradient(cp)}, feat_detached, action_new.astype(NET_DTYPE))
+    
     return jnp.mean(ALPHA_FIXED * log_pi) - jnp.mean(q_atoms), jnp.mean(log_pi)
 
 @jax.jit
