@@ -135,11 +135,13 @@ def main():
         ax.grid(True, alpha=0.3)
         any_data = True
 
-    # Every panel gets its own x-label/ticks (independent x-axes).
+    # Independent x-axes: every panel keeps its own tick labels, but the
+    # "Training Steps (M)" axis label is shown only once, on the bottom panel.
     for ax in axes:
-        ax.set_xlabel("Training Steps (M)")
         ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f"))
         ax.tick_params(labelbottom=True)
+        ax.set_ylim(-50, 20)
+    axes[-1].set_xlabel("Training Steps (M)")
 
     if not any_data:
         print("⚠  No training logs found for any algorithm. Nothing to plot.")
