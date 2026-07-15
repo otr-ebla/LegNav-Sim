@@ -21,21 +21,27 @@ import matplotlib.ticker as mticker
 from legnav import paths
 
 # ── Log file locations (must match the training scripts) ──────────────────────
+# "max_steps_m": maximum number of env steps (in millions) to plot for that
+# algorithm. Set to None to plot the full log. Edit these to control how far
+# each curve extends along the x-axis.
 ALGOS = [
     {
         "name":  "PPO",
         "path":  paths.checkpoint("ppo", "ppo_training_log.csv"),
-        "color": "#3B82F6",   # blue
+        "color": "#1F77B4",   # blue
+        "max_steps_m": None,
     },
     {
         "name":  "SAC",
         "path":  paths.checkpoint("sac", "sac_training_log.csv"),
-        "color": "#F59E0B",   # amber
+        "color": "#FF7F0E",   # orange
+        "max_steps_m": 20,
     },
     {
         "name":  "TQC",
         "path":  paths.checkpoint("tqc", "tqc_training_log.csv"),
-        "color": "#10B981",   # emerald
+        "color": "#2CA02C",   # green
+        "max_steps_m": 20,
     },
 ]
 
@@ -99,6 +105,22 @@ def main():
 
         steps, rewards = _read_csv_columns(log_path)
         steps_m = steps / 1e6                       # → millions
+
+        # optional cutoff along the x-axis
+        max_steps_m = algo.get("max_steps_m")
+        if max_steps_m is not None:
+            mask = steps_m <= max_steps_m
+            steps_m, rewards = steps_m[mask], rewards[mask]
+
+        if steps_m.size == 0:
+            ax.text(0.5, 0.5, f"{name}  —  no data in range",
+                    ha="center", va="center", fontsize=12,
+                    color="#9CA3AF", style="italic",
+                    transform=ax.transAxes)
+            ax.set_ylabel("Episode Reward")
+            ax.set_title(name)
+            ax.grid(True, alpha=0.3)
+            continue
 
         # raw curve (faint)
         ax.plot(steps_m, rewards, color=color, alpha=ALPHA_RAW, linewidth=0.8)
