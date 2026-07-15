@@ -154,9 +154,15 @@ class SharedEncoder(nn.Module):
 
     Input:  (..., OBS_SIZE)
     Output: (..., 128) feature vector
+
+    `use_se2_reproject` toggles the parameter-free SE(2) ego-motion
+    compensation. Since the reprojection has no learnable weights, disabling
+    it yields an identical parameter tree (ablation-friendly): only the raw
+    stacked scans reach the CNN, and the ego-motion deltas go unused.
     """
     stack_dim: int = 3
     num_rays:   int = 216
+    use_se2_reproject: bool = True
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -173,8 +179,10 @@ class SharedEncoder(nn.Module):
         lidar_frames = lidar_flat.reshape((*batch_shape, self.stack_dim, self.num_rays))
         delta_frames = delta_flat.reshape((*batch_shape, self.stack_dim, _EGO_DELTA_SIZE))
 
-        # Ego-motion compensation: align every frame to the newest one
-        lidar_frames = se2_reproject_stack(lidar_frames, delta_frames, self.num_rays)
+        # Ego-motion compensation: align every frame to the newest one.
+        # Ablation: skip the SE(2) reprojection and feed raw stacked scans.
+        if self.use_se2_reproject:
+            lidar_frames = se2_reproject_stack(lidar_frames, delta_frames, self.num_rays)
 
         FRAME_FEAT  = 64
         cnn_encoder = LidarFrameCNN(frame_feat=FRAME_FEAT)
@@ -201,6 +209,11 @@ class EndToEndActorCritic(nn.Module):
     stack_dim:  int = 3
     num_rays:   int = 216
     tanh_inside: bool = USE_TANH_INSIDE
+    # Ablation switch: when False, the parameter-free SE(2) scan reprojection
+    # is skipped and the CNN sees the raw stacked LiDAR frames (ego-motion
+    # deltas unused). The learnable parameter tree is IDENTICAL either way,
+    # so checkpoints are structurally interchangeable between both variants.
+    use_se2_reproject: bool = True
 
     @nn.compact
     def __call__(
@@ -232,7 +245,9 @@ class EndToEndActorCritic(nn.Module):
         # ── SE(2) ego-motion compensation ─────────────────────────────────────
         # Past scans are reprojected into the current sensor frame using the
         # per-frame (Δx, Δy, Δθ) deltas — parameter-free geometric alignment.
-        lidar_frames = se2_reproject_stack(lidar_frames, delta_frames, self.num_rays)
+        # Ablation (use_se2_reproject=False): feed raw stacked scans instead.
+        if self.use_se2_reproject:
+            lidar_frames = se2_reproject_stack(lidar_frames, delta_frames, self.num_rays)
 
         FRAME_FEAT = 64
         cnn_encoder = LidarFrameCNN(frame_feat=FRAME_FEAT)  # single instance → shared weights

@@ -11,6 +11,13 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES",           "0")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.88")
 os.environ.setdefault("TF_GPU_ALLOCATOR",               "cuda_malloc_async")
 
+# Ablation switch: set PPO_NO_SE2=1 (env) to disable the SE(2) LiDAR-scan
+# reprojection. The network then consumes the raw stacked scans; checkpoints
+# and logs are written with a `_noreproj` suffix to keep runs separate.
+os.environ.setdefault("PPO_NO_SE2", "0")
+NO_SE2 = os.environ["PPO_NO_SE2"] == "1"
+_ABLATION_SUFFIX = "_noreproj" if NO_SE2 else ""
+
 import time
 import warnings
 import jax
@@ -68,7 +75,7 @@ ENTROPY_COEF = 0.015   # initial value (suc=0) — continuously interpolated by 
 # ══ Logging ═══════════════════════════════════════════════════════════════════
 PRINT_EVERY = 5        # print a progress line every N updates (CSV logs every update)
 
-network   = EndToEndActorCritic(action_dim=2)
+network   = EndToEndActorCritic(action_dim=2, use_se2_reproject=not NO_SE2)
 net_apply = bf16_apply(network.apply)   # bf16 forward, fp32 outputs/params
 
 # ══ Curriculum ════════════════════════════════════════════════════════════════
@@ -332,7 +339,8 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
         optax.adam(learning_rate=scheduler, eps=1e-5),
     )
 
-    print(f"PPO Training  [Stateless / Flat Loss / Frame-Stack Attention]")
+    _mode = "NO SE(2) reprojection (ABLATION)" if NO_SE2 else "SE(2) scan reprojection"
+    print(f"PPO Training  [Stateless / Flat Loss / Frame-Stack Attention]  ·  {_mode}")
     print(f"  Envs        : {NUM_ENVS}  x  steps {ROLLOUT_STEPS}  =  {BATCH_SIZE:,} batch")
     print(f"  Minibatches : {N_MINIBATCHES} x {MINI_BATCH_SIZE} sample  (flat T*N)")
     print(f"  Budget      : {total_env_steps:,} env steps  →  {total_updates} updates")
@@ -350,11 +358,11 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     train_state = (params, opt_state)
 
     if jax_env.USE_LEGS:
-        ckpt_path       = paths.checkpoint("ppo", "ppo_legs_best.msgpack")
-        final_ckpt_path = paths.checkpoint("ppo", "ppo_legs_final.msgpack")
+        ckpt_path       = paths.checkpoint("ppo", f"ppo_legs{_ABLATION_SUFFIX}_best.msgpack")
+        final_ckpt_path = paths.checkpoint("ppo", f"ppo_legs{_ABLATION_SUFFIX}_final.msgpack")
     else:
-        ckpt_path       = paths.checkpoint("ppo", "ppo_circles_best.msgpack")
-        final_ckpt_path = paths.checkpoint("ppo", "ppo_circles_final.msgpack")
+        ckpt_path       = paths.checkpoint("ppo", f"ppo_circles{_ABLATION_SUFFIX}_best.msgpack")
+        final_ckpt_path = paths.checkpoint("ppo", f"ppo_circles{_ABLATION_SUFFIX}_final.msgpack")
 
     cur_max_dist, cur_ghost, cur_ent, cur_max_scen = get_continuous_curriculum(0.0)
     rolling_suc  = 0.0
@@ -375,9 +383,9 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     best_suc = 55.0  # NEVER TOUCH THIS LINE
 
     if jax_env.USE_LEGS:
-        _LOG_PATH = paths.checkpoint("ppo", "ppo_legs_log.csv")
+        _LOG_PATH = paths.checkpoint("ppo", f"ppo_legs{_ABLATION_SUFFIX}_log.csv")
     else:
-        _LOG_PATH = paths.checkpoint("ppo", "ppo_circles_log.csv")
+        _LOG_PATH = paths.checkpoint("ppo", f"ppo_circles{_ABLATION_SUFFIX}_log.csv")
     os.makedirs(str(paths.CHECKPOINTS_DIR), exist_ok=True)
     _log_file = open(_LOG_PATH, "w", newline="")
     _log_writer = csv.writer(_log_file)
