@@ -84,7 +84,7 @@ TOTAL_GRAD_UPDATES = TOTAL_CHUNKS * GRAD_UPDATES_PER_CHUNK  # LR-schedule horizo
 
 # ══ Replay buffer (prioritized: p = |TD|^α, IS weight ∝ (N·P)^-β) ═════════════
 BUFFER_CAP     = 300_000   # == TQCjac; fits fermi's 16 GB with wide margin
-BATCH_SIZE     = 512
+BATCH_SIZE     = 1024
 PER_ALPHA      = 0.6
 PER_BETA_START = 0.4
 PER_BETA_END   = 1.0
