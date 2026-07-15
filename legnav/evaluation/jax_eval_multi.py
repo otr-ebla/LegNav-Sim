@@ -226,30 +226,33 @@ def _build_ppo_asym():
 # Checkpoint keys: "enc_params", "actor_head_params".
 
 class _SACActorHead(nn.Module):
+    """Mirror of SACjax.SACActorHead: RAW (pre-tanh) mean + a STATE-DEPENDENT
+    log-std, both from a Dense layer named to match the training checkpoint
+    ("mean", "log_std"). The tanh squash is applied afterwards. Only the mean is
+    needed for deterministic eval, but the log_std layer must exist so the
+    checkpoint's parameter tree restores cleanly."""
     action_dim:  int   = ACTION_DIM
     LOG_STD_MIN: float = -5.0
     LOG_STD_MAX: float =  0.5
-    tanh_inside: bool  = False  # set at build time from jax_network.USE_TANH_INSIDE
 
     @nn.compact
     def __call__(self, feat):
-        raw_mean = nn.Dense(self.action_dim, name="mean")(feat)
-        if self.tanh_inside:
-            v_mean = jnp.tanh(raw_mean[..., 0]) * 0.5 + 0.5
-            w_mean = jnp.tanh(raw_mean[..., 1])
-            actor_mean = jnp.stack([v_mean, w_mean], axis=-1)
-        else:
-            actor_mean = raw_mean
+        raw_mean   = nn.Dense(self.action_dim, name="mean")(feat)
+        logstd_pre = nn.Dense(self.action_dim, name="log_std")(feat)
+        log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) \
+                  * (jnp.tanh(logstd_pre) + 1.0)
+        return raw_mean, log_std
 
-        logstd_param = self.param('log_std', nn.initializers.constant(1.0), (self.action_dim,))
-        actor_logstd_raw = jnp.broadcast_to(logstd_param, actor_mean.shape)
-        actor_logstd = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (jnp.tanh(actor_logstd_raw) + 1.0)
-        return actor_mean, actor_logstd
+def _sac_deterministic_action(mean, max_v):
+    """Policy mode: tanh(raw_mean) mapped to the env action box — matches
+    SACjax.deterministic_action (v ∈ [0, max_v], w ∈ [-1, 1])."""
+    tanh_m = jnp.tanh(mean)
+    return jnp.stack([(tanh_m[..., 0] + 1.0) * 0.5 * max_v, tanh_m[..., 1]], axis=-1)
 
 def _build_sac():
-    from legnav.core.jax_network import SharedEncoder, USE_TANH_INSIDE, scale_action_to_env
+    from legnav.core.jax_network import SharedEncoder
     enc  = SharedEncoder()
-    head = _SACActorHead(tanh_inside=USE_TANH_INSIDE)
+    head = _SACActorHead()
     rng  = jax.random.PRNGKey(0)
     dummy_obs  = jnp.zeros((1, OBS_SIZE))
     enc_params  = enc.init(rng, dummy_obs)["params"]
@@ -266,8 +269,8 @@ def _build_sac():
     def infer(params, obs, max_v):
         enc_p, head_p = params
         feat = enc.apply({"params": enc_p}, obs[None])
-        mean, _ = head.apply({"params": head_p}, feat)
-        return scale_action_to_env(jnp.squeeze(mean, 0), float(max_v))
+        raw_mean, _ = head.apply({"params": head_p}, feat)
+        return jnp.squeeze(_sac_deterministic_action(raw_mean, float(max_v)), 0)
 
     return init_params, load, infer
 

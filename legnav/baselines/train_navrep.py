@@ -404,6 +404,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS,
             raw_rewards = rollout_history["rewards"]
             values      = rollout_history["values"]
             dones       = rollout_history["dones"]
+            timeouts    = rollout_history["timeout"]
 
             rewards, running_ret, rms_state = normalize_batch_rewards(
                 raw_rewards, dones, running_ret, rms_state, GAMMA
@@ -423,7 +424,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS,
                     raw_rewards, dones, goal_reached, collision, passive_col, active_col
                 )
 
-            advantages, returns = compute_gae(rewards, values, dones, last_val)
+            advantages, returns = compute_gae(rewards, values, dones, timeouts, last_val)
 
             # ── Frozen V+M → features, then controller-only PPO ──────────────
             feat_seq = extract_features(train_state[0], obs_seq)

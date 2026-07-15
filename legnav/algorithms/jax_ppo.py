@@ -160,19 +160,29 @@ def collect_episode_outcomes(rewards, dones, goal_reached, collision, passive_co
 
 
 @jax.jit
-def compute_gae(rewards, values, dones, last_val):
+def compute_gae(rewards, values, dones, timeouts, last_val):
+    # Two distinct masks (the classic GAE-with-truncation formulation):
+    #   * `terminations` (done AND NOT timeout) cuts the value bootstrap. A
+    #     timeout ends the episode without terminating the MDP, so its value
+    #     must still bootstrap from the successor state — mirrors SAC's
+    #     `terminal = done & ~timeout`. Only goal/collision are true terminals.
+    #   * `dones` resets the advantage trace at every episode boundary
+    #     (termination OR timeout), so advantage cannot leak backward across
+    #     concatenated episodes in the rollout buffer.
+    terminations = jnp.logical_and(dones, jnp.logical_not(timeouts))
+
     def _step(carry, t):
         gae, nv = carry
-        r, v, d = t
-        nd    = 1.0 - d
-        delta = r + GAMMA * nv * nd - v
-        gae   = delta + GAMMA * GAE_LAMBDA * nd * gae
+        r, v, term, done = t
+        delta = r + GAMMA * nv * (1.0 - term) - v
+        gae   = delta + GAMMA * GAE_LAMBDA * (1.0 - done) * gae
         return (gae, v), gae
 
     _, adv = jax.lax.scan(
         _step,
         (jnp.zeros_like(last_val), last_val),
-        (rewards, values, dones.astype(jnp.float32)),
+        (rewards, values,
+         terminations.astype(jnp.float32), dones.astype(jnp.float32)),
         reverse=True,
     )
     returns = adv + values
@@ -396,6 +406,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
             raw_rewards = rollout_history["rewards"]
             values      = rollout_history["values"]
             dones       = rollout_history["dones"]
+            timeouts    = rollout_history["timeout"]
 
             rewards, running_ret, rms_state = normalize_batch_rewards(
                 raw_rewards, dones, running_ret, rms_state, GAMMA
@@ -455,7 +466,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
             cur_scenario = -1
             entropy_coef = jnp.array(new_ent)
 
-            advantages, returns = compute_gae(rewards, values, dones, last_val)
+            advantages, returns = compute_gae(rewards, values, dones, timeouts, last_val)
 
             train_state, mean_loss, aux = run_ppo_updates(
                 train_state,

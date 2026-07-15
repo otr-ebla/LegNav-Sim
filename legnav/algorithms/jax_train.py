@@ -140,6 +140,7 @@ def collect_rollouts(
             "values":       values,
             "rewards":      rewards,
             "dones":        dones,
+            "timeout":      infos["timeout"],
             "max_v":        max_v,
             "goal_reached": infos["goal_reached"],
             "collision":    infos["collision"],

@@ -412,6 +412,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
             raw_rewards = rollout_history["rewards"]
             values      = rollout_history["values"]
             dones       = rollout_history["dones"]
+            timeouts    = rollout_history["timeout"]
 
             rewards, running_ret, rms_state = normalize_batch_rewards(
                 raw_rewards, dones, running_ret, rms_state, GAMMA
@@ -470,7 +471,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
             cur_scenario = -1            # let env sample randomly
             entropy_coef = jnp.array(new_ent)
 
-            advantages, returns = compute_gae(rewards, values, dones, last_val)
+            advantages, returns = compute_gae(rewards, values, dones, timeouts, last_val)
 
             train_state, mean_loss, aux = run_ppo_updates(
                 train_state, obs_seq, acts_seq, advantages, returns,

@@ -58,8 +58,10 @@ POLICY_COLORS = {"PPO": "#4C72B0", "SAC": "#DD8452", "TQC": "#55A868"}
 # PPO: EndToEndActorCritic (monolithic encoder+actor+critic)
 _ppo_net = EndToEndActorCritic(action_dim=ACTION_DIM)
 
-# SAC: SharedEncoder + SACActorHead (named 'mean' Dense, 'log_std' param vector).
-# Must match SACjax.SACActorHead / jax_eval_multi._SACActorHead exactly.
+# SAC: SharedEncoder + SACActorHead (named 'mean' Dense, STATE-DEPENDENT
+# 'log_std' Dense). Must match SACjax.SACActorHead / jax_eval_multi._SACActorHead
+# exactly — SAC's log_std is a Dense layer, not a global param vector, so the
+# checkpoint stores log_std/{kernel,bias}.
 class _SACActorHead(nn.Module):
     action_dim:  int   = ACTION_DIM
     LOG_STD_MIN: float = -5.0
@@ -75,9 +77,8 @@ class _SACActorHead(nn.Module):
             actor_mean = jnp.stack([v_mean, w_mean], axis=-1)
         else:
             actor_mean = raw_mean
-        logstd_param = self.param('log_std', nn.initializers.constant(1.0), (self.action_dim,))
-        actor_logstd_raw = jnp.broadcast_to(logstd_param, actor_mean.shape)
-        actor_logstd = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (jnp.tanh(actor_logstd_raw) + 1.0)
+        logstd_pre = nn.Dense(self.action_dim, name="log_std")(feat)
+        actor_logstd = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (jnp.tanh(logstd_pre) + 1.0)
         return actor_mean, actor_logstd
 
 # TQC: SharedEncoder + TQCActorHead (unnamed Dense mean, 'log_std' param vector).

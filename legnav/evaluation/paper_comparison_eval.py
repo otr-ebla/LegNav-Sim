@@ -390,9 +390,11 @@ def _build_navrep_act_vmap(ckpt_path):
     return act_vmap
 
 # SAC/TQC actor heads must match SACjax/TQCjac/jax_eval_multi exactly: a 'mean'
-# Dense (named for SAC, unnamed for TQC), a 'log_std' parameter vector, and
-# tanh-inside squashing (USE_TANH_INSIDE). Squashing goes through
-# scale_action_to_env, identical to training.
+# Dense (named for SAC, unnamed for TQC) and tanh-inside squashing
+# (USE_TANH_INSIDE). log_std differs by algo: SAC uses a state-dependent
+# 'log_std' Dense, TQC a global 'log_std' param vector — the eval only needs the
+# mean, but the log_std structure must match so the checkpoint restores.
+# Squashing goes through scale_action_to_env, identical to training.
 def _build_sac_act_vmap(ckpt_path):
     from legnav.core.jax_network import USE_TANH_INSIDE, scale_action_to_env
     enc, bundle = SharedEncoder(), _load_raw(ckpt_path)
@@ -404,7 +406,10 @@ def _build_sac_act_vmap(ckpt_path):
             if self.tanh_inside:
                 raw_mean = jnp.stack([jnp.tanh(raw_mean[..., 0]) * 0.5 + 0.5,
                                       jnp.tanh(raw_mean[..., 1])], axis=-1)
-            self.param('log_std', nn.initializers.constant(1.0), (ACTION_DIM,))
+            # SAC's log_std is a STATE-DEPENDENT Dense (see SACjax.SACActorHead),
+            # so the checkpoint stores log_std/{kernel,bias}. Declare the layer so
+            # the param tree matches on restore (its output is unused at eval).
+            nn.Dense(ACTION_DIM, name="log_std")(feat)
             return raw_mean
     head, enc_p, head_p = SACHead(), bundle["enc_params"], bundle["actor_head_params"]
     def act_vmap(obs_batch):
