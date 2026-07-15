@@ -8,6 +8,10 @@ class RobotConfig:
     DT = 0.15 # 0.25
     LIDAR_OFFSET = -0.05  # meters
     LIDAR_STACK_DIM = 3  #3
+    # Temporal stride between stacked frames. With DT small, consecutive scans
+    # are nearly identical, so we stack every STRIDE-th frame: the exposed stack
+    # holds o_t, o_{t-STRIDE}, o_{t-2*STRIDE}, ... (STRIDE=1 => classic o_t,o_{t-1},o_{t-2}).
+    LIDAR_STACK_STRIDE = 2
 
 class SimConfig:
     HSFM_DT = 0.01

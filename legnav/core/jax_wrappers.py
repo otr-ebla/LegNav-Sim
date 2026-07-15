@@ -31,6 +31,14 @@ FIXES vs previous version:
     SE(2) pose of frame t-k expressed in the current robot frame. The network
     uses them to reproject past scans into the current frame (align t-k → t).
 
+  CHANGE — strided frame stacking (RobotConfig.LIDAR_STACK_STRIDE):
+    With a small DT consecutive scans are nearly identical, so stacking
+    o_t, o_{t-1}, o_{t-2} carries little temporal signal. Instead we keep an
+    internal full-resolution ring buffer and expose every STRIDE-th frame:
+    o_t, o_{t-STRIDE}, o_{t-2*STRIDE}, .... The exposed obs still has stack_dim
+    frames, so the layout/size and the network are unchanged. STRIDE=1 recovers
+    the classic consecutive stack.
+
 Obs layout: [kin_vec(5) | goal_stack(2*stack_dim=6) | ego_deltas(3*stack_dim=9) | lidar_stack(num_rays*stack_dim=648)]
 Total: 5 + 6 + 9 + 648 = 668
 """
@@ -40,6 +48,7 @@ import jax.numpy as jnp
 import random as _random
 from flax import struct
 from legnav.core.jax_env import EnvState, NUM_RAYS, SINGLE_OBS_SIZE, KIN_VEC_SIZE, GOAL_VEC_SIZE
+from legnav.config import RobotConfig
 
 GOAL_SIZE      = GOAL_VEC_SIZE
 EGO_DELTA_SIZE = 3   # (Δx, Δy, Δθ) per frame, in the current robot frame
@@ -48,9 +57,9 @@ EGO_DELTA_SIZE = 3   # (Δx, Δy, Δθ) per frame, in the current robot frame
 @struct.dataclass
 class StackedEnvState:
     env_state:   EnvState
-    lidar_stack: jnp.ndarray        # (stack_dim, NUM_RAYS)
-    goal_stack:  jnp.ndarray        # (stack_dim, GOAL_SIZE) ego goal vec per frame, oldest first
-    pose_stack:  jnp.ndarray = None  # (stack_dim, 3) world pose [x, y, θ] at each frame time
+    lidar_stack: jnp.ndarray        # (buffer_len, NUM_RAYS) full-resolution ring buffer, oldest first
+    goal_stack:  jnp.ndarray        # (buffer_len, GOAL_SIZE) ego goal vec per frame, oldest first
+    pose_stack:  jnp.ndarray = None  # (buffer_len, 3) world pose [x, y, θ] at each frame time
 
 
 def _ego_deltas(pose_stack: jnp.ndarray) -> jnp.ndarray:
@@ -71,7 +80,21 @@ def _ego_deltas(pose_stack: jnp.ndarray) -> jnp.ndarray:
 
 
 def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3,
-                     num_rays: int = NUM_RAYS):
+                     num_rays: int = NUM_RAYS,
+                     stride: int = RobotConfig.LIDAR_STACK_STRIDE):
+    """Temporal frame stacking with a configurable stride.
+
+    A full-resolution ring buffer of length ``buffer_len = (stack_dim-1)*stride+1``
+    is kept internally; the flat observation exposes only ``stack_dim`` frames
+    spaced ``stride`` apart — i.e. o_t, o_{t-stride}, o_{t-2*stride}, ....
+    With ``stride=1`` this reduces to the classic o_t, o_{t-1}, o_{t-2} stack.
+    The exposed observation layout (and its size) is independent of ``stride``,
+    so the network is unchanged. The newest frame is always the buffer's last
+    row, so downstream reads of ``state.lidar_stack[-1]`` stay valid.
+    """
+    buffer_len = (stack_dim - 1) * stride + 1
+    # Oldest-first indices selecting the strided subset (last = newest frame).
+    sel = jnp.arange(stack_dim) * stride
 
     def reset_stacked(key, max_goal_dist: float = 3.0, ghost_prob: float = 1.0, scenario_idx: int = -1, min_goal_dist: float = 0.8, **kwargs):
         # Passes any extra dynamic args (like scenario_idx) gracefully down to the environment
@@ -80,11 +103,11 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3,
         kin_vec   = base_obs[GOAL_SIZE : GOAL_SIZE + KIN_VEC_SIZE]
         lidar     = base_obs[GOAL_SIZE + KIN_VEC_SIZE:]
 
-        lidar_stack = jnp.tile(lidar[None, :], (stack_dim, 1))
-        goal_stack  = jnp.tile(goal[None,  :], (stack_dim, 1))
+        lidar_stack = jnp.tile(lidar[None, :], (buffer_len, 1))
+        goal_stack  = jnp.tile(goal[None,  :], (buffer_len, 1))
 
         pose       = jnp.array([base_state.x, base_state.y, base_state.theta])
-        pose_stack = jnp.tile(pose[None, :], (stack_dim, 1))
+        pose_stack = jnp.tile(pose[None, :], (buffer_len, 1))
 
         stacked_state = StackedEnvState(
             env_state=base_state,
@@ -93,8 +116,8 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3,
             pose_stack=pose_stack
         )
         flat_obs = jnp.concatenate([
-            kin_vec, goal_stack.flatten(),
-            _ego_deltas(pose_stack).flatten(), lidar_stack.flatten()
+            kin_vec, goal_stack[sel].flatten(),
+            _ego_deltas(pose_stack[sel]).flatten(), lidar_stack[sel].flatten()
         ])
         return flat_obs, stacked_state
 
@@ -120,8 +143,8 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3,
             pose_stack=new_pose_stack
         )
         flat_obs = jnp.concatenate([
-            new_kin_vec, new_goal_stack.flatten(),
-            _ego_deltas(new_pose_stack).flatten(), new_lidar_stack.flatten()
+            new_kin_vec, new_goal_stack[sel].flatten(),
+            _ego_deltas(new_pose_stack[sel]).flatten(), new_lidar_stack[sel].flatten()
         ])
         return flat_obs, new_stacked_state, reward, done, info
 
