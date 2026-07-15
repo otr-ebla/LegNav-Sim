@@ -381,14 +381,16 @@ def sac_update(sep, eos, tsep, ahp, ahos, q1p, q1os, q2p, q2os, tq1p, tq2p,
     new_q2p = optax.apply_updates(q2p, q2_upd)
 
     def _actor_loss(ahp_, sep_):
-        feat = scale_gradient(enc_apply({"params": sep_}, obs.astype(NET_DTYPE)),
-                              ACTOR_ENC_GRAD_SCALE)
+        feat = scale_gradient(enc_apply({"params": sep_}, obs.astype(NET_DTYPE)), ACTOR_ENC_GRAD_SCALE)
         mean, log_std = actor_apply({"params": ahp_}, feat)
         action_new, log_pi = sample_action(rng_a, mean, log_std, max_v_obs)
-        q1 = q1_apply({"params": jax.lax.stop_gradient(new_q1p)}, feat, action_new.astype(NET_DTYPE))
-        q2 = q2_apply({"params": jax.lax.stop_gradient(new_q2p)}, feat, action_new.astype(NET_DTYPE))
         
-        action_reg = 1e-3 * jnp.mean(mean ** 2) # L2 reg of mean for avoiding drifting too far from zero
+        feat_detached = jax.lax.stop_gradient(feat) # FIX: Detach feat to prevent the encoder from hallucinating states to maximize Q
+        
+        q1 = q1_apply({"params": jax.lax.stop_gradient(new_q1p)}, feat_detached, action_new.astype(NET_DTYPE))
+        q2 = q2_apply({"params": jax.lax.stop_gradient(new_q2p)}, feat_detached, action_new.astype(NET_DTYPE))
+        
+        action_reg = 1e-3 * jnp.mean(mean ** 2)
         
         return jnp.mean(ALPHA_FIXED * log_pi - jnp.minimum(q1, q2) + action_reg), jnp.mean(log_pi)
 
