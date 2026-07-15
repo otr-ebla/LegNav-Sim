@@ -53,7 +53,7 @@ MAX_V_OBS_IDX = 2     # kin_vec[v_norm, w, max_v_norm, ...] → max_v at idx 2
 # ══ Training length ═══════════════════════════════════════════════════════════
 # Training runs in fixed chunks (one fused train_chunk call each): collect
 # COLLECT_STEPS × N_ENVS transitions, then run GRAD_UPDATES_PER_CHUNK gradient
-# updates. With BUFFER_CAP = 1M the buffer holds ~10 chunks of history, so the
+# updates. With BUFFER_CAP = 600k the buffer holds ~6 chunks of history, so the
 # critic keeps an anchor of older data if the current policy degrades (at 300k
 # it held ~3 chunks — a collapse flushed all good data within 3 chunks).
 TOTAL_ENV_STEPS        = 70_000_000
@@ -67,7 +67,10 @@ TOTAL_CHUNKS       = TOTAL_ENV_STEPS // STEPS_PER_CHUNK     # ~683
 TOTAL_GRAD_UPDATES = TOTAL_CHUNKS * GRAD_UPDATES_PER_CHUNK  # LR-schedule horizon
 
 # ══ Replay buffer (prioritized: p = |TD|^α, IS weight ∝ (N·P)^-β) ═════════════
-BUFFER_CAP     = 1_000_000   # ~2.7 GB at bf16 obs (2.7 KB/transition)
+# 600k ≈ 1.6 GB of bf16 obs arrays. XLA materialises the buffer TWICE inside
+# train_chunk (donated input + scan carry), so 1M (2.7 GB × 2) OOMs a 10 GB card
+# on top of the ~3.5 GB working set.
+BUFFER_CAP     = 600_000
 BATCH_SIZE     = 512
 PER_ALPHA      = 0.6
 PER_BETA_START = 0.4
