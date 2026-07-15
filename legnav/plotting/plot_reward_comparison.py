@@ -69,7 +69,29 @@ def smooth_ema(values, weight=EMA_WEIGHT):
     return smoothed
 
 
-def main():
+def _load_series(algo):
+    """Return (steps_m, rewards) for an algorithm, applying its step cutoff.
+
+    Returns None if the log file is missing or empty within the range.
+    """
+    log_path = algo["path"]
+    if not os.path.exists(log_path):
+        return None
+
+    steps, rewards = _read_csv_columns(log_path)
+    steps_m = steps / 1e6                           # → millions
+
+    max_steps_m = algo.get("max_steps_m")
+    if max_steps_m is not None:
+        mask = steps_m <= max_steps_m
+        steps_m, rewards = steps_m[mask], rewards[mask]
+
+    if steps_m.size == 0:
+        return None
+    return steps_m, rewards
+
+
+def _apply_rcparams():
     plt.rcParams.update({
         "font.family":    "sans-serif",
         "font.sans-serif": ["Inter", "Helvetica Neue", "Arial"],
@@ -81,6 +103,9 @@ def main():
         "ytick.labelsize": 15,
     })
 
+
+def plot_stacked():
+    """Three vertically-stacked panels, one per algorithm."""
     # Independent x-axes (each panel autoscales to its own step range, so a
     # 20M-step run fills the full panel width), but a shared y-axis so the
     # reward scale is identical across all three algorithms.
@@ -94,10 +119,12 @@ def main():
     for ax, algo in zip(axes, ALGOS):
         name  = algo["name"]
         color = algo["color"]
-        log_path = algo["path"]
 
-        if not os.path.exists(log_path):
-            ax.text(0.5, 0.5, f"{name}  —  no training log found",
+        series = _load_series(algo)
+        if series is None:
+            msg = ("no training log found" if not os.path.exists(algo["path"])
+                   else "no data in range")
+            ax.text(0.5, 0.5, f"{name}  —  {msg}",
                     ha="center", va="center", fontsize=12,
                     color="#9CA3AF", style="italic",
                     transform=ax.transAxes)
@@ -106,25 +133,7 @@ def main():
             ax.grid(True, alpha=0.3)
             continue
 
-        steps, rewards = _read_csv_columns(log_path)
-        steps_m = steps / 1e6                       # → millions
-
-        # optional cutoff along the x-axis
-        max_steps_m = algo.get("max_steps_m")
-        if max_steps_m is not None:
-            mask = steps_m <= max_steps_m
-            steps_m, rewards = steps_m[mask], rewards[mask]
-
-        if steps_m.size == 0:
-            ax.text(0.5, 0.5, f"{name}  —  no data in range",
-                    ha="center", va="center", fontsize=12,
-                    color="#9CA3AF", style="italic",
-                    transform=ax.transAxes)
-            ax.set_ylabel("Episode Reward")
-            ax.set_title(name)
-            ax.grid(True, alpha=0.3)
-            continue
-
+        steps_m, rewards = series
         # raw curve (faint)
         ax.plot(steps_m, rewards, color=color, alpha=ALPHA_RAW, linewidth=0.8)
         # EMA overlay
@@ -144,16 +153,71 @@ def main():
     axes[-1].set_xlabel("Training Steps (M)")
 
     if not any_data:
-        print("⚠  No training logs found for any algorithm. Nothing to plot.")
-        sys.exit(1)
+        return None
 
     fig.tight_layout()
+    return fig
 
+
+def plot_overlaid():
+    """All three algorithms superposed on a single axes, with a legend."""
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    any_data = False
+
+    for algo in ALGOS:
+        name  = algo["name"]
+        color = algo["color"]
+
+        series = _load_series(algo)
+        if series is None:
+            continue
+
+        steps_m, rewards = series
+        # raw curve (faint)
+        ax.plot(steps_m, rewards, color=color, alpha=ALPHA_RAW, linewidth=0.8)
+        # EMA overlay (this one carries the legend entry)
+        ax.plot(steps_m, smooth_ema(rewards), color=color, linewidth=2.2,
+                label=name)
+        any_data = True
+
+    ax.set_xlabel("Training Steps (M)")
+    ax.set_ylabel("Episode Reward")
+    ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f"))
+    ax.set_ylim(-50, 20)
+    ax.grid(True, alpha=0.3)
+
+    if not any_data:
+        return None
+
+    ax.legend(loc="lower right", framealpha=0.7)
+    fig.tight_layout()
+    return fig
+
+
+def main():
+    _apply_rcparams()
     os.makedirs(paths.FIGURES_DIR, exist_ok=True)
-    out_path = paths.figure("reward_comparison_ppo_sac_tqc.pdf")
-    fig.savefig(out_path, bbox_inches="tight")
-    print(f"✅ Saved → {out_path}")
-    plt.close(fig)
+
+    figures = [
+        (plot_stacked,  "reward_comparison_ppo_sac_tqc.pdf"),
+        (plot_overlaid, "reward_comparison_overlaid.pdf"),
+    ]
+
+    saved_any = False
+    for build, filename in figures:
+        fig = build()
+        if fig is None:
+            continue
+        out_path = paths.figure(filename)
+        fig.savefig(out_path, bbox_inches="tight")
+        print(f"✅ Saved → {out_path}")
+        plt.close(fig)
+        saved_any = True
+
+    if not saved_any:
+        print("⚠  No training logs found for any algorithm. Nothing to plot.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
