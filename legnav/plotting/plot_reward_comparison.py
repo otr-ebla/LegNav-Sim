@@ -67,10 +67,12 @@ def main():
     plt.rcParams.update({
         "font.family":    "sans-serif",
         "font.sans-serif": ["Inter", "Helvetica Neue", "Arial"],
-        "font.size":       11,
-        "axes.titlesize":  13,
+        "font.size":       15,
+        "axes.titlesize":  17,
         "axes.titleweight": "bold",
-        "axes.labelsize":  11,
+        "axes.labelsize":  18,
+        "xtick.labelsize": 15,
+        "ytick.labelsize": 15,
     })
 
     fig, axes = plt.subplots(
@@ -117,12 +119,11 @@ def main():
         print("⚠  No training logs found for any algorithm. Nothing to plot.")
         sys.exit(1)
 
-    fig.suptitle("Episode Reward during Training", fontsize=15, fontweight="bold", y=0.98)
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.tight_layout()
 
     os.makedirs(paths.FIGURES_DIR, exist_ok=True)
-    out_path = paths.figure("reward_comparison_ppo_sac_tqc.png")
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    out_path = paths.figure("reward_comparison_ppo_sac_tqc.pdf")
+    fig.savefig(out_path, bbox_inches="tight")
     print(f"✅ Saved → {out_path}")
     plt.close(fig)
 
