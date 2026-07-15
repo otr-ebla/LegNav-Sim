@@ -95,7 +95,7 @@ _BUF_OBS_DTYPE = jnp.bfloat16   # halves obs storage; cast to f32 at sample time
 GAMMA         = 0.99
 TAU           = 0.005
 LR            = 3e-4    # decays linearly to LR*0.1 over the run
-ALPHA_FIXED   = 0.0005
+ALPHA_FIXED   = 0.005
 
 # Fix 3: Scale down Huber delta to match the new scaled reward magnitude
 HUBER_DELTA   = 0.8
