@@ -619,15 +619,13 @@ def draw_humans(surface, state, foot_state_np, show_arrows, use_legs, show_body,
             draw_shoe(surface, float(left_legs[i, 0]),  float(left_legs[i, 1]),  left_theta, col, border, scale, sim_h)
             draw_shoe(surface, float(right_legs[i, 0]), float(right_legs[i, 1]), right_theta, col, border, scale, sim_h)
             leg_r = max(2, int(LEG_RADIUS * scale))
-            # Inset the leg circle forward by LEG_RADIUS so it lies entirely
-            # inside the shoe rectangle (matches the LiDAR collision shape
-            # produced by jax_legs.get_leg_circles).
-            l_off_x = LEG_RADIUS * math.cos(left_theta)
-            l_off_y = LEG_RADIUS * math.sin(left_theta)
-            r_off_x = LEG_RADIUS * math.cos(right_theta)
-            r_off_y = LEG_RADIUS * math.sin(right_theta)
-            lx, ly   = W_(float(left_legs[i, 0])  + l_off_x, float(left_legs[i, 1])  + l_off_y)
-            rx_, ry_ = W_(float(right_legs[i, 0]) + r_off_x, float(right_legs[i, 1]) + r_off_y)
+            # Draw each leg circle exactly where the LiDAR traces it:
+            # jax_legs.get_leg_circles centres it on the raw foot position with
+            # radius LEG_RADIUS — no offset. A forward inset would displace the
+            # drawn circle from the true collision circle, making rays appear to
+            # miss / cut through it.
+            lx, ly   = W_(float(left_legs[i, 0]),  float(left_legs[i, 1]))
+            rx_, ry_ = W_(float(right_legs[i, 0]), float(right_legs[i, 1]))
             pygame.draw.circle(surface, tuple(min(255,int(c*1.1)) for c in col), (lx, ly), leg_r)
             pygame.draw.circle(surface, (20,20,20), (lx, ly), leg_r, 1)
             pygame.draw.circle(surface, tuple(max(0,int(c*0.75)) for c in col), (rx_, ry_), leg_r)

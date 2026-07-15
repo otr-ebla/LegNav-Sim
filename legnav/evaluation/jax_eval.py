@@ -249,19 +249,15 @@ def draw_humans(surface, state, foot_state_np, show_arrows, use_legs):
             # Faint body centre ring (shows collision boundary)
             #pygame.draw.circle(surface, C_BODY_RING, (sx, sy), body_r, 1)
 
-            # Inset the visual leg circle by LEG_RADIUS along each foot's
-            # heading so it sits inside the shoe rectangle and aligns with
-            # the LiDAR collision shape produced by jax_legs.get_leg_circles.
-            left_theta_f  = float(foot_state_np[i, 10])
-            right_theta_f = float(foot_state_np[i, 11])
-            l_off_x = LEG_RADIUS * math.cos(left_theta_f)
-            l_off_y = LEG_RADIUS * math.sin(left_theta_f)
-            r_off_x = LEG_RADIUS * math.cos(right_theta_f)
-            r_off_y = LEG_RADIUS * math.sin(right_theta_f)
+            # Draw the leg circle exactly where the LiDAR traces it:
+            # jax_legs.get_leg_circles centres each circle on the raw foot
+            # position foot_state[:, 0:2] with radius LEG_RADIUS — no offset.
+            # Any forward inset here would displace the drawn circle from the
+            # true collision circle, making rays appear to miss / cut through it.
 
             # Left leg — tinted with person's shoe colour
-            lx, ly = W(float(left_legs_np[i, 0]) + l_off_x,
-                       float(left_legs_np[i, 1]) + l_off_y)
+            lx, ly = W(float(left_legs_np[i, 0]),
+                       float(left_legs_np[i, 1]))
             shoe_col, _ = _shoe_colour(i)
             # Brighten for left, slightly darken for right so they're distinguishable
             lc = tuple(min(255, int(c * 1.1)) for c in shoe_col) if not dist_ else C_LEG_DL
@@ -269,8 +265,8 @@ def draw_humans(surface, state, foot_state_np, show_arrows, use_legs):
             pygame.draw.circle(surface, (20, 20, 20), (lx, ly), leg_r, 1)
 
             # Right leg
-            rx_, ry_ = W(float(right_legs_np[i, 0]) + r_off_x,
-                         float(right_legs_np[i, 1]) + r_off_y)
+            rx_, ry_ = W(float(right_legs_np[i, 0]),
+                         float(right_legs_np[i, 1]))
             rc = tuple(max(0, int(c * 0.75)) for c in shoe_col) if not dist_ else C_LEG_DR
             pygame.draw.circle(surface, rc, (rx_, ry_), leg_r)
             pygame.draw.circle(surface, (20, 20, 20), (rx_, ry_), leg_r, 1)
