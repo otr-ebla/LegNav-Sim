@@ -11,7 +11,16 @@ branch is simply never called at inference time.
 
 import os
 import csv
+import argparse
 from legnav import paths
+
+# GPU selection must happen before `import jax` (CUDA_VISIBLE_DEVICES is read
+# at import time).
+_pre = argparse.ArgumentParser(add_help=False)
+_pre.add_argument("--gpu", type=int, default=None)
+_pre_args, _ = _pre.parse_known_args()
+if _pre_args.gpu is not None:
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(_pre_args.gpu)
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES",           "0")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.88")
