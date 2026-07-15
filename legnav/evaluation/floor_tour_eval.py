@@ -64,7 +64,7 @@ _jax_env.PEOPLE_RADIUS = 0.25   # map floor scenario uses smaller people radius
 from legnav.core.jax_env import (ROBOT_RADIUS, PEOPLE_RADIUS,
                                   NUM_RAYS, MAX_LIDAR_DIST, FOV, MAX_STEPS)
 from legnav.core.jax_env_multi import reset_env, step_env, NUM_PEOPLE as _NUM_PEOPLE
-from legnav.core.jax_wrappers import make_stacked_env
+from legnav.core.jax_wrappers import make_stacked_env, assemble_stacked_obs
 from legnav.core.jax_scenarios import MAP_ROOM_W, MAP_ROOM_H
 from legnav.core.jax_legs import init_foot_state as _init_foot_state
 
@@ -443,9 +443,7 @@ def main():
             goal_stack=ss.goal_stack.at[-1].set(goal),
             lidar_stack=ss.lidar_stack.at[-1].set(lidar),
         )
-        obs = jnp.concatenate([
-            ss.goal_stack.flatten(), kin_vec, ss.lidar_stack.flatten()
-        ])
+        obs = assemble_stacked_obs(kin_vec, ss.goal_stack, ss.pose_stack, ss.lidar_stack)
         stacked_state = ss
 
     def _wp0_theta(ss, wps):

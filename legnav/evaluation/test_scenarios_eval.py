@@ -64,7 +64,7 @@ _jax_env.SENSOR_NOISE = True
 from legnav.core.jax_env import (ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS,
                      NUM_RAYS, MAX_LIDAR_DIST, FOV, MAX_STEPS, GOAL_RADIUS)
 from legnav.core.jax_env_multi import reset_env, step_env
-from legnav.core.jax_wrappers import make_stacked_env, _ego_deltas
+from legnav.core.jax_wrappers import make_stacked_env, _ego_deltas, assemble_stacked_obs
 from legnav.core.jax_scenarios import TEST_ROBOT_WAYPOINTS, TEST_SCENARIO_NAMES
 
 # --- INIZIO MODIFICA: Sovrascriviamo i waypoint dello scenario 9 ---
@@ -317,12 +317,10 @@ def run_interactive():
             goal_stack=new_goal_stack,
             lidar_stack=new_lidar_stack,
         )
-        # Rebuild flat obs (new 668 layout: kin | goal_stack | ego_deltas | lidar_stack)
-        obs = jnp.concatenate([
-            kin_vec, new_goal_stack.flatten(),
-            _ego_deltas(stacked_state.pose_stack).flatten(),
-            new_lidar_stack.flatten()
-        ])
+        # Rebuild flat obs (668 layout, strided frame selection) via shared helper
+        obs = assemble_stacked_obs(
+            kin_vec, new_goal_stack, stacked_state.pose_stack, new_lidar_stack
+        )
 
         # Waypoint change = goal change, so any stateful policy (MPPI) must
         # drop its warm-start plan: the previous u_mean was aiming at the
@@ -661,12 +659,12 @@ def run_headless():
                                 goal_stack=stacked_state.goal_stack.at[-1].set(goal_vec),
                                 lidar_stack=stacked_state.lidar_stack.at[-1].set(lidar),
                             )
-                            obs = jnp.concatenate([
+                            obs = assemble_stacked_obs(
                                 kin_vec,
-                                stacked_state.goal_stack.flatten(),
-                                _ego_deltas(stacked_state.pose_stack).flatten(),
-                                stacked_state.lidar_stack.flatten()
-                            ])
+                                stacked_state.goal_stack,
+                                stacked_state.pose_stack,
+                                stacked_state.lidar_stack,
+                            )
                             # Waypoint changed → drop stale warm-start plan.
                             _policy_reset()
                             break  # break inner for-loop; while continues

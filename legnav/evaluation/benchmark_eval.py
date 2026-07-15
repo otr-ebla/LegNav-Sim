@@ -34,7 +34,8 @@ jax_env.USE_LEGS = True
 
 from legnav.core.jax_env import ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS, DT, MAX_STEPS, get_obs
 from legnav.core.jax_env_multi import reset_env, step_env
-from legnav.core.jax_wrappers import StackedEnvState, _ego_deltas
+from legnav.core.jax_wrappers import StackedEnvState, _ego_deltas, assemble_stacked_obs
+from legnav.config import RobotConfig
 from legnav.core.jax_network import SharedEncoder, EndToEndActorCritic, scale_action_to_env, USE_TANH_INSIDE
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -136,6 +137,9 @@ from legnav.core.jax_env import KIN_VEC_SIZE as _SVS
 
 POSE_SIZE  = 2
 STACK_DIM  = 3
+# Full-resolution ring buffer length feeding the strided stack (o_t, o_{t-STRIDE}, ...).
+STRIDE     = RobotConfig.LIDAR_STACK_STRIDE
+BUFFER_LEN = (STACK_DIM - 1) * STRIDE + 1
 
 @jax.jit
 def dynamic_reset_stacked(key, min_dist, scen_idx, target_max_v):
@@ -151,18 +155,15 @@ def dynamic_reset_stacked(key, min_dist, scen_idx, target_max_v):
         kin_vec[3], kin_vec[4],
     ])
 
-    lidar_stack = jnp.tile(lidar[None, :], (STACK_DIM, 1))
-    goal_stack  = jnp.tile(goal[None, :],  (STACK_DIM, 1))
+    lidar_stack = jnp.tile(lidar[None, :], (BUFFER_LEN, 1))
+    goal_stack  = jnp.tile(goal[None, :],  (BUFFER_LEN, 1))
     pose        = jnp.array([base_state.x, base_state.y, base_state.theta])
-    pose_stack  = jnp.tile(pose[None, :], (STACK_DIM, 1))
+    pose_stack  = jnp.tile(pose[None, :], (BUFFER_LEN, 1))
     stacked_state = StackedEnvState(
         env_state=base_state, lidar_stack=lidar_stack, goal_stack=goal_stack,
         pose_stack=pose_stack
     )
-    flat_obs = jnp.concatenate([
-        new_kin_vec, goal_stack.flatten(),
-        _ego_deltas(pose_stack).flatten(), lidar_stack.flatten()
-    ])
+    flat_obs = assemble_stacked_obs(new_kin_vec, goal_stack, pose_stack, lidar_stack)
     return flat_obs, stacked_state
 
 
@@ -181,10 +182,7 @@ def step_stacked_headless(key, state: StackedEnvState, action):
         env_state=new_base_state, lidar_stack=new_lidar_stack, goal_stack=new_goal_stack,
         pose_stack=new_pose_stack
     )
-    flat_obs = jnp.concatenate([
-        new_kin_vec, new_goal_stack.flatten(),
-        _ego_deltas(new_pose_stack).flatten(), new_lidar_stack.flatten()
-    ])
+    flat_obs = assemble_stacked_obs(new_kin_vec, new_goal_stack, new_pose_stack, new_lidar_stack)
     return flat_obs, new_stacked_state, reward, done, info
 
 
@@ -771,12 +769,9 @@ def _advance_waypoint(stacked_state, next_gx, next_gy, gr_flag, v_max, rng_key):
         goal_stack=new_goal_stack,
         pose_stack=stacked_state.pose_stack,
     )
-    new_obs = jnp.concatenate([
-        new_kin_vec,
-        new_goal_stack.reshape(N_TEST_ENVS, -1),
-        jax.vmap(_ego_deltas)(stacked_state.pose_stack).reshape(N_TEST_ENVS, -1),
-        new_lidar_stack.reshape(N_TEST_ENVS, -1),
-    ], axis=1)
+    new_obs = jax.vmap(assemble_stacked_obs)(
+        new_kin_vec, new_goal_stack, stacked_state.pose_stack, new_lidar_stack
+    )
     return new_obs, new_state
 
 
