@@ -2,7 +2,7 @@
 
 Official implementation of
 
-[Learning Robot Social Navigation among Human Legs](#) by
+[Learning Robot Social Navigation By Sensing Human Legs](#) by
 
 [Alberto Vaglio](#), [Andrea Garulli](#), [Antonio Giannitrapani](#), [Renato Quartullo](#), [Tommaso Van Der Meer](#) (University of Siena & Uninettuno University)</br>
 
