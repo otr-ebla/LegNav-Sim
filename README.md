@@ -1,5 +1,8 @@
 <h1>LegNav-Sim</h1>
 
+[![JAX](https://img.shields.io/badge/JAX-Enabled-orange?style=flat-square&logo=google)](https://github.com/google/jax)
+[![CUDA](https://img.shields.io/badge/CUDA-Accelerated-green?style=flat-square&logo=nvidia)](https://developer.nvidia.com/cuda-zone)
+
 Official implementation of
 
 [Learning Robot Social Navigation By Sensing Human Legs](https://arxiv.org/abs/2607.27922) by
