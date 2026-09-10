@@ -2,13 +2,13 @@
 
 Official implementation of
 
-[Learning Robot Social Navigation By Sensing Human Legs](#) by
+[Learning Robot Social Navigation By Sensing Human Legs](https://arxiv.org/abs/2607.27922) by
 
 [Alberto Vaglio](#), [Andrea Garulli](https://scholar.google.com/citations?user=4rFwUskAAAAJ&hl=en&oi=ao), [Antonio Giannitrapani](https://scholar.google.com/citations?user=0eeBLTYAAAAJ&hl=en&oi=ao), [Renato Quartullo](https://scholar.google.com/citations?user=Dl4lZcEAAAAJ&hl=en&oi=ao), [Tommaso Van Der Meer](https://scholar.google.com/citations?user=-o4MmxgAAAAJ&hl=en&oi=ao) (University of Siena & Uninettuno University)</br>
 
 <img src="assets/indoor_gif.gif" width="70%"></br>
 
-[[Paper]](#) [[Project Page]](#) [[Models]](#)
+[[Paper]](https://arxiv.org/abs/2607.27922) [[Models]](#)
 
 ----
 
