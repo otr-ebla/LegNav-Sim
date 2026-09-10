@@ -68,3 +68,6 @@ Thumbs.db
 # --- JAX / XLA ---
 # Se JAX genera file di cache per la compilazione (XLA_FLAGS)
 .jax_cache/
+
+# CLAUDE 
+.claude
