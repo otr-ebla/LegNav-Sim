@@ -16,8 +16,9 @@ Official implementation of
 </br>
 
 <p align="center">
+  <b>Video of Experiments</b><br>
   <a href="https://youtu.be/P6gFTvi3k7w">
-    <img src="https://img.youtube.com/vi/P6gFTvi3k7w/maxresdefault.jpg" alt="Video Presentation" width="70%">
+    <img src="https://img.youtube.com/vi/P6gFTvi3k7w/maxresdefault.jpg" alt="Video of Experiments" width="70%">
   </a>
 </p>
 
