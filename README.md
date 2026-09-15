@@ -11,7 +11,15 @@ Official implementation of
 
 <img src="assets/indoor_gif.gif" width="70%"></br>
 
-[[Paper]](https://arxiv.org/abs/2607.27922) [[Models]](#)
+[[Paper]](https://arxiv.org/abs/2607.27922) [[Video]](https://youtu.be/P6gFTvi3k7w) [[Models]](#)
+
+</br>
+
+<p align="center">
+  <a href="https://youtu.be/P6gFTvi3k7w">
+    <img src="https://img.youtube.com/vi/P6gFTvi3k7w/maxresdefault.jpg" alt="Video Presentation" width="70%">
+  </a>
+</p>
 
 ----
 
