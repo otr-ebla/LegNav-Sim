@@ -13,14 +13,11 @@ Official implementation of
 
 [[Paper]](https://arxiv.org/abs/2607.27922) [[Video]](https://youtu.be/P6gFTvi3k7w) [[Models]](#)
 
-</br>
+### Video of Experiments
 
-<p align="center">
-  <b>Video of Experiments</b><br>
-  <a href="https://youtu.be/P6gFTvi3k7w">
-    <img src="https://img.youtube.com/vi/P6gFTvi3k7w/maxresdefault.jpg" alt="Video of Experiments" width="70%">
-  </a>
-</p>
+<a href="https://youtu.be/P6gFTvi3k7w">
+  <img src="https://img.youtube.com/vi/P6gFTvi3k7w/maxresdefault.jpg" alt="Video of Experiments" width="70%">
+</a>
 
 ----
 
