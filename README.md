@@ -139,10 +139,13 @@ If you use LegNav-Sim in your research, please cite our paper (arXiv preprint
 coming soon):
 
 ```bibtex
-@article{vaglio2026legnav,
-  title   = {Learning Robot Social Navigation among Human Legs},
-  author  = {Vaglio, Alberto and Garulli, Andrea and Giannitrapani, Antonio
-             and Quartullo, Renato and Van Der Meer, Tommaso},
-  year    = {2026},
+@misc{vaglio2026learningsocialrobotnavigation,
+      title={Learning Social Robot Navigation By Sensing Human Legs}, 
+      author={Alberto Vaglio and Andrea Garulli and Antonio Giannitrapani and Renato Quartullo and Tommaso Van Der Meer},
+      year={2026},
+      eprint={2607.27922},
+      archivePrefix={arXiv},
+      primaryClass={cs.RO},
+      url={https://arxiv.org/abs/2607.27922}, 
 }
 ```
