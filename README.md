@@ -1,4 +1,4 @@
-<h1>LegNav-Sim</h1>
+<h1>LegNav-Sim - IROS2026W</h1>
 
 **Accepted at an IROS 2026 workshop.**
 
