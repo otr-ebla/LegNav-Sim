@@ -58,10 +58,10 @@ In a new temporary Python 3.13.5 environment on Linux x86-64:
   this validated path.
 - SHAC, PPO circles and asymmetric PPO default checkpoints are absent from Git.
   Use the validated SAC/PPO/TQC defaults for the workshop.
-- Historical gitlinks `.claude/worktrees/great-cori` and
-  `legnav/baselines/navrep` have no `.gitmodules` definitions. Avoid recursive
-  submodule cloning. The core simulator does not need them; repository cleanup
-  is still outstanding.
+- The historical gitlink `legnav/baselines/navrep` has no `.gitmodules`
+  definition. Avoid recursive submodule cloning. The core simulator does not
+  need it; cleanup of this gitlink is still outstanding. `.claude` is excluded
+  from version control.
 - There is no top-level license file. The vendored JHSFM license does not specify
   the license of the entire project; the owner should choose one before wider
   redistribution.
