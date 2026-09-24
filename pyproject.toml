@@ -6,9 +6,25 @@ build-backend = "setuptools.build_meta"
 name = "legnav"
 version = "0.1.0"
 description = "LegNav-Sim: a fast JAX 2D LiDAR navigation environment for DRL in dynamic human (leg-level) crowds."
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 readme = "README.md"
+dependencies = [
+    "jax==0.9.0.1",
+    "flax==0.12.4",
+    "optax==0.2.6",
+    "numpy>=2.0,<3",
+    "pygame==2.6.1",
+]
+
+[project.optional-dependencies]
+cuda12 = ["jax[cuda12]==0.9.0.1"]
+plots = ["matplotlib>=3.9,<4", "pandas>=2.2,<3", "seaborn>=0.13,<0.14"]
+baselines = ["gymnasium>=1.0,<2", "stable-baselines3>=2.7,<3", "sb3-contrib>=2.7,<3", "tensorboard>=2.20,<3", "tqdm>=4.67,<5"]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["legnav*"]
+exclude = ["legnav.baselines.navrep", "legnav.baselines.navrep.*"]
+
+[tool.setuptools.package-data]
+legnav = ["map/*.npz", "jhsfm/grid_decomp/*.txt"]

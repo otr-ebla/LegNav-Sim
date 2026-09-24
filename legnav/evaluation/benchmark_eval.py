@@ -70,7 +70,7 @@ class _SACActorHead(nn.Module):
     tanh_inside: bool  = False  # set at build time from jax_network.USE_TANH_INSIDE
 
     @nn.compact
-    def __call__(self, feat):
+    def __call__(self, feat, mean_only=False):
         raw_mean = nn.Dense(self.action_dim, name="mean")(feat)
         if self.tanh_inside:
             v_mean = jnp.tanh(raw_mean[..., 0]) * 0.5 + 0.5
@@ -78,6 +78,10 @@ class _SACActorHead(nn.Module):
             actor_mean = jnp.stack([v_mean, w_mean], axis=-1)
         else:
             actor_mean = raw_mean
+        # Deterministic evaluation also accepts older checkpoints with a
+        # global log_std vector instead of a state-dependent Dense layer.
+        if mean_only:
+            return actor_mean, jnp.zeros_like(actor_mean)
         logstd_pre = nn.Dense(self.action_dim, name="log_std")(feat)
         actor_logstd = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (jnp.tanh(logstd_pre) + 1.0)
         return actor_mean, actor_logstd
@@ -116,7 +120,7 @@ _tqc_head    = _TQCActorHead(tanh_inside=USE_TANH_INSIDE)
 def _sac_apply(variables, obs):
     p = variables["params"]
     feat = _shared_enc.apply({"params": p["enc"]}, obs)
-    return _sac_head.apply({"params": p["head"]}, feat)
+    return _sac_head.apply({"params": p["head"]}, feat, mean_only=True)
 
 def _tqc_apply(variables, obs):
     p = variables["params"]
@@ -1067,6 +1071,8 @@ def _plot_test_dashboard(test_df):
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
+    paths.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    paths.FIGURES_DIR.mkdir(parents=True, exist_ok=True)
     t_total = time.time()
     gpu = jax.devices("cuda")[0] if jax.devices("cuda") else jax.devices()[0]
     print(f"Running on: {gpu}\n")

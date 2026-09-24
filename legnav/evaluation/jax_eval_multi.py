@@ -28,7 +28,7 @@ import argparse
 import pathlib
 import os
 from legnav import paths
-os.environ["JAX_PLATFORMS"] = "cpu"
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import math
 import functools
@@ -63,7 +63,14 @@ def _parse_args():
                    help="Enable Salt&Pepper sensor noise (off by default for clean eval).")
     p.add_argument("--watch", action="store_true", default=False,
                    help="Watch the checkpoint file and hot-reload weights when modified.")
-    return p.parse_args()
+    p.add_argument("--headless", action="store_true",
+                   help="Run a short policy rollout without opening a window.")
+    p.add_argument("--steps", type=int, default=10,
+                   help="Number of simulation steps for --headless (default: 10).")
+    parsed = p.parse_args()
+    if parsed.steps < 1:
+        p.error("--steps must be positive")
+    return parsed
 
 args = _parse_args()
 
@@ -236,8 +243,12 @@ class _SACActorHead(nn.Module):
     LOG_STD_MAX: float =  0.5
 
     @nn.compact
-    def __call__(self, feat):
+    def __call__(self, feat, mean_only=False):
         raw_mean   = nn.Dense(self.action_dim, name="mean")(feat)
+        # Deterministic evaluation also accepts older checkpoints with a
+        # global log_std vector instead of a state-dependent Dense layer.
+        if mean_only:
+            return raw_mean, jnp.zeros_like(raw_mean)
         logstd_pre = nn.Dense(self.action_dim, name="log_std")(feat)
         log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) \
                   * (jnp.tanh(logstd_pre) + 1.0)
@@ -269,7 +280,7 @@ def _build_sac():
     def infer(params, obs, max_v):
         enc_p, head_p = params
         feat = enc.apply({"params": enc_p}, obs[None])
-        raw_mean, _ = head.apply({"params": head_p}, feat)
+        raw_mean, _ = head.apply({"params": head_p}, feat, mean_only=True)
         return jnp.squeeze(_sac_deterministic_action(raw_mean, float(max_v)), 0)
 
     return init_params, load, infer
@@ -885,9 +896,11 @@ def main():
     try:
         params = load_fn(ckpt)
         print(f"✅ Loaded {algo.upper()} weights from {ckpt}")
-    except FileNotFoundError:
-        params = init_params
-        print(f"⚠️  Checkpoint not found — running with random weights.")
+    except FileNotFoundError as exc:
+        raise SystemExit(
+            f"Checkpoint not found: {ckpt}\n"
+            "Clone the repository to obtain pretrained weights, or pass --ckpt PATH."
+        ) from exc
 
     last_mtime = os.path.getmtime(ckpt) if os.path.exists(ckpt) else 0
 
@@ -905,8 +918,27 @@ def main():
 
     rng = jax.random.PRNGKey(42)
     evaluation_mode  = "random"
-    current_scenario = random.randint(0, 6)
+    current_scenario = 0 if args.headless else random.randint(0, 6)
     fast_reset, fast_step = build_fast_reset(current_scenario)
+
+    if args.headless:
+        print(f"Backend: {jax.default_backend()}; compiling reset and step...", flush=True)
+        obs, stacked_state = fast_reset(rng)
+        for index in range(args.steps):
+            rng, step_rng = jax.random.split(rng)
+            action = infer_fn(params, obs, stacked_state.env_state.max_v)
+            obs, stacked_state, reward, done, _ = fast_step(step_rng, stacked_state, action)
+            if not (np.isfinite(np.asarray(obs)).all()
+                    and np.isfinite(np.asarray(action)).all()
+                    and np.isfinite(float(reward))):
+                raise RuntimeError(f"Non-finite output at step {index + 1}")
+            if bool(done):
+                rng, reset_rng = jax.random.split(rng)
+                obs, stacked_state = fast_reset(reset_rng)
+                getattr(infer_fn, "reset_hook", lambda: None)()
+        print(f"PASS: {algo.upper()} checkpoint loaded; {args.steps} simulation steps; "
+              f"observation shape {obs.shape}.")
+        return
 
     pygame.init()
     screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
