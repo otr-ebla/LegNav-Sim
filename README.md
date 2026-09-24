@@ -1,6 +1,6 @@
 <h1>LegNav-Sim</h1>
 
-**Accepted for presentation at an IROS 2026 workshop.**
+**Accepted at an IROS 2026 workshop.**
 
 [![JAX](https://img.shields.io/badge/JAX-Enabled-orange?style=flat-square&logo=google)](https://github.com/google/jax)
 [![CUDA](https://img.shields.io/badge/CUDA-Accelerated-green?style=flat-square&logo=nvidia)](https://developer.nvidia.com/cuda-zone)
