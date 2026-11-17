@@ -19,7 +19,7 @@ from legnav.config import SimConfig, RobotConfig, LidarConfig
 # ── Feature flags ─────────────────────────────────────────────────────────────
 # Flip USE_LEGS to False for cylinder-model baseline/ablation training.
 # Eval scripts can override: import jax_env; jax_env.USE_LEGS = False
-USE_LEGS = True
+USE_LEGS = __import__("os").environ.get("LEGNAV_USE_LEGS", "1") != "0"   # 0 = disc pedestrians
 SENSOR_NOISE = True
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -44,7 +44,8 @@ PROGRESS_COEF  = 1.0
 MAX_RESAMPLE_ITERS = 200
 DEFAULT_MIN_GOAL_DIST = 3.0
 
-KIN_VEC_SIZE    = 5   # v, w, max_v_norm, goal_dist, goal_align
+KIN_VEC_SIZE    = 5   # simulator kin vec: v, w, max_v_norm, goal_dist, goal_align
+KIN_OBS_SIZE    = 4   # policy-facing kin vec (current layout): goal_align is NOT exposed; legacy ckpts get it back via obs_layouts
 GOAL_VEC_SIZE   = 2   # gdx_ego, gdy_ego (goal offset in robot frame)
 _MAX_GOAL_DIST  = math.sqrt(ROOM_W**2 + ROOM_H**2)
 SINGLE_OBS_SIZE = GOAL_VEC_SIZE + KIN_VEC_SIZE + NUM_RAYS   # 223

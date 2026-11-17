@@ -55,6 +55,7 @@ import os
 import csv
 import sys
 from legnav import paths
+import legnav.core.jax_env as jax_env
 
 # ---------------------------------------------------------------------------
 # Path setup (same logic used by dwa_planner.py / mppi_planner.py)
@@ -90,6 +91,8 @@ import optax
 import flax.linen as nn
 import flax.serialization
 import numpy as np
+from legnav.algorithms.early_stop import EarlyStopper
+from legnav.algorithms.run_log import RunLogger
 from flax.linen.initializers import orthogonal, constant
 from flax import struct
 
@@ -118,23 +121,26 @@ from legnav.core.precision import bf16_apply, PRECISION_STR
 
 
 # ── Hyperparameters (identical to jax_ppo.py) ──────────────────────────────
-GAMMA          = 0.99
-GAE_LAMBDA     = 0.95
-CLIP_EPS       = 0.2
-VF_COEF        = 0.25
-ENTROPY_COEF   = 0.015
-MAX_GRAD_NORM  = 0.5
-PPO_EPOCHS     = 6
-LR_START       = 2.5e-4
-LR_END         = 1e-5
-LR_MIN         = 1e-5
-WARMUP_UPDATES = 5
+from legnav import runconfig as _rc
+_C = _rc.load()   # frozen config: configs/revision.yaml
 
-DEFAULT_TOTAL_ENV_STEPS = 100_000_000
+GAMMA          = _C["vanilla"]["gamma"]
+GAE_LAMBDA     = _C["vanilla"]["gae_lambda"]
+CLIP_EPS       = _C["vanilla"]["clip_eps"]
+VF_COEF        = _C["vanilla"]["vf_coef"]
+ENTROPY_COEF   = _C["vanilla"]["entropy_coef"]
+MAX_GRAD_NORM  = _C["vanilla"]["max_grad_norm"]
+PPO_EPOCHS     = _C["vanilla"]["epochs"]
+LR_START       = _C["vanilla"]["lr_start"]
+LR_END         = _C["vanilla"]["lr_end"]
+LR_MIN         = _C["vanilla"]["lr_min"]
+WARMUP_UPDATES = _C["vanilla"]["warmup_updates"]
+
+DEFAULT_TOTAL_ENV_STEPS = _C["vanilla"]["total_env_steps"]
 
 # ── Minibatch geometry (identical) ─────────────────────────────────────────
 BATCH_SIZE      = NUM_ENVS * ROLLOUT_STEPS          # 65_536
-N_MINIBATCHES   = 8
+N_MINIBATCHES   = _C["vanilla"]["n_minibatches"]
 assert BATCH_SIZE % N_MINIBATCHES == 0
 MINI_BATCH_SIZE = BATCH_SIZE // N_MINIBATCHES       # 8_192
 
@@ -350,7 +356,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     print(f"  Precision   : {PRECISION_STR} (GPU compute)")
     print(f"  Continuous curriculum anchors: suc={list(_SUC_ANCHORS)}\n")
 
-    rng = jax.random.PRNGKey(42)
+    rng = jax.random.PRNGKey(int(os.environ.get("LEGNAV_SEED", 42)))
     rng, init_rng, env_rng = jax.random.split(rng, 3)
 
     # Initialise network parameters
@@ -380,7 +386,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
 
     print(f"Ready. obs={env_obs.shape}\n")
 
-    best_suc = 55.0   # mirror jax_ppo.py threshold — never touch
+    best_suc = _C["checkpoint_selection"]["best_suc_init"]["vanilla"]   # mirror jax_ppo.py threshold — never touch
 
     os.makedirs(CKPT_DIR, exist_ok=True)
     _log_file   = open(LOG_PATH, "w", newline="")
@@ -397,6 +403,11 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
 
     t_start = time.time()
 
+    _es = EarlyStopper.from_env(total_updates * BATCH_SIZE)
+    _rc.verify_env()
+    _seed = int(os.environ.get("LEGNAV_SEED", 42))
+    _log = RunLogger("vanilla", "nsg" if jax_env.USE_LEGS else "disc", _seed, NUM_ENVS, paths.checkpoint("vanilla_ppo"))
+    _stop_reason = ""
     try:
         for update in range(total_updates):
             t0 = time.time()
@@ -413,6 +424,9 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
             values      = rollout_history["values"]
             dones       = rollout_history["dones"]
             timeouts    = rollout_history["timeout"]
+            _log.update(raw_rewards, dones, rollout_history["goal_reached"], rollout_history["static_col"],
+                        rollout_history["active_col"], rollout_history["passive_col"], rollout_history["rew_terms"],
+                        BATCH_SIZE, extra={"dist": cur_max_dist, "ghost": cur_ghost, "scen": cur_max_scen})
 
             rewards, running_ret, rms_state = normalize_batch_rewards(
                 raw_rewards, dones, running_ret, rms_state, GAMMA
@@ -445,7 +459,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
 
             # ── Curriculum (strictly monotonic) ──────────────────────────
             if n_ep > 0:
-                rolling_suc         = 0.9 * rolling_suc + 0.1 * suc_pct
+                rolling_suc         = (1 - _C["curriculum"]["ppo_rolling_alpha"]) * rolling_suc + _C["curriculum"]["ppo_rolling_alpha"] * suc_pct
                 highest_rolling_suc = max(highest_rolling_suc, rolling_suc)
 
             new_max_dist, new_ghost, new_ent, new_max_scen = \
@@ -456,7 +470,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
             old_print_scen  = cur_max_scen
 
             if new_max_dist > cur_max_dist:
-                cur_max_dist = min(cur_max_dist + 0.2, new_max_dist)
+                cur_max_dist = min(cur_max_dist + _C["curriculum"]["ppo_dist_step"], new_max_dist)
             if new_ghost > cur_ghost:
                 cur_ghost = new_ghost
             if new_max_scen > cur_max_scen:
@@ -511,8 +525,12 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
                 best_suc = suc_pct
                 save_checkpoint(train_state[0], train_state[1], CKPT_BEST)
 
+            if _es and n_ep > 0 and _es.update((update + 1) * BATCH_SIZE, suc_pct):
+                _stop_reason = _es.reason((update + 1) * BATCH_SIZE); print("  " + _stop_reason); break
+
     finally:
         _log_file.close()
+        _log.close(stopped_early=bool(_stop_reason), reason=_stop_reason)
 
     print(f"Training log → {LOG_PATH}")
     elapsed = time.time() - t_start
@@ -521,4 +539,4 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
 
 
 if __name__ == "__main__":
-    train()
+    train(int(os.environ.get("LEGNAV_TOTAL_STEPS", DEFAULT_TOTAL_ENV_STEPS)))

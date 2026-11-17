@@ -37,9 +37,12 @@ def _verify_gpu():
 GPU_DEVICE = _verify_gpu()
 
 # Config
-NUM_ENVS      = 1024
-ROLLOUT_STEPS = 128
-OBS_SIZE      = 5 + 2 * 3 + 3 * 3 + 216 * 3    # 668 = kin(5) + goal_stack(6) + ego_deltas(9) + lidar_stack(648)
+from legnav import runconfig as _rc
+_C = _rc.load()   # frozen config: configs/revision.yaml
+
+NUM_ENVS      = _C["ppo"]["num_envs"]
+ROLLOUT_STEPS = _C["ppo"]["rollout_steps"]
+OBS_SIZE      = 4 + 2 * 3 + 3 * 3 + 216 * 3    # 667 = kin(4) + goal_stack(6) + ego_deltas(9) + lidar_stack(648)
 
 _VMAP_STEP_CACHE: dict = {}
 
@@ -141,6 +144,8 @@ def collect_rollouts(
             "rewards":      rewards,
             "dones":        dones,
             "timeout":      infos["timeout"],
+            "static_col":   infos["static_col"],
+            "rew_terms":    infos["rew_terms"],
             "max_v":        max_v,
             "goal_reached": infos["goal_reached"],
             "collision":    infos["collision"],

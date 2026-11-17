@@ -26,6 +26,8 @@ os.environ["XLA_FLAGS"] = (os.environ.get("XLA_FLAGS", "")
                            + " --xla_gpu_experimental_enable_fusion_autotuner=false").strip()
 
 import time
+from legnav.algorithms.early_stop import EarlyStopper
+from legnav.algorithms.run_log import RunLogger
 import functools
 import warnings
 import jax
@@ -45,7 +47,7 @@ jax.config.update("jax_persistent_cache_min_compile_time_secs", 2.0)
 # `from jax_env import USE_LEGS` at import time). Matches the eval default:
 # leg-pair human model + salt&pepper LiDAR noise.
 import legnav.core.jax_env as _jax_env
-_jax_env.USE_LEGS     = True
+_jax_env.USE_LEGS     = os.environ.get("LEGNAV_USE_LEGS", "1") != "0"
 _jax_env.SENSOR_NOISE = True
 
 from legnav.core.jax_env import MAX_STEPS
@@ -54,7 +56,7 @@ from legnav.core.jax_wrappers import make_stacked_env, make_autoreset_env
 from legnav.algorithms.jax_ppo import get_continuous_curriculum
 
 # ══ Observation / action ══════════════════════════════════════════════════════
-OBS_SIZE      = 668   # kin(5) + goal_stack(6) + ego_deltas(9) + lidar_stack(648)
+OBS_SIZE      = 667   # kin(4) + goal_stack(6) + ego_deltas(9) + lidar_stack(648)
 ACTION_DIM    = 2
 MAX_V_OBS_IDX = 2     # kin_vec[v_norm, w, max_v_norm, ...] → max_v at idx 2
 
@@ -63,48 +65,51 @@ MAX_V_OBS_IDX = 2     # kin_vec[v_norm, w, max_v_norm, ...] → max_v at idx 2
 # COLLECT_STEPS × N_ENVS transitions, then run GRAD_UPDATES_PER_CHUNK gradient
 # updates. COLLECT_STEPS is kept small so the buffer holds ~3 chunks of history
 # (at 50 it held only ~1.5 — effectively on-policy data).
-TOTAL_ENV_STEPS        = 70_000_000
-N_ENVS                 = 4096
-COLLECT_STEPS          = 25
-GRAD_UPDATES_PER_CHUNK = 1_000
-WARMUP_STEPS           = 10_000
+from legnav import runconfig as _rc
+_C = _rc.load()   # frozen config: configs/revision.yaml
+
+TOTAL_ENV_STEPS        = _C["tqc"]["total_env_steps"]
+N_ENVS                 = _C["tqc"]["n_envs"]
+COLLECT_STEPS          = _C["tqc"]["collect_steps"]
+GRAD_UPDATES_PER_CHUNK = _C["tqc"]["grad_updates_per_chunk"]
+WARMUP_STEPS           = _C["tqc"]["warmup_steps"]
 
 STEPS_PER_CHUNK    = N_ENVS * COLLECT_STEPS                 # 102,400
 TOTAL_CHUNKS       = TOTAL_ENV_STEPS // STEPS_PER_CHUNK     # ~683
 TOTAL_GRAD_UPDATES = TOTAL_CHUNKS * GRAD_UPDATES_PER_CHUNK  # LR-schedule horizon
 
 # ══ Replay buffer (prioritized: p = |TD|^α, IS weight ∝ (N·P)^-β) ═════════════
-BUFFER_CAP     = 300_000
-BATCH_SIZE     = 512
-PER_ALPHA      = 0.6
-PER_BETA_START = 0.4
-PER_BETA_END   = 1.0
-PER_EPS        = 1e-6
+BUFFER_CAP     = _C["tqc"]["buffer_cap"]
+BATCH_SIZE     = _C["tqc"]["batch_size"]
+PER_ALPHA      = _C["tqc"]["per_alpha"]
+PER_BETA_START = _C["tqc"]["per_beta_start"]
+PER_BETA_END   = _C["tqc"]["per_beta_end"]
+PER_EPS        = _C["tqc"]["per_eps"]
 _BUF_OBS_DTYPE = jnp.bfloat16   # halves obs storage; cast to f32 at sample time
 
 # ══ TQC hyperparameters ═══════════════════════════════════════════════════════
-GAMMA         = 0.99
-TAU           = 0.005
-LR            = 3e-4    # decays linearly to LR*0.1 over the run
+GAMMA         = _C["tqc"]["gamma"]
+TAU           = _C["tqc"]["tau"]
+LR            = _C["tqc"]["lr"]    # decays linearly to LR*0.1 over the run
 # Fixed entropy coefficient. Auto-tuning was removed: the -2.0 target was
 # unreachable (log_pi sits at +4..5 for a good policy), so α railed against its
 # cap and the -α·log_pi term in the backup dominated Q; α swings then collapsed
 # training. A small constant keeps the entropy bonus a mild regulariser.
-ALPHA_FIXED   = 0.05
-MAX_GRAD_NORM = 10.0
-LOG_STD_EPS   = 1e-6
-ACTOR_ENC_GRAD_SCALE = 0.1   # fraction of actor gradient let into the shared encoder
+ALPHA_FIXED   = _C["tqc"]["alpha_fixed"]
+MAX_GRAD_NORM = _C["tqc"]["max_grad_norm"]
+LOG_STD_EPS   = _C["tqc"]["log_std_eps"]
+ACTOR_ENC_GRAD_SCALE = _C["tqc"]["actor_enc_grad_scale"]   # fraction of actor gradient let into the shared encoder
 
-N_CRITICS        = 5
-N_ATOMS          = 25
-N_TOP_ATOMS_DROP = 3    # truncation: drop the top atoms of the pooled target
+N_CRITICS        = _C["tqc"]["n_critics"]
+N_ATOMS          = _C["tqc"]["n_atoms"]
+N_TOP_ATOMS_DROP = _C["tqc"]["n_top_atoms_drop"]    # truncation: drop the top atoms of the pooled target
 N_TARGET_ATOMS   = N_CRITICS * N_ATOMS - N_TOP_ATOMS_DROP
-HUBER_KAPPA      = 1.0
+HUBER_KAPPA      = _C["tqc"]["huber_kappa"]
 
 # ══ Logging / eval / safety stop ══════════════════════════════════════════════
-PRINT_EVERY_CHUNKS   = 5
-EVAL_EVERY_CHUNKS    = 5
-DIVERGENCE_CRIT_LOSS = 200.0   # stop if mean critic loss exceeds this
+PRINT_EVERY_CHUNKS   = _C["tqc"]["print_every_chunks"]
+EVAL_EVERY_CHUNKS    = _C["tqc"]["eval_every_chunks"]
+DIVERGENCE_CRIT_LOSS = _C["tqc"]["divergence_crit_loss"]   # stop if mean critic loss exceeds this
 
 CKPT_DIR  = paths.checkpoint("tqc")
 CKPT_PATH = f"{CKPT_DIR}/tqc_best.msgpack"
@@ -433,7 +438,7 @@ def collect_step(sep, ap, env_state, env_obs, rng_key, vmap_step,
 # ── Deterministic evaluation (policy mode, no exploration noise) ──────────────
 # 1024 envs × MAX_STEPS completes thousands of episodes — plenty for checkpoint
 # selection at a fraction of the cost of evaluating all training envs.
-EVAL_ENVS    = 1024
+EVAL_ENVS    = _C["tqc"]["eval_envs"]
 EVAL_HORIZON = MAX_STEPS
 
 @functools.partial(jax.jit, static_argnums=(5, 10))
@@ -480,7 +485,8 @@ def train_chunk(ap, aos, cp, cos, tp, sep, eos, tsep, buf,
         # the bootstrap of timeout transitions.
         new_buf = buf_add(buf_, obs_b, env_a, rew, info["final_obs"],
                           terminal.astype(jnp.float32))
-        step_data = (rew, done, info["goal_reached"], info["collision"], info["passive_col"])
+        step_data = (rew, done, info["goal_reached"], info["collision"], info["passive_col"],
+                     info["active_col"], info["static_col"], info["rew_terms"])   # [5:] only for run_log
         return (new_es, new_eo, new_buf, key_), step_data
 
     (new_es, new_eo, new_buf, key), all_step_data = jax.lax.scan(
@@ -570,7 +576,7 @@ def train():
     print(f"  Chunk: {STEPS_PER_CHUNK:,} env steps -> {GRAD_UPDATES_PER_CHUNK} grad updates")
     print(f"  Budget: {TOTAL_ENV_STEPS:,} env steps  ->  ~{TOTAL_CHUNKS} chunks")
 
-    rng = jax.random.PRNGKey(7)
+    rng = jax.random.PRNGKey(int(os.environ.get("LEGNAV_SEED", 7)))
     rng, k_se, ka, kc = jax.random.split(rng, 4)
 
     # Init params: shared encoder, actor head, critic ensemble (+ target copies).
@@ -599,8 +605,11 @@ def train():
                                                    ghost_prob=cur_ghost)
     replay_buf = make_buffer(BUFFER_CAP)
     total_steps, n_updates = 0, 0
-    best_suc = 0.0
+    best_suc = _C["checkpoint_selection"]["best_suc_init"]["tqc"]
 
+    _rc.verify_env()
+    _log = RunLogger("calf_tqc", "nsg" if _jax_env.USE_LEGS else "disc", int(os.environ.get("LEGNAV_SEED", 0)), N_ENVS, CKPT_DIR)
+    _log.phase = "warmup"; _stop_reason = ""
     print("Warming up buffer with random actions...")
     rng, k_warmup = jax.random.split(rng)
     for _ in range((WARMUP_STEPS // N_ENVS) + 1):
@@ -619,8 +628,12 @@ def train():
                              info["final_obs"], terminal.astype(jnp.float32))
         env_obs = new_obs
         total_steps += N_ENVS
+        _log.update(reward[None], done[None], info["goal_reached"][None], info["static_col"][None], info["active_col"][None],
+                    info["passive_col"][None], info["rew_terms"][None], N_ENVS,
+                    extra={"dist": cur_max_dist, "ghost": cur_ghost, "scen": cur_max_scen})
 
     print("Warmup done. JIT compiling train chunk (this may take a minute)...")
+    _log.set_phase("train")
     _c, _sd, _m = train_chunk(
         ap, aos, cp, cos, tp, sep, eos, tsep, replay_buf,
         vmap_step, jnp.float32(cur_max_dist), jnp.int32(cur_scenario), jnp.float32(cur_ghost),
@@ -630,6 +643,8 @@ def train():
     ap, aos, cp, cos, tp, sep, eos, tsep, replay_buf, env_state, env_obs, rng = _c
     n_updates   += GRAD_UPDATES_PER_CHUNK
     total_steps += STEPS_PER_CHUNK
+    _log.update(_sd[0], _sd[1], _sd[2], _sd[6], _sd[5], _sd[4], _sd[7], STEPS_PER_CHUNK,
+                extra={"dist": cur_max_dist, "ghost": cur_ghost, "scen": cur_max_scen})   # the compile-time chunk is real env data
     print("Compilation done.")
 
     hdr = (f"{'Upd':>7} | {'Steps':>10} | {'EpRet':>7} | "
@@ -641,6 +656,7 @@ def train():
 
     chunk   = 0
     t_start = time.time()
+    _es = EarlyStopper.from_env(TOTAL_ENV_STEPS)
 
     log_path = paths.checkpoint("tqc", "tqc_training_log.csv")
     os.makedirs(CKPT_DIR, exist_ok=True)
@@ -669,8 +685,11 @@ def train():
         total_steps += STEPS_PER_CHUNK
 
         ep_rets, ep_suc, ep_col, ep_pcol, ep_tmo, ep_msk = \
-            collect_episode_outcomes(*all_step_data)
+            collect_episode_outcomes(*all_step_data[:5])
         n_ep = int(ep_msk.sum())
+        _log.update(all_step_data[0], all_step_data[1], all_step_data[2], all_step_data[6], all_step_data[5],
+                    all_step_data[4], all_step_data[7], STEPS_PER_CHUNK,
+                    extra={"dist": cur_max_dist, "ghost": cur_ghost, "scen": cur_max_scen})
 
         if n_ep > 0:
             mean_ret = float((ep_rets * ep_msk).sum() / n_ep)
@@ -705,27 +724,28 @@ def train():
 
         if m_crit > DIVERGENCE_CRIT_LOSS:
             print(f"  !! Critic loss {m_crit:.1f} > {DIVERGENCE_CRIT_LOSS:.0f} — training diverged, stopping early.")
+            _stop_reason = "diverged"
             break
 
         if n_ep > 0:
             # Curriculum: difficulty tracks rolling success in BOTH directions,
             # rate-limited per chunk, so a collapse eases difficulty back
             # instead of drowning the buffer in max-difficulty failures.
-            rolling_suc = 0.80 * rolling_suc + 0.20 * suc_pct
+            rolling_suc = (1 - _C["curriculum"]["offpolicy_rolling_alpha"]) * rolling_suc + _C["curriculum"]["offpolicy_rolling_alpha"] * suc_pct
             new_max_dist, new_ghost, _, new_max_scen = get_continuous_curriculum(rolling_suc)
 
             if new_max_dist > cur_max_dist:
-                cur_max_dist = min(new_max_dist, cur_max_dist + 0.3)
+                cur_max_dist = min(new_max_dist, cur_max_dist + _C["curriculum"]["offpolicy_dist_step"])
             elif new_max_dist < cur_max_dist:
-                cur_max_dist = max(new_max_dist, cur_max_dist - 0.3)
+                cur_max_dist = max(new_max_dist, cur_max_dist - _C["curriculum"]["offpolicy_dist_step"])
             if new_ghost > cur_ghost:
-                cur_ghost = min(new_ghost, cur_ghost + 0.02)
+                cur_ghost = min(new_ghost, cur_ghost + _C["curriculum"]["offpolicy_ghost_step"])
             elif new_ghost < cur_ghost:
-                cur_ghost = max(new_ghost, cur_ghost - 0.02)
+                cur_ghost = max(new_ghost, cur_ghost - _C["curriculum"]["offpolicy_ghost_step"])
             if new_max_scen > cur_max_scen:
-                cur_max_scen = min(new_max_scen, cur_max_scen + 1)
+                cur_max_scen = min(new_max_scen, cur_max_scen + _C["curriculum"]["offpolicy_scen_step"])
             elif new_max_scen < cur_max_scen:
-                cur_max_scen = max(new_max_scen, cur_max_scen - 1)
+                cur_max_scen = max(new_max_scen, cur_max_scen - _C["curriculum"]["offpolicy_scen_step"])
 
             cur_scenario = -1   # -1 → uniform draw in [0, cur_max_scen] at each reset
 
@@ -751,18 +771,23 @@ def train():
                 best_suc = det_suc
                 save_checkpoint(sep, tsep, ap, cp, tp, eos, aos, cos, n_updates)
 
+        if _es and n_ep > 0 and _es.update(total_steps, suc_pct):
+            _stop_reason = _es.reason(total_steps); print("  " + _stop_reason); break
+
     # Final checkpoint == best checkpoint: the live params at the end of a run
     # can be worse than the best on disk.
     import shutil
     final_path = paths.checkpoint("tqc", "tqc_final.msgpack")
     if os.path.exists(CKPT_PATH):
-        shutil.copyfile(CKPT_PATH, final_path)
+        with open(CKPT_PATH, "rb") as _f: _b = _f.read()   # read+write, not shutil (NFS copy_file_range hangs)
+        with open(final_path, "wb") as _f: _f.write(_b)
         print(f"  Final checkpoint -> {final_path} (copied from best, {best_suc:.1f}%)")
     else:
         save_checkpoint(sep, tsep, ap, cp, tp, eos, aos, cos, n_updates, filepath=final_path)
         print(f"  Final checkpoint -> {final_path} (no best found, saved current)")
 
     print(f"\nTQC done! {(time.time() - t_start)/3600:.2f}h | Best success: {best_suc:.1f}%")
+    _log.close(stopped_early=bool(_stop_reason), reason=_stop_reason)
     log_file.close()
     print(f"Training log saved -> {log_path}")
 

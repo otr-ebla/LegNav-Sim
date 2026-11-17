@@ -9,8 +9,8 @@ Pipeline (see architecture figure):
   ──► temporal self-attention over N tokens ──► ⊕ global state g_T ──► MLP
   ──► actor / critic heads.
 
-Obs layout (stacked): [kin_vec(5) | goal_stack(2*stack_dim) | ego_deltas(3*stack_dim) | lidar_stack(num_rays*stack_dim)]
-  g_T = kin_vec ⊕ goal_stack_flat: kin_vec = [v_t, ω_t, v_max, d_t, ρ_t] (current
+Obs layout (stacked): [kin_vec(4; legacy 5) | goal_stack(2*stack_dim) | ego_deltas(3*stack_dim) | lidar_stack(num_rays*stack_dim)]
+  g_T = kin_vec ⊕ goal_stack_flat: kin_vec = [v_t, ω_t, v_max, d_t] (current
   frame only, not stacked) and goal_stack = ego goal vec (g_x, g_y) over the last
   stack_dim frames, flattened. The ego-motion deltas feed ONLY the
   (parameter-free) reprojection block, not the fused trunk.
@@ -28,11 +28,19 @@ LOG_STD_MIN = -4.0
 LOG_STD_MAX =  0.0
 
 USE_TANH_INSIDE = True
-_KIN_VEC_SIZE   = 5
+_KIN_VEC_SIZE   = 4    # v/vmax, w, max_v_norm, goal_dist (legacy ckpts: 5, + goal_align)
 _GOAL_VEC_SIZE  = 2    # ego goal vector (g_x, g_y) per frame, stacked like lidar
 _EGO_DELTA_SIZE = 3    # (Δx, Δy, Δθ) of each frame w.r.t. the newest frame
 ATTN_HEADS      = 4    # numero di teste attention sul frame stack
 ATTN_HEAD_DIM   = 16   # dim per head → QKV dim = ATTN_HEADS * ATTN_HEAD_DIM = 64
+
+
+def _infer_kin_size(obs_dim, goal_size, delta_size, lidar_size, legacy_pose_layout, stack_dim):
+    """Kin-vector width read off the obs width: 4 for the current layout (667-D); 5 for
+    legacy checkpoints that also carried goal_align (668-D, or 662-D legacy pose layout).
+    Lets one network class load both generations of checkpoints."""
+    rest = 3 * stack_dim + lidar_size if legacy_pose_layout else goal_size + delta_size + lidar_size
+    return obs_dim - rest
 
 
 def se2_reproject_stack(lidar_frames: jnp.ndarray, deltas: jnp.ndarray,
@@ -163,17 +171,28 @@ class SharedEncoder(nn.Module):
     stack_dim: int = 3
     num_rays:   int = 216
     use_se2_reproject: bool = True
+    # Backward compat: pre-SE(2) checkpoints (fused input 206) were trained on the old 662-D
+    # layout [pose(3*S) | state_vec(5) | lidar]; True reproduces that slicing (no SE(2)).
+    legacy_pose_layout: bool = False
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        kin_size   = _KIN_VEC_SIZE
         goal_size  = _GOAL_VEC_SIZE * self.stack_dim
         delta_size = _EGO_DELTA_SIZE * self.stack_dim
+        kin_size   = _infer_kin_size(x.shape[-1], goal_size, delta_size, self.num_rays * self.stack_dim,
+                                     self.legacy_pose_layout, self.stack_dim)
 
         kin_vec    = x[..., :kin_size]
         goal_flat  = x[..., kin_size : kin_size + goal_size]
         delta_flat = x[..., kin_size + goal_size : kin_size + goal_size + delta_size]
         lidar_flat = x[..., kin_size + goal_size + delta_size:]
+        g_a, g_b   = kin_vec, goal_flat                  # global-state parts, in fused order
+        if self.legacy_pose_layout:                      # old [pose | state_vec | lidar] layout
+            pose_n     = 3 * self.stack_dim
+            g_a        = x[..., :pose_n]
+            g_b        = x[..., pose_n : pose_n + kin_size]
+            lidar_flat = x[..., pose_n + kin_size:]
+            delta_flat = jnp.zeros((*x.shape[:-1], delta_size), x.dtype)
 
         batch_shape  = lidar_flat.shape[:-1]
         lidar_frames = lidar_flat.reshape((*batch_shape, self.stack_dim, self.num_rays))
@@ -181,7 +200,7 @@ class SharedEncoder(nn.Module):
 
         # Ego-motion compensation: align every frame to the newest one.
         # Ablation: skip the SE(2) reprojection and feed raw stacked scans.
-        if self.use_se2_reproject:
+        if self.use_se2_reproject and not self.legacy_pose_layout:
             lidar_frames = se2_reproject_stack(lidar_frames, delta_frames, self.num_rays)
 
         FRAME_FEAT  = 64
@@ -194,7 +213,7 @@ class SharedEncoder(nn.Module):
         attn_flat = attn_out.reshape((*batch_shape, self.stack_dim * FRAME_FEAT))  # (..., 192)
 
         # global state g_T = kin_vec [v, ω, v_max, d, ρ] ⊕ goal_stack flat
-        fused = jnp.concatenate([attn_flat, kin_vec, goal_flat], axis=-1)
+        fused = jnp.concatenate([attn_flat, g_a, g_b], axis=-1)
 
         shared = nn.relu(
             nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(fused)
@@ -214,6 +233,7 @@ class EndToEndActorCritic(nn.Module):
     # deltas unused). The learnable parameter tree is IDENTICAL either way,
     # so checkpoints are structurally interchangeable between both variants.
     use_se2_reproject: bool = True
+    legacy_pose_layout: bool = False   # see SharedEncoder (old 662-D layout, fused input 206)
 
     @nn.compact
     def __call__(
@@ -224,14 +244,22 @@ class EndToEndActorCritic(nn.Module):
         STATELESS: takes only the observation, returns (mean, logstd, value).
         No hidden state — compatible with flat forward pass over (T*N, D).
         """
-        kin_size   = _KIN_VEC_SIZE                       # 5
         goal_size  = _GOAL_VEC_SIZE * self.stack_dim     # 6
         delta_size = _EGO_DELTA_SIZE * self.stack_dim    # 9
+        kin_size   = _infer_kin_size(x.shape[-1], goal_size, delta_size, self.num_rays * self.stack_dim,
+                                     self.legacy_pose_layout, self.stack_dim)
 
         kin_vec    = x[..., :kin_size]
         goal_flat  = x[..., kin_size : kin_size + goal_size]
         delta_flat = x[..., kin_size + goal_size : kin_size + goal_size + delta_size]
         lidar_flat = x[..., kin_size + goal_size + delta_size:]
+        g_a, g_b   = kin_vec, goal_flat                  # global-state parts, in fused order
+        if self.legacy_pose_layout:                      # old [pose | state_vec | lidar] layout
+            pose_n     = 3 * self.stack_dim
+            g_a        = x[..., :pose_n]
+            g_b        = x[..., pose_n : pose_n + kin_size]
+            lidar_flat = x[..., pose_n + kin_size:]
+            delta_flat = jnp.zeros((*x.shape[:-1], delta_size), x.dtype)
 
         # ── Per-frame CNN → sequence of temporal tokens ───────────────────────
         # LidarFrameCNN is instantiated ONCE: all 3 calls share the same
@@ -246,7 +274,7 @@ class EndToEndActorCritic(nn.Module):
         # Past scans are reprojected into the current sensor frame using the
         # per-frame (Δx, Δy, Δθ) deltas — parameter-free geometric alignment.
         # Ablation (use_se2_reproject=False): feed raw stacked scans instead.
-        if self.use_se2_reproject:
+        if self.use_se2_reproject and not self.legacy_pose_layout:
             lidar_frames = se2_reproject_stack(lidar_frames, delta_frames, self.num_rays)
 
         FRAME_FEAT = 64
@@ -268,7 +296,7 @@ class EndToEndActorCritic(nn.Module):
 
         # ── Fused trunk ───────────────────────────────────────────────────────
         # global state g_T = kin_vec [v_t, ω_t, v_max, d_t, ρ_t] ⊕ goal_stack flat
-        fused = jnp.concatenate([attn_flat, kin_vec, goal_flat], axis=-1)  # (..., 203)
+        fused = jnp.concatenate([attn_flat, g_a, g_b], axis=-1)  # (..., 203)
         shared = nn.relu(
             nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(fused)
         )

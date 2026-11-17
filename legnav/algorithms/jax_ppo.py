@@ -33,6 +33,8 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 from legnav.core.jax_network import EndToEndActorCritic, squash_corrected_log_prob
 from legnav.core.precision import bf16_apply, PRECISION_STR
+from legnav.algorithms.early_stop import EarlyStopper
+from legnav.algorithms.run_log import RunLogger
 import legnav.core.jax_env as jax_env
 from legnav.algorithms.jax_train import (
     collect_rollouts, init_env_state, rebuild_vmap_step,
@@ -45,12 +47,15 @@ from legnav.algorithms.jax_train import (
 # The loop runs  total_updates = total_env_steps // BATCH_SIZE  updates,
 # each doing PPO_EPOCHS × N_MINIBATCHES gradient steps.
 # NUM_ENVS and ROLLOUT_STEPS live in jax_train.py (shared with the baselines).
-DEFAULT_TOTAL_ENV_STEPS = 70_000_000             # env-step budget for the run
+from legnav import runconfig as _rc
+_C = _rc.load()   # frozen config: configs/revision.yaml
+
+DEFAULT_TOTAL_ENV_STEPS = _C["ppo"]["total_env_steps"]             # env-step budget for the run
 
 BATCH_SIZE      = NUM_ENVS * ROLLOUT_STEPS       # 1024 × 128 = 131,072 steps/update
-N_MINIBATCHES   = 8
+N_MINIBATCHES   = _C["ppo"]["n_minibatches"]
 MINI_BATCH_SIZE = BATCH_SIZE // N_MINIBATCHES
-PPO_EPOCHS      = 6
+PPO_EPOCHS      = _C["ppo"]["epochs"]
 assert BATCH_SIZE % N_MINIBATCHES == 0
 
 _OPT_STEPS_PER_UPDATE = PPO_EPOCHS * N_MINIBATCHES   # gradient steps per update
@@ -58,22 +63,22 @@ _OPT_STEPS_PER_UPDATE = PPO_EPOCHS * N_MINIBATCHES   # gradient steps per update
 # ══ Optimisation ══════════════════════════════════════════════════════════════
 # LR: linear warm-up over the first WARMUP_UPDATES updates, then linear decay
 # to LR_END over the remainder of the budget (schedule built inside train()).
-LR_START       = 2.5e-4
-LR_END         = 1e-5
-LR_MIN         = 1e-5
-WARMUP_UPDATES = 5
+LR_START       = _C["ppo"]["lr_start"]
+LR_END         = _C["ppo"]["lr_end"]
+LR_MIN         = _C["ppo"]["lr_min"]
+WARMUP_UPDATES = _C["ppo"]["warmup_updates"]
 _WARMUP_OPT_STEPS = WARMUP_UPDATES * _OPT_STEPS_PER_UPDATE
-MAX_GRAD_NORM  = 0.5
+MAX_GRAD_NORM  = _C["ppo"]["max_grad_norm"]
 
 # ══ PPO loss ══════════════════════════════════════════════════════════════════
-GAMMA        = 0.99
-GAE_LAMBDA   = 0.95
-CLIP_EPS     = 0.2
-VF_COEF      = 0.25
-ENTROPY_COEF = 0.015   # initial value (suc=0) — continuously interpolated by curriculum
+GAMMA        = _C["ppo"]["gamma"]
+GAE_LAMBDA   = _C["ppo"]["gae_lambda"]
+CLIP_EPS     = _C["ppo"]["clip_eps"]
+VF_COEF      = _C["ppo"]["vf_coef"]
+ENTROPY_COEF = _C["ppo"]["entropy_coef"]   # initial value (suc=0) — continuously interpolated by curriculum
 
 # ══ Logging ═══════════════════════════════════════════════════════════════════
-PRINT_EVERY = 5        # print a progress line every N updates (CSV logs every update)
+PRINT_EVERY = _C["ppo"]["print_every"]        # print a progress line every N updates (CSV logs every update)
 
 network   = EndToEndActorCritic(action_dim=2, use_se2_reproject=not NO_SE2)
 net_apply = bf16_apply(network.apply)   # bf16 forward, fp32 outputs/params
@@ -85,11 +90,11 @@ net_apply = bf16_apply(network.apply)   # bf16 forward, fp32 outputs/params
 #   82%→harder test-style scenarios (7-12)   90%→floor CCW tour (17)
 # Visual-only scenarios 13-15 and the static NPZ map (16) are redirected to 0
 # inside generate_scenario.
-_SUC_ANCHORS  = np.array([0.0, 20.0, 35.0, 50.0, 60.0, 70.0, 82.0, 90.0, 100.0])
-_DIST_ANCHORS = np.array([1.5,  1.5,  2.5,  4.0,  6.0,  7.5,  9.0,  9.0,   9.0])
-_GHOST_ANCHORS= np.array([0.0,  0.02, 0.05, 0.10, 0.20, 0.35, 0.55, 0.8,   1.0])
-_ENT_ANCHORS  = np.array([0.02, 0.02, 0.018, 0.015, 0.012, 0.01, 0.008, 0.006, 0.005])
-_SCEN_ANCHORS = np.array([0,    1,    2,    3,    5,    6,    12,   17,    17])
+_SUC_ANCHORS  = np.array(_C["curriculum"]["suc_anchors"])
+_DIST_ANCHORS = np.array(_C["curriculum"]["dist_anchors"])
+_GHOST_ANCHORS= np.array(_C["curriculum"]["ghost_anchors"])
+_ENT_ANCHORS  = np.array(_C["curriculum"]["ent_anchors"])
+_SCEN_ANCHORS = np.array(_C["curriculum"]["scen_anchors"])
 
 def get_continuous_curriculum(suc_pct: float):
     dist  = float(np.interp(suc_pct, _SUC_ANCHORS, _DIST_ANCHORS))
@@ -348,7 +353,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     print(f"  Precision   : {PRECISION_STR} (GPU compute)")
     print(f"  Continuous curriculum anchors: suc={list(_SUC_ANCHORS)}\n")
 
-    rng = jax.random.PRNGKey(42)
+    rng = jax.random.PRNGKey(int(os.environ.get("LEGNAV_SEED", 42)))
     rng, init_rng, env_rng = jax.random.split(rng, 3)
 
     dummy_obs = jnp.zeros((1, OBS_SIZE))
@@ -380,7 +385,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
 
     print(f"Ready. obs={env_obs.shape}\n")
 
-    best_suc = 55.0  # NEVER TOUCH THIS LINE
+    best_suc = _C["checkpoint_selection"]["best_suc_init"]["ppo"]  # NEVER TOUCH THIS LINE
 
     if jax_env.USE_LEGS:
         _LOG_PATH = paths.checkpoint("ppo", f"ppo_legs{_ABLATION_SUFFIX}_log.csv")
@@ -398,6 +403,11 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     print("─" * len(hdr))
 
     t_start = time.time()
+    _es = EarlyStopper.from_env(total_updates * BATCH_SIZE)
+    _rc.verify_env()
+    _seed = int(os.environ.get("LEGNAV_SEED", 42))
+    _log = RunLogger("calf_ppo", "nsg" if jax_env.USE_LEGS else "disc", _seed, NUM_ENVS, paths.checkpoint("ppo"))
+    _stop_reason = ""
 
     try:
         for update in range(total_updates):
@@ -415,6 +425,9 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
             values      = rollout_history["values"]
             dones       = rollout_history["dones"]
             timeouts    = rollout_history["timeout"]
+            _log.update(raw_rewards, dones, rollout_history["goal_reached"], rollout_history["static_col"],
+                        rollout_history["active_col"], rollout_history["passive_col"], rollout_history["rew_terms"],
+                        BATCH_SIZE, extra={"dist": cur_max_dist, "ghost": cur_ghost, "scen": cur_max_scen})
 
             rewards, running_ret, rms_state = normalize_batch_rewards(
                 raw_rewards, dones, running_ret, rms_state, GAMMA
@@ -447,7 +460,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
             # Monotonic curriculum: tracking signal and per-dimension state are
             # strictly non-decreasing — a passed level is never unlearned.
             if n_ep > 0:
-                rolling_suc         = 0.9 * rolling_suc + 0.1 * suc_pct
+                rolling_suc         = (1 - _C["curriculum"]["ppo_rolling_alpha"]) * rolling_suc + _C["curriculum"]["ppo_rolling_alpha"] * suc_pct
                 highest_rolling_suc = max(highest_rolling_suc, rolling_suc)
 
             new_max_dist, new_ghost, new_ent, new_max_scen = get_continuous_curriculum(highest_rolling_suc)
@@ -458,7 +471,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
 
             if new_max_dist > cur_max_dist:
                 # smooth-step distance (0.2 m / update) to avoid difficulty shocks
-                cur_max_dist = min(cur_max_dist + 0.2, new_max_dist)
+                cur_max_dist = min(cur_max_dist + _C["curriculum"]["ppo_dist_step"], new_max_dist)
             if new_ghost > cur_ghost:
                 cur_ghost = new_ghost
             if new_max_scen > cur_max_scen:
@@ -522,8 +535,12 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
             if suc_pct > best_suc and n_ep > 0 and curriculum_mature:
                 best_suc = suc_pct
                 save_checkpoint(train_state[0], train_state[1], ckpt_path)
+
+            if _es and n_ep > 0 and _es.update((update + 1) * BATCH_SIZE, suc_pct):
+                _stop_reason = _es.reason((update + 1) * BATCH_SIZE); print("  " + _stop_reason); break
     finally:
         _log_file.close()
+        _log.close(stopped_early=bool(_stop_reason), reason=_stop_reason)
 
     print(f"Training log saved -> {_LOG_PATH}")
 
@@ -543,4 +560,4 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     print("="*55 + "\n")
 
 if __name__ == "__main__":
-    train()
+    train(int(os.environ.get("LEGNAV_TOTAL_STEPS", DEFAULT_TOTAL_ENV_STEPS)))

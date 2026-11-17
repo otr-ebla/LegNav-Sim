@@ -1,0 +1,26 @@
+{
+  "family": "B: dead-neuron skip implant",
+  "parent": "original",
+  "carriers": {
+    "dense0": [
+      0,
+      30
+    ],
+    "dense1": [
+      2,
+      24
+    ]
+  },
+  "layers_modified": [
+    "Dense_0",
+    "Dense_1",
+    "Dense_2",
+    "Dense_3(row zeroed)"
+  ],
+  "edit": "raw_w += -0.5*galign/pi",
+  "name": "B_goalP_b-0.5",
+  "file": "candidates/B_goalP_b-0.5.msgpack",
+  "sha256": "16e1a6ae7d51e61dd085cda2abff7abb41205ec6a3fce702f0b7899b4d59195d",
+  "created": "2026-11-13 19:12:30",
+  "original_sha256_at_save": "4b1dec6bc550e432f0c48cf02b69206354b742574f2eac027ac8565dfe8e6568"
+}

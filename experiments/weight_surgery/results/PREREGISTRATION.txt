@@ -1,0 +1,1 @@
+PRE-REGISTERED (before any test-split run, Fri Nov 13 07:57:26 PM CET 2026): primary pick = C_c2_4 (chosen on dev); finalists = C_c2_4 C_c3_1 C_c2_6 A_headcal_gv1_bv-0.7_gw1.15_bw0 B_lowpassW_a0.2

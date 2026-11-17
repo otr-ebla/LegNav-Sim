@@ -1,0 +1,25 @@
+{
+  "family": "C: composite analytic edit (head calibration + dead-neuron skip implant)",
+  "parent": "original",
+  "edit": {
+    "bv": -0.4,
+    "gw": 1.25,
+    "alpha": 0.3,
+    "skip": {
+      "v": {
+        "v_prev": -1.2
+      }
+    }
+  },
+  "layers_modified": [
+    "Dense_0",
+    "Dense_1",
+    "Dense_2",
+    "Dense_3(row zeroed)"
+  ],
+  "name": "C_c3_0",
+  "file": "candidates/C_c3_0.msgpack",
+  "sha256": "b491d31818ee9a398776e1b82acac85e2e1131d07d86d8a0af097e4d4df0385f",
+  "created": "2026-11-13 19:51:39",
+  "original_sha256_at_save": "4b1dec6bc550e432f0c48cf02b69206354b742574f2eac027ac8565dfe8e6568"
+}

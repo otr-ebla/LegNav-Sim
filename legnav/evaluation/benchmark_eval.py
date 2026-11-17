@@ -36,10 +36,11 @@ from legnav.core.jax_env import ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS, DT,
 from legnav.core.jax_env_multi import reset_env, step_env
 from legnav.core.jax_wrappers import StackedEnvState, _ego_deltas, assemble_stacked_obs
 from legnav.config import RobotConfig
+from legnav.core import obs_layouts as OL
 from legnav.core.jax_network import SharedEncoder, EndToEndActorCritic, scale_action_to_env, USE_TANH_INSIDE
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-OBS_SIZE   = 668   # kin(5) + goal_stack(2*3) + ego_deltas(3*3) + lidar_stack(216*3)
+OBS_SIZE   = 667   # kin(4) + goal_stack(2*3) + ego_deltas(3*3) + lidar_stack(216*3)
 ACTION_DIM = 2
 N_ENVS     = 4096
 
@@ -58,6 +59,10 @@ POLICY_COLORS = {"PPO": "#4C72B0", "SAC": "#DD8452", "TQC": "#55A868"}
 
 # PPO: EndToEndActorCritic (monolithic encoder+actor+critic)
 _ppo_net = EndToEndActorCritic(action_dim=ACTION_DIM)
+
+def _ppo_apply(variables, obs):
+    # legacy (203-input) checkpoints get goal_align re-inserted; identity for current ones
+    return _ppo_net.apply(variables, OL.fit_obs(obs, variables["params"]))
 
 # SAC: SharedEncoder + SACActorHead (named 'mean' Dense, STATE-DEPENDENT
 # 'log_std' Dense). Must match SACjax.SACActorHead / jax_eval_multi._SACActorHead
@@ -119,11 +124,13 @@ _tqc_head    = _TQCActorHead(tanh_inside=USE_TANH_INSIDE)
 
 def _sac_apply(variables, obs):
     p = variables["params"]
+    obs = OL.fit_obs(obs, p["enc"])
     feat = _shared_enc.apply({"params": p["enc"]}, obs)
     return _sac_head.apply({"params": p["head"]}, feat, mean_only=True)
 
 def _tqc_apply(variables, obs):
     p = variables["params"]
+    obs = OL.fit_obs(obs, p["enc"])
     feat = _shared_enc.apply({"params": p["enc"]}, obs)
     return _tqc_head.apply({"params": p["head"]}, feat)
 
@@ -315,7 +322,7 @@ def _rollout_body(net_apply_fn, squash_fn, params, scen_idx, target_max_v, rng_k
 # One JIT kernel per network architecture.
 @jax.jit
 def evaluate_cell_ppo(params, scen_idx, target_max_v, rng_key):
-    return _rollout_body(_ppo_net.apply, _squash_action, params,
+    return _rollout_body(_ppo_apply, _squash_action, params,
                          scen_idx, target_max_v, rng_key)
 
 @jax.jit
@@ -369,9 +376,9 @@ def _check_arch(params):
     """Reject pre-ego-delta checkpoints (fused trunk was 206 = attn 192 + pose 9 + state 5)."""
     trunk = params.get("enc", params)
     in_dim = trunk["Dense_0"]["kernel"].shape[0]
-    if in_dim != 203:
+    if in_dim not in (202, 203):     # 202 = current (v667), 203 = legacy v668 (kin + goal_align)
         raise ValueError(
-            f"trunk input {in_dim} ≠ 203 — trained on the old 662-obs layout "
+            f"trunk input {in_dim} ∉ {{202, 203}} — trained on the old 662-obs layout "
             "(no ego-motion deltas), incompatible with the new SE(2) network"
         )
 
@@ -713,7 +720,7 @@ def _segment_core(net_apply_fn, squash_fn, params,
 
 @jax.jit
 def segment_ppo(params, init_obs, init_state, rng_key, step_offset):
-    return _segment_core(_ppo_net.apply, _squash_action, params,
+    return _segment_core(_ppo_apply, _squash_action, params,
                          init_obs, init_state, rng_key, step_offset)
 
 @jax.jit

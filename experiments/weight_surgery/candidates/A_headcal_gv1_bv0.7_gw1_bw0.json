@@ -1,0 +1,19 @@
+{
+  "family": "A: actor-head calibration",
+  "parent": "original",
+  "edit": {
+    "gv": 1,
+    "bv": 0.7,
+    "gw": 1,
+    "bw": 0
+  },
+  "layers_modified": [
+    "Dense_2/kernel",
+    "Dense_2/bias"
+  ],
+  "name": "A_headcal_gv1_bv0.7_gw1_bw0",
+  "file": "candidates/A_headcal_gv1_bv0.7_gw1_bw0.msgpack",
+  "sha256": "a7b4d064317a1da770673f5a0004d2a6d99df22b24f156b5cc51eab642ca76d5",
+  "created": "2026-11-13 18:56:31",
+  "original_sha256_at_save": "4b1dec6bc550e432f0c48cf02b69206354b742574f2eac027ac8565dfe8e6568"
+}

@@ -666,5 +666,12 @@ def step_env(key, state, action, ghost_robot: bool = True):
         "rew_heading":   heading_bonus,
         "rew_comfort":   jnp.array(0.0),  # commented out above
         "rew_yield":     yield_pen,
+        # Training-curve logging (legnav/algorithms/run_log.py): static-obstacle/wall collision flag and
+        # the full additive decomposition of the reward (terms sum exactly to `reward`).
+        "static_col":    obs_collision | wall_collision,
+        "rew_terms":     jnp.stack([jnp.asarray(t, jnp.float32) for t in (
+                             progress_reward, step_pen, smooth_pen, rot_pen,
+                             spin_in_place_pen + unjustified_stop_pen, heading_bonus, yield_pen,
+                             reward - dense_reward)]),
     }
     return obs, new_state, reward, done, info

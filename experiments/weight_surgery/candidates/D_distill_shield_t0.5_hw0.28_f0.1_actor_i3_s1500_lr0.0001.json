@@ -1,0 +1,26 @@
+{
+  "family": "D: behaviour distillation (DAgger) of an obs-only LiDAR braking shield",
+  "parent": "original",
+  "teacher": {
+    "kind": "front-gap speed cap",
+    "tau": 0.5,
+    "half_width": 0.28,
+    "v_floor": 0.1
+  },
+  "layers_modified": [
+    "LidarFrameCNN_0",
+    "LayerNorm_0",
+    "FrameStackAttention_0",
+    "Dense_0",
+    "Dense_1",
+    "Dense_2"
+  ],
+  "dagger_iters": 3,
+  "fit_steps_per_iter": 1500,
+  "lr": 0.0001,
+  "name": "D_distill_shield_t0.5_hw0.28_f0.1_actor_i3_s1500_lr0.0001",
+  "file": "candidates/D_distill_shield_t0.5_hw0.28_f0.1_actor_i3_s1500_lr0.0001.msgpack",
+  "sha256": "6858a4c5d631d3f7f8806483c6cbeb81aef9cd3a49f101a843026b3620e45dbc",
+  "created": "2026-11-13 20:01:41",
+  "original_sha256_at_save": "4b1dec6bc550e432f0c48cf02b69206354b742574f2eac027ac8565dfe8e6568"
+}

@@ -84,8 +84,9 @@ from legnav.core.jax_env import (ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS,
 from legnav.core.jax_env_multi import reset_env, step_env
 from legnav.core.jax_legs import LEG_RADIUS, SHOE_LENGTH, SHOE_WIDTH
 from legnav.core.jax_wrappers import make_stacked_env
+from legnav.core import obs_layouts as OL
 
-OBS_SIZE   = 668   # kin(5) + goal_stack(2*3) + ego_deltas(3*3) + lidar_stack(216*3)
+OBS_SIZE   = 667   # kin(4) + goal_stack(2*3) + ego_deltas(3*3) + lidar_stack(216*3)
 ACTION_DIM = 2
 
 # Yield-score constants — must match the yield reward cone in jax_env_multi.py
@@ -191,7 +192,8 @@ def _build_ppo_shac():
             mean, _, _ = net_old.apply({"params": params}, obs[None])
             return scale_action_to_env(jnp.squeeze(mean, 0), float(max_v))
 
-        # New frame-stack attention architecture
+        # New frame-stack attention architecture (legacy v668 ckpts: goal_align re-inserted)
+        obs = OL.fit_obs(obs, params)
         mean, _, _ = net_new.apply({"params": params}, obs[None])
         return scale_action_to_env(jnp.squeeze(mean, 0), float(max_v))
 
@@ -279,6 +281,7 @@ def _build_sac():
 
     def infer(params, obs, max_v):
         enc_p, head_p = params
+        obs = OL.fit_obs(obs, enc_p)
         feat = enc.apply({"params": enc_p}, obs[None])
         raw_mean, _ = head.apply({"params": head_p}, feat, mean_only=True)
         return jnp.squeeze(_sac_deterministic_action(raw_mean, float(max_v)), 0)
@@ -330,6 +333,7 @@ def _build_tqc():
 
     def infer(params, obs, max_v):
         enc_p, head_p = params
+        obs = OL.fit_obs(obs, enc_p)
         feat = enc.apply({"params": enc_p}, obs[None])
         mean, _ = head.apply({"params": head_p}, feat)
         return scale_action_to_env(jnp.squeeze(mean, 0), float(max_v))
@@ -358,6 +362,7 @@ def _build_mlp():
         return bundle.get("params", bundle)
 
     def infer(params, obs, max_v):
+        obs = OL.fit_obs(obs, params)
         mean, _, _ = net.apply({"params": params}, obs[None])
         return scale_action_to_env(jnp.squeeze(mean, 0), float(max_v))
 

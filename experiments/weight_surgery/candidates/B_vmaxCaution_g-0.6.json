@@ -1,0 +1,26 @@
+{
+  "family": "B: dead-neuron skip implant",
+  "parent": "original",
+  "carriers": {
+    "dense0": [
+      0,
+      30
+    ],
+    "dense1": [
+      2,
+      24
+    ]
+  },
+  "layers_modified": [
+    "Dense_0",
+    "Dense_1",
+    "Dense_2",
+    "Dense_3(row zeroed)"
+  ],
+  "edit": "raw_v += -0.6*vmax_norm",
+  "name": "B_vmaxCaution_g-0.6",
+  "file": "candidates/B_vmaxCaution_g-0.6.msgpack",
+  "sha256": "cf0fd623aadc5478c9eff1db8db03c1eb415cd9689b176155da46903bf4c9de0",
+  "created": "2026-11-13 19:13:59",
+  "original_sha256_at_save": "4b1dec6bc550e432f0c48cf02b69206354b742574f2eac027ac8565dfe8e6568"
+}

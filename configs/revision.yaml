@@ -1,0 +1,264 @@
+# configs/revision.yaml — FROZEN configuration for the paper revision (generated mechanically from the trainers' constants; edit with care).
+# Trainers read their sections from here; `env_expect` is checked against the code at start-up (legnav/runconfig.py).
+meta:
+  name: revision
+  description: 'Frozen configuration for the paper revision: every trainer reads its hyper-parameters from here; the `env_expect`
+    block is verified against the code at trainer start-up (mismatch = abort).'
+env:
+  module: legnav.core.jax_env_multi
+  pedestrian_model: nsg
+  use_legs: true
+  sensor_noise: true
+  ghost_prob_source: curriculum
+  scenarios:
+    train: curriculum (uniform in [0, max_scenario])
+    test:
+    - 7
+    - 8
+    - 9
+    - 10
+    - 11
+    - 12
+obs:
+  layout: v667
+  size: 667
+  stack_dim: 3
+  stride: 2
+  se2_reproject: true
+  tanh_inside: true
+  kin: 4
+  goal_per_frame: 2
+  ego_delta_per_frame: 3
+  lidar_rays: 216
+env_expect:
+  legnav.core.jax_env_multi:_R_GOAL: 30.0
+  legnav.core.jax_env_multi:_R_OBS_COL: -20.0
+  legnav.core.jax_env_multi:_R_WALL_COL: -20.0
+  legnav.core.jax_env_multi:_R_ACTIVE_COL: -50.0
+  legnav.core.jax_env_multi:_R_PASSIVE_COL: -15
+  legnav.core.jax_env_multi:_R_TIMEOUT: -9.0
+  legnav.core.jax_env_multi:_PROGRESS_COEF: 2.0
+  legnav.core.jax_env_multi:_STEP_PEN: -0.075
+  legnav.core.jax_env_multi:_SMOOTH_WEIGHT: 0.3
+  legnav.core.jax_env_multi:_ROT_WEIGHT: 0.2
+  legnav.core.jax_env_multi:_HEADING_ALIGN_COEF: 0.12
+  legnav.core.jax_env_multi:_COMFORT_DIST: 1.2
+  legnav.core.jax_env_multi:_COMFORT_COEF: 0.015
+  legnav.core.jax_env_multi:_YIELD_DIST: 1.8
+  legnav.core.jax_env_multi:_YIELD_COEF: 10
+  legnav.core.jax_env_multi:HSFM_DT: 0.03
+  legnav.core.jax_env:SENSOR_NOISE: true
+  legnav.core.jax_env:NUM_RAYS: 216
+  legnav.core.jax_env:MAX_LIDAR_DIST: 12.0
+  legnav.core.jax_env:ROBOT_RADIUS: 0.2
+  legnav.core.jax_env:PEOPLE_RADIUS: 0.4
+  legnav.core.jax_env:DT: 0.15
+  legnav.core.jax_env:MAX_STEPS: 500
+  legnav.core.jax_network:USE_TANH_INSIDE: true
+  legnav.config.RobotConfig:LIDAR_STACK_DIM: 3
+  legnav.config.RobotConfig:LIDAR_STACK_STRIDE: 2
+  legnav.config.RobotConfig:MAX_LINEAR_VEL: 2.0
+  legnav.config.RobotConfig:MAX_W: 1.0
+  legnav.config.SimConfig:MAX_STEPS: 500
+  legnav.config.SimConfig:JAX_NUM_PEOPLE: 24
+  legnav.config.SimConfig:JAX_NUM_OBS_CIR: 12
+  legnav.config.SimConfig:JAX_NUM_OBS_BOX: 12
+launch:
+  seeds:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  ablation_baseline: vanilla
+  pedestrian_models:
+  - nsg
+  - disc
+early_stop:
+  enabled: true
+  signal: smoothed training success (%)
+  min_frac: 0.3
+  patience_frac: 0.2
+  min_delta: 1.0
+  smooth_frac: 0.03
+logging:
+  interval_steps: 500000
+  format: csv
+  reward_terms:
+  - progress
+  - step
+  - smooth
+  - rot
+  - stop
+  - heading
+  - yield
+  - terminal
+curriculum:
+  suc_anchors:
+  - 0.0
+  - 20.0
+  - 35.0
+  - 50.0
+  - 60.0
+  - 70.0
+  - 82.0
+  - 90.0
+  - 100.0
+  dist_anchors:
+  - 1.5
+  - 1.5
+  - 2.5
+  - 4.0
+  - 6.0
+  - 7.5
+  - 9.0
+  - 9.0
+  - 9.0
+  ghost_anchors:
+  - 0.0
+  - 0.02
+  - 0.05
+  - 0.1
+  - 0.2
+  - 0.35
+  - 0.55
+  - 0.8
+  - 1.0
+  ent_anchors:
+  - 0.02
+  - 0.02
+  - 0.018
+  - 0.015
+  - 0.012
+  - 0.01
+  - 0.008
+  - 0.006
+  - 0.005
+  scen_anchors:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 5
+  - 6
+  - 12
+  - 17
+  - 17
+  ppo_mode: monotone (never decreases)
+  ppo_rolling_alpha: 0.1
+  ppo_dist_step: 0.2
+  offpolicy_mode: bidirectional (rate-limited)
+  offpolicy_rolling_alpha: 0.2
+  offpolicy_dist_step: 0.3
+  offpolicy_ghost_step: 0.02
+  offpolicy_scen_step: 1
+checkpoint_selection:
+  ppo: final = last parameters (best.msgpack kept separately)
+  vanilla: final = last parameters
+  sac: final = copy of best by deterministic eval
+  tqc: final = copy of best by deterministic eval
+  tagd: final = last parameters
+  best_suc_init:
+    ppo: 55.0
+    vanilla: 55.0
+    sac: 0.0
+    tqc: 0.0
+    tagd: 0.0
+ppo:
+  total_env_steps: 70000000
+  n_minibatches: 8
+  epochs: 6
+  lr_start: 0.00025
+  lr_end: 1.0e-05
+  lr_min: 1.0e-05
+  warmup_updates: 5
+  max_grad_norm: 0.5
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_eps: 0.2
+  vf_coef: 0.25
+  entropy_coef: 0.015
+  print_every: 5
+  num_envs: 1024
+  rollout_steps: 128
+vanilla:
+  total_env_steps: 100000000
+  n_minibatches: 8
+  epochs: 6
+  lr_start: 0.00025
+  lr_end: 1.0e-05
+  lr_min: 1.0e-05
+  warmup_updates: 5
+  max_grad_norm: 0.5
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_eps: 0.2
+  vf_coef: 0.25
+  entropy_coef: 0.015
+sac:
+  total_env_steps: 70000000
+  n_envs: 4096
+  collect_steps: 25
+  grad_updates_per_chunk: 1000
+  buffer_cap: 300000
+  batch_size: 512
+  per_alpha: 0.6
+  per_beta_start: 0.4
+  per_beta_end: 1.0
+  per_eps: 1.0e-06
+  gamma: 0.99
+  tau: 0.005
+  lr: 0.0003
+  alpha_fixed: 0.05
+  max_grad_norm: 10.0
+  log_std_eps: 1.0e-06
+  actor_enc_grad_scale: 0.1
+  print_every_chunks: 5
+  eval_every_chunks: 5
+  divergence_crit_loss: 200.0
+  eval_envs: 1024
+  huber_delta: 10.0
+tqc:
+  total_env_steps: 70000000
+  n_envs: 4096
+  collect_steps: 25
+  grad_updates_per_chunk: 1000
+  buffer_cap: 300000
+  batch_size: 512
+  per_alpha: 0.6
+  per_beta_start: 0.4
+  per_beta_end: 1.0
+  per_eps: 1.0e-06
+  gamma: 0.99
+  tau: 0.005
+  lr: 0.0003
+  alpha_fixed: 0.05
+  max_grad_norm: 10.0
+  log_std_eps: 1.0e-06
+  actor_enc_grad_scale: 0.1
+  print_every_chunks: 5
+  eval_every_chunks: 5
+  divergence_crit_loss: 200.0
+  eval_envs: 1024
+  warmup_steps: 10000
+  n_critics: 5
+  n_atoms: 25
+  n_top_atoms_drop: 3
+  huber_kappa: 1.0
+tagd:
+  buffer_cap: 600000
+  batch_size: 256
+  g_updates: 10
+  warmup_steps: 20000
+  gamma: 0.98
+  tau: 0.005
+  lr_actor: 0.0003
+  lr_critic: 0.0003
+  max_grad_norm: 10.0
+  expl_noise_std: 0.1
+  expl_noise_min: 0.01
+  expl_noise_decay: 0.9999
+  log_every: 100
+  save_every: 2000
+  n_envs: 512
+  total_steps: 20000000

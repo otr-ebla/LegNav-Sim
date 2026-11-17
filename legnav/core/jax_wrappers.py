@@ -39,15 +39,15 @@ FIXES vs previous version:
     frames, so the layout/size and the network are unchanged. STRIDE=1 recovers
     the classic consecutive stack.
 
-Obs layout: [kin_vec(5) | goal_stack(2*stack_dim=6) | ego_deltas(3*stack_dim=9) | lidar_stack(num_rays*stack_dim=648)]
-Total: 5 + 6 + 9 + 648 = 668
+Obs layout: [kin_vec(4) | goal_stack(2*stack_dim=6) | ego_deltas(3*stack_dim=9) | lidar_stack(num_rays*stack_dim=648)]
+Total: 4 + 6 + 9 + 648 = 667
 """
 
 import jax
 import jax.numpy as jnp
 import random as _random
 from flax import struct
-from legnav.core.jax_env import EnvState, NUM_RAYS, SINGLE_OBS_SIZE, KIN_VEC_SIZE, GOAL_VEC_SIZE
+from legnav.core.jax_env import EnvState, NUM_RAYS, SINGLE_OBS_SIZE, KIN_VEC_SIZE, KIN_OBS_SIZE, GOAL_VEC_SIZE
 from legnav.config import RobotConfig
 
 GOAL_SIZE      = GOAL_VEC_SIZE
@@ -89,7 +89,7 @@ def strided_indices(buffer_len: int, stride: int = RobotConfig.LIDAR_STACK_STRID
 
 def assemble_stacked_obs(kin_vec, goal_stack, pose_stack, lidar_stack,
                          stride: int = RobotConfig.LIDAR_STACK_STRIDE):
-    """Build the flat 668-D observation from full-resolution stacks.
+    """Build the flat 667-D observation from full-resolution stacks.
 
     Single source of truth for the obs layout so every consumer (training
     wrapper and the manual eval/deployment loops) stays consistent with the
@@ -98,7 +98,7 @@ def assemble_stacked_obs(kin_vec, goal_stack, pose_stack, lidar_stack,
     """
     sel = strided_indices(goal_stack.shape[0], stride)
     return jnp.concatenate([
-        kin_vec,
+        kin_vec[:KIN_OBS_SIZE],      # drop goal_align (last simulator kin entry): redundant with goal_stack
         goal_stack[sel].flatten(),
         _ego_deltas(pose_stack[sel]).flatten(),
         lidar_stack[sel].flatten(),

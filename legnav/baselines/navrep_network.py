@@ -267,14 +267,23 @@ class NavRepActorCritic(nn.Module):
     hidden_dim: int = 64
     z_dim:      int = Z_DIM
     freeze_vm:  bool = True   # canonical NavRep: V+M frozen, only C trained.
+    # Backward compat: old checkpoints used the 662-D layout [pose(9) | state(5) | lidar]
+    # and SR_DIM=8 (M's sr_head 64x8). Set both to evaluate them (defaults = current).
+    legacy_pose_layout: bool = False
+    sr_dim: int = SR_DIM
 
     @nn.compact
     def __call__(self, obs: jnp.ndarray):
         batch_shape = obs.shape[:-1]
 
-        goal_flat  = obs[..., :_GOAL_STACK_END]
-        kin_vec    = obs[..., _GOAL_STACK_END:_KIN_END]
-        lidar_flat = obs[..., _KIN_END:]
+        if self.legacy_pose_layout:
+            goal_flat  = obs[..., :9]          # pose stack (plays the "goal" role in the old C input)
+            kin_vec    = obs[..., 9:14]
+            lidar_flat = obs[..., 14:]
+        else:
+            goal_flat  = obs[..., :_GOAL_STACK_END]
+            kin_vec    = obs[..., _GOAL_STACK_END:_KIN_END]
+            lidar_flat = obs[..., _KIN_END:]
 
         lidar_stack = lidar_flat.reshape(*batch_shape, STACK_DIM, NUM_RAYS)
 
@@ -282,7 +291,7 @@ class NavRepActorCritic(nn.Module):
         z_mean, _z_logvar = LidarEncoder(z_dim=self.z_dim, name="encoder")(lidar_stack)
 
         # M: causal Transformer over 3 frames → hidden h (..., 3, d_model)
-        _next_z, _sr_pred, h_seq = TransformerM(z_dim=self.z_dim, name="M")(z_mean)
+        _next_z, _sr_pred, h_seq = TransformerM(z_dim=self.z_dim, sr_dim=self.sr_dim, name="M")(z_mean)
 
         # Most recent latent / hidden. Frozen (stop_gradient) when freeze_vm.
         _freeze = jax.lax.stop_gradient if self.freeze_vm else (lambda x: x)

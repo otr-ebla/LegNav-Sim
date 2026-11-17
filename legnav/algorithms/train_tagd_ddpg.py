@@ -44,6 +44,8 @@ import flax
 import flax.linen as nn
 import flax.serialization
 import numpy as np
+from legnav.algorithms.early_stop import EarlyStopper
+from legnav.algorithms.run_log import RunLogger
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -66,6 +68,7 @@ jax.config.update("jax_default_device", target_gpu)
 # ── Environment ───────────────────────────────────────────────────────────────
 from legnav.core.jax_env_multi import reset_env, step_env
 from legnav.core.jax_wrappers import make_stacked_env, make_autoreset_env
+from legnav.core import obs_layouts as OL
 from legnav.algorithms.jax_ppo import get_continuous_curriculum
 from legnav.baselines.tagd_network import TAGDActor, TAGDCritic
 from legnav.core.precision import bf16_apply, PRECISION_STR
@@ -74,8 +77,8 @@ from legnav.core.precision import bf16_apply, PRECISION_STR
 def _parse():
     p = _ap.ArgumentParser()
     p.add_argument("--gpu",   type=int,   default=None)
-    p.add_argument("--envs",  type=int,   default=512,       help="Parallel envs")
-    p.add_argument("--steps", type=int,   default=20_000_000,help="Total env steps")
+    p.add_argument("--envs",  type=int,   default=_C["tagd"]["n_envs"], help="Parallel envs")
+    p.add_argument("--steps", type=int,   default=_C["tagd"]["total_steps"], help="Total env steps")
     p.add_argument("--seed",  type=int,   default=0)
     p.add_argument("--resume",action="store_true",           help="Resume from latest ckpt")
     return p.parse_args()
@@ -88,23 +91,26 @@ ACTION_DIM     = 2
 N_ENVS         = args.envs
 TOTAL_STEPS    = args.steps
 
-BUFFER_CAP     = 600_000      # transitions (≈ 1.2 GB float32 obs × 2)
-BATCH_SIZE     = 256          # paper: 256
-G_UPDATES      = 10           # gradient updates per env step
-WARMUP_STEPS   = 20_000       # collect transitions before first update
+from legnav import runconfig as _rc
+_C = _rc.load()   # frozen config: configs/revision.yaml
 
-GAMMA          = 0.98         # paper
-TAU            = 0.005        # soft target update rate
-LR_ACTOR       = 3e-4
-LR_CRITIC      = 3e-4
-MAX_GRAD_NORM  = 10.0
+BUFFER_CAP     = _C["tagd"]["buffer_cap"]      # transitions (≈ 1.2 GB float32 obs × 2)
+BATCH_SIZE     = _C["tagd"]["batch_size"]          # paper: 256
+G_UPDATES      = _C["tagd"]["g_updates"]           # gradient updates per env step
+WARMUP_STEPS   = _C["tagd"]["warmup_steps"]       # collect transitions before first update
 
-EXPL_NOISE_STD = 0.10         # Gaussian exploration noise σ
-EXPL_NOISE_MIN = 0.01         # noise annealing floor
-EXPL_NOISE_DECAY = 0.9999     # multiply std each env step (very slow decay)
+GAMMA          = _C["tagd"]["gamma"]         # paper
+TAU            = _C["tagd"]["tau"]        # soft target update rate
+LR_ACTOR       = _C["tagd"]["lr_actor"]
+LR_CRITIC      = _C["tagd"]["lr_critic"]
+MAX_GRAD_NORM  = _C["tagd"]["max_grad_norm"]
 
-LOG_EVERY      = 100          # env-step batches
-SAVE_EVERY     = 2000
+EXPL_NOISE_STD = _C["tagd"]["expl_noise_std"]         # Gaussian exploration noise σ
+EXPL_NOISE_MIN = _C["tagd"]["expl_noise_min"]         # noise annealing floor
+EXPL_NOISE_DECAY = _C["tagd"]["expl_noise_decay"]     # multiply std each env step (very slow decay)
+
+LOG_EVERY      = _C["tagd"]["log_every"]          # env-step batches
+SAVE_EVERY     = _C["tagd"]["save_every"]
 
 CKPT_DIR       = paths.checkpoint("tagd")
 CKPT_BEST      = f"{CKPT_DIR}/tagd_best.msgpack"
@@ -114,7 +120,22 @@ LOG_CSV        = f"{CKPT_DIR}/tagd_training_log.csv"
 os.makedirs(CKPT_DIR, exist_ok=True)
 
 # ── Environment setup ─────────────────────────────────────────────────────────
-reset_stacked, step_stacked = make_stacked_env(reset_env, step_env, stack_dim=3)
+# TAGD is defined on consecutive frames and the 659-D layout [goal_stack(6) | kin(5) | lidar(648)]
+# (tagd_network.MAX_V_OBS_IDX=8). The shared wrapper now emits the 667-D CALF layout
+# [kin | goal | ego_deltas | lidar] (strided), so build it with stride=1 and re-slice to 659.
+_reset_668, _step_668 = make_stacked_env(reset_env, step_env, stack_dim=3, stride=1)
+
+def _to_659(o):
+    o = OL.to_v668(o)                                     # TAGD's kin(5) still carries goal_align
+    return jnp.concatenate([o[5:11], o[:5], o[20:]])      # goal(6) | kin(5) | lidar(648)
+
+def reset_stacked(*a, **k):
+    o, st = _reset_668(*a, **k)
+    return _to_659(o), st
+
+def step_stacked(*a, **k):
+    o, st, r, d, i = _step_668(*a, **k)
+    return _to_659(o), st, r, d, i
 _step_auto = make_autoreset_env(reset_stacked, step_stacked)
 
 vmap_step = jax.jit(
@@ -288,7 +309,7 @@ def train():
 
     # Optionally resume
     global_steps = 0
-    best_suc     = 0.0
+    best_suc     = _C["checkpoint_selection"]["best_suc_init"]["tagd"]
     if args.resume and os.path.exists(CKPT_FINAL):
         bundle = _load(CKPT_FINAL)
         ap        = bundle["actor_params"]
@@ -335,6 +356,11 @@ def train():
     print(f"{'='*70}\n")
 
     t0 = time.time()
+    _es = EarlyStopper.from_env(TOTAL_STEPS)
+    _rc.verify_env()
+    import legnav.core.jax_env as _je
+    _log = RunLogger("tagd", "nsg" if _je.USE_LEGS else "disc", args.seed, N_ENVS, CKPT_DIR)
+    _log.phase = "warmup"; _stop_reason = ""
     update_counter = 0
     c_loss_avg = a_loss_avg = q_mean_avg = 0.0
 
@@ -381,8 +407,12 @@ def train():
         ep_rew_acc[finished] = 0.0
         ep_suc_acc[finished] = 0.0
 
+        _log.update(rewards[None], dones[None], info["goal_reached"][None], info["static_col"][None], info["active_col"][None],
+                    info["passive_col"][None], info["rew_terms"][None], N_ENVS,
+                    extra={"dist": dist, "ghost": ghost, "scen": max_scen})
         obs_buf    = next_obs
         global_steps += N_ENVS
+        if global_steps >= WARMUP_STEPS: _log.set_phase("train")
 
         # ── Gradient updates ─────────────────────────────────────────────────
         buf_ready = global_steps >= WARMUP_STEPS and int(jax.device_get(buf["size"])) >= BATCH_SIZE
@@ -454,11 +484,15 @@ def train():
             _save(CKPT_FINAL, ap, cp, ap_tgt, cp_tgt,
                   {"steps": global_steps, "best_suc": max(best_suc, suc_r)})
 
+        if _es and recent_suc and _es.update(global_steps, float(np.mean(recent_suc) * 100.0)):
+            _stop_reason = _es.reason(global_steps); print("  " + _stop_reason); break
+
     # ── Final save ────────────────────────────────────────────────────────────
     suc_r = float(np.mean(recent_suc) * 100.0) if recent_suc else 0.0
     _save(CKPT_FINAL, ap, cp, ap_tgt, cp_tgt,
           {"steps": global_steps, "best_suc": max(best_suc, suc_r)})
     csv_f.close()
+    _log.close(stopped_early=bool(_stop_reason), reason=_stop_reason)
     print(f"\nTraining complete.  Final suc={suc_r:.1f}%  best={best_suc:.1f}%")
 
 

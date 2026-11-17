@@ -45,8 +45,8 @@ ALGOS = [
     },
 ]
 
-EMA_WEIGHT = 0.90       # smoothing factor (higher → smoother)
-ALPHA_RAW  = 0.20       # opacity for the raw curve behind the EMA
+SMOOTH_WINDOW = 3      # rolling-average window size in samples (higher → smoother)
+ALPHA_RAW     = 0.20    # opacity for the raw curve behind the smoothed line
 
 
 def _read_csv_columns(filepath, col_step="step", col_reward="mean_ep_reward"):
@@ -60,12 +60,21 @@ def _read_csv_columns(filepath, col_step="step", col_reward="mean_ep_reward"):
     return np.array(steps), np.array(rewards)
 
 
-def smooth_ema(values, weight=EMA_WEIGHT):
-    """Exponential moving average, same style as TensorBoard."""
-    smoothed = np.empty_like(values)
-    smoothed[0] = values[0]
-    for i in range(1, len(values)):
-        smoothed[i] = smoothed[i - 1] * weight + (1 - weight) * values[i]
+def smooth_window(values, window=SMOOTH_WINDOW):
+    """Centred rolling-average smoothing with an editable window size.
+
+    The window shrinks near the endpoints so the smoothed curve spans the
+    full x-range without introducing edge artefacts.
+    """
+    values = np.asarray(values, dtype=float)
+    n = len(values)
+    window = max(1, min(int(window), n))
+    half = window // 2
+    smoothed = np.empty(n, dtype=float)
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        smoothed[i] = values[lo:hi].mean()
     return smoothed
 
 
@@ -135,22 +144,25 @@ def plot_stacked():
 
         steps_m, rewards = series
         # raw curve (faint)
-        ax.plot(steps_m, rewards, color=color, alpha=ALPHA_RAW, linewidth=0.8)
-        # EMA overlay
-        ax.plot(steps_m, smooth_ema(rewards), color=color, linewidth=2.2)
+        ax.plot(steps_m, rewards, color=color, alpha=ALPHA_RAW, linewidth=0.8,
+                label="raw")
+        # smoothed overlay (rolling average)
+        ax.plot(steps_m, smooth_window(rewards), color=color, linewidth=2.2,
+                label="smoothed")
 
         ax.set_ylabel("Episode Reward")
         ax.set_title(name)
         ax.grid(True, alpha=0.3)
+        ax.legend(loc="lower right", framealpha=0.7, fontsize=12)
         any_data = True
 
     # Independent x-axes: every panel keeps its own tick labels, but the
-    # "Training Steps (M)" axis label is shown only once, on the bottom panel.
+    # "Environment steps (M)" axis label is shown only once, on the bottom panel.
     for ax in axes:
         ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f"))
         ax.tick_params(labelbottom=True)
         ax.set_ylim(-50, 20)
-    axes[-1].set_xlabel("Training Steps (M)")
+    axes[-1].set_xlabel("Environment steps (M)")
 
     if not any_data:
         return None
@@ -176,12 +188,12 @@ def plot_overlaid():
         steps_m, rewards = series
         # raw curve (faint)
         ax.plot(steps_m, rewards, color=color, alpha=ALPHA_RAW, linewidth=0.8)
-        # EMA overlay (this one carries the legend entry)
-        ax.plot(steps_m, smooth_ema(rewards), color=color, linewidth=2.2,
+        # smoothed overlay (this one carries the legend entry)
+        ax.plot(steps_m, smooth_window(rewards), color=color, linewidth=2.2,
                 label=name)
         any_data = True
 
-    ax.set_xlabel("Training Steps (M)")
+    ax.set_xlabel("Environment steps (M)")
     ax.set_ylabel("Episode Reward")
     ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f"))
     ax.set_ylim(-50, 20)
