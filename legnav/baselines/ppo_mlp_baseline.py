@@ -16,8 +16,8 @@ Serves as an ablation / baseline for benchmarking:
 Differences from ``jax_ppo.py``
 --------------------------------
 * **Network**: ``VanillaMLPActorCritic`` instead of ``EndToEndActorCritic``.
-  The MLP receives the raw 659-dim stacked obs directly — no CNN, no
-  frame-stack attention, no LiDAR-specific feature extraction.
+  The MLP receives the 668-dim stacked obs after the same parameter-free
+  SE(2) scan reprojection as CALF — no CNN, no frame-stack attention.
 * **Checkpoints**: saved under ``checkpoints_vanilla_ppo/``.
 * **Log file**: ``checkpoints_vanilla_ppo/ppo_mlp_training_log.csv``.
 * Everything else — curriculum, rollout collection, GAE, PPO clipping,
