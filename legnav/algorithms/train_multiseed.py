@@ -6,13 +6,14 @@ model, training seed), each in its own checkpoint sandbox, and stores the final
 checkpoint as  checkpoints/multiseed/<method>_<ped>_s<seed>.msgpack
 (the names paper_comparison_eval.py discovers).
 
-  methods : calf_ppo calf_sac calf_tqc vanilla tagd
+  methods : calf_ppo calf_sac calf_tqc vanilla
+            (TAGD is NOT retrained: the paper uses the authors' released weights as is)
   ped     : nsg  (leg-pair pedestrian model, USE_LEGS=1 — the default of all trainers)
             disc (disc/cylinder pedestrians, USE_LEGS=0)
 
 Suites
-  main     : 5 methods x nsg x seeds                                  (paper table)
-  ablation : {vanilla,tagd (--ablation-baseline)} + calf_ppo, each x {nsg,disc}  (2x2)
+  main     : 4 methods x nsg x seeds                                  (paper table)
+  ablation : vanilla + calf_ppo, each x {nsg,disc}  (2x2)
   all      : main + ablation, de-duplicated (the nsg ablation cells ARE main runs)
 
 A run is DONE only if its final checkpoint exists in checkpoints/multiseed/, so an
@@ -28,6 +29,11 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+# The launcher only checks the config (rc.verify_env imports the env modules, i.e. JAX): keep it on the
+# CPU so it does not pre-allocate 75% of the GPU that the child trainer needs. Children get the original value.
+_USER_JAX_PLATFORMS = os.environ.get("JAX_PLATFORMS")
+os.environ["JAX_PLATFORMS"] = "cpu"
 
 from legnav import runconfig as rc
 
@@ -46,10 +52,8 @@ METHODS = {
     "calf_tqc": dict(mod="legnav.algorithms.TQCjac", final=lambda ped: "tqc/tqc_final.msgpack", env={}),
     "vanilla":  dict(mod="legnav.baselines.ppo_mlp_baseline",
                      final=lambda ped: "vanilla_ppo/ppo_mlp_final.msgpack", env={}),
-    "tagd":     dict(mod="legnav.algorithms.train_tagd_ddpg",
-                     final=lambda ped: "tagd/tagd_final.msgpack", env={}, seed_arg=True),
 }
-MAIN_METHODS = ["calf_ppo", "calf_sac", "calf_tqc", "vanilla", "tagd"]
+MAIN_METHODS = ["calf_ppo", "calf_sac", "calf_tqc", "vanilla"]
 
 
 def build_runs(suite, ablation_baseline, seeds, methods=None):
@@ -60,7 +64,7 @@ def build_runs(suite, ablation_baseline, seeds, methods=None):
         for m in MAIN_METHODS:
             for s in seeds: add(m, "nsg", s)
     if suite in ("ablation", "all"):
-        base = {"vanilla": ["vanilla"], "tagd": ["tagd"], "both": ["vanilla", "tagd"]}[ablation_baseline]
+        base = {"vanilla": ["vanilla"]}[ablation_baseline]
         for m in base + ["calf_ppo"]:
             for p in ("nsg", "disc"):
                 for s in seeds: add(m, p, s)
@@ -102,6 +106,8 @@ def run_one(m, ped, seed, dry, early_stop=True):
     env = dict(os.environ, LEGNAV_CKPT_ROOT=str(work), LEGNAV_SEED=str(seed), LEGNAV_RUN_NAME=name,
                LEGNAV_USE_LEGS="1" if ped == "nsg" else "0", LEGNAV_ALLOW_ANY_HOST="1",
                PYTHONPATH=str(REPO) + os.pathsep + os.environ.get("PYTHONPATH", ""), **spec["env"])
+    env.pop("JAX_PLATFORMS", None)
+    if _USER_JAX_PLATFORMS is not None: env["JAX_PLATFORMS"] = _USER_JAX_PLATFORMS
     if not early_stop: env["LEGNAV_EARLY_STOP"] = "0"
     env["XLA_FLAGS"] = (env.get("XLA_FLAGS", "") +
                         " --xla_gpu_experimental_enable_fusion_autotuner=false").strip()
@@ -132,7 +138,7 @@ def main():
     cfg = rc.load()
     ap = argparse.ArgumentParser()
     ap.add_argument("--suite", choices=["main", "ablation", "all"], default="all")
-    ap.add_argument("--ablation-baseline", choices=["vanilla", "tagd", "both"], default=cfg["launch"]["ablation_baseline"])
+    ap.add_argument("--ablation-baseline", choices=["vanilla"], default=cfg["launch"]["ablation_baseline"])
     ap.add_argument("--seeds", type=int, nargs="+", default=cfg["launch"]["seeds"])
     ap.add_argument("--methods", nargs="+", default=None, choices=list(METHODS), help="restrict to these methods")
     ap.add_argument("--no-early-stop", action="store_true", help="always train the full budget")

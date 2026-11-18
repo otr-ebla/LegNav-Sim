@@ -144,7 +144,7 @@ def _build_tagd():
 
 _DEFAULT_CKPT["tagd"] = paths.checkpoint("tagd", "tagd_best.msgpack")
 
-OBS_SIZE   = 667   # kin(4) + goal_stack(2*3) + ego_deltas(3*3) + lidar_stack(216*3)
+OBS_SIZE   = 668   # kin(5) + goal_stack(2*3) + ego_deltas(3*3) + lidar_stack(216*3)
 ACTION_DIM = 2
 use_legs   = args.use_legs
 

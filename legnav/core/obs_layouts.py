@@ -3,12 +3,11 @@ obs_layouts.py — single source of truth for observation layouts (current + leg
 
 Four flat-observation layouts exist in the repo history / checkpoints:
 
-  v667  current  [kin(4) | goal_stack(2S) | ego_deltas(3S) | lidar(216 S)]       S=3
-                 kin = [v/vmax, w, max_v_norm, goal_dist]  (goal_align removed: it is a
-                 function of goal_stack). CALF nets, current VanillaE2E.
-  v668  legacy   [kin(5) | goal_stack(2S) | ego_deltas(3S) | lidar(216 S)]       S=3
-                 same as v667 but kin carries goal_align/pi as 5th entry; CALF checkpoints
-                 trained before goal_align was dropped (fused input 203).
+  v668  current  [kin(5) | goal_stack(2S) | ego_deltas(3S) | lidar(216 S)]       S=3
+                 kin = [v/vmax, w, max_v_norm, goal_dist, goal_align/pi]. CALF nets (fused
+                 input 203), current VanillaE2E.
+  v667  legacy   same as v668 without goal_align (fused input 202). Tried for the revision
+                 and reverted: PPO learned clearly slower without the explicit goal angle.
   v662  legacy   [pose(3S: gdx,gdy,theta/pi per frame) | state_vec(5) | lidar]   consecutive frames
                  pre-SE(2) PPO (fused input 206), old vanilla MLP, old NavRep.
   v659  legacy   [goal_stack(2S) | kin(5) | lidar]                               consecutive frames
@@ -46,7 +45,7 @@ class Unsupported(Exception):
 
 @dataclass(frozen=True)
 class ObsSpec:
-    layout: str = "v667"
+    layout: str = "v668"
     stride: int = CURRENT_STRIDE
     legacy_net: bool = False        # old fused-206 network slicing
     se2: bool = True                # parameter-free SE(2) reprojection on/off
@@ -143,13 +142,21 @@ def detect_mlp(params, stride=None):
 def to_v668(obs):
     """Current v667 flat obs (..., 667) -> legacy v668 (..., 668): re-insert goal_align/pi as
     kin[4]. It is atan2(g_y, g_x)/pi of the NEWEST ego goal, i.e. exactly the value the old
-    simulator exposed, so legacy policies see the observations they were trained on."""
+    simulator exposed, so legacy policies see the observations they were trained on.
+    Identity on an obs that is already 668-D (current layout)."""
+    if obs.shape[-1] == LAYOUT_SIZE["v668"]:
+        return obs
     g = obs[..., 4:10][..., -2:]                       # newest ego goal (g_x, g_y)
     align = (jnp.arctan2(g[..., 1], g[..., 0]) / jnp.pi)[..., None]
     return jnp.concatenate([obs[..., :4], align, obs[..., 4:]], axis=-1)
 
 
 def fit_obs(obs, params):
-    """Adapt a current-layout obs to the checkpoint whose `params` are given (auto-detected from the
-    first fused Dense input: 203 / 668 -> v668). Identity for current checkpoints."""
-    return to_v668(obs) if _first_dense_in(params) in (203, LAYOUT_SIZE["v668"]) else obs
+    """Adapt a v668/v667 flat obs to the checkpoint whose `params` are given (auto-detected from the
+    first fused Dense input: 203 / 668 -> v668, 202 / 667 -> v667). Identity when they already match."""
+    want = _first_dense_in(params)
+    if want in (203, LAYOUT_SIZE["v668"]):
+        return to_v668(obs)
+    if want in (202, LAYOUT_SIZE["v667"]) and obs.shape[-1] == LAYOUT_SIZE["v668"]:
+        return jnp.concatenate([obs[..., :4], obs[..., 5:]], axis=-1)     # drop goal_align
+    return obs

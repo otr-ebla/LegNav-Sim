@@ -9,8 +9,8 @@ Pipeline (see architecture figure):
   ──► temporal self-attention over N tokens ──► ⊕ global state g_T ──► MLP
   ──► actor / critic heads.
 
-Obs layout (stacked): [kin_vec(4; legacy 5) | goal_stack(2*stack_dim) | ego_deltas(3*stack_dim) | lidar_stack(num_rays*stack_dim)]
-  g_T = kin_vec ⊕ goal_stack_flat: kin_vec = [v_t, ω_t, v_max, d_t] (current
+Obs layout (stacked): [kin_vec(5; legacy v667: 4) | goal_stack(2*stack_dim) | ego_deltas(3*stack_dim) | lidar_stack(num_rays*stack_dim)]
+  g_T = kin_vec ⊕ goal_stack_flat: kin_vec = [v_t, ω_t, v_max, d_t, ρ_t] (current
   frame only, not stacked) and goal_stack = ego goal vec (g_x, g_y) over the last
   stack_dim frames, flattened. The ego-motion deltas feed ONLY the
   (parameter-free) reprojection block, not the fused trunk.
@@ -28,7 +28,7 @@ LOG_STD_MIN = -4.0
 LOG_STD_MAX =  0.0
 
 USE_TANH_INSIDE = True
-_KIN_VEC_SIZE   = 4    # v/vmax, w, max_v_norm, goal_dist (legacy ckpts: 5, + goal_align)
+_KIN_VEC_SIZE   = 5    # v/vmax, w, max_v_norm, goal_dist, goal_align (informative only: kin width is inferred from the obs)
 _GOAL_VEC_SIZE  = 2    # ego goal vector (g_x, g_y) per frame, stacked like lidar
 _EGO_DELTA_SIZE = 3    # (Δx, Δy, Δθ) of each frame w.r.t. the newest frame
 ATTN_HEADS      = 4    # numero di teste attention sul frame stack

@@ -42,7 +42,7 @@ _C = _rc.load()   # frozen config: configs/revision.yaml
 
 NUM_ENVS      = _C["ppo"]["num_envs"]
 ROLLOUT_STEPS = _C["ppo"]["rollout_steps"]
-OBS_SIZE      = 4 + 2 * 3 + 3 * 3 + 216 * 3    # 667 = kin(4) + goal_stack(6) + ego_deltas(9) + lidar_stack(648)
+OBS_SIZE      = 5 + 2 * 3 + 3 * 3 + 216 * 3    # 668 = kin(5) + goal_stack(6) + ego_deltas(9) + lidar_stack(648)
 
 _VMAP_STEP_CACHE: dict = {}
 

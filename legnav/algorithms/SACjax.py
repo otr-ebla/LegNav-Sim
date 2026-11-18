@@ -62,7 +62,7 @@ from legnav.core.jax_env_multi import reset_env, step_env
 from legnav.core.jax_wrappers import make_stacked_env, make_autoreset_env
 
 # ══ Observation / action ══════════════════════════════════════════════════════
-OBS_SIZE      = 667   # kin(4) + goal_stack(6) + ego_deltas(9) + lidar_stack(648)
+OBS_SIZE      = 668   # kin(5) + goal_stack(6) + ego_deltas(9) + lidar_stack(648)
 ACTION_DIM    = 2
 MAX_V_OBS_IDX = 2     # kin_vec[v_norm, w, max_v_norm, ...] → max_v at idx 2
 

@@ -45,7 +45,7 @@ MAX_RESAMPLE_ITERS = 200
 DEFAULT_MIN_GOAL_DIST = 3.0
 
 KIN_VEC_SIZE    = 5   # simulator kin vec: v, w, max_v_norm, goal_dist, goal_align
-KIN_OBS_SIZE    = 4   # policy-facing kin vec (current layout): goal_align is NOT exposed; legacy ckpts get it back via obs_layouts
+KIN_OBS_SIZE    = 5   # policy-facing kin vec (current layout v668): goal_align IS exposed (dropping it, v667, slowed PPO learning)
 GOAL_VEC_SIZE   = 2   # gdx_ego, gdy_ego (goal offset in robot frame)
 _MAX_GOAL_DIST  = math.sqrt(ROOM_W**2 + ROOM_H**2)
 SINGLE_OBS_SIZE = GOAL_VEC_SIZE + KIN_VEC_SIZE + NUM_RAYS   # 223

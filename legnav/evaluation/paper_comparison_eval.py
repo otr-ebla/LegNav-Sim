@@ -75,7 +75,7 @@ SPACE_COMP_DIST = 0.5  # min surface distance (m) for a "space-compliant" timest
 
 # The env keeps FULL-resolution ring buffers (kin, goal, pose, lidar; OL.RAW_LEN frames) and
 # the rollout carries them as one "raw" vector. Every policy sees its own view of it through
-# OL.adapt(raw, layout, stride) — current 667-D layout or any legacy layout (v668/v662/v659) — so all policies
+# OL.adapt(raw, layout, stride) — current 668-D layout or any legacy layout (v667/v662/v659) — so all policies
 # (old and new) are evaluated on identical episodes.
 @jax.jit
 def _reset_stacked(key, v_max, scenario_idx):
@@ -553,7 +553,7 @@ _METRIC_COLS = ["SR", "ACR", "PCR", "TR", "SPL", "TTG", "MHD", "AJ", "SC", "YS"]
 # Methods that have one checkpoint per TRAINING seed in <ckpt-root>, named
 # <key>_<ped>_s<seed>.msgpack (written by legnav/algorithms/train_multiseed.py). If none are
 # found the single registry checkpoint is used (1 checkpoint -> std/CI are NaN).
-MULTISEED_KEY = {"TAGD": "tagd", "VanillaE2E": "vanilla", "PPO (legs)": "calf_ppo",
+MULTISEED_KEY = {"VanillaE2E": "vanilla", "PPO (legs)": "calf_ppo",
                  "SAC": "calf_sac", "TQC": "calf_tqc"}
 
 def _discover(name, default_ckpt):

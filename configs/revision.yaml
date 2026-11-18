@@ -20,13 +20,13 @@ env:
     - 11
     - 12
 obs:
-  layout: v667
-  size: 667
+  layout: v668
+  size: 668
   stack_dim: 3
   stride: 2
   se2_reproject: true
   tanh_inside: true
-  kin: 4
+  kin: 5
   goal_per_frame: 2
   ego_delta_per_frame: 3
   lidar_rays: 216
