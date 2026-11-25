@@ -15,7 +15,7 @@ if project_root not in sys.path:
 from legnav.core.jax_env import (EnvState, get_obs,
                      ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS, DT,
                      MAX_STEPS, GOAL_RADIUS, NUM_RAYS,
-                     USE_LEGS,
+                     USE_LEGS, ROBOT_SHAPE, ROBOT_HALF_L, ROBOT_HALF_W,
                      P_HUMAN_STOP, STOP_MIN_STEPS, STOP_MAX_STEPS)
 from legnav.core.jax_scenarios import generate_scenario
 from legnav.core.jax_legs import advance_feet, init_foot_state, get_shoe_boxes, get_leg_positions, LEG_RADIUS as _LEG_R
@@ -71,6 +71,140 @@ _GHOST_POS = -999.0
 
 
 _CIRCLE_SIDES = 8   # octagon approximation (fits 2 groups of 4 edges)
+
+# ── Rectangular robot footprint (ROBOT_SHAPE == "rect", resolved at import) ───
+_RECT_ROBOT = ROBOT_SHAPE == "rect"
+if ROBOT_SHAPE not in ("circle", "rect"):
+    raise ValueError(f"ROBOT_SHAPE must be 'circle' or 'rect', got {ROBOT_SHAPE!r}")
+_ROBOT_CIRCUM_R = (ROBOT_HALF_L ** 2 + ROBOT_HALF_W ** 2) ** 0.5
+
+# ── Social fine-tuning reward (LEGNAV_SOCIAL_FT=1, resolved at import) ─────────
+# Off by default: the paper reward is untouched. When on, three dense terms are added
+# (group space, anticipatory closest-point-of-approach, shoe margin) and the yield term
+# is scaled from _YIELD_COEF down to _FT_YIELD_COEF so braking is no longer the cheapest
+# answer to an approaching person.
+_SOCIAL_FT       = os.environ.get("LEGNAV_SOCIAL_FT", "0") == "1"
+_FT_YIELD_COEF   = 3.0
+_FT_GRP_COEF     = 1.0    # per-step penalty with the robot on a group's spine
+_FT_GRP_MARGIN   = 0.5    # m — surface gap from the spine where the penalty fades to 0
+_FT_GRP_IN_COEF  = 2.0    # extra per-step penalty approaching the gap *between* two group members
+_FT_GRP_IN_MARGIN = 0.8   # m — surface gap from the inner half of a link where it fades to 0
+_FT_GRP_CROSS    = 15.0   # one-off penalty each time the robot centre crosses a link (cuts a group)
+_FT_WALL_COEF    = 0.3    # per-step penalty for running along a side wall
+_FT_WALL_MARGIN  = 0.6    # m — footprint gap to the left/right wall where it fades to 0
+_GRP_LINK_MAX    = 1.7    # m — two standing people closer than this form a group link (intra-group <= 1.6, separate groups >= 1.77)
+_FT_CPA_COEF     = 0.5    # per-step penalty for a predicted head-on pass
+_FT_CPA_SAFE     = 0.6    # m — predicted surface-to-person-centre distance considered safe
+_FT_CPA_HORIZON  = 3.0    # s — prediction horizon (constant velocities)
+_FT_CPA_TAU      = 1.5    # s — discount on how far in the future the closest approach is
+_FT_PATH_COEF    = 0.6    # per-step penalty for standing in a walker's upcoming path
+_FT_PATH_T       = 2.5    # s — length of the upcoming path (walker speed x this)
+_FT_PATH_HALF_W  = 0.8    # m — half-width of the path strip, robot centre to the walker's line
+_FT_PATH_MIN_V   = 0.3    # m/s — slower people are not "walking somewhere"
+_FT_FOOT_COEF    = 0.5    # per-step penalty with the footprint touching a shoe
+_FT_FOOT_MARGIN  = 0.15   # m — shoe gap where the penalty fades to 0
+
+
+def anticipation_weights(rx, ry, rtheta, rv, hx, hy, hvx, hvy, valid, r_robot):
+    """Per-person anticipation weights in [0, 1] (social fine-tuning reward).
+    cpa : closest point of approach in the next _FT_CPA_HORIZON s under constant velocities,
+          surface distance below _FT_CPA_SAFE, discounted by how far ahead it is. Symmetric: any
+          swerve that opens the predicted gap lowers it.
+    path: robot centre inside the strip a walking person will cover in the next _FT_PATH_T s
+          (ahead of them, within _FT_PATH_HALF_W of their line), larger near them and near the
+          line. Asymmetric: for someone crossing in front, steering toward where they come from
+          (passing behind) leaves the strip; steering their way or braking stays in it."""
+    r_vx, r_vy = rv * jnp.cos(rtheta), rv * jnp.sin(rtheta)
+    rel_px, rel_py = hx - rx, hy - ry
+    rel_vx, rel_vy = hvx - r_vx, hvy - r_vy
+    rel_v2 = rel_vx ** 2 + rel_vy ** 2
+    t_cpa = jnp.clip(-(rel_px * rel_vx + rel_py * rel_vy) / jnp.maximum(rel_v2, 1e-6), 0.0, _FT_CPA_HORIZON)
+    d_cpa = jnp.hypot(rel_px + rel_vx * t_cpa, rel_py + rel_vy * t_cpa) - r_robot
+    cpa = (jnp.maximum(0.0, 1.0 - d_cpa / _FT_CPA_SAFE) ** 2) * jnp.exp(-t_cpa / _FT_CPA_TAU)
+    cpa = jnp.where(valid & (rel_v2 > 0.01), cpa, 0.0)
+
+    sp = jnp.hypot(hvx, hvy)
+    ux, uy = hvx / jnp.maximum(sp, 1e-6), hvy / jnp.maximum(sp, 1e-6)
+    along = (rx - hx) * ux + (ry - hy) * uy            # robot ahead of the person (> 0)
+    lat   = jnp.abs((rx - hx) * uy - (ry - hy) * ux)  # robot distance from the person's line
+    reach = sp * _FT_PATH_T + 0.3
+    path = (jnp.clip(1.0 - lat / _FT_PATH_HALF_W, 0.0, 1.0)
+            * jnp.clip(1.0 - along / reach, 0.0, 1.0) * (along > 0.0))
+    path = jnp.where(valid & (sp > _FT_PATH_MIN_V), path, 0.0)
+    return cpa, path
+
+
+def group_space_gap(people, x, y, theta):
+    """Robot-surface gap to the 'spine' of standing groups: segments joining every pair of
+    standing people (active, g1 == g2) whose centres are < _GRP_LINK_MAX apart. Returns
+    (gap_full, gap_inner): gap over the whole segments (endpoints = the people themselves) and
+    over their middle half only (t in [0.25, 0.75], i.e. passing *between* people). 1e4 if none."""
+    st = (people[:, 10] >= 0.0) & (people[:, 6] == people[:, 8]) & (people[:, 7] == people[:, 9])
+    px, py = people[:, 0], people[:, 1]
+    n = px.shape[0]
+    link = (st[:, None] & st[None, :]
+            & (jnp.hypot(px[:, None] - px[None, :], py[:, None] - py[None, :]) < _GRP_LINK_MAX)
+            & (jnp.arange(n)[:, None] < jnp.arange(n)[None, :]))
+    t = jnp.linspace(0.0, 1.0, 9)
+    sx = px[:, None, None] + t * (px[None, :, None] - px[:, None, None])   # (N, N, 9)
+    sy = py[:, None, None] + t * (py[None, :, None] - py[:, None, None])
+    if _RECT_ROBOT:
+        d = _obb_point_dist(x, y, ROBOT_HALF_L, ROBOT_HALF_W, theta, sx, sy)
+    else:
+        d = jnp.maximum(jnp.hypot(sx - x, sy - y) - ROBOT_RADIUS, 0.0)
+    inner = (t >= 0.25) & (t <= 0.75)
+    gap_full  = jnp.min(jnp.where(link, jnp.min(d, axis=-1), 1e4))
+    gap_inner = jnp.min(jnp.where(link, jnp.min(jnp.where(inner, d, 1e4), axis=-1), 1e4))
+    return gap_full, gap_inner
+
+
+def group_crossings(people, x0, y0, x1, y1):
+    """Number of group links (same definition as group_space_gap) that the robot-centre step
+    (x0, y0) -> (x1, y1) properly intersects, i.e. walking through a pair / into or out of a triad."""
+    st = (people[:, 10] >= 0.0) & (people[:, 6] == people[:, 8]) & (people[:, 7] == people[:, 9])
+    px, py = people[:, 0], people[:, 1]
+    n = px.shape[0]
+    link = (st[:, None] & st[None, :]
+            & (jnp.hypot(px[:, None] - px[None, :], py[:, None] - py[None, :]) < _GRP_LINK_MAX)
+            & (jnp.arange(n)[:, None] < jnp.arange(n)[None, :]))
+    ax, ay = px[:, None], py[:, None]
+    bx, by = px[None, :], py[None, :]
+    def cross(ux, uy, vx, vy):
+        return ux * vy - uy * vx
+    s0 = cross(bx - ax, by - ay, x0 - ax, y0 - ay)
+    s1 = cross(bx - ax, by - ay, x1 - ax, y1 - ay)
+    sa = cross(x1 - x0, y1 - y0, ax - x0, ay - y0)
+    sb = cross(x1 - x0, y1 - y0, bx - x0, by - y0)
+    hit = (s0 * s1 < 0.0) & (sa * sb < 0.0)
+    return jnp.sum((link & hit).astype(jnp.float32))
+
+
+def _obb_corners(cx, cy, half_l, half_w, theta):
+    """(4, 2) CCW corners of an oriented box (half_l along theta)."""
+    c, s = jnp.cos(theta), jnp.sin(theta)
+    lx = jnp.array([1.0, -1.0, -1.0, 1.0]) * half_l
+    ly = jnp.array([1.0, 1.0, -1.0, -1.0]) * half_w
+    return jnp.stack([cx + c * lx - s * ly, cy + s * lx + c * ly], axis=-1)
+
+
+def _obb_point_dist(cx, cy, half_l, half_w, theta, px, py):
+    """Distance from point(s) (px, py) to an oriented box (0 inside)."""
+    c, s = jnp.cos(theta), jnp.sin(theta)
+    dx, dy = px - cx, py - cy
+    lx = jnp.abs(c * dx + s * dy) - half_l
+    ly = jnp.abs(-s * dx + c * dy) - half_w
+    return jnp.hypot(jnp.maximum(lx, 0.0), jnp.maximum(ly, 0.0))
+
+
+def _convex_overlap(P, Q):
+    """Separating-axis test for two convex quads given as (4, 2) vertices."""
+    def normals(V):
+        e = jnp.roll(V, -1, axis=0) - V
+        return jnp.stack([-e[:, 1], e[:, 0]], axis=-1)
+    axes = jnp.concatenate([normals(P), normals(Q)], axis=0)   # (8, 2)
+    pp, qq = P @ axes.T, Q @ axes.T                             # (4, 8)
+    separated = (pp.max(0) < qq.min(0)) | (qq.max(0) < pp.min(0))
+    return ~jnp.any(separated)
 
 
 def build_hsfm_obstacles(obs_boxes, obs_circles, room_h=ROOM_H, room_w=ROOM_W):
@@ -223,14 +357,27 @@ def step_env(key, state, action, ghost_robot: bool = True):
     new_theta = (state.theta + target_w * DT + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
 
     # Boolean wall_collision for episode logic (stop_grad'd later)
-    wall_collision = (raw_x < ROBOT_RADIUS) | (raw_x > state.room_w - ROBOT_RADIUS) | \
-                     (raw_y < ROBOT_RADIUS) | (raw_y > state.room_h - ROBOT_RADIUS)
+    if _RECT_ROBOT:
+        # Half-extents of the rotated rectangle's axis-aligned bounding box.
+        ext_x = ROBOT_HALF_L * jnp.abs(jnp.cos(new_theta)) + ROBOT_HALF_W * jnp.abs(jnp.sin(new_theta))
+        ext_y = ROBOT_HALF_L * jnp.abs(jnp.sin(new_theta)) + ROBOT_HALF_W * jnp.abs(jnp.cos(new_theta))
+    else:
+        ext_x = ext_y = ROBOT_RADIUS
+    wall_collision = (raw_x < ext_x) | (raw_x > state.room_w - ext_x) | \
+                     (raw_y < ext_y) | (raw_y > state.room_h - ext_y)
 
-    new_x = jnp.clip(raw_x, ROBOT_RADIUS, state.room_w - ROBOT_RADIUS)
-    new_y = jnp.clip(raw_y, ROBOT_RADIUS, state.room_h - ROBOT_RADIUS)
+    new_x = jnp.clip(raw_x, ext_x, state.room_w - ext_x)
+    new_y = jnp.clip(raw_y, ext_y, state.room_h - ext_y)
+    if _RECT_ROBOT:
+        robot_corners = _obb_corners(new_x, new_y, ROBOT_HALF_L, ROBOT_HALF_W, new_theta)   # (4, 2)
+
+        def _robot_pt_dist(px, py):
+            return _obb_point_dist(new_x, new_y, ROBOT_HALF_L, ROBOT_HALF_W, new_theta, px, py)
 
     # ── 2. JHSFM substeps ─────────────────────────────────────────────────────
     hsfm_params      = get_standard_humans_parameters(NUM_PEOPLE + 1)
+    if _RECT_ROBOT:   # humans see the rectangular robot as its circumscribed disc
+        hsfm_params = hsfm_params.at[-1, 0].set(_ROBOT_CIRCUM_R)
     static_obstacles = build_hsfm_obstacles(state.obs_boxes, state.obs_circles, state.room_h, state.room_w)
 
     # Build goal arrays for humans using the active waypoint per human.
@@ -402,7 +549,9 @@ def step_env(key, state, action, ghost_robot: bool = True):
     g1y_sg = state.people[:, 7]
     g2x_sg = state.people[:, 8]
     g2y_sg = state.people[:, 9]
-    is_static_groups = jnp.all((g1x_sg == g2x_sg) & (g1y_sg == g2y_sg))
+    # Per-person (g1 == g2 → standing still): identical to the old all-or-nothing rule for every
+    # scenario 0-17 (none mixes static and moving people); scenario 18 uses it for the talking pair.
+    is_static_groups = (g1x_sg == g2x_sg) & (g1y_sg == g2y_sg)
 
     freeze = (is_stopped_h | is_static_groups) & active_mask_stop
 
@@ -435,6 +584,11 @@ def step_env(key, state, action, ghost_robot: bool = True):
     dy_p = center_y - new_y
     #dists_p = jnp.sqrt(dx_p**2 + dy_p**2 + 1e-8)
     dists_p = jnp.hypot(dx_p, dy_p)
+    if _RECT_ROBOT:
+        # "Equivalent centre distance": gap from the rectangle's surface + ROBOT_RADIUS, so every
+        # centre-distance threshold below (body collision, yield, proximity, closest_human → MHD)
+        # measures the same surface gap it measures for the reference disc robot.
+        dists_p = _robot_pt_dist(center_x, center_y) + ROBOT_RADIUS
 
     # Mask dummies from all distance/collision logic
     active_mask    = new_people[:, 10] >= 0.0
@@ -461,10 +615,23 @@ def step_env(key, state, action, ghost_robot: bool = True):
             ddy = jnp.maximum(jnp.abs(local_y) - half_W, 0.0)
             return jnp.sqrt(ddx**2 + ddy**2 + 1e-8)
 
-        shoe_dists_cf = jax.vmap(_obb_shoe_dist_cf)(shoe_boxes_cf)   # (2N,)
-        shoe_dists_cf = jnp.where(owner_active_cf, shoe_dists_cf, _DUMMY_DIST)
-        # Subtract ROBOT_RADIUS so we get surface-to-surface gap
-        closest_shoe_surface = jnp.maximum(0.0, jnp.min(shoe_dists_cf) - ROBOT_RADIUS)
+        if _RECT_ROBOT:
+            # Exact gap between two disjoint convex polygons = min vertex-to-polygon distance.
+            def _rect_shoe_gap(shoe):
+                scx, scy, half_L, half_W, stheta = shoe
+                d_rc = _obb_point_dist(scx, scy, half_L, half_W, stheta,
+                                       robot_corners[:, 0], robot_corners[:, 1])
+                sc = _obb_corners(scx, scy, half_L, half_W, stheta)
+                d_sc = _robot_pt_dist(sc[:, 0], sc[:, 1])
+                gap = jnp.minimum(jnp.min(d_rc), jnp.min(d_sc))
+                return jnp.where(_convex_overlap(robot_corners, sc), 0.0, gap)
+            shoe_gaps_cf = jax.vmap(_rect_shoe_gap)(shoe_boxes_cf)
+            closest_shoe_surface = jnp.min(jnp.where(owner_active_cf, shoe_gaps_cf, _DUMMY_DIST))
+        else:
+            shoe_dists_cf = jax.vmap(_obb_shoe_dist_cf)(shoe_boxes_cf)   # (2N,)
+            shoe_dists_cf = jnp.where(owner_active_cf, shoe_dists_cf, _DUMMY_DIST)
+            # Subtract ROBOT_RADIUS so we get surface-to-surface gap
+            closest_shoe_surface = jnp.maximum(0.0, jnp.min(shoe_dists_cf) - ROBOT_RADIUS)
     else:
         # Fallback: body circle edge-to-edge (original formula)
         closest_shoe_surface = jnp.maximum(0.0, closest_human - PEOPLE_RADIUS - ROBOT_RADIUS)
@@ -527,7 +694,18 @@ def step_env(key, state, action, ghost_robot: bool = True):
 
     closest_box = jnp.min(jax.vmap(_quad_dist)(state.obs_boxes))
 
-    static_obs_collision = (closest_cir < ROBOT_RADIUS) | (closest_box < ROBOT_RADIUS)
+    if _RECT_ROBOT:
+        cir_valid = state.obs_circles[:, 2] > 0.0
+        cir_hit = (_robot_pt_dist(state.obs_circles[:, 0], state.obs_circles[:, 1])
+                   < state.obs_circles[:, 2]) & cir_valid
+
+        def _rect_box_hit(b):
+            span = jnp.maximum(jnp.abs(b[0] - b[4]), jnp.abs(b[1] - b[5]))
+            return _convex_overlap(robot_corners, b.reshape(4, 2)) & (span > 1e-6)
+
+        static_obs_collision = jnp.any(cir_hit) | jnp.any(jax.vmap(_rect_box_hit)(state.obs_boxes))
+    else:
+        static_obs_collision = (closest_cir < ROBOT_RADIUS) | (closest_box < ROBOT_RADIUS)
 
     # ── 5c. Shoe OBB collisions (USE_LEGS=True only, resolved at trace time) ───
     if USE_LEGS:
@@ -553,7 +731,12 @@ def step_env(key, state, action, ghost_robot: bool = True):
         owner_active   = active_mask[owner_idx]                             # (2N,)
         shoe_dists     = jnp.where(owner_active, shoe_dists_raw, jnp.inf)  # (2N,)
 
-        shoe_collision_mask = shoe_dists < ROBOT_RADIUS                     # (2N,)
+        if _RECT_ROBOT:
+            shoe_overlap = jax.vmap(lambda sh: _convex_overlap(
+                robot_corners, _obb_corners(sh[0], sh[1], sh[2], sh[3], sh[4])))(shoe_boxes)
+            shoe_collision_mask = shoe_overlap & owner_active              # (2N,)
+        else:
+            shoe_collision_mask = shoe_dists < ROBOT_RADIUS                     # (2N,)
         any_shoe_col        = jnp.any(shoe_collision_mask)
 
         owner_heading_dot = heading_dot[owner_idx]   # (2N,)
@@ -618,6 +801,32 @@ def step_env(key, state, action, ghost_robot: bool = True):
     heading_err  = (goal_angle - new_theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
     heading_bonus = _HEADING_ALIGN_COEF * jnp.cos(heading_err) * target_v * jnp.maximum(0.0, 1.0 - yield_pressure)
 
+    grp_gap, grp_gap_inner = group_space_gap(new_people, new_x, new_y, new_theta)
+    if _SOCIAL_FT:
+        # Yield: same shape, smaller weight — braking is no longer the cheapest answer.
+        yield_pen = yield_pen * (_FT_YIELD_COEF / _YIELD_COEF)
+        # (a) Group space: walking through / along a standing group's spine.
+        grp_pen = (-_FT_GRP_COEF * jnp.maximum(0.0, 1.0 - grp_gap / _FT_GRP_MARGIN)
+                   - _FT_GRP_IN_COEF * jnp.maximum(0.0, 1.0 - grp_gap_inner / _FT_GRP_IN_MARGIN)
+                   - _FT_GRP_CROSS * group_crossings(new_people, state.x, state.y, new_x, new_y))
+        # (d) Side walls: a small running cost, so hugging a wall is used only when it pays.
+        wall_gap = jnp.minimum(new_x - ext_x, state.room_w - ext_x - new_x)
+        wall_pen = -_FT_WALL_COEF * jnp.maximum(0.0, 1.0 - wall_gap / _FT_WALL_MARGIN)
+        # (b) Anticipation: closest point of approach under constant velocities (stopping does not
+        #     remove it for someone walking at the robot; stepping aside does) + standing in a
+        #     walker's upcoming path (favours passing behind a crossing person).
+        r_cpa = _ROBOT_CIRCUM_R if _RECT_ROBOT else ROBOT_RADIUS
+        cpa_w, path_w = anticipation_weights(new_x, new_y, new_theta, target_v, center_x, center_y,
+                                             new_people[:, 2], new_people[:, 3],
+                                             active_mask & (dists_p < 5.0), r_cpa)
+        cpa_pen = -_FT_CPA_COEF * jnp.max(cpa_w) - _FT_PATH_COEF * jnp.max(path_w)   # logged as "cpa"
+        # (c) Feet: graded margin before the terminal shoe contact.
+        foot_pen = -_FT_FOOT_COEF * jnp.maximum(0.0, 1.0 - closest_shoe_surface / _FT_FOOT_MARGIN)
+        social_pen = grp_pen + cpa_pen + foot_pen + wall_pen
+    else:
+        grp_pen = cpa_pen = foot_pen = wall_pen = social_pen = jnp.float32(0.0)
+    yield_pen = yield_pen + social_pen   # logged in the existing "yield" slot of rew_terms
+
     # Minimal baseline + smoothness
     dense_reward     = progress_reward + step_pen + smooth_pen + rot_pen + spin_in_place_pen + unjustified_stop_pen + yield_pen + heading_bonus
     
@@ -666,6 +875,13 @@ def step_env(key, state, action, ghost_robot: bool = True):
         "rew_heading":   heading_bonus,
         "rew_comfort":   jnp.array(0.0),  # commented out above
         "rew_yield":     yield_pen,
+        # Social fine-tuning diagnostics (zeros when LEGNAV_SOCIAL_FT is off) + group-space gaps.
+        "rew_grp":       grp_pen,
+        "rew_cpa":       cpa_pen,
+        "rew_foot":      foot_pen,
+        "rew_wall":      wall_pen,
+        "grp_gap":       grp_gap,
+        "grp_gap_inner": grp_gap_inner,
         # Training-curve logging (legnav/algorithms/run_log.py): static-obstacle/wall collision flag and
         # the full additive decomposition of the reward (terms sum exactly to `reward`).
         "static_col":    obs_collision | wall_collision,

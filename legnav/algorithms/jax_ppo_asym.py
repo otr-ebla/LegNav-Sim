@@ -196,6 +196,58 @@ def actor_apply(params, obs):
     return net_apply({"params": params}, obs, method=AsymmetricActorCritic.actor)
 
 
+# ── Social fine-tuning mode (LEGNAV_FT_INIT=<CALF PPO checkpoint>) ─────────────
+# Starts from a trained CALF PPO checkpoint instead of from scratch: the actor (and, as a warm
+# start, the critic's LiDAR trunk) is copied in; the privileged branch and value head are new.
+# Curriculum pinned at its mature values, actor frozen (LR 0) for the first FT_CRITIC_WARMUP
+# updates while the new critic fits the new reward, low constant entropy, periodic snapshots
+# exported back to the CALF format (loadable with --algo ppo / on the robot).
+FT_INIT           = os.environ.get("LEGNAV_FT_INIT", "")
+FT_LR             = float(os.environ.get("LEGNAV_FT_LR", "5e-5"))
+FT_LR_END         = float(os.environ.get("LEGNAV_FT_LR_END", "1e-5"))
+FT_CRITIC_LR      = float(os.environ.get("LEGNAV_FT_CRITIC_LR", "2.5e-4"))
+FT_CRITIC_WARMUP  = int(os.environ.get("LEGNAV_FT_CRITIC_WARMUP", "30"))    # updates, actor frozen
+FT_ACTOR_RAMP     = int(os.environ.get("LEGNAV_FT_ACTOR_RAMP", "10"))       # updates, LR 0 -> FT_LR
+FT_ENT            = float(os.environ.get("LEGNAV_FT_ENT", "0.005"))
+FT_GHOST          = float(os.environ.get("LEGNAV_FT_GHOST", "0.5"))    # base run ended at 0.34
+FT_DIST           = float(os.environ.get("LEGNAV_FT_DIST", "7.5"))     # base run ended at 7.35 m
+FT_MAX_SCEN       = int(os.environ.get("LEGNAV_FT_MAX_SCEN", "6"))     # base run reached 0-5; 6 = static groups
+FT_SNAP_EVERY     = int(os.environ.get("LEGNAV_FT_SNAP_EVERY", "50"))       # updates
+_ACTOR_KEYS       = ("actor_encoder", "actor_out", "log_std")
+_TRUNK_KEYS       = ("Dense_0", "Dense_1", "FrameStackAttention_0", "LayerNorm_0", "LidarFrameCNN_0")
+
+
+def _read_calf(path):
+    with open(path, "rb") as f:
+        return flax.serialization.msgpack_restore(f.read())
+
+
+def transplant_calf(params, calf_params):
+    """CALF EndToEndActorCritic params → AsymmetricActorCritic params (actor + critic trunk)."""
+    p = jax.tree_util.tree_map(lambda x: x, flax.core.unfreeze(params))
+    trunk = {k: calf_params[k] for k in _TRUNK_KEYS}
+    p["actor_encoder"]  = jax.tree_util.tree_map(jnp.asarray, trunk)
+    p["critic_encoder"] = jax.tree_util.tree_map(jnp.asarray, trunk)
+    p["actor_out"]      = jax.tree_util.tree_map(jnp.asarray, calf_params["Dense_2"])
+    p["log_std"]        = jnp.asarray(calf_params["log_std"])
+    return p
+
+
+def export_calf(params, calf_bundle, filepath):
+    """Asymmetric actor → CALF-format checkpoint (old value head Dense_3/4 kept, unused at eval)."""
+    calf = dict(calf_bundle["params"])
+    host = jax.device_get(params)
+    for k in _TRUNK_KEYS:
+        calf[k] = host["actor_encoder"][k]
+    calf["Dense_2"] = host["actor_out"]
+    calf["log_std"] = host["log_std"]
+    out = dict(calf_bundle); out["params"] = calf
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, "wb") as f:
+        f.write(flax.serialization.msgpack_serialize(out))
+    print(f"  CALF export -> {filepath}")
+
+
 # ── Main training loop ────────────────────────────────────────────────────────
 
 def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
@@ -218,6 +270,24 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
         optax.clip_by_global_norm(MAX_GRAD_NORM),
         optax.adam(learning_rate=scheduler, eps=1e-5),
     )
+    if FT_INIT:
+        # Two Adams: the actor's moments track its real gradients from step 0, but its LR is
+        # 0 during the critic warm-up (no "unfreeze" shock), then ramps up and decays.
+        w_end = FT_CRITIC_WARMUP * _OPT_STEPS_PER_UPDATE
+        r_end = w_end + FT_ACTOR_RAMP * _OPT_STEPS_PER_UPDATE
+        scheduler = optax.join_schedules(schedules=[
+            optax.constant_schedule(0.0),
+            optax.linear_schedule(0.0, FT_LR, max(1, r_end - w_end)),
+            optax.linear_schedule(FT_LR, FT_LR_END, max(1, total_opt_steps - r_end)),
+        ], boundaries=[w_end, r_end])
+        critic_sched = optax.linear_schedule(FT_CRITIC_LR, FT_CRITIC_LR * 0.2, max(1, total_opt_steps))
+        label_fn = lambda p: {k: ("actor" if k in _ACTOR_KEYS else "critic") for k in p}
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(MAX_GRAD_NORM),
+            optax.multi_transform({"actor":  optax.adam(learning_rate=scheduler, eps=1e-5),
+                                   "critic": optax.adam(learning_rate=critic_sched, eps=1e-5)},
+                                  label_fn),
+        )
 
     print(f"PPO Training  [ASYMMETRIC CRITIC — privileged human state]")
     print(f"  Envs        : {NUM_ENVS}  x  steps {ROLLOUT_STEPS}  =  {BATCH_SIZE:,} batch")
@@ -234,6 +304,19 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     dummy_obs  = jnp.zeros((1, OBS_SIZE))
     dummy_priv = jnp.zeros((1, PRIV_OBS_SIZE))
     params     = network.init(init_rng, dummy_obs, dummy_priv)["params"]
+    calf_bundle = None
+    if FT_INIT:
+        if jax_env.ROBOT_SHAPE != "rect" and os.environ.get("LEGNAV_FT_ALLOW_CIRCLE") != "1":
+            raise SystemExit(f"FT mode expects the rectangular footprint (LEGNAV_ROBOT_FOOTPRINT), "
+                             f"got ROBOT_SHAPE={jax_env.ROBOT_SHAPE!r}")
+        calf_bundle = _read_calf(FT_INIT)
+        params = transplant_calf(params, calf_bundle["params"])
+        print(f"  FT init     : {FT_INIT}  (footprint {jax_env.ROBOT_SHAPE} "
+              f"{2*jax_env.ROBOT_HALF_L:.2f}x{2*jax_env.ROBOT_HALF_W:.2f})")
+        print(f"  FT schedule : critic warm-up {FT_CRITIC_WARMUP} upd, actor LR {FT_LR:g}->{FT_LR_END:g}, "
+              f"critic LR {FT_CRITIC_LR:g}, ent {FT_ENT}, ghost {FT_GHOST}, dist {FT_DIST}, scen<={FT_MAX_SCEN}")
+        print(f"  FT env      : SOCIAL_FT={os.environ.get('LEGNAV_SOCIAL_FT', '0')}  "
+              f"SCEN18_PROB={os.environ.get('LEGNAV_FT_SCEN18_PROB', '0')}")
 
     opt_state   = optimizer.init(params)
     train_state = (params, opt_state)
@@ -244,6 +327,8 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     _LOG_PATH       = paths.checkpoint("ppo_asym", f"ppo_asym_{tag}_log.csv")
 
     cur_max_dist, cur_ghost, cur_ent, cur_max_scen = get_continuous_curriculum(0.0)
+    if FT_INIT:
+        cur_max_dist, cur_ghost, cur_ent, cur_max_scen = FT_DIST, FT_GHOST, FT_ENT, FT_MAX_SCEN
     rolling_suc = 0.0
     highest_rolling_suc = 0.0
 
@@ -326,6 +411,8 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
                 highest_rolling_suc = max(highest_rolling_suc, rolling_suc)
 
             new_max_dist, new_ghost, new_ent, new_max_scen = get_continuous_curriculum(highest_rolling_suc)
+            if FT_INIT:   # curriculum pinned
+                new_max_dist, new_ghost, new_ent, new_max_scen = cur_max_dist, cur_ghost, FT_ENT, cur_max_scen
 
             old_print_dist  = round(cur_max_dist, 1)
             old_print_ghost = round(cur_ghost, 2)
@@ -370,6 +457,13 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
                     f"{cur_max_dist:>6.1f}m {cur_ghost:>5.2f}g "
                     f"{ent_coef_now:>6.4f}e scen<=={cur_max_scen} {elapsedtime:>5.1f}min"
                 )
+                if FT_INIT:
+                    rh = rollout_history
+                    print(f"        per-step  progress {float(rh['rew_progress'].mean()):+.4f}  "
+                          f"yield+social {float(rh['rew_yield'].mean()):+.4f}  "
+                          f"grp {float(rh['rew_grp'].mean()):+.4f}  cpa {float(rh['rew_cpa'].mean()):+.4f}  "
+                          f"foot {float(rh['rew_foot'].mean()):+.4f}  wall {float(rh['rew_wall'].mean()):+.4f}  | between-group steps "
+                          f"{100*float(rh['grp_inner'].mean()):.3f}%")
 
             if n_ep > 0:
                 _, curr_logstd = actor_apply(train_state[0], jnp.zeros((1, OBS_SIZE)))
@@ -380,8 +474,13 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
                                       round(float(curr_sigma[0]), 5), round(float(curr_sigma[1]), 5)])
                 _log_file.flush()
 
+            if FT_INIT and update > 0 and update % FT_SNAP_EVERY == 0:
+                snap = paths.checkpoint("ppo_asym_ft", f"ft_u{update:05d}.msgpack")
+                save_checkpoint(train_state[0], train_state[1], snap)
+                export_calf(train_state[0], calf_bundle, snap.replace(".msgpack", "_calf.msgpack"))
+
             curriculum_mature = cur_max_scen >= 1 and cur_max_dist >= 5.0
-            if suc_pct > best_suc and n_ep > 0 and curriculum_mature:
+            if suc_pct > best_suc and n_ep > 0 and curriculum_mature and not FT_INIT:
                 best_suc = suc_pct
                 save_checkpoint(train_state[0], train_state[1], ckpt_path)
     finally:
@@ -391,7 +490,11 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
 
     elapsed = time.time() - t_start
     print(f"\nDone! {elapsed/3600:.2f}h | Best success: {best_suc:.1f}%")
+    if FT_INIT:
+        final_ckpt_path = paths.checkpoint("ppo_asym_ft", "ft_final.msgpack")
     save_checkpoint(train_state[0], train_state[1], final_ckpt_path)
+    if FT_INIT:
+        export_calf(train_state[0], calf_bundle, final_ckpt_path.replace(".msgpack", "_calf.msgpack"))
 
     _, final_logstd = actor_apply(train_state[0], jnp.zeros((1, OBS_SIZE)))
     final_sigma = jax.device_get(jnp.exp(final_logstd[0]))
@@ -405,4 +508,4 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
 
 
 if __name__ == "__main__":
-    train()
+    train(int(os.environ.get("LEGNAV_TOTAL_STEPS", DEFAULT_TOTAL_ENV_STEPS)))

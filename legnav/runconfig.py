@@ -75,11 +75,20 @@ def verify_env(effective_use_legs=None):
             holder = getattr(importlib.import_module(m), cls)
         got = getattr(holder, attr)
         got = float(got) if hasattr(got, "item") else got
-        if isinstance(want, bool) or isinstance(got, bool):
+        if isinstance(want, str) or isinstance(got, str):
+            ok = str(got) == str(want)
+        elif isinstance(want, bool) or isinstance(got, bool):
             ok = bool(got) == bool(want)
         else:
             ok = abs(float(got) - float(want)) <= 1e-9 * max(1.0, abs(float(want)))
         if not ok: bad.append(f"{key}: code={got} config={want}")
+    # Robot footprint: config env.robot_footprint (absent = "circle", the paper's TurtleBot disc)
+    # must match what jax_env parsed from $LEGNAV_ROBOT_FOOTPRINT.
+    from legnav.core import jax_env as _je
+    want_fp = load()["env"].get("robot_footprint", "circle")
+    if _je._parse_footprint(want_fp) != (_je.ROBOT_SHAPE, _je.ROBOT_HALF_L, _je.ROBOT_HALF_W):
+        bad.append(f"robot footprint: code={(_je.ROBOT_SHAPE, _je.ROBOT_HALF_L, _je.ROBOT_HALF_W)} "
+                   f"config={want_fp!r} (set LEGNAV_ROBOT_FOOTPRINT)")
     if bad:
         raise RuntimeError("Code differs from the frozen config:\n  " + "\n  ".join(bad))
     if effective_use_legs is not None:
@@ -97,6 +106,7 @@ def write_sidecar(out_dir, method, ped, seed, extra=None):
     cfg = dict(load())
     cfg["effective"] = {"method": method, "pedestrian_model": ped, "seed": seed,
                         "use_legs": os.environ.get("LEGNAV_USE_LEGS", "1") != "0",
+                        "robot_footprint": os.environ.get("LEGNAV_ROBOT_FOOTPRINT", "circle"),
                         "total_steps_override": os.environ.get("LEGNAV_TOTAL_STEPS"),
                         "early_stop_override": os.environ.get("LEGNAV_EARLY_STOP")}
     with open(out / "run_config.yaml", "w") as f:

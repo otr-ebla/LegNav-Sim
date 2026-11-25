@@ -744,8 +744,16 @@ def draw_scene(surface, state, raw_lidar, foot_state_np, show_lidar, show_arrows
                 pygame.draw.circle(surface, (230, 60, 60), (px, py), 3)
 
     rx, ry = W_(float(state.x), float(state.y)); rr = max(4, int(ROBOT_RADIUS*scale))
-    pygame.draw.circle(surface, C_ROBOT,   (rx, ry), rr)
-    pygame.draw.circle(surface, C_ROBOT_H, (rx, ry), rr, 2)
+    if _jax_env.ROBOT_SHAPE == "rect":
+        c, s = math.cos(float(state.theta)), math.sin(float(state.theta))
+        hl, hw = _jax_env.ROBOT_HALF_L, _jax_env.ROBOT_HALF_W
+        pts = [W_(float(state.x) + c*lx - s*ly, float(state.y) + s*lx + c*ly)
+               for lx, ly in ((hl, hw), (-hl, hw), (-hl, -hw), (hl, -hw))]
+        pygame.draw.polygon(surface, C_ROBOT,   pts)
+        pygame.draw.polygon(surface, C_ROBOT_H, pts, 2)
+    else:
+        pygame.draw.circle(surface, C_ROBOT,   (rx, ry), rr)
+        pygame.draw.circle(surface, C_ROBOT_H, (rx, ry), rr, 2)
     hx, hy = W_(state.x + ROBOT_RADIUS*3*math.cos(float(state.theta)),
                 state.y + ROBOT_RADIUS*3*math.sin(float(state.theta)))
     pygame.draw.line(surface, C_ROBOT_H, (rx, ry), (hx, hy), 3)

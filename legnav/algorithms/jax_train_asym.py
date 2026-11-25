@@ -93,6 +93,14 @@ def collect_rollouts_asym(
             "collision":    infos["collision"],
             "passive_col":  infos["passive_col"],
             "active_col":   infos["active_col"],
+            # per-step reward diagnostics (social fine-tuning terms are 0 unless LEGNAV_SOCIAL_FT=1)
+            "rew_progress": infos["rew_progress"],
+            "rew_yield":    infos["rew_yield"],
+            "rew_grp":      infos["rew_grp"],
+            "rew_cpa":      infos["rew_cpa"],
+            "rew_foot":     infos["rew_foot"],
+            "rew_wall":     infos["rew_wall"],
+            "grp_inner":    (infos["grp_gap_inner"] < 0.05).astype(jnp.float32),
         }
         return (next_state, next_obs, next_priv, current_rng), transition
 

@@ -22,6 +22,10 @@ defaults of each training script (env vars only select seed/ped/output dir).
 
     2drlenv/bin/python -m legnav.algorithms.train_multiseed --suite all --dry-run
     2drlenv/bin/python -m legnav.algorithms.train_multiseed --suite all
+
+Other robot footprints use their own config + output dir (never mixed with the paper runs), e.g. TIAGo OMNI:
+    LEGNAV_CONFIG=configs/revision_tiago.yaml 2drlenv/bin/python -m legnav.algorithms.train_multiseed \
+        --suite main --methods calf_ppo --seeds 0 --out checkpoints/multiseed_tiago
 """
 import argparse
 import os
@@ -36,6 +40,9 @@ _USER_JAX_PLATFORMS = os.environ.get("JAX_PLATFORMS")
 os.environ["JAX_PLATFORMS"] = "cpu"
 
 from legnav import runconfig as rc
+
+# Footprint comes from the config (env.robot_footprint, default "circle") and is passed to the children.
+os.environ["LEGNAV_ROBOT_FOOTPRINT"] = rc.load()["env"].get("robot_footprint", "circle")
 
 REPO = Path(__file__).resolve().parents[2]
 OUT = REPO / "checkpoints" / "multiseed"
@@ -143,7 +150,13 @@ def main():
     ap.add_argument("--methods", nargs="+", default=None, choices=list(METHODS), help="restrict to these methods")
     ap.add_argument("--no-early-stop", action="store_true", help="always train the full budget")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--out", default=None, help="output dir (default checkpoints/multiseed)")
     a = ap.parse_args()
+    if a.out:
+        global OUT, WORK
+        OUT = Path(a.out).resolve(); WORK = OUT / "_work"
+    if OUT == REPO / "checkpoints" / "multiseed" and os.environ["LEGNAV_ROBOT_FOOTPRINT"] != "circle":
+        sys.exit("non-default robot footprint: pass --out (keep checkpoints/multiseed for the paper runs)")
     rc.verify_env()
     runs = build_runs(a.suite, a.ablation_baseline, a.seeds, a.methods)
     todo = [r for r in runs if not is_done(f"{r[0]}_{r[1]}_s{r[2]}")[0]]

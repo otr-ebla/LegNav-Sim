@@ -32,6 +32,23 @@ NUM_OBS_BOX    = SimConfig.JAX_NUM_OBS_BOX
 ROOM_W         = 12.0
 ROOM_H         = 12.0
 ROBOT_RADIUS   = RobotConfig.RADIUS
+# Robot footprint used for collisions in jax_env_multi.step_env.
+#   "circle": disc of radius ROBOT_RADIUS (TurtleBot 4, default, paper setting).
+#   "rect"  : oriented rectangle 2*ROBOT_HALF_L (along heading) x 2*ROBOT_HALF_W,
+#             centred on (x, y) — e.g. TIAGo OMNI base 0.72 x 0.50 m.
+# Set via $LEGNAV_ROBOT_FOOTPRINT ("circle" or "rect:<length>x<width>", e.g. "rect:0.72x0.50"),
+# or, like USE_LEGS, patch these BEFORE importing jax_env_multi (resolved at trace time).
+def _parse_footprint(spec):
+    if spec == "circle":
+        return "circle", 0.36, 0.25
+    shape, _, dims = spec.partition(":")
+    length, width = (float(d) for d in dims.split("x"))
+    if shape != "rect" or length <= 0 or width <= 0:
+        raise ValueError(f"bad LEGNAV_ROBOT_FOOTPRINT {spec!r}")
+    return "rect", length / 2.0, width / 2.0
+
+ROBOT_SHAPE, ROBOT_HALF_L, ROBOT_HALF_W = _parse_footprint(
+    __import__("os").environ.get("LEGNAV_ROBOT_FOOTPRINT", "circle"))
 PEOPLE_RADIUS  = SimConfig.HUMANS_RADIUS
 MAX_LIDAR_DIST = 12.0
 FOV            = 2.0 * math.pi   # 360° full-circle LiDAR

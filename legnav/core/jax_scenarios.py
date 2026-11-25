@@ -7,7 +7,19 @@ import jax.numpy as jnp
 
 ROOM_W = 12.0
 ROOM_H = 12.0
-ROBOT_RADIUS = 0.2
+SMALL_ROOM_W, SMALL_ROOM_H = 5.0, 9.0   # scenario 18
+# Social fine-tuning only: probability that a random (scenario_idx < 0) training draw is replaced by
+# scenario 18. 0 (default, unset) = original behaviour, scenario 18 never drawn in training.
+import os as _os
+FT_SCEN18_PROB = float(_os.environ.get("LEGNAV_FT_SCEN18_PROB", "0"))
+from legnav.core import jax_env as _jax_env
+# Spawn-clearance radius: the robot disc (0.2 m), or the circumscribed disc of a rectangular footprint.
+ROBOT_RADIUS = (math.hypot(_jax_env.ROBOT_HALF_L, _jax_env.ROBOT_HALF_W)
+                if _jax_env.ROBOT_SHAPE == "rect" else 0.2)
+# Min robot-centre ↔ person-centre distance at spawn: 1.0 m for the 0.2 m disc, grown by the extra
+# clearance radius otherwise so the surface gap stays the same (exactly 1.0 for the disc robot).
+HUMAN_SPAWN_CLEAR = 1.0 + (ROBOT_RADIUS - 0.2)
+SMALL_ROOM_ROBOT_Y = ROBOT_RADIUS + 0.05   # scenario 18 robot start: lowest wall-safe y
 PEOPLE_RADIUS = 0.4   # FIX: was 0.2 — must match jax_env.py (PEOPLE_RADIUS=0.4)
                       # With 0.2, PERSON_ROBOT_CLEAR=0.7m but body_thresh=0.6m -> margin <0.1m
                       # -> immediate collisions at first step guaranteed
@@ -187,11 +199,14 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
     # as training episodes.  Pinned evals are unaffected.
     non_train_scen = ((idx == 13) | (idx == 14) | (idx == 15) | (idx == 16)) & (jnp.int32(scenario_idx) < 0)
     idx = jnp.where(non_train_scen, jnp.int32(0), idx)
+    if FT_SCEN18_PROB > 0.0:   # trace-time: absent from the graph in normal runs
+        pick18 = jax.random.bernoulli(jax.random.fold_in(k_scen, 18), FT_SCEN18_PROB) & (jnp.int32(scenario_idx) < 0)
+        idx = jnp.where(pick18, jnp.int32(18), idx)
 
     # Scenarios where enforcing a large minimum initial goal distance is
     # impractical: intersections and multi-waypoint test scenarios.
     # Include `bottleneck` (4) alongside intersections and multi-waypoint tests
-    _EXCEPTION_SCENS = jnp.array([4, 5, 7, 9, 11, 12, 13, 14, 15], dtype=jnp.int32)
+    _EXCEPTION_SCENS = jnp.array([4, 5, 7, 9, 11, 12, 13, 14, 15, 18], dtype=jnp.int32)
     is_exception_scen = jnp.any(jnp.int32(idx) == _EXCEPTION_SCENS)
 
     def pack_human(px, py, th, g1x, g1y, g2x, g2y):
@@ -1167,6 +1182,152 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
         people      = _make_dummies(NUM_PEOPLE)
         return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
 
+    # ── 18: SMALL ROOM 5x9 — walkers + standing pairs/triads (test) ─────────
+    def _small_room_scen(k):
+        """5 m (x) x 9 m (y) room. Robot at the bottom wall, goal near the top wall (y = 8.35, random x).
+        Per episode one of 6 layouts of standing groups (each a pair or triad, 50/50, standing
+        still with g1 == g2 and facing its centre; body gaps ~0.50-0.65 m pair, ~0.6-0.8 m triad):
+          0 none (3 walkers)            1 one group in the middle (2 walkers)
+          2 one group on the left wall  3 one group on the right wall (2 walkers each)
+          4 left wall low + right wall high   5 right wall low + left wall high (1 walker each)
+        A wall group's outermost person stands 0.4-0.5 m from the wall, so that side is closed
+        and the robot has to pick the open side; no side of the room is always free. Groups in
+        layouts 4-5 keep >= 2.2 m between their people so they never read as one group."""
+        W, H = SMALL_ROOM_W, SMALL_ROOM_H
+        (k1, k_cfg, k_rx, k_gx, k_g1, k_g2, k_gn,
+         k_wt, k_wa, k_wb, k_wt0, k_wi) = jax.random.split(k, 12)
+        max_v = jax.random.uniform(k1, minval=0.5, maxval=1.0)
+        obs_circles = jnp.zeros((NUM_OBS_CIR, 3))
+        obs_boxes   = jnp.zeros((NUM_OBS_BOX, 8))
+
+        rx = jax.random.uniform(k_rx, minval=1.0, maxval=W - 1.0)
+        ry, rtheta = jnp.float32(SMALL_ROOM_ROBOT_Y), jnp.float32(jnp.pi / 2.0)
+        gx = jax.random.uniform(k_gx, minval=1.0, maxval=W - 1.0)
+        gy = jnp.float32(H - 0.65)   # just inside the goal-clearance limit (H - 0.6)
+
+        cfg = jax.random.randint(k_cfg, (), 0, 6)
+        #                 layout:   0    1    2    3    4    5
+        g1_on   = jnp.array([0,   1,   1,   1,   1,   1])[cfg] > 0
+        g1_side = jnp.array([0,   0,  -1,   1,  -1,   1])[cfg]          # -1 left wall, 0 middle, 1 right wall
+        g1_ylo  = jnp.array([3.0, 3.0, 2.7, 2.7, 2.7, 2.7])[cfg]
+        g1_yhi  = jnp.array([6.0, 6.0, 6.4, 6.4, 3.6, 3.6])[cfg]
+        g2_on   = jnp.array([0,   0,   0,   0,   1,   1])[cfg] > 0
+        g2_side = jnp.array([0,   0,   0,   0,   1,  -1])[cfg]
+        n_walkers = jnp.array([3, 2, 2, 2, 1, 1])[cfg]
+        n_g = jnp.where(jax.random.bernoulli(k_gn, 0.5, (2,)), 3, 2)     # pair or triad, per group
+
+        def _group_cands(kc, n, side, ylo, yhi):
+            """N_GUESSES candidate placements (px, py, facing) of an n-person group, (C, 3) each.
+            Regular polygon (pair = segment, triad = triangle), random rotation, facing its centre."""
+            ky, kp, ks, kx = jax.random.split(kc, 4)
+            C = N_GUESSES
+            cy  = jax.random.uniform(ky, (C,), minval=ylo, maxval=yhi)
+            phi = jax.random.uniform(kp, (C,), minval=0.0, maxval=2 * jnp.pi)
+            u   = jax.random.uniform(ks, (C,))
+            sep = jnp.where(n == 2, 1.3 + 0.15 * u, 1.4 + 0.2 * u)      # neighbour centre-to-centre
+            n_f = n.astype(jnp.float32)
+            rad = sep / (2.0 * jnp.sin(jnp.pi / n_f))                    # circumradius
+            ang = phi[:, None] + 2.0 * jnp.pi * jnp.arange(3) / n_f      # (C, 3)
+            ox, oy = rad[:, None] * jnp.cos(ang), rad[:, None] * jnp.sin(ang)
+            on = jnp.arange(3) < n
+            min_ox = jnp.min(jnp.where(on, ox, 1e3), axis=-1)
+            max_ox = jnp.max(jnp.where(on, ox, -1e3), axis=-1)
+            d_wall = jax.random.uniform(kx, (C,), minval=0.4, maxval=0.5)    # outer person centre ↔ wall (people are clipped to >= 0.4)
+            cx_mid = jax.random.uniform(jax.random.fold_in(kx, 1), (C,), minval=2.1, maxval=W - 2.1)
+            cx = jnp.select([side < 0, side > 0], [d_wall - min_ox, W - d_wall - max_ox], cx_mid)
+            return cx[:, None] + ox, cy[:, None] + oy, ang + jnp.pi
+
+        g1x, g1y, g1th = (a[0] for a in _group_cands(k_g1, n_g[0], g1_side, g1_ylo, g1_yhi))
+        on1 = g1_on & (jnp.arange(3) < n_g[0])
+        # Second group: first candidate whose people all stay >= 2.2 m from the first group's.
+        c2x, c2y, c2th = _group_cands(k_g2, n_g[1], g2_side, 5.4, 6.4)
+        on2_ = jnp.arange(3) < n_g[1]
+        d12 = jnp.hypot(c2x[:, :, None] - g1x[None, None, :], c2y[:, :, None] - g1y[None, None, :])
+        d12 = jnp.where(on2_[None, :, None] & on1[None, None, :], d12, 1e3).min(axis=(1, 2))   # (C,)
+        b2 = jnp.where(jnp.any(d12 >= 2.2), jnp.argmax(d12 >= 2.2), jnp.argmax(d12))
+        g2x, g2y, g2th = c2x[b2], c2y[b2], c2th[b2]
+        on2 = g2_on & on2_
+
+        grp_x  = jnp.concatenate([g1x, g2x]);  grp_y = jnp.concatenate([g1y, g2y])
+        grp_on = jnp.concatenate([on1, on2])                                    # (6,)
+        pair = pack_human(grp_x, grp_y, jnp.concatenate([g1th, g2th]), grp_x, grp_y, grp_x, grp_y)
+
+        # Walkers (slots 6-8): bounce between A and B. Type 0 horizontal, 1 vertical,
+        # 2 diagonal. Vertical ends at y=1.6/6.4 (never g1y=1.0 → no teleport).
+        # N_GUESSES candidate paths per walker; the first whose whole A-B segment stays
+        # WALK_CLR from every standing group's hull (segment for a pair, triangle for a
+        # triad) is used. A walker with no clear candidate is dropped (made a dummy).
+        N_W = 3
+        WALK_CLR = 2 * PEOPLE_RADIUS + 0.2      # walker body never closer than 0.2 m to a standing body
+        sh = (N_W, N_GUESSES)
+        wtype = jax.random.randint(k_wt, sh, 0, 3)
+        ua = jax.random.uniform(k_wa, sh)
+        ub = jax.random.uniform(k_wb, sh)
+        ax = jnp.select([wtype == 0, wtype == 1], [jnp.full(sh, 0.7), 0.7 + ua * (W - 1.4)], 0.7)
+        ay = jnp.select([wtype == 0, wtype == 1], [1.4 + ua * 6.2, jnp.full(sh, 1.6)], 1.4 + ua * 2.0)
+        bx = jnp.select([wtype == 0, wtype == 1], [jnp.full(sh, W - 0.7), ax], W - 0.7)
+        by = jnp.select([wtype == 0, wtype == 1], [1.4 + ub * 6.2, jnp.full(sh, H - 0.6)], 5.8 + ub * 2.6)
+        flip = jax.random.bernoulli(jax.random.fold_in(k_wa, 1), 0.5, sh)   # mirror diagonals / sides
+        ax, bx = jnp.where(flip, bx, ax), jnp.where(flip, ax, bx)
+
+        # Distance of 64 points along each candidate path to the group hull.
+        tt = jnp.linspace(0.0, 1.0, 64)
+        qx = ax[..., None] + tt * (bx - ax)[..., None]          # (N_W, N_GUESSES, 32)
+        qy = ay[..., None] + tt * (by - ay)[..., None]
+        def _seg_d(px_, py_, x0, y0, x1, y1):
+            ex, ey = x1 - x0, y1 - y0
+            u = jnp.clip(((px_ - x0) * ex + (py_ - y0) * ey) / jnp.maximum(ex * ex + ey * ey, 1e-9), 0.0, 1.0)
+            return jnp.hypot(px_ - (x0 + u * ex), py_ - (y0 + u * ey))
+
+        def _hull_d(gxs, gys, n, on):
+            """Distance of the path points to one group's hull (segment / triangle); 1e3 if absent."""
+            is_tri = n == 3
+            vx = jnp.where(is_tri, gxs, gxs.at[2].set(gxs[0]))   # pair: degenerate 3rd vertex
+            vy = jnp.where(is_tri, gys, gys.at[2].set(gys[0]))
+            d = jnp.minimum(jnp.minimum(_seg_d(qx, qy, vx[0], vy[0], vx[1], vy[1]),
+                                        _seg_d(qx, qy, vx[1], vy[1], vx[2], vy[2])),
+                            _seg_d(qx, qy, vx[2], vy[2], vx[0], vy[0]))
+            cr = lambda i, j: (vx[j] - vx[i]) * (qy - vy[i]) - (vy[j] - vy[i]) * (qx - vx[i])
+            c0, c1, c2 = cr(0, 1), cr(1, 2), cr(2, 0)
+            inside = is_tri & (((c0 >= 0) & (c1 >= 0) & (c2 >= 0)) | ((c0 <= 0) & (c1 <= 0) & (c2 <= 0)))
+            return jnp.where(on, jnp.where(inside, 0.0, d), 1e3)
+
+        d_hull = jnp.minimum(_hull_d(g1x, g1y, n_g[0], g1_on), _hull_d(g2x, g2y, n_g[1], g2_on))
+        path_ok = jnp.min(d_hull, axis=-1) >= WALK_CLR                  # (N_W, N_GUESSES)
+        pick = jnp.argmax(path_ok, axis=-1)
+        walk_ok = jnp.any(path_ok, axis=-1)
+        take = lambda a: jnp.take_along_axis(a, pick[:, None], axis=-1)[:, 0]
+        ax, ay, bx, by = take(ax), take(ay), take(bx), take(by)
+
+        # Start point along A→B, placed one walker at a time: best of N_GUESSES, clear of
+        # the robot, the goal, the group and the walkers already placed.
+        t = jax.random.uniform(k_wt0, (N_W, N_GUESSES))
+        sx = ax[:, None] + t * (bx - ax)[:, None]
+        sy = ay[:, None] + t * (by - ay)[:, None]
+        occ_x = jnp.where(grp_on, grp_x, -999.0)
+        occ_y = jnp.where(grp_on, grp_y, -999.0)
+        wx, wy = [], []
+        for i in range(N_W):
+            d_rob  = jnp.hypot(sx[i] - rx, sy[i] - ry) - (HUMAN_SPAWN_CLEAR + 0.3)
+            d_goal = jnp.hypot(sx[i] - gx, sy[i] - gy) - (PEOPLE_RADIUS + GOAL_RADIUS + 0.2)
+            d_occ  = jnp.min(jnp.hypot(sx[i][:, None] - occ_x, sy[i][:, None] - occ_y), axis=-1) \
+                     - (2 * PEOPLE_RADIUS + 0.3)
+            b = jnp.argmax(jnp.minimum(jnp.minimum(d_rob, d_goal), d_occ))
+            wx.append(sx[i, b]); wy.append(sy[i, b])
+            occ_x = jnp.append(occ_x, sx[i, b]); occ_y = jnp.append(occ_y, sy[i, b])
+        wx, wy = jnp.stack(wx), jnp.stack(wy)
+        widx = jax.random.randint(k_wi, (N_W,), 0, 2).astype(jnp.float32)
+        tgx = jnp.where(widx == 0, ax, bx)
+        tgy = jnp.where(widx == 0, ay, by)
+        walkers = pack_human(wx, wy, jnp.arctan2(tgy - wy, tgx - wx), ax, ay, bx, by)
+        walkers = walkers.at[:, 10].set(widx)
+
+        dummies = _make_dummies(9)
+        on = jnp.concatenate([grp_on, (jnp.arange(N_W) < n_walkers) & walk_ok])
+        people9 = jnp.where(on[:, None], jnp.concatenate([pair, walkers], axis=0), dummies)
+        people = jnp.concatenate([people9, _make_dummies(NUM_PEOPLE - 9)], axis=0)
+        return rx, ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people
+
     branches = [
         _random_scen,
         _parallel_scen,
@@ -1186,16 +1347,21 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
         _gait_circle_scen,         # 15 — visual gait check (single walker, circle)
         _npz_map_scen,             # 16 — real-world floor-plan from NPZ map
         _floor_tour_scen,          # 17 — CCW floor tour with corridor patrollers (training)
+        _small_room_scen,          # 18 — 5x9 m room, walkers + standing groups (test)
     ]
 
     # Compile all scenarios into the XLA switch statement
     raw_rx, raw_ry, rtheta, gx, gy, max_v, obs_circles, obs_boxes, people = jax.lax.switch(idx, branches, k_branch)
 
-    # Room dimensions: scenario 11 uses 24 m height; scenarios 16-17 use the NPZ map size.
+    # Room dimensions: scenario 11 uses 24 m height; scenarios 16-17 use the NPZ map size;
+    # scenario 18 is the small 5x9 m room.
     _uses_map = (jnp.int32(idx) == 16) | (jnp.int32(idx) == 17)
+    _small = jnp.int32(idx) == 18
     room_h = jnp.where(jnp.int32(idx) == 11, jnp.float32(24.0),
-             jnp.where(_uses_map, jnp.float32(MAP_ROOM_H), jnp.float32(ROOM_H)))
-    room_w = jnp.where(_uses_map, jnp.float32(MAP_ROOM_W), jnp.float32(ROOM_W))
+             jnp.where(_uses_map, jnp.float32(MAP_ROOM_H),
+             jnp.where(_small, jnp.float32(SMALL_ROOM_H), jnp.float32(ROOM_H))))
+    room_w = jnp.where(_uses_map, jnp.float32(MAP_ROOM_W),
+             jnp.where(_small, jnp.float32(SMALL_ROOM_W), jnp.float32(ROOM_W)))
 
     # ── Universal Robot Safety Check (Vectorized) ──
     # Post-process: Guarantees the robot NEVER spawns directly on top of a human
@@ -1206,13 +1372,16 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
     off_x = jnp.concatenate([jnp.array([0.0]), jax.random.uniform(k_off_x, (N_GUESSES-1,), minval=-2.0, maxval=2.0)])
     off_y = jnp.concatenate([jnp.array([0.0]), jax.random.uniform(k_off_y, (N_GUESSES-1,), minval=-2.0, maxval=2.0)])
 
+    # Scenario 18 starts the robot against the bottom wall: lower y clip + wall clearance.
+    y_lo = jnp.where(_small, jnp.float32(SMALL_ROOM_ROBOT_Y), jnp.float32(1.0))
+    wall_clear = jnp.where(_small, jnp.float32(SMALL_ROOM_ROBOT_Y - 0.02), jnp.float32(ROBOT_RADIUS + 0.3))
     rx_guesses = jnp.clip(raw_rx + off_x, 1.0, room_w - 1.0)
-    ry_guesses = jnp.clip(raw_ry + off_y, 1.0, room_h - 1.0)
+    ry_guesses = jnp.clip(raw_ry + off_y, y_lo, room_h - 1.0)
 
     def check_post_safe(x, y):
         dist = jnp.sqrt((people[:, 0] - x)**2 + (people[:, 1] - y)**2)
-        human_ok = jnp.min(dist) >= 1.0
-        wall_ok = _is_safe(x, y, ROBOT_RADIUS + 0.3, obs_circles, obs_boxes, room_w, room_h)
+        human_ok = jnp.min(dist) >= HUMAN_SPAWN_CLEAR
+        wall_ok = _is_safe(x, y, wall_clear, obs_circles, obs_boxes, room_w, room_h)
         return human_ok & wall_ok
 
     safe_mask = jax.vmap(check_post_safe)(rx_guesses, ry_guesses)
@@ -1220,6 +1389,20 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
 
     rx_safe = rx_guesses[best_idx]
     ry_safe = ry_guesses[best_idx]
+
+    if _jax_env.ROBOT_SHAPE == "rect":
+        # With the larger clearance, no guess may be safe (e.g. a person spawned on the robot in a
+        # narrow corridor) and the robot then stays in place: push such people radially away from it
+        # (no-op whenever a safe guess was found). Not applied to the disc robot (paper runs unchanged).
+        ROBOT_HUMAN_SAFE = HUMAN_SPAWN_CLEAR + 0.05
+        p_on = people[:, 10] >= 0.0
+        rdx, rdy = people[:, 0] - rx_safe, people[:, 1] - ry_safe
+        rdist = jnp.hypot(rdx, rdy)
+        r_push = p_on & (rdist < ROBOT_HUMAN_SAFE)
+        rux = jnp.where(rdist > 1e-6, rdx / jnp.maximum(rdist, 1e-6), jnp.cos(rtheta))
+        ruy = jnp.where(rdist > 1e-6, rdy / jnp.maximum(rdist, 1e-6), jnp.sin(rtheta))
+        people = people.at[:, 0].set(jnp.where(r_push, jnp.clip(rx_safe + rux * ROBOT_HUMAN_SAFE, 0.4, room_w - 0.4), people[:, 0]))
+        people = people.at[:, 1].set(jnp.where(r_push, jnp.clip(ry_safe + ruy * ROBOT_HUMAN_SAFE, 0.4, room_h - 0.4), people[:, 1]))
 
     # Enforce a minimum initial goal distance for non-exception scenarios by
     # post-processing the chosen goal: if the goal is too close to the robot,
@@ -1352,6 +1535,7 @@ TEST_SCENARIO_NAMES = {
     10: "Zigzag Counter-flow",
     11: "Long Parallel Corridor",
     12: "U-Turn Corridor",
+    18: "Small Room 5x9",
 }
 
 # Robot waypoint lists per test scenario.
@@ -1367,5 +1551,6 @@ TEST_ROBOT_WAYPOINTS = {
     
     10: [(6.0, 11.0)],                                       
     11: [(6.0, 12.0), (6.0, 19.2)],   
-    12: [(1.5, 1.5), (10.5, 1.5), (10.5, 10.5)],            
+    12: [(1.5, 1.5), (10.5, 1.5), (10.5, 10.5)],
+    18: [(-1.0, -1.0)],   # single random goal, set by the scenario (value unused)
 }

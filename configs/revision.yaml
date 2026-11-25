@@ -75,7 +75,7 @@ launch:
   - nsg
   - disc
 early_stop:
-  enabled: true
+  enabled: false
   signal: smoothed training success (%)
   min_frac: 0.3
   patience_frac: 0.2

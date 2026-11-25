@@ -17,7 +17,7 @@ Usage:
   python3 test_scenarios_eval.py --algo hsfm  # HSFM: robot driven as a human circle (no checkpoint)
 
 Keys:
-  7-9, 0(=10), -/'(=11), =(=12)   Select test scenario
+  7-9, 0(=10), -/'(=11), =(=12), 1(=18)   Select test scenario
   R     Reset episode    →   Skip to random test scenario
   N     Next waypoint (skip to next, for debugging)
   L     Toggle LiDAR     H   Toggle arrows
@@ -50,7 +50,12 @@ def _parse_args():
     p.add_argument("--no-legs", dest="use_legs", action="store_false")
     p.add_argument("--ghost-body", action="store_true")
     p.add_argument("--scenario", type=int, default=7,
-                   help="Starting test scenario (7-12). Default: 7")
+                   help="Starting test scenario (7-12, or 18 = small 5x9 room; 18 stays on 18). Default: 7")
+    p.add_argument("--footprint", choices=["circle", "rect"], default="circle",
+                   help="Robot collision footprint: circle (ROBOT_RADIUS) or oriented rectangle.")
+    p.add_argument("--robot-size", type=float, nargs=2, default=[0.72, 0.50],
+                   metavar=("LENGTH", "WIDTH"),
+                   help="Rectangle size in metres (length along heading, width). Default: TIAGo OMNI 0.72 0.50")
     p.add_argument("--episodes", type=int, default=0,
                    help="Episodes per scenario for batch/headless mode. 0 = interactive (default).")
     return p.parse_args()
@@ -60,6 +65,9 @@ args = _parse_args()
 import legnav.core.jax_env as _jax_env
 _jax_env.USE_LEGS     = args.use_legs
 _jax_env.SENSOR_NOISE = True
+_jax_env.ROBOT_SHAPE  = args.footprint
+_jax_env.ROBOT_HALF_L = args.robot_size[0] / 2.0
+_jax_env.ROBOT_HALF_W = args.robot_size[1] / 2.0
 
 from legnav.core.jax_env import (ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS,
                      NUM_RAYS, MAX_LIDAR_DIST, FOV, MAX_STEPS, GOAL_RADIUS)
@@ -196,24 +204,24 @@ def run_interactive():
     # Optional per-policy reset (MPPI reseeds its warm-start u_mean).
     _policy_reset = getattr(infer_fn, "reset_hook", lambda: None)
 
-    current_scenario = max(7, min(12, args.scenario))
+    current_scenario = 18 if args.scenario == 18 else max(7, min(12, args.scenario))
     fast_reset, fast_step = build_fast_reset(current_scenario)
 
     rng = jax.random.PRNGKey(42)
 
     pygame.init()
 
-    def _viz_params(room_h_val):
-        """Return (scale, sim_w, sim_h, win_w, win_h) for the given room height."""
-        sc  = SIM_SIZE / max(ROOM_W, room_h_val)
-        sw  = int(ROOM_W * sc)
+    def _viz_params(room_h_val, room_w_val=ROOM_W):
+        """Return (scale, sim_w, sim_h, win_w, win_h) for the given room size."""
+        sc  = SIM_SIZE / max(room_w_val, room_h_val)
+        sw  = int(room_w_val * sc)
         sh  = int(room_h_val * sc)
         return sc, sw, sh, sw + PANEL_W, sh
 
     rng, reset_rng = jax.random.split(rng)
     obs, stacked_state = fast_reset(reset_rng)
     _init_rh = float(stacked_state.env_state.room_h)
-    _sc, _sw, _sh, _ww, _wh = _viz_params(_init_rh)
+    _sc, _sw, _sh, _ww, _wh = _viz_params(_init_rh, float(stacked_state.env_state.room_w))
 
     screen = pygame.display.set_mode((_ww, _wh))
     pygame.display.set_caption(f"Test Scenarios — {algo.upper()}")
@@ -389,6 +397,7 @@ def run_interactive():
                 if k == pygame.K_0: new_scen = 10
                 if k in (pygame.K_MINUS, pygame.K_QUOTE): new_scen = 11
                 if k == pygame.K_EQUALS: new_scen = 12
+                if k == pygame.K_1: new_scen = 18
                 if new_scen is not None:
                     current_scenario = new_scen
                     waypoints = TEST_ROBOT_WAYPOINTS[current_scenario]
@@ -438,7 +447,7 @@ def run_interactive():
 
         # ── Rescale viewport to fit the current room (24 m corridor → narrower sim) ──
         rh_val = float(cpu_state.room_h)
-        sc, sw, sh, ww, wh = _viz_params(rh_val)
+        sc, sw, sh, ww, wh = _viz_params(rh_val, float(cpu_state.room_w))
         if screen.get_size() != (ww, wh):
             screen = pygame.display.set_mode((ww, wh))
 
@@ -494,6 +503,10 @@ def run_interactive():
 
             ep += 1
             # After every episode (success or failure) jump to a random test scenario
+            # (scenario 18 stays on 18: a new random configuration every episode)
+            if current_scenario == 18:
+                reset_episode()
+                continue
             _choices = [s for s in range(7, 13) if s != current_scenario]
             current_scenario = int(np.random.choice(_choices))
             waypoints = TEST_ROBOT_WAYPOINTS[current_scenario]
@@ -537,11 +550,12 @@ def run_headless():
     SPACE_COMP_DIST = 0.5       # surface distance (m) for a "space-compliant" step
 
     hdr = (f"{'Scenario':21s} | {'SR%':>5s} | {'ACR%':>5s} | {'PCR%':>5s} | {'TR%':>5s} | "
-           f"{'SPL':>4s} | {'TTG':>5s} | {'MHD':>5s} | {'AJ':>6s} | {'SC':>4s} | {'YS':>4s}")
+           f"{'SPL':>4s} | {'TTG':>5s} | {'MHD':>5s} | {'AJ':>6s} | {'SC':>4s} | {'YS':>4s} | "
+           f"{'GI%':>4s} | {'Stop%':>5s}")
     print("\n" + hdr)
     print("-" * len(hdr))
 
-    for scen_idx in range(7, 13):
+    for scen_idx in ([18] if args.scenario == 18 else range(7, 13)):
         scen_name = TEST_SCENARIO_NAMES[scen_idx]
         waypoints = TEST_ROBOT_WAYPOINTS[scen_idx]
         fast_reset, fast_step = build_fast_reset(scen_idx)
@@ -549,6 +563,7 @@ def run_headless():
         # Per-episode metric samples.
         m_sr, m_acr, m_pcr, m_tr = [], [], [], []
         m_spl, m_ttg, m_mhd, m_aj, m_sc, m_ys = [], [], [], [], [], []
+        m_gi, m_stop = [], []   # group intrusion (passed between standing people), stopped-step fraction
 
         for ep in range(n_episodes):
             rng, reset_rng = jax.random.split(rng)
@@ -566,6 +581,7 @@ def run_headless():
             yz_steps = 0; yc_steps = 0     # yield situations / compliant
             prev_w   = 0.0; prev_aw = 0.0  # angular jerk history (reset per episode)
             n_steps_ep = 0
+            gi_ep = False; stop_steps = 0
             outcome  = "tr"         # default outcome if budget exhausted
 
             while not episode_done:
@@ -603,6 +619,8 @@ def run_headless():
                     n_jerk += 1
                     prev_w, prev_aw = w, aw
                     n_steps_ep += 1
+                    gi_ep = gi_ep or float(info["grp_gap_inner"]) < 0.05
+                    stop_steps += int(v <= 0.1)
 
                     # Yield: a human in the frontal cone within YIELD_DIST means the
                     # robot should stop (v <= 0.1 m/s).
@@ -701,6 +719,8 @@ def run_headless():
             m_sc.append(sc_compliant / max(sc_total, 1))
             if yz_steps > 0:
                 m_ys.append(yc_steps / yz_steps)
+            m_gi.append(1.0 if gi_ep else 0.0)
+            m_stop.append(stop_steps / max(n_steps_ep, 1))
 
         # ── Scenario row ────────────────────────────────────────────────────────
         sr  = np.mean(m_sr) * 100
@@ -716,7 +736,8 @@ def run_headless():
 
         label = f"{scen_idx:2d}.{scen_name}"[:21]
         print(f"{label:21s} | {sr:4.0f}% | {acr:4.0f}% | {pcr:4.0f}% | {tr:4.0f}% | "
-              f"{spl:4.2f} | {ttg:5.1f} | {mhd_v:5.2f} | {aj:6.1f} | {sc:4.2f} | {ys:4.2f}")
+              f"{spl:4.2f} | {ttg:5.1f} | {mhd_v:5.2f} | {aj:6.1f} | {sc:4.2f} | {ys:4.2f} | "
+              f"{np.mean(m_gi)*100:3.0f}% | {np.mean(m_stop)*100:4.0f}%")
 
     print()
 
