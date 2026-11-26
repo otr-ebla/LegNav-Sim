@@ -54,6 +54,13 @@ from legnav.algorithms.jax_train_asym import (
     collect_rollouts_asym, init_env_state_asym,
     NUM_ENVS, ROLLOUT_STEPS, OBS_SIZE,
 )
+# Real-robot actuation (delay + lag + slew, Shelfy measurements): LEGNAV_REAL_ENV=1 swaps the env
+# functions the stacked env is built from (jax_train.init_env_state looks the names up at call time).
+if os.environ.get("LEGNAV_REAL_ENV", "0") == "1":
+    import legnav.algorithms.jax_train as _jax_train
+    from legnav.core.jax_env_real import reset_env_real, step_env_real
+    _jax_train.reset_env, _jax_train.step_env = reset_env_real, step_env_real
+
 from legnav.algorithms.jax_ppo import (
     GAMMA, GAE_LAMBDA, CLIP_EPS, VF_COEF, ENTROPY_COEF, MAX_GRAD_NORM,
     PPO_EPOCHS, LR_START, LR_END, LR_MIN, WARMUP_UPDATES,
@@ -213,6 +220,25 @@ FT_GHOST          = float(os.environ.get("LEGNAV_FT_GHOST", "0.5"))    # base ru
 FT_DIST           = float(os.environ.get("LEGNAV_FT_DIST", "7.5"))     # base run ended at 7.35 m
 FT_MAX_SCEN       = int(os.environ.get("LEGNAV_FT_MAX_SCEN", "6"))     # base run reached 0-5; 6 = static groups
 FT_SNAP_EVERY     = int(os.environ.get("LEGNAV_FT_SNAP_EVERY", "50"))       # updates
+# From-scratch scenario-18 run (no FT_INIT, LEGNAV_FT_SCEN18_PROB > 0): stock PPO recipe and curriculum,
+# but periodic snapshots (jobs have a walltime) and the social diagnostics. LEGNAV_CALF_TEMPLATE=<any CALF
+# checkpoint> only supplies the container for the deployable CALF export of the snapshots (its weights unused).
+S18_SCRATCH       = (not FT_INIT) and float(os.environ.get("LEGNAV_FT_SCEN18_PROB", "0")) > 0.0
+CALF_TEMPLATE     = os.environ.get("LEGNAV_CALF_TEMPLATE", "")
+# S18 scratch fixes (s18_run2 post-mortem, evaluation/diag_s18.py). Both off when unset.
+#  LEGNAV_S18_ENT="start,end": entropy coef annealed linearly over the run, decoupled from the curriculum.
+#    The curriculum ties it to success; blended success stalled at ~58% so it stayed at 0.012 for 130M
+#    steps and sigma_v climbed to 0.97 (cap 1.0 on a [0,1] action range): training on near-random speed.
+#  LEGNAV_S18_GATE=1: the curriculum advances on the success of the NON-s18 episodes only. With 80% of
+#    the episodes in s18 the blended rate measures s18, not the curriculum scenarios it is meant to gate.
+_s18_ent          = os.environ.get("LEGNAV_S18_ENT", "")
+S18_ENT           = tuple(float(x) for x in _s18_ent.split(",")) if _s18_ent else None
+S18_GATE          = os.environ.get("LEGNAV_S18_GATE", "0") == "1"
+#  LEGNAV_S18_GHOST=<p>: pin the ghost-robot probability (humans blind to the robot). It is drawn once
+#    per episode for EVERY scenario, s18 included, so without a pin the gated curriculum would also set
+#    how often the s18 people ignore the robot.
+_s18_ghost        = os.environ.get("LEGNAV_S18_GHOST", "")
+S18_GHOST         = float(_s18_ghost) if _s18_ghost else None
 _ACTOR_KEYS       = ("actor_encoder", "actor_out", "log_std")
 _TRUNK_KEYS       = ("Dense_0", "Dense_1", "FrameStackAttention_0", "LayerNorm_0", "LidarFrameCNN_0")
 
@@ -318,6 +344,13 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
         print(f"  FT env      : SOCIAL_FT={os.environ.get('LEGNAV_SOCIAL_FT', '0')}  "
               f"SCEN18_PROB={os.environ.get('LEGNAV_FT_SCEN18_PROB', '0')}")
 
+    if S18_SCRATCH:
+        if CALF_TEMPLATE:
+            calf_bundle = _read_calf(CALF_TEMPLATE)
+        print(f"  Scratch S18 : stock curriculum, SCEN18_PROB={os.environ.get('LEGNAV_FT_SCEN18_PROB')}, "
+              f"snapshots every {FT_SNAP_EVERY} upd, CALF export "
+              f"{'on (template ' + CALF_TEMPLATE + ')' if calf_bundle is not None else 'OFF (set LEGNAV_CALF_TEMPLATE)'}")
+
     opt_state   = optimizer.init(params)
     train_state = (params, opt_state)
 
@@ -329,6 +362,8 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     cur_max_dist, cur_ghost, cur_ent, cur_max_scen = get_continuous_curriculum(0.0)
     if FT_INIT:
         cur_max_dist, cur_ghost, cur_ent, cur_max_scen = FT_DIST, FT_GHOST, FT_ENT, FT_MAX_SCEN
+    if S18_SCRATCH and S18_GHOST is not None:
+        cur_ghost = S18_GHOST
     rolling_suc = 0.0
     highest_rolling_suc = 0.0
 
@@ -406,13 +441,22 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
                 mean_ret, suc_pct, obs_pct, acol_pct, pcol_pct, tmo_pct = 0., 0., 0., 0., 0., 0.
 
             # ── Monotonic curriculum (identical to jax_ppo) ───────────────
-            if n_ep > 0:
-                rolling_suc         = 0.9 * rolling_suc + 0.1 * suc_pct
+            gate_suc, gate_n = suc_pct, n_ep
+            if S18_SCRATCH and S18_GATE:
+                not18   = ~rollout_history["is_s18"].ravel()
+                gate_m  = ep_msk * not18
+                gate_n  = int(gate_m.sum())
+                gate_suc = float((ep_suc * gate_m).sum() / max(gate_n, 1)) * 100.0
+            if gate_n > 0:
+                rolling_suc         = 0.9 * rolling_suc + 0.1 * gate_suc
                 highest_rolling_suc = max(highest_rolling_suc, rolling_suc)
 
             new_max_dist, new_ghost, new_ent, new_max_scen = get_continuous_curriculum(highest_rolling_suc)
             if FT_INIT:   # curriculum pinned
                 new_max_dist, new_ghost, new_ent, new_max_scen = cur_max_dist, cur_ghost, FT_ENT, cur_max_scen
+            if S18_SCRATCH and S18_ENT is not None:
+                frac    = update / max(1, total_updates - 1)
+                new_ent = S18_ENT[0] + (S18_ENT[1] - S18_ENT[0]) * frac
 
             old_print_dist  = round(cur_max_dist, 1)
             old_print_ghost = round(cur_ghost, 2)
@@ -422,6 +466,8 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
                 cur_max_dist = min(cur_max_dist + 0.2, new_max_dist)
             if new_ghost > cur_ghost:
                 cur_ghost = new_ghost
+            if S18_SCRATCH and S18_GHOST is not None:
+                cur_ghost = S18_GHOST
             if new_max_scen > cur_max_scen:
                 cur_max_scen = new_max_scen
 
@@ -457,13 +503,15 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
                     f"{cur_max_dist:>6.1f}m {cur_ghost:>5.2f}g "
                     f"{ent_coef_now:>6.4f}e scen<=={cur_max_scen} {elapsedtime:>5.1f}min"
                 )
-                if FT_INIT:
+                if FT_INIT or S18_SCRATCH:
                     rh = rollout_history
                     print(f"        per-step  progress {float(rh['rew_progress'].mean()):+.4f}  "
                           f"yield+social {float(rh['rew_yield'].mean()):+.4f}  "
                           f"grp {float(rh['rew_grp'].mean()):+.4f}  cpa {float(rh['rew_cpa'].mean()):+.4f}  "
                           f"foot {float(rh['rew_foot'].mean()):+.4f}  wall {float(rh['rew_wall'].mean()):+.4f}  | between-group steps "
-                          f"{100*float(rh['grp_inner'].mean()):.3f}%")
+                          f"{100*float(rh['grp_inner'].mean()):.3f}%  | group-cross {int(rh['grp_cross'].sum())} "
+                          f"({100*float(rh['grp_cross'].sum()) / max(1, int(rh['dones'].sum())):.2f}% of episodes)"
+                          f"  | curriculum gate suc {gate_suc:.1f}% (n={gate_n}, rolling max {highest_rolling_suc:.1f}%)")
 
             if n_ep > 0:
                 _, curr_logstd = actor_apply(train_state[0], jnp.zeros((1, OBS_SIZE)))
@@ -474,10 +522,11 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
                                       round(float(curr_sigma[0]), 5), round(float(curr_sigma[1]), 5)])
                 _log_file.flush()
 
-            if FT_INIT and update > 0 and update % FT_SNAP_EVERY == 0:
-                snap = paths.checkpoint("ppo_asym_ft", f"ft_u{update:05d}.msgpack")
+            if (FT_INIT or S18_SCRATCH) and update > 0 and update % FT_SNAP_EVERY == 0:
+                snap = paths.checkpoint("ppo_asym_ft" if FT_INIT else "ppo_asym_s18", f"u{update:05d}.msgpack")
                 save_checkpoint(train_state[0], train_state[1], snap)
-                export_calf(train_state[0], calf_bundle, snap.replace(".msgpack", "_calf.msgpack"))
+                if calf_bundle is not None:
+                    export_calf(train_state[0], calf_bundle, snap.replace(".msgpack", "_calf.msgpack"))
 
             curriculum_mature = cur_max_scen >= 1 and cur_max_dist >= 5.0
             if suc_pct > best_suc and n_ep > 0 and curriculum_mature and not FT_INIT:
@@ -493,7 +542,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     if FT_INIT:
         final_ckpt_path = paths.checkpoint("ppo_asym_ft", "ft_final.msgpack")
     save_checkpoint(train_state[0], train_state[1], final_ckpt_path)
-    if FT_INIT:
+    if calf_bundle is not None:
         export_calf(train_state[0], calf_bundle, final_ckpt_path.replace(".msgpack", "_calf.msgpack"))
 
     _, final_logstd = actor_apply(train_state[0], jnp.zeros((1, OBS_SIZE)))

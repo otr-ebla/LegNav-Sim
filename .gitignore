@@ -71,3 +71,7 @@ Thumbs.db
 
 # CLAUDE 
 .claude
+
+# Private cluster notes (account details, not for the public repo)
+grid5k.md
+AGENTS.md

@@ -72,6 +72,9 @@ _jax_env.ROBOT_HALF_W = args.robot_size[1] / 2.0
 from legnav.core.jax_env import (ROOM_W, ROOM_H, ROBOT_RADIUS, PEOPLE_RADIUS,
                      NUM_RAYS, MAX_LIDAR_DIST, FOV, MAX_STEPS, GOAL_RADIUS)
 from legnav.core.jax_env_multi import reset_env, step_env
+import os as _os
+if _os.environ.get("LEGNAV_REAL_ENV") == "1":   # evaluate under the real-robot actuation (delay + lag + slew)
+    from legnav.core.jax_env_real import reset_env_real as reset_env, step_env_real as step_env
 from legnav.core.jax_wrappers import make_stacked_env, _ego_deltas, assemble_stacked_obs
 from legnav.core.jax_scenarios import TEST_ROBOT_WAYPOINTS, TEST_SCENARIO_NAMES
 
@@ -551,7 +554,7 @@ def run_headless():
 
     hdr = (f"{'Scenario':21s} | {'SR%':>5s} | {'ACR%':>5s} | {'PCR%':>5s} | {'TR%':>5s} | "
            f"{'SPL':>4s} | {'TTG':>5s} | {'MHD':>5s} | {'AJ':>6s} | {'SC':>4s} | {'YS':>4s} | "
-           f"{'GI%':>4s} | {'Stop%':>5s}")
+           f"{'GI%':>4s} | {'GX%':>4s} | {'Stop%':>5s}")
     print("\n" + hdr)
     print("-" * len(hdr))
 
@@ -563,7 +566,7 @@ def run_headless():
         # Per-episode metric samples.
         m_sr, m_acr, m_pcr, m_tr = [], [], [], []
         m_spl, m_ttg, m_mhd, m_aj, m_sc, m_ys = [], [], [], [], [], []
-        m_gi, m_stop = [], []   # group intrusion (passed between standing people), stopped-step fraction
+        m_gi, m_gx, m_stop = [], [], []   # group intrusion (passed between standing people), stopped-step fraction
 
         for ep in range(n_episodes):
             rng, reset_rng = jax.random.split(rng)
@@ -581,7 +584,7 @@ def run_headless():
             yz_steps = 0; yc_steps = 0     # yield situations / compliant
             prev_w   = 0.0; prev_aw = 0.0  # angular jerk history (reset per episode)
             n_steps_ep = 0
-            gi_ep = False; stop_steps = 0
+            gi_ep = False; gx_ep = False; stop_steps = 0
             outcome  = "tr"         # default outcome if budget exhausted
 
             while not episode_done:
@@ -620,6 +623,7 @@ def run_headless():
                     prev_w, prev_aw = w, aw
                     n_steps_ep += 1
                     gi_ep = gi_ep or float(info["grp_gap_inner"]) < 0.05
+                    gx_ep = gx_ep or bool(info["grp_cross"])   # robot centre cut through a group link
                     stop_steps += int(v <= 0.1)
 
                     # Yield: a human in the frontal cone within YIELD_DIST means the
@@ -720,6 +724,7 @@ def run_headless():
             if yz_steps > 0:
                 m_ys.append(yc_steps / yz_steps)
             m_gi.append(1.0 if gi_ep else 0.0)
+            m_gx.append(1.0 if gx_ep else 0.0)
             m_stop.append(stop_steps / max(n_steps_ep, 1))
 
         # ── Scenario row ────────────────────────────────────────────────────────
@@ -737,7 +742,7 @@ def run_headless():
         label = f"{scen_idx:2d}.{scen_name}"[:21]
         print(f"{label:21s} | {sr:4.0f}% | {acr:4.0f}% | {pcr:4.0f}% | {tr:4.0f}% | "
               f"{spl:4.2f} | {ttg:5.1f} | {mhd_v:5.2f} | {aj:6.1f} | {sc:4.2f} | {ys:4.2f} | "
-              f"{np.mean(m_gi)*100:3.0f}% | {np.mean(m_stop)*100:4.0f}%")
+              f"{np.mean(m_gi)*100:3.0f}% | {np.mean(m_gx)*100:3.0f}% | {np.mean(m_stop)*100:4.0f}%")
 
     print()
 

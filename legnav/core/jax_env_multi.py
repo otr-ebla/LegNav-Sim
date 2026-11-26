@@ -84,7 +84,7 @@ _ROBOT_CIRCUM_R = (ROBOT_HALF_L ** 2 + ROBOT_HALF_W ** 2) ** 0.5
 # is scaled from _YIELD_COEF down to _FT_YIELD_COEF so braking is no longer the cheapest
 # answer to an approaching person.
 _SOCIAL_FT       = os.environ.get("LEGNAV_SOCIAL_FT", "0") == "1"
-_FT_YIELD_COEF   = 3.0
+_FT_YIELD_COEF   = float(os.environ.get("LEGNAV_FT_YIELD", "3.0"))   # stock _YIELD_COEF = 10
 _FT_GRP_COEF     = 1.0    # per-step penalty with the robot on a group's spine
 _FT_GRP_MARGIN   = 0.5    # m — surface gap from the spine where the penalty fades to 0
 _FT_GRP_IN_COEF  = 2.0    # extra per-step penalty approaching the gap *between* two group members
@@ -103,6 +103,59 @@ _FT_PATH_HALF_W  = 0.8    # m — half-width of the path strip, robot centre to 
 _FT_PATH_MIN_V   = 0.3    # m/s — slower people are not "walking somewhere"
 _FT_FOOT_COEF    = 0.5    # per-step penalty with the footprint touching a shoe
 _FT_FOOT_MARGIN  = 0.15   # m — shoe gap where the penalty fades to 0
+
+
+# ── Waypoint-aware predicted-trajectory conflict (LEGNAV_FT_PRED=1, needs LEGNAV_SOCIAL_FT=1) ──
+# Replaces the constant-velocity CPA term of the social reward. A walking person is predicted to
+# go straight to its CURRENT WAYPOINT at its current speed (and stop there); the robot is predicted
+# from its actual (v, w) relaxing to the latest command with the actuator lag. The penalty is a
+# SPACE-TIME conflict (both predicted bodies near each other at the SAME instant), never a pure
+# path-line intersection: in a 5x9 m room almost every robot path crosses some walker's line, and
+# crossing it behind the walker is exactly what we want the policy to learn.
+_FT_PRED         = _SOCIAL_FT and os.environ.get("LEGNAV_FT_PRED", "0") == "1"
+_PRED_STEP       = 0.3    # s — prediction sampling step
+_PRED_K          = 10     # samples -> 3.0 s horizon (same as _FT_CPA_HORIZON)
+_PRED_MIN_V      = 0.2    # m/s — slower people are not "walking to a waypoint"
+_PRED_MIN_WP     = 0.3    # m — a person already at its waypoint has no direction to predict
+
+# ── Terminal group crossing (LEGNAV_GRP_CROSS_TERMINAL=1, TRAINING ONLY) ───────────────────────
+# The robot centre crossing a link between two members of a standing group (pair / triad) ends the
+# episode with _R_GRP_CROSS. Off by default so evaluation / deployment envs never terminate on it;
+# `info["grp_cross"]` is always reported either way.
+_GRP_CROSS_TERMINAL = os.environ.get("LEGNAV_GRP_CROSS_TERMINAL", "0") == "1"
+_R_GRP_CROSS     = -60.0  # heavier than the worst collision (_R_ACTIVE_COL = -50): never a shortcut
+
+
+def human_waypoints(people):
+    """Current waypoint (x, y) of every person: people[:, 10] selects g1 (0) or g2 (1)."""
+    cur0 = people[:, 10] == 0
+    return jnp.where(cur0, people[:, 6], people[:, 8]), jnp.where(cur0, people[:, 7], people[:, 9])
+
+
+def predicted_conflict(rx, ry, rtheta, v0, w0, vc, wc, tau, hx, hy, hvx, hvy, wpx, wpy, valid, r_robot):
+    """Per-person space-time conflict weight in [0, 1], shape (N,).
+    Robot: (v, w)(t) = cmd + (now - cmd) * exp(-t / tau), unicycle-integrated over _PRED_K samples.
+    Person: straight line to its waypoint at its current speed, clamped at the waypoint.
+    weight = max_k  max(0, 1 - d_k / _FT_CPA_SAFE)^2 * exp(-t_k / _FT_CPA_TAU), d_k = centre distance
+    at the same t_k minus r_robot. Fully vectorised (N, K)."""
+    t = _PRED_STEP * jnp.arange(1, _PRED_K + 1, dtype=jnp.float32)              # (K,)
+    lag = jnp.exp(-t / jnp.maximum(tau, 1e-3))
+    v_t = vc + (v0 - vc) * lag
+    w_t = wc + (w0 - wc) * lag
+    th_mid = rtheta + jnp.cumsum(w_t * _PRED_STEP) - 0.5 * w_t * _PRED_STEP
+    px_t = rx + jnp.cumsum(v_t * jnp.cos(th_mid) * _PRED_STEP)
+    py_t = ry + jnp.cumsum(v_t * jnp.sin(th_mid) * _PRED_STEP)
+
+    sp = jnp.hypot(hvx, hvy)
+    dwx, dwy = wpx - hx, wpy - hy
+    dw = jnp.hypot(dwx, dwy)
+    ux, uy = dwx / jnp.maximum(dw, 1e-6), dwy / jnp.maximum(dw, 1e-6)
+    s = jnp.minimum(sp[:, None] * t[None, :], dw[:, None])                        # (N, K)
+    d = jnp.hypot(hx[:, None] + ux[:, None] * s - px_t[None, :],
+                  hy[:, None] + uy[:, None] * s - py_t[None, :]) - r_robot
+    w = (jnp.maximum(0.0, 1.0 - d / _FT_CPA_SAFE) ** 2) * jnp.exp(-t / _FT_CPA_TAU)[None, :]
+    moving = valid & (sp > _PRED_MIN_V) & (dw > _PRED_MIN_WP)
+    return jnp.where(moving, jnp.max(w, axis=-1), 0.0)
 
 
 def anticipation_weights(rx, ry, rtheta, rv, hx, hy, hvx, hvy, valid, r_robot):
@@ -156,6 +209,17 @@ def group_space_gap(people, x, y, theta):
     gap_full  = jnp.min(jnp.where(link, jnp.min(d, axis=-1), 1e4))
     gap_inner = jnp.min(jnp.where(link, jnp.min(jnp.where(inner, d, 1e4), axis=-1), 1e4))
     return gap_full, gap_inner
+
+
+def group_members(people):
+    """(N,) bool: standing person (active, g1 == g2) with at least one other standing person
+    closer than _GRP_LINK_MAX — i.e. belongs to a pair / triad (same link definition as above)."""
+    st = (people[:, 10] >= 0.0) & (people[:, 6] == people[:, 8]) & (people[:, 7] == people[:, 9])
+    px, py = people[:, 0], people[:, 1]
+    n = px.shape[0]
+    link = (st[:, None] & st[None, :] & ~jnp.eye(n, dtype=bool)
+            & (jnp.hypot(px[:, None] - px[None, :], py[:, None] - py[None, :]) < _GRP_LINK_MAX))
+    return st & jnp.any(link, axis=-1)
 
 
 def group_crossings(people, x0, y0, x1, y1):
@@ -308,7 +372,7 @@ def reset_env(key: jax.Array, max_goal_dist: float = 3.0, scenario_idx: int = -1
     return obs, state
 
 
-def step_env(key, state, action, ghost_robot: bool = True):
+def step_env(key, state, action, ghost_robot: bool = True, robot_pred=None):
     """
     Advance the environment by one timestep.
 
@@ -320,6 +384,9 @@ def step_env(key, state, action, ghost_robot: bool = True):
     ghost_robot : bool (static, resolved at trace time)
         True  → robot is invisible to humans (training mode).
         False → robot is visible to humans (evaluation mode).
+    robot_pred  : optional (v_now, w_now, v_cmd, w_cmd, tau) used ONLY by the LEGNAV_FT_PRED
+        conflict term to predict the robot (real-actuation wrapper). None = ideal actuation:
+        the robot is predicted to keep the (v, w) of this step.
 
     DIFFERENTIABILITY (SHAC):
     All jnp.clip calls on robot position and action are replaced by soft_clip
@@ -401,6 +468,11 @@ def step_env(key, state, action, ghost_robot: bool = True):
 
     # Precompute dummy mask outside the loop to save inner-loop FLOPs
     is_dummy_sub = state.people[:, 10] < 0.0
+    # Standing people (g1 == g2: pair / triad members, static groups) are not simulated by HSFM: their
+    # row is pinned every substep, so neither the robot nor other people can push them (and they
+    # keep repelling walkers/robot from a fixed spot). The post-step freeze below stays as a safety net.
+    is_standing_sub = (state.people[:, 6] == state.people[:, 8]) & (state.people[:, 7] == state.people[:, 9]) & ~is_dummy_sub
+    pinned_rows_full = h_state_init.at[:, 2:4].set(0.0).at[:, 5].set(0.0)
 
     def _hsfm_substep(carry, step_idx):
         ext_state = carry
@@ -436,6 +508,8 @@ def step_env(key, state, action, ghost_robot: bool = True):
                                  
         # Preserve robot row unchanged; only humans are clamped
         clamped_ext  = next_ext.at[:-1, 0].set(clamped_x).at[:-1, 1].set(clamped_y)
+        # Pin standing people to their (zero-velocity) pre-step state.
+        clamped_ext  = clamped_ext.at[:-1].set(jnp.where(is_standing_sub[:, None], pinned_rows_full, clamped_ext[:-1]))
         return clamped_ext, None
 
     final_ext, _ = jax.lax.scan(
@@ -761,8 +835,13 @@ def step_env(key, state, action, ghost_robot: bool = True):
 
     collision    = human_collision | any_shoe_col | obs_collision | wall_collision
     timeout      = (state.time_step + 1) >= MAX_STEPS
-    goal_reached = new_dist < GOAL_RADIUS
-    done         = goal_reached | collision | timeout
+    # Robot centre crossed a link of a standing group this step (always measured; terminal only
+    # when LEGNAV_GRP_CROSS_TERMINAL=1, i.e. in training). Crossing wins over reaching the goal.
+    n_cross      = group_crossings(new_people, state.x, state.y, new_x, new_y)
+    grp_cross    = n_cross > 0.5
+    cross_term   = grp_cross if _GRP_CROSS_TERMINAL else jnp.array(False)
+    goal_reached = (new_dist < GOAL_RADIUS) & ~cross_term
+    done         = goal_reached | collision | timeout | cross_term
 
     # ── 6. Reward ───────────────────────────────────────────────────────────────
 
@@ -808,7 +887,7 @@ def step_env(key, state, action, ghost_robot: bool = True):
         # (a) Group space: walking through / along a standing group's spine.
         grp_pen = (-_FT_GRP_COEF * jnp.maximum(0.0, 1.0 - grp_gap / _FT_GRP_MARGIN)
                    - _FT_GRP_IN_COEF * jnp.maximum(0.0, 1.0 - grp_gap_inner / _FT_GRP_IN_MARGIN)
-                   - _FT_GRP_CROSS * group_crossings(new_people, state.x, state.y, new_x, new_y))
+                   - (0.0 if _GRP_CROSS_TERMINAL else _FT_GRP_CROSS) * n_cross)   # terminal replaces the one-off
         # (d) Side walls: a small running cost, so hugging a wall is used only when it pays.
         wall_gap = jnp.minimum(new_x - ext_x, state.room_w - ext_x - new_x)
         wall_pen = -_FT_WALL_COEF * jnp.maximum(0.0, 1.0 - wall_gap / _FT_WALL_MARGIN)
@@ -819,6 +898,12 @@ def step_env(key, state, action, ghost_robot: bool = True):
         cpa_w, path_w = anticipation_weights(new_x, new_y, new_theta, target_v, center_x, center_y,
                                              new_people[:, 2], new_people[:, 3],
                                              active_mask & (dists_p < 5.0), r_cpa)
+        if _FT_PRED:   # waypoint-aware space-time conflict replaces the constant-velocity CPA
+            rp = robot_pred if robot_pred is not None else (target_v, target_w, target_v, target_w, 1e-3)
+            wpx, wpy = human_waypoints(new_people)
+            cpa_w = predicted_conflict(new_x, new_y, new_theta, *rp, center_x, center_y,
+                                       new_people[:, 2], new_people[:, 3], wpx, wpy,
+                                       active_mask & (dists_p < 5.0), r_cpa)
         cpa_pen = -_FT_CPA_COEF * jnp.max(cpa_w) - _FT_PATH_COEF * jnp.max(path_w)   # logged as "cpa"
         # (c) Feet: graded margin before the terminal shoe contact.
         foot_pen = -_FT_FOOT_COEF * jnp.maximum(0.0, 1.0 - closest_shoe_surface / _FT_FOOT_MARGIN)
@@ -839,6 +924,7 @@ def step_env(key, state, action, ghost_robot: bool = True):
     reward = jnp.where(active_col & ~obs_collision & ~wall_collision & ~goal_reached, _R_ACTIVE_COL, reward)
     reward = jnp.where(passive_col & ~active_col & ~obs_collision & ~wall_collision & ~goal_reached, _R_PASSIVE_COL, reward)
     reward = jnp.where(timeout & ~goal_reached & ~collision, _R_TIMEOUT, reward)
+    reward = jnp.where(cross_term, _R_GRP_CROSS, reward)   # cutting through a group: never acceptable
 
     new_state = state.replace(
         x=new_x, y=new_y, theta=new_theta,
@@ -865,7 +951,7 @@ def step_env(key, state, action, ghost_robot: bool = True):
         "closest_human": closest_human,
         "closest_shoe_surface": closest_shoe_surface,
         "sp_mask":       sp_mask,
-        "timeout":       timeout,
+        "timeout":       timeout & ~cross_term,   # a group-crossing termination is not a truncation
         "instant_col":   instant_col,
         # Per-step reward components for eval panel
         "rew_progress":  progress_reward,
@@ -880,6 +966,7 @@ def step_env(key, state, action, ghost_robot: bool = True):
         "rew_cpa":       cpa_pen,
         "rew_foot":      foot_pen,
         "rew_wall":      wall_pen,
+        "grp_cross":     grp_cross,   # robot centre crossed a group link this step (terminal iff flag)
         "grp_gap":       grp_gap,
         "grp_gap_inner": grp_gap_inner,
         # Training-curve logging (legnav/algorithms/run_log.py): static-obstacle/wall collision flag and

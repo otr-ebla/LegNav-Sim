@@ -101,6 +101,11 @@ def collect_rollouts_asym(
             "rew_foot":     infos["rew_foot"],
             "rew_wall":     infos["rew_wall"],
             "grp_inner":    (infos["grp_gap_inner"] < 0.05).astype(jnp.float32),
+            "grp_cross":    infos["grp_cross"].astype(jnp.float32),   # terminal iff LEGNAV_GRP_CROSS_TERMINAL
+            # Episode is scenario 18 (no scenario id in EnvState: the 5x9 m room identifies it), so the
+            # curriculum can be gated on the curriculum scenarios alone (see S18_GATE in jax_ppo_asym).
+            "is_s18":       (jnp.abs(current_state.env_state.room_w - 5.0) < 1e-3)
+                            & (jnp.abs(current_state.env_state.room_h - 9.0) < 1e-3),
         }
         return (next_state, next_obs, next_priv, current_rng), transition
 

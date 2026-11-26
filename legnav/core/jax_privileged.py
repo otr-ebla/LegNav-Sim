@@ -19,17 +19,28 @@ Positions are normalised by PRIV_RANGE and velocities by MAX_SPEED so the
 critic MLP sees O(1) inputs.
 """
 
+import os
 import jax
 import jax.numpy as jnp
 
 from legnav.core.jax_humans import MAX_SPEED
 
+# LEGNAV_PRIV_V2=1 (social fine-tuning, scenario 18): richer ground truth for the critic so it can
+# price the social reward / terminal penalty exactly. Resolved at import — the critic's input size
+# depends on it, so V1 checkpoints (default) stay loadable. Extra, all in the robot frame:
+#   per human (+5): current waypoint (x, y), standing flag, group-member flag, predicted
+#                   space-time conflict weight with the robot (same function as the reward);
+#   per frame (+12): robot-to-group-link gaps (full / inner), robot position in the room,
+#                    hidden actuation of the real-robot env (tau, a_max, alpha_max, delay2, cmd_buf).
+PRIV_V2     = os.environ.get("LEGNAV_PRIV_V2", "0") == "1"
+
 PRIV_RANGE  = 5.0                          # m — radius around the robot
-PRIV_HUMANS = 6                            # nearest humans emitted
-PRIV_FEAT   = 7                            # per human: 2+2+2 floats + valid flag
+PRIV_HUMANS = 8 if PRIV_V2 else 6          # nearest humans emitted (scenario 18 has up to 7 people)
+PRIV_FEAT   = 12 if PRIV_V2 else 7         # per human: 2+2+2 floats + valid flag (+5 in V2)
+PRIV_GLOBAL = 12 if PRIV_V2 else 0         # per frame, not tied to a human
 PRIV_STACK  = 3                            # frames, matches the LiDAR stack
-PRIV_SIZE   = PRIV_HUMANS * PRIV_FEAT      # 42 — one frame
-PRIV_OBS_SIZE = PRIV_SIZE * PRIV_STACK     # 126 — what the critic actually sees
+PRIV_SIZE   = PRIV_HUMANS * PRIV_FEAT + PRIV_GLOBAL     # one frame (V1: 42)
+PRIV_OBS_SIZE = PRIV_SIZE * PRIV_STACK     # what the critic actually sees (V1: 126)
 
 
 def privileged_frame(env_state) -> jnp.ndarray:
@@ -58,19 +69,47 @@ def privileged_frame(env_state) -> jnp.ndarray:
     rx_, ry_ = to_ego(foot_state[:, 2], foot_state[:, 3])
     vx, vy = rot_ego(people[:, 2], people[:, 3])
 
-    feats = jnp.stack([
+    cols = [
         lx / PRIV_RANGE, ly / PRIV_RANGE,
         rx_ / PRIV_RANGE, ry_ / PRIV_RANGE,
         vx / MAX_SPEED,  vy / MAX_SPEED,
         jnp.ones_like(lx),
-    ], axis=-1)                                        # (N, PRIV_FEAT)
+    ]
+    if PRIV_V2:
+        from legnav.core import jax_env_multi as em
+        wpx, wpy = em.human_waypoints(people)
+        wx, wy = to_ego(wpx, wpy)
+        standing = (people[:, 10] >= 0.0) & (people[:, 6] == people[:, 8]) & (people[:, 7] == people[:, 9])
+        r_rob = em._ROBOT_CIRCUM_R if em._RECT_ROBOT else em.ROBOT_RADIUS
+        conf = em.predicted_conflict(rx, ry, rtheta, env_state.v, env_state.w, env_state.v, env_state.w,
+                                     1.0, bx, by, people[:, 2], people[:, 3], wpx, wpy, valid, r_rob)
+        cols += [jnp.clip(wx / PRIV_RANGE, -2.0, 2.0), jnp.clip(wy / PRIV_RANGE, -2.0, 2.0),
+                 standing.astype(jnp.float32), em.group_members(people).astype(jnp.float32), conf]
+    feats = jnp.stack(cols, axis=-1)                   # (N, PRIV_FEAT)
     feats = jnp.where(valid[:, None], feats, 0.0)
 
     # Nearest-first ordering; invalid humans are pushed to the back of the sort
     # so that the leading slots are always the real, in-range ones.
     rank_key = jnp.where(valid, dist, jnp.inf)
     idx = jnp.argsort(rank_key)[:PRIV_HUMANS]
-    return feats[idx].reshape(-1)                      # (PRIV_SIZE,)
+    out = feats[idx].reshape(-1)
+    if not PRIV_V2:
+        return out                                     # (PRIV_SIZE,)
+
+    gap_full, gap_inner = em.group_space_gap(people, rx, ry, rtheta)
+    zero = jnp.float32(0.0)
+    cmd_buf = getattr(env_state, "cmd_buf", None)       # real-robot env only; zeros in the stock env
+    cmd_buf = jnp.zeros(4) if cmd_buf is None else jnp.asarray(cmd_buf).reshape(-1)
+    glob = jnp.concatenate([
+        jnp.stack([jnp.minimum(gap_full / 3.0, 1.0), jnp.minimum(gap_inner / 3.0, 1.0),
+                   rx / env_state.room_w, ry / env_state.room_h,
+                   jnp.asarray(getattr(env_state, "tau", zero), jnp.float32),
+                   jnp.asarray(getattr(env_state, "a_max", zero), jnp.float32),
+                   jnp.asarray(getattr(env_state, "alpha_max", zero), jnp.float32),
+                   jnp.asarray(getattr(env_state, "delay2", zero), jnp.float32)]),
+        cmd_buf,
+    ])                                                  # (12,)
+    return jnp.concatenate([out, glob])
 
 
 # Batched over the NUM_ENVS axis of a vmapped StackedEnvState.

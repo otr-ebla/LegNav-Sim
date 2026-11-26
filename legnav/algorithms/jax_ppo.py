@@ -53,7 +53,7 @@ _C = _rc.load()   # frozen config: configs/revision.yaml
 DEFAULT_TOTAL_ENV_STEPS = _C["ppo"]["total_env_steps"]             # env-step budget for the run
 
 BATCH_SIZE      = NUM_ENVS * ROLLOUT_STEPS       # 1024 × 128 = 131,072 steps/update
-N_MINIBATCHES   = _C["ppo"]["n_minibatches"]
+N_MINIBATCHES   = int(os.environ.get("LEGNAV_N_MINIBATCHES", _C["ppo"]["n_minibatches"]))   # scale with LEGNAV_NUM_ENVS
 MINI_BATCH_SIZE = BATCH_SIZE // N_MINIBATCHES
 PPO_EPOCHS      = _C["ppo"]["epochs"]
 assert BATCH_SIZE % N_MINIBATCHES == 0
@@ -129,11 +129,18 @@ class RunningMeanStd:
         return self.replace(mean=new_mean, var=new_var, count=tot_count)
 
 
+# Clip on the std-normalised per-step reward. The per-step std is ~2.5 (dense terms ~0.1, one terminal
+# every ~150 steps), so with 10 the terminals saturate: goal +30 -> +10, active collision -50 -> -10,
+# group crossing -60 -> -10 (86-93% of terminals clipped, measured with evaluation/diag_s18.py),
+# which erases "hitting a person costs more than reaching the goal pays". 10 = paper runs.
+_REW_CLIP = float(os.environ.get("LEGNAV_REW_CLIP", "10.0"))
+
+
 @jax.jit
 def normalize_batch_rewards(rewards, dones, running_ret, rms_state, gamma):
     new_rms_state = rms_state.update(rewards.flatten())
     normalized_rewards = rewards / jnp.sqrt(new_rms_state.var + 1e-8)
-    normalized_rewards = jnp.clip(normalized_rewards, -10.0, 10.0)
+    normalized_rewards = jnp.clip(normalized_rewards, -_REW_CLIP, _REW_CLIP)
     return normalized_rewards, running_ret, new_rms_state
 
 scheduler = None

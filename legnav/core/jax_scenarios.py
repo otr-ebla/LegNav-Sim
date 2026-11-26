@@ -1185,14 +1185,12 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
     # ── 18: SMALL ROOM 5x9 — walkers + standing pairs/triads (test) ─────────
     def _small_room_scen(k):
         """5 m (x) x 9 m (y) room. Robot at the bottom wall, goal near the top wall (y = 8.35, random x).
-        Per episode one of 6 layouts of standing groups (each a pair or triad, 50/50, standing
-        still with g1 == g2 and facing its centre; body gaps ~0.50-0.65 m pair, ~0.6-0.8 m triad):
+        Per episode one of 4 layouts, with AT MOST ONE standing group (a pair or a triad, 50/50, standing
+        still with g1 == g2 and facing its centre; body gaps ~0.50-0.65 m pair, ~0.05-0.15 m triad (personal circles almost touching)):
           0 none (3 walkers)            1 one group in the middle (2 walkers)
           2 one group on the left wall  3 one group on the right wall (2 walkers each)
-          4 left wall low + right wall high   5 right wall low + left wall high (1 walker each)
         A wall group's outermost person stands 0.4-0.5 m from the wall, so that side is closed
-        and the robot has to pick the open side; no side of the room is always free. Groups in
-        layouts 4-5 keep >= 2.2 m between their people so they never read as one group."""
+        and the robot has to pick the open side."""
         W, H = SMALL_ROOM_W, SMALL_ROOM_H
         (k1, k_cfg, k_rx, k_gx, k_g1, k_g2, k_gn,
          k_wt, k_wa, k_wb, k_wt0, k_wi) = jax.random.split(k, 12)
@@ -1205,15 +1203,13 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
         gx = jax.random.uniform(k_gx, minval=1.0, maxval=W - 1.0)
         gy = jnp.float32(H - 0.65)   # just inside the goal-clearance limit (H - 0.6)
 
-        cfg = jax.random.randint(k_cfg, (), 0, 6)
-        #                 layout:   0    1    2    3    4    5
-        g1_on   = jnp.array([0,   1,   1,   1,   1,   1])[cfg] > 0
-        g1_side = jnp.array([0,   0,  -1,   1,  -1,   1])[cfg]          # -1 left wall, 0 middle, 1 right wall
-        g1_ylo  = jnp.array([3.0, 3.0, 2.7, 2.7, 2.7, 2.7])[cfg]
-        g1_yhi  = jnp.array([6.0, 6.0, 6.4, 6.4, 3.6, 3.6])[cfg]
-        g2_on   = jnp.array([0,   0,   0,   0,   1,   1])[cfg] > 0
-        g2_side = jnp.array([0,   0,   0,   0,   1,  -1])[cfg]
-        n_walkers = jnp.array([3, 2, 2, 2, 1, 1])[cfg]
+        cfg = jax.random.randint(k_cfg, (), 0, 4)
+        #                 layout:   0    1    2    3
+        g1_on   = jnp.array([0,   1,   1,   1])[cfg] > 0
+        g1_side = jnp.array([0,   0,  -1,   1])[cfg]          # -1 left wall, 0 middle, 1 right wall
+        g1_ylo  = jnp.array([3.0, 3.0, 2.7, 2.7])[cfg]
+        g1_yhi  = jnp.array([6.0, 6.0, 6.4, 6.4])[cfg]
+        n_walkers = jnp.array([3, 2, 2, 2])[cfg]
         n_g = jnp.where(jax.random.bernoulli(k_gn, 0.5, (2,)), 3, 2)     # pair or triad, per group
 
         def _group_cands(kc, n, side, ylo, yhi):
@@ -1224,7 +1220,7 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
             cy  = jax.random.uniform(ky, (C,), minval=ylo, maxval=yhi)
             phi = jax.random.uniform(kp, (C,), minval=0.0, maxval=2 * jnp.pi)
             u   = jax.random.uniform(ks, (C,))
-            sep = jnp.where(n == 2, 1.3 + 0.15 * u, 1.4 + 0.2 * u)      # neighbour centre-to-centre
+            sep = jnp.where(n == 2, 1.3 + 0.15 * u, 0.85 + 0.1 * u)      # neighbour centre-to-centre
             n_f = n.astype(jnp.float32)
             rad = sep / (2.0 * jnp.sin(jnp.pi / n_f))                    # circumradius
             ang = phi[:, None] + 2.0 * jnp.pi * jnp.arange(3) / n_f      # (C, 3)
@@ -1239,14 +1235,9 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
 
         g1x, g1y, g1th = (a[0] for a in _group_cands(k_g1, n_g[0], g1_side, g1_ylo, g1_yhi))
         on1 = g1_on & (jnp.arange(3) < n_g[0])
-        # Second group: first candidate whose people all stay >= 2.2 m from the first group's.
-        c2x, c2y, c2th = _group_cands(k_g2, n_g[1], g2_side, 5.4, 6.4)
-        on2_ = jnp.arange(3) < n_g[1]
-        d12 = jnp.hypot(c2x[:, :, None] - g1x[None, None, :], c2y[:, :, None] - g1y[None, None, :])
-        d12 = jnp.where(on2_[None, :, None] & on1[None, None, :], d12, 1e3).min(axis=(1, 2))   # (C,)
-        b2 = jnp.where(jnp.any(d12 >= 2.2), jnp.argmax(d12 >= 2.2), jnp.argmax(d12))
-        g2x, g2y, g2th = c2x[b2], c2y[b2], c2th[b2]
-        on2 = g2_on & on2_
+        # No second group: slots 3-5 stay switched off (kept so the people layout is unchanged).
+        g2x, g2y, g2th = g1x, g1y, g1th
+        on2 = jnp.zeros(3, dtype=bool)
 
         grp_x  = jnp.concatenate([g1x, g2x]);  grp_y = jnp.concatenate([g1y, g2y])
         grp_on = jnp.concatenate([on1, on2])                                    # (6,)
@@ -1292,7 +1283,7 @@ def generate_scenario(key: jnp.ndarray, max_goal_dist: float,
             inside = is_tri & (((c0 >= 0) & (c1 >= 0) & (c2 >= 0)) | ((c0 <= 0) & (c1 <= 0) & (c2 <= 0)))
             return jnp.where(on, jnp.where(inside, 0.0, d), 1e3)
 
-        d_hull = jnp.minimum(_hull_d(g1x, g1y, n_g[0], g1_on), _hull_d(g2x, g2y, n_g[1], g2_on))
+        d_hull = _hull_d(g1x, g1y, n_g[0], g1_on)
         path_ok = jnp.min(d_hull, axis=-1) >= WALK_CLR                  # (N_W, N_GUESSES)
         pick = jnp.argmax(path_ok, axis=-1)
         walk_ok = jnp.any(path_ok, axis=-1)
