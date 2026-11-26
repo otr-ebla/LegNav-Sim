@@ -15,7 +15,7 @@ Deploy contract (obs builder, parity check): `legnav/deployment/shelfy/`.
 
 | Run | Checkpoint | ghost 0: success / active col | ghost 0.2: success / active col | Status |
 |---|---|---|---|---|
-| run2 | `checkpoints/s18_run2/final/` (Mac + shared home) | 76.4% / 12.7% | 64.2% / 20.1% | **current deploy fallback** |
+| run2 | `checkpoints/s18_run2/final/` (Mac + shared home) | 76.4% / 12.7% | 64.2% / 20.1% | superseded by ft2 |
 | run3 base | u700 | 67.0% / 21.5% | 55.2% / 28.8% | worse than run2, kept u700 + final as reference |
 | run3 clip10 | u1100 | 65.4% / 25.3% | 53.8% / 32.7% | deleted |
 | ft2 (no real-env training) | `checkpoints/multiseed_tiago_ft2/ppo_asym_ft/ft_final_calf` | 85.2% / 5.0% | 73.2% / 11.9% | **best so far, fine-tune source** |
