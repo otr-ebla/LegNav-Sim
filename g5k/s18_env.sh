@@ -30,6 +30,9 @@ export LEGNAV_TOTAL_STEPS="${LEGNAV_TOTAL_STEPS:-150000000}"   # run 1 (70M, 27 
 #             New obs width: trains from scratch, deploy needs legnav/deployment/shelfy (not v668 code).
 #   cmdnokl : cmdobs without target-KL                      (ablation: obs alone vs obs + KL stop)
 #   cmdsmoke: cmdobs, 3M steps, snapshot every 2 updates
+# Run 5 (contacts at ~max_v, ~40% with standing people: the robot never brakes):
+#   brake   : cmdobs + stopping-distance speed barrier near people (LEGNAV_BRAKE_PEN, jax_env_multi)
+#   brakesmoke: brake, 3M steps, snapshot every 2 updates
 # All full variants run the same 150M schedule (entropy and LR anneal over the whole run), so the
 # winner IS the deployable policy: no retraining with a different schedule afterwards.
 VARIANT="${VARIANT:-base}"
@@ -48,10 +51,12 @@ case "$VARIANT" in
   cmdobs)   export LEGNAV_OBS_CMD=1 LEGNAV_TARGET_KL=0.02 ;;
   cmdnokl)  export LEGNAV_OBS_CMD=1 ;;
   cmdsmoke) export LEGNAV_OBS_CMD=1 LEGNAV_TARGET_KL=0.02 LEGNAV_TOTAL_STEPS=3000000 LEGNAV_FT_SNAP_EVERY=2 ;;
+  brake)    export LEGNAV_OBS_CMD=1 LEGNAV_TARGET_KL=0.02 LEGNAV_BRAKE_PEN=1.0 ;;
+  brakesmoke) export LEGNAV_OBS_CMD=1 LEGNAV_TARGET_KL=0.02 LEGNAV_BRAKE_PEN=1.0 LEGNAV_TOTAL_STEPS=3000000 LEGNAV_FT_SNAP_EVERY=2 ;;
   *) echo "unknown variant $VARIANT"; return 1 2>/dev/null || exit 1 ;;
 esac
 export LEGNAV_CKPT_ROOT="$PWD/checkpoints/s18_run3_${VARIANT}_${RUN_TAG:-local}"
 export PYTHONUNBUFFERED=1                 # live lines in the log
 echo "variant=$VARIANT  clip=${LEGNAV_REW_CLIP:-10} ent=${LEGNAV_S18_ENT:-curriculum} gate=${LEGNAV_S18_GATE:-0} \
 ghost=${LEGNAV_S18_GHOST:-curriculum} cmd_pen=${LEGNAV_CMD_PEN:-off} yield=${LEGNAV_FT_YIELD:-3} \
-obs_cmd=${LEGNAV_OBS_CMD:-0} target_kl=${LEGNAV_TARGET_KL:-off} steps=$LEGNAV_TOTAL_STEPS -> $LEGNAV_CKPT_ROOT"
+obs_cmd=${LEGNAV_OBS_CMD:-0} brake=${LEGNAV_BRAKE_PEN:-off} target_kl=${LEGNAV_TARGET_KL:-off} steps=$LEGNAV_TOTAL_STEPS -> $LEGNAV_CKPT_ROOT"

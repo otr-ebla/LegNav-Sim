@@ -125,6 +125,33 @@ _PRED_MIN_WP     = 0.3    # m — a person already at its waypoint has no direct
 _GRP_CROSS_TERMINAL = os.environ.get("LEGNAV_GRP_CROSS_TERMINAL", "0") == "1"
 _R_GRP_CROSS     = -60.0  # heavier than the worst collision (_R_ACTIVE_COL = -50): never a shortcut
 
+# ── Stopping-distance speed barrier near people (LEGNAV_BRAKE_PEN="coef", off when unset) ─────────
+# s18 run 2/3: active contacts happen at ~max_v (0.35 m/s of 0.45), ~40% of them with STANDING people,
+# i.e. the robot never brakes. The yield term only sees a +-45 deg cone and charges v * (1 - d/1.8)^2,
+# which ignores the actuation: with a 1-2 step transport delay and a first-order lag tau ~0.55 s the
+# base needs ~v * (DELAY + tau) ~ 0.3 m to stop. This term caps the speed at what the robot can still
+# kill before touching each person in its swept corridor:
+#     v_safe_i = relu(gap_i - margin) / (DELAY + tau)       gap_i = robot surface -> person reach
+#     pen      = -coef * max_i relu(v_eff - v_safe_i) / max_v,   v_eff = max(v_actual, v_cmd)
+# Zero at v = 0 (never punishes being walked into) and outside the corridor (steering around is free).
+# Every input is in the v672 actor obs (lidar, v, the pending commands), so the cap is observable.
+_BRAKE_PEN       = float(os.environ.get("LEGNAV_BRAKE_PEN", "0") or 0.0)
+_BRAKE_REACH     = 0.25   # m — person centre -> outer edge of the shoes (SHOE_LENGTH 0.3, legs 0.08)
+_BRAKE_MARGIN    = 0.10   # m — gap kept after the stop
+_BRAKE_DELAY     = 1.2 * DT   # s — mean transport delay (1 step, 2 steps with p = 0.2)
+_BRAKE_SIDE      = 0.10   # m — corridor half-width beyond robot half-width + reach
+
+
+def brake_barrier(fwd, lat, gap, v_eff, tau, max_v, valid):
+    """Speed-barrier weight in [0, 1] (scalar): how far v_eff exceeds the speed that can still be
+    stopped before the closest person in the forward corridor. fwd/lat: person centre in the robot
+    frame; gap: robot surface -> person centre minus _BRAKE_REACH; valid: active people mask."""
+    half_w = (ROBOT_HALF_W if _RECT_ROBOT else ROBOT_RADIUS) + _BRAKE_REACH + _BRAKE_SIDE
+    in_lane = valid & (fwd > 0.0) & (jnp.abs(lat) < half_w)
+    v_safe = jnp.maximum(gap - _BRAKE_MARGIN, 0.0) / (_BRAKE_DELAY + tau)
+    excess = jnp.where(in_lane, jnp.maximum(v_eff - v_safe, 0.0), 0.0)
+    return jnp.clip(jnp.max(excess) / jnp.maximum(max_v, 1e-3), 0.0, 1.0)
+
 
 def human_waypoints(people):
     """Current waypoint (x, y) of every person: people[:, 10] selects g1 (0) or g2 (1)."""
@@ -910,7 +937,16 @@ def step_env(key, state, action, ghost_robot: bool = True, robot_pred=None):
         social_pen = grp_pen + cpa_pen + foot_pen + wall_pen
     else:
         grp_pen = cpa_pen = foot_pen = wall_pen = social_pen = jnp.float32(0.0)
-    yield_pen = yield_pen + social_pen   # logged in the existing "yield" slot of rew_terms
+    if _BRAKE_PEN > 0.0:
+        # (v_now, w_now, v_cmd, w_cmd, tau) from the real-actuation wrapper; ideal actuation: tau ~ 0.
+        bp = robot_pred if robot_pred is not None else (target_v, target_w, target_v, target_w, 1e-3)
+        lat_p = -dx_p * jnp.sin(new_theta) + dy_p * jnp.cos(new_theta)
+        brake_pen = -_BRAKE_PEN * brake_barrier(heading_dot, lat_p,
+                                                dists_p_active - ROBOT_RADIUS - _BRAKE_REACH,
+                                                jnp.maximum(bp[0], bp[2]), bp[4], state.max_v, active_mask)
+    else:
+        brake_pen = jnp.float32(0.0)
+    yield_pen = yield_pen + social_pen + brake_pen   # logged in the existing "yield" slot of rew_terms
 
     # Minimal baseline + smoothness
     dense_reward     = progress_reward + step_pen + smooth_pen + rot_pen + spin_in_place_pen + unjustified_stop_pen + yield_pen + heading_bonus
@@ -966,6 +1002,7 @@ def step_env(key, state, action, ghost_robot: bool = True, robot_pred=None):
         "rew_cpa":       cpa_pen,
         "rew_foot":      foot_pen,
         "rew_wall":      wall_pen,
+        "rew_brake":     brake_pen,
         "grp_cross":     grp_cross,   # robot centre crossed a group link this step (terminal iff flag)
         "grp_gap":       grp_gap,
         "grp_gap_inner": grp_gap_inner,
