@@ -15,9 +15,10 @@ Deploy contract (obs builder, parity check): `legnav/deployment/shelfy/`.
 
 | Run | Checkpoint | ghost 0: success / active col | ghost 0.2: success / active col | Status |
 |---|---|---|---|---|
-| run2 | `checkpoints/s18_run2/final/` (local Mac only) | 78% / - | 63-67% / - | **current deploy fallback** |
+| run2 | `checkpoints/s18_run2/final/` (Mac + shared home) | 76.4% / 12.7% | 64.2% / 20.1% | **current deploy fallback** |
 | run3 base | u700 | 67.0% / 21.5% | 55.2% / 28.8% | worse than run2, kept u700 + final as reference |
 | run3 clip10 | u1100 | 65.4% / 25.3% | 53.8% / 32.7% | deleted |
+| ft2 (no real-env training) | `checkpoints/multiseed_tiago_ft2/ppo_asym_ft/ft_final_calf` | 85.2% / 5.0% | 73.2% / 11.9% | **best so far, fine-tune source** |
 | run3 yield6 | u700 | 52.6% / 15.1% (static col 30%) | 44.8% / 21.1% | deleted |
 
 Training-log plateau shared by every run3/run4 variant: curriculum stuck at scen<=4, 5.1 m, training success
@@ -54,13 +55,31 @@ own motion. `LEGNAV_OBS_CMD=1` appends the pending commands (obs 668 -> 672; dep
 - Seed noise between two practically identical runs is ~4-5 Acol points: differences smaller than that are noise.
 - Conclusion: seeing the pending commands alone does not make the robot brake.
 
-### run5: stopping-distance speed barrier (`LEGNAV_BRAKE_PEN`, in progress)
+### run5: stopping-distance speed barrier (`LEGNAV_BRAKE_PEN`, abandoned)
 `brake` = cmdobs + a penalty in `jax_env_multi.brake_barrier`: for every person in the forward corridor
 (|lateral| < half width + 0.35 m), the highest speed that still stops before contact is
 `v_safe = relu(gap - 0.10) / (1.2*DT + tau)` (gap = surface distance minus 0.25 m reach); the penalty is
 `-coef * max_i relu(max(v_actual, v_cmd) - v_safe_i) / max_v`, coef 1.0. Zero when stopped, zero for people
 behind or beside the robot. At 0.45 m/s: 0.09 at 0.4 m, 0.70 at 0.2 m, 1.0 below 0.1 m.
 Success criterion at u200-300: Acol below 20% (base was 25-28% at the same updates) without a success drop.
+Result: seed 42 u220 Acol 21.7%, seed 1 u260 Acol 27.4% (cmdobs 26.5% at u220): inside the seed noise, and the
+curriculum still stalls at scen<=3-4. Both runs stopped, checkpoints deleted. The flag stays in the code (off).
+
+### run6: fine-tune the ideal-env v668 policy in the real env (`ftreal`, in progress)
+Key measurement (deterministic diag of existing policies, ALL episodes, success / active col):
+
+| Policy | ideal env ghost 0 | ideal env ghost 0.2 | real env ghost 0 | real env ghost 0.2 |
+|---|---|---|---|---|
+| ft2 `multiseed_tiago_ft2/ppo_asym_ft/ft_final_calf` (v668, trained without delay/lag) | 93.4% / 1.8% | 84.4% / 3.8% | **85.2% / 5.0%** | **73.2% / 11.9%** |
+| run2 (scratch in the real env) | - | - | 76.4% / 12.7% | 64.2% / 20.1% |
+
+The ideal-env social policy, unchanged, already beats every policy trained from scratch in the real env: the
+scratch runs fail on the curriculum (never past scen<=4 / 5.1 m), not on the actuation. The real-env gap of ft2
+is ~8 points of success. `ftreal` = `LEGNAV_FT_INIT=ft2` in the real env: actor copied, new privileged critic
+(30 warm-up updates with the actor frozen), actor LR 5e-5 -> 1e-5, entropy 0.005, ghost 0.2, scenario 18 only,
+target-KL 0.02, 40M steps (~305 updates), snapshots every 25. Obs stays v668: deployable with the existing bridge,
+as long as kin v,w is the measured odometry velocity (see `legnav/deployment/shelfy/`).
+Seeds: 42 (fermi GPU1), 2 (fermi GPU0), 1 (jack). Goal: real env >= 90% / <= 3% at ghost 0.
 
 ## Housekeeping
 - Smoke runs (`smoke`, `cmdsmoke`, `brakesmoke`) only validate code paths: checkpoints deleted after passing.
