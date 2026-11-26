@@ -27,7 +27,7 @@ if os.environ.get("LEGNAV_REAL_ENV", "0") == "1":
 else:
     from legnav.core.jax_env_multi import reset_env, step_env
 
-OBS_SIZE = 668
+from legnav.core.obs_layouts import OBS_SIZE   # 668, or 672 with LEGNAV_OBS_CMD=1
 TERMS = ("progress", "step", "smooth", "rot", "stop/spin", "heading", "yield+social", "terminal")
 COLS = []
 SOC = ("rew_grp", "rew_cpa", "rew_foot", "rew_wall")

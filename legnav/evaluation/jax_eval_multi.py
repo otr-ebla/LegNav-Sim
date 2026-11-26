@@ -86,7 +86,7 @@ from legnav.core.jax_legs import LEG_RADIUS, SHOE_LENGTH, SHOE_WIDTH
 from legnav.core.jax_wrappers import make_stacked_env
 from legnav.core import obs_layouts as OL
 
-OBS_SIZE   = 668   # kin(5) + goal_stack(2*3) + ego_deltas(3*3) + lidar_stack(216*3)
+from legnav.core.obs_layouts import OBS_SIZE   # 668; 672 = real-robot v672 (LEGNAV_OBS_CMD=1)
 ACTION_DIM = 2
 
 # Yield-score constants — must match the yield reward cone in jax_env_multi.py

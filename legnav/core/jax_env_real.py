@@ -122,6 +122,20 @@ _CMD_PEN = tuple(float(c) for c in _os.environ.get("LEGNAV_CMD_PEN", "").split("
     if _os.environ.get("LEGNAV_CMD_PEN") else None
 
 
+CMD_OBS_SIZE = 4
+
+
+def cmd_obs(state: RealEnvState) -> jnp.ndarray:
+    """Pending-command features for the v672 layout (LEGNAV_OBS_CMD=1): the two commands still in the
+    transport delay, newest first, [v_cmd/max_v, w_cmd, v_cmd_prev/max_v, w_cmd_prev]. Without them the
+    actor only sees the lagged actual (v, w) and cannot tell what it already sent (1-2 step delay +
+    tau 0.4-0.7 s): it keeps correcting an error whose correction is still in flight. Zeros at reset.
+    On the robot: the last two commands PUBLISHED on cmd_vel (after any safety clamp)."""
+    inv = 1.0 / jnp.maximum(state.max_v, 1e-3)
+    new, old = state.cmd_buf[1], state.cmd_buf[0]
+    return jnp.stack([new[0] * inv, new[1], old[0] * inv, old[1]])
+
+
 def step_env_real(key, state: RealEnvState, action, **kwargs):
     v_end, w_end, v_mean, w_mean = _actuate(state, action)
 

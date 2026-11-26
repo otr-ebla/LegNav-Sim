@@ -104,7 +104,8 @@ def ppo_loss_fn(
     entropy_loss = -entropy_coef * entropy
     total_loss   = policy_loss + value_loss + entropy_loss
 
-    kl_div    = jnp.mean(old_log_probs - log_prob)
+    log_r     = log_prob - old_log_probs
+    kl_div    = jnp.mean(jnp.exp(log_r) - 1.0 - log_r)     # k3 estimator: unbiased, always >= 0
     clip_frac = jnp.mean((jnp.abs(ratio - 1.0) > CLIP_EPS).astype(jnp.float32))
 
     return total_loss, (policy_loss, value_loss, entropy, kl_div, clip_frac)
@@ -113,7 +114,7 @@ def ppo_loss_fn(
 @jax.jit
 def ppo_update_epoch(carry, perm):
     (params, opt_state, obs_flat, priv_flat, actions_flat,
-     adv_flat, ret_flat, old_lp_flat, max_v_flat, entropy_coef) = carry
+     adv_flat, ret_flat, old_lp_flat, max_v_flat, entropy_coef, stop) = carry
 
     obs_p     = obs_flat[perm]
     priv_p    = priv_flat[perm]
@@ -124,7 +125,7 @@ def ppo_update_epoch(carry, perm):
     max_v_p   = max_v_flat[perm]
 
     def _mb_step(mb_carry, mb_i):
-        p, os_ = mb_carry
+        p, os_, stop = mb_carry
         s = mb_i * MINI_BATCH_SIZE
         mb_obs     = jax.lax.dynamic_slice_in_dim(obs_p,     s, MINI_BATCH_SIZE, axis=0)
         mb_priv    = jax.lax.dynamic_slice_in_dim(priv_p,    s, MINI_BATCH_SIZE, axis=0)
@@ -138,15 +139,22 @@ def ppo_update_epoch(carry, perm):
             p, mb_obs, mb_priv, mb_actions, mb_adv, mb_ret, mb_old_lp, mb_max_v, entropy_coef
         )
         updates, new_os = optimizer.update(grads, os_, p)
-        return (optax.apply_updates(p, updates), new_os), (loss, aux)
+        new_p = optax.apply_updates(p, updates)
+        # Target-KL early stop (LEGNAV_TARGET_KL): once a minibatch's KL to the rollout policy
+        # exceeds 1.5x target, this and all remaining minibatches/epochs of the update are skipped.
+        if TARGET_KL > 0.0:
+            stop = stop | (aux[3] > 1.5 * TARGET_KL)
+            keep = lambda a, b: jax.tree_util.tree_map(lambda x, y: jnp.where(stop, x, y), a, b)
+            new_p, new_os = keep(p, new_p), keep(os_, new_os)
+        return (new_p, new_os, stop), (loss, aux, ~stop)
 
-    (new_p, new_os), (losses, auxes) = jax.lax.scan(
-        _mb_step, (params, opt_state), jnp.arange(N_MINIBATCHES),
+    (new_p, new_os, stop), (losses, auxes, taken) = jax.lax.scan(
+        _mb_step, (params, opt_state, stop), jnp.arange(N_MINIBATCHES),
     )
 
     new_carry = (new_p, new_os, obs_p, priv_p, actions_p,
-                 adv_p, ret_p, old_lp_p, max_v_p, entropy_coef)
-    return new_carry, (losses, auxes)
+                 adv_p, ret_p, old_lp_p, max_v_p, entropy_coef, stop)
+    return new_carry, (losses, auxes, taken)
 
 
 # donate_argnums=(0,): train_state (params + Adam moments) is reassigned by the
@@ -173,10 +181,15 @@ def run_ppo_updates(train_state, obs_seq, priv_seq, actions_seq, adv_seq, ret_se
     )
 
     carry = (params, opt_state, obs_flat, priv_flat, actions_flat,
-             adv_flat, ret_flat, old_lp_flat, max_v_flat, entropy_coef)
-    carry, (all_losses, all_auxes) = jax.lax.scan(ppo_update_epoch, carry, perms)
-    last_aux = jax.tree_util.tree_map(lambda x: x[-1, -1], all_auxes)
-    return (carry[0], carry[1]), all_losses.mean(), last_aux
+             adv_flat, ret_flat, old_lp_flat, max_v_flat, entropy_coef, jnp.array(False))
+    carry, (all_losses, all_auxes, taken) = jax.lax.scan(ppo_update_epoch, carry, perms)
+    taken = taken.reshape(-1)
+    n_taken = taken.sum()
+    # Logged aux = last minibatch that was actually applied (KL at the stop point when early-stopped).
+    last_i = jnp.maximum(n_taken - 1, 0)
+    last_aux = jax.tree_util.tree_map(lambda x: x.reshape(-1)[last_i], all_auxes)
+    mean_loss = jnp.sum(all_losses.reshape(-1) * taken) / jnp.maximum(n_taken, 1)
+    return (carry[0], carry[1]), mean_loss, (*last_aux, n_taken)
 
 
 # ── Checkpoints ───────────────────────────────────────────────────────────────
@@ -239,6 +252,10 @@ S18_GATE          = os.environ.get("LEGNAV_S18_GATE", "0") == "1"
 #    how often the s18 people ignore the robot.
 _s18_ghost        = os.environ.get("LEGNAV_S18_GHOST", "")
 S18_GHOST         = float(_s18_ghost) if _s18_ghost else None
+#  LEGNAV_TARGET_KL=<kl>: target-KL early stop of the PPO epochs (0 = off, stock). s18_run3 reached
+#    KL ~0.12 / clip fraction ~0.4 per update as sigma shrank (same mean shift = larger KL), 5-10x the
+#    usual 0.01-0.02. The MB column of the log is the number of minibatch steps applied (of epochs x MB).
+TARGET_KL         = float(os.environ.get("LEGNAV_TARGET_KL", "0"))
 _ACTOR_KEYS       = ("actor_encoder", "actor_out", "log_std")
 _TRUNK_KEYS       = ("Dense_0", "Dense_1", "FrameStackAttention_0", "LayerNorm_0", "LidarFrameCNN_0")
 
@@ -389,7 +406,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
                           "pcol_pct", "tmo_pct", "sigma_v", "sigma_w"])
 
     hdr = (f"{'Upd':>5} | {'EpRet':>7} | {'Suc%':>5} {'Obs%':>5} {'Acol%':>5} {'Pcol%':>5} {'Tmo%':>5} |"
-           f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} {'KL':>6} {'ClpF':>5} | {'FPS':>7} {'#Ep':>6} {'LR':>8} | "
+           f" {'Loss':>7} {'pi':>6} {'V':>6} {'H':>6} {'KL':>6} {'ClpF':>5} {'MB':>3} | {'FPS':>7} {'#Ep':>6} {'LR':>8} | "
            f"{'MaxDist':>7} {'Ghost':>6} {'Ent':>7} {'ScenMax':>7} {'Time':>8}")
     print(hdr)
     print("─" * len(hdr))
@@ -489,7 +506,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
             fps = BATCH_SIZE / (time.time() - t0)
 
             if update % 5 == 0:
-                p_loss, v_loss, entropy, kl_div, clip_frac = aux
+                p_loss, v_loss, entropy, kl_div, clip_frac, n_mb = aux
                 lr_now       = float(scheduler(update * _OPT_STEPS_PER_UPDATE))
                 ent_coef_now = float(entropy_coef)
                 elapsedtime  = (time.time() - t_start) / 60.0
@@ -498,7 +515,7 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
                     f"{suc_pct:>4.1f}% {obs_pct:>4.1f}% {acol_pct:>4.1f}% {pcol_pct:>4.1f}% {tmo_pct:>4.1f}% | "
                     f"{float(mean_loss):>7.2f} {float(p_loss):>6.2f} "
                     f"{float(v_loss):>6.2f} {float(entropy):>6.2f} "
-                    f"{float(kl_div):>6.4f} {float(clip_frac):>4.2f} | "
+                    f"{float(kl_div):>6.4f} {float(clip_frac):>4.2f} {int(n_mb):>3d} | "
                     f"{fps:>7,.0f} {n_ep:>6d} {lr_now:.2e} | "
                     f"{cur_max_dist:>6.1f}m {cur_ghost:>5.2f}g "
                     f"{ent_coef_now:>6.4f}e scen<=={cur_max_scen} {elapsedtime:>5.1f}min"

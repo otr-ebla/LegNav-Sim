@@ -75,7 +75,7 @@ from legnav.core.jax_env_multi import reset_env, step_env
 import os as _os
 if _os.environ.get("LEGNAV_REAL_ENV") == "1":   # evaluate under the real-robot actuation (delay + lag + slew)
     from legnav.core.jax_env_real import reset_env_real as reset_env, step_env_real as step_env
-from legnav.core.jax_wrappers import make_stacked_env, _ego_deltas, assemble_stacked_obs
+from legnav.core.jax_wrappers import make_stacked_env, _ego_deltas, assemble_stacked_obs, extra_kin
 from legnav.core.jax_scenarios import TEST_ROBOT_WAYPOINTS, TEST_SCENARIO_NAMES
 
 # --- INIZIO MODIFICA: Sovrascriviamo i waypoint dello scenario 9 ---
@@ -155,7 +155,7 @@ def _build_tagd():
 
 _DEFAULT_CKPT["tagd"] = paths.checkpoint("tagd", "tagd_best.msgpack")
 
-OBS_SIZE   = 668   # kin(5) + goal_stack(2*3) + ego_deltas(3*3) + lidar_stack(216*3)
+from legnav.core.obs_layouts import OBS_SIZE   # 668; 672 = real-robot v672 (LEGNAV_OBS_CMD=1)
 ACTION_DIM = 2
 use_legs   = args.use_legs
 
@@ -330,7 +330,8 @@ def run_interactive():
         )
         # Rebuild flat obs (668 layout, strided frame selection) via shared helper
         obs = assemble_stacked_obs(
-            kin_vec, new_goal_stack, stacked_state.pose_stack, new_lidar_stack
+            kin_vec, new_goal_stack, stacked_state.pose_stack, new_lidar_stack,
+            extra=extra_kin(env_state),
         )
 
         # Waypoint change = goal change, so any stateful policy (MPPI) must

@@ -23,6 +23,7 @@ policy ever needs the env to be rebuilt.
 crashing). Things shapes cannot tell are encoded by file-name rule (see _name_flags)
 and by an explicit override.
 """
+import os
 from dataclasses import dataclass
 import jax.numpy as jnp
 
@@ -34,9 +35,19 @@ RAW_LEN = (STACK_DIM - 1) * max(CURRENT_STRIDE, 1) + 1     # ring-buffer length 
 KIN, GOAL, POSE, RAYS = 5, 2, 3, 216
 RAW_SIZE = KIN + RAW_LEN * (GOAL + POSE + RAYS)
 
+# v672  real-robot track (LEGNAV_OBS_CMD=1, needs LEGNAV_REAL_ENV=1)
+#       [kin(5) | cmd(4) | goal_stack(2S) | ego_deltas(3S) | lidar(216 S)]
+#       kin's v, w are the MEASURED velocities; cmd = the two commands still in the transport delay,
+#       newest first [v/max_v, w, v_prev/max_v, w_prev] (jax_env_real.cmd_obs). The network reads
+#       kin+cmd as one 9-wide kin vector (fused input 207). Contract: legnav/deployment/shelfy/.
+CMD_OBS = os.environ.get("LEGNAV_OBS_CMD", "0") == "1"
+CMD = 4
+OBS_LAYOUT = "v672" if CMD_OBS else "v668"
+
 # index of max_v_norm = (max_v-0.2)/1.8 inside each layout (kin[2])
-MAX_V_IDX = {"v667": 2, "v668": 2, "v662": 11, "v659": 8}
-LAYOUT_SIZE = {"v667": 667, "v668": 668, "v662": 662, "v659": 659}
+MAX_V_IDX = {"v667": 2, "v668": 2, "v672": 2, "v662": 11, "v659": 8}
+LAYOUT_SIZE = {"v667": 667, "v668": 668, "v672": 672, "v662": 662, "v659": 659}
+OBS_SIZE = LAYOUT_SIZE[OBS_LAYOUT]                         # what the current trainers produce
 
 
 class Unsupported(Exception):
@@ -90,6 +101,8 @@ def adapt(raw, layout, stride):
         return jnp.concatenate([pz.reshape(-1), kin, lidar[sel].reshape(-1)])
     if layout == "v659":
         return jnp.concatenate([goal[sel].reshape(-1), kin, lidar[sel].reshape(-1)])
+    if layout == "v672":
+        raise Unsupported("v672 needs the pending-command buffer (real-robot env), not in the raw ring buffer")
     raise ValueError(layout)
 
 
@@ -123,6 +136,9 @@ def detect_shared_encoder(params, ckpt_path="", stride=None):
         return ObsSpec("v667", CURRENT_STRIDE if stride is None else stride, False, f["se2"], f["tanh_inside"])
     if dim == 203:       # legacy: kin carried goal_align
         return ObsSpec("v668", CURRENT_STRIDE if stride is None else stride, False, f["se2"], f["tanh_inside"])
+    if dim == 207:       # real-robot track: kin + pending commands
+        return ObsSpec("v672", CURRENT_STRIDE if stride is None else stride, False, f["se2"], f["tanh_inside"],
+                       note="real-robot obs (pending commands)")
     if dim == 206:
         return ObsSpec("v662", 1, True, False, f["tanh_inside"],
                        note="pre-SE(2) checkpoint, old pose layout")
@@ -155,6 +171,11 @@ def fit_obs(obs, params):
     """Adapt a v668/v667 flat obs to the checkpoint whose `params` are given (auto-detected from the
     first fused Dense input: 203 / 668 -> v668, 202 / 667 -> v667). Identity when they already match."""
     want = _first_dense_in(params)
+    if want in (207, LAYOUT_SIZE["v672"]) or obs.shape[-1] == LAYOUT_SIZE["v672"]:
+        if obs.shape[-1] != LAYOUT_SIZE["v672"] or want not in (207, LAYOUT_SIZE["v672"]):
+            raise Unsupported(f"v672 policy/obs mismatch: obs {obs.shape[-1]}, policy fused input {want} "
+                              "(set LEGNAV_REAL_ENV=1 LEGNAV_OBS_CMD=1 for v672 policies, unset for others)")
+        return obs
     if want in (203, LAYOUT_SIZE["v668"]):
         return to_v668(obs)
     if want in (202, LAYOUT_SIZE["v667"]) and obs.shape[-1] == LAYOUT_SIZE["v668"]:

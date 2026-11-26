@@ -1,6 +1,6 @@
 #!/bin/bash
 # Deterministic (deploy-mode) check of the latest CALF snapshot of every s18_run3 run, at ghost 0 (GUI-like)
-# and 0.2 (training). Shares the GPU with running trainings (no memory preallocation).
+# and 0.2 (training). cmd* runs use the v672 obs (LEGNAV_OBS_CMD=1). Shares the GPU with running trainings (no memory preallocation).
 #   [GPU=<index>] ./jack/diag_latest.sh [extra_ckpt ...]      full output in logs/diag_<stamp>.log
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -20,7 +20,7 @@ done
 for c in "${ckpts[@]}"; do
   for g in 0.0 0.2; do
     echo "######## $c  ghost=$g" | tee -a "$LOG"
-    python -m legnav.evaluation.diag_s18 --ckpt "$c" --mode det --ghost "$g" --envs 256 --steps 1000 2>&1 \
+    LEGNAV_OBS_CMD=$([[ "$c" == *cmd* ]] && echo 1 || echo 0) python -m legnav.evaluation.diag_s18 --ckpt "$c" --mode det --ghost "$g" --envs 256 --steps 1000 2>&1 \
       | tee -a "$LOG" | grep -E "sigma|active collisions|^\[|^ +(success|active_col) "
   done
 done

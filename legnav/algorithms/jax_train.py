@@ -42,7 +42,7 @@ _C = _rc.load()   # frozen config: configs/revision.yaml
 
 NUM_ENVS      = int(os.environ.get("LEGNAV_NUM_ENVS", _C["ppo"]["num_envs"]))   # override: big-VRAM GPUs
 ROLLOUT_STEPS = _C["ppo"]["rollout_steps"]
-OBS_SIZE      = 5 + 2 * 3 + 3 * 3 + 216 * 3    # 668 = kin(5) + goal_stack(6) + ego_deltas(9) + lidar_stack(648)
+from legnav.core.obs_layouts import OBS_SIZE   # 668 = kin(5)+goal(6)+ego_deltas(9)+lidar(648); 672 = v672 (+4 pending commands)
 
 _VMAP_STEP_CACHE: dict = {}
 

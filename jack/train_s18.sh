@@ -3,7 +3,7 @@
 # shared home). Same recipe as Grid'5000 (g5k/s18_env.sh),
 # 1024-env paper batch (131,072 steps/update) so it fits in 10 GB.
 # Runs detached (survives the ssh logout); log in logs/s18_<variant>_<stamp>.log.
-#   [GPU=<index>] ./jack/train_s18.sh <variant>        variants: smoke legacy base clip10 yield6
+#   [GPU=<index>] ./jack/train_s18.sh <variant>        variants: smoke legacy base clip10 yield6 cmdobs cmdsmoke
 set -euo pipefail
 cd "$(dirname "$0")/.."
 [ -n "${VIRTUAL_ENV:-}" ] || source 2drlenv/bin/activate

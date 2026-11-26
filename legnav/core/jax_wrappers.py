@@ -41,6 +41,7 @@ FIXES vs previous version:
 
 Obs layout: [kin_vec(5) | goal_stack(2*stack_dim=6) | ego_deltas(3*stack_dim=9) | lidar_stack(num_rays*stack_dim=648)]
 Total: 5 + 6 + 9 + 648 = 668
+Real-robot layout v672 (LEGNAV_OBS_CMD=1): kin_vec(5) | pending commands(4) | ... = 672 (see obs_layouts).
 """
 
 import jax
@@ -49,6 +50,7 @@ import random as _random
 from flax import struct
 from legnav.core.jax_env import EnvState, NUM_RAYS, SINGLE_OBS_SIZE, KIN_VEC_SIZE, KIN_OBS_SIZE, GOAL_VEC_SIZE
 from legnav.config import RobotConfig
+from legnav.core.obs_layouts import CMD_OBS
 
 GOAL_SIZE      = GOAL_VEC_SIZE
 EGO_DELTA_SIZE = 3   # (Δx, Δy, Δθ) per frame, in the current robot frame
@@ -87,9 +89,21 @@ def strided_indices(buffer_len: int, stride: int = RobotConfig.LIDAR_STACK_STRID
     return jnp.arange(stack_dim) * stride
 
 
+def extra_kin(env_state):
+    """Current-frame features appended to kin_vec (not stacked). Empty for v668; the two pending
+    commands for the real-robot layout v672 (LEGNAV_OBS_CMD=1, see obs_layouts)."""
+    if not CMD_OBS:
+        return jnp.zeros((0,), jnp.float32)
+    if not hasattr(env_state, "cmd_buf"):
+        raise ValueError("LEGNAV_OBS_CMD=1 needs the real-robot env (LEGNAV_REAL_ENV=1)")
+    from legnav.core.jax_env_real import cmd_obs
+    return cmd_obs(env_state)
+
+
 def assemble_stacked_obs(kin_vec, goal_stack, pose_stack, lidar_stack,
-                         stride: int = RobotConfig.LIDAR_STACK_STRIDE):
-    """Build the flat 668-D observation from full-resolution stacks.
+                         stride: int = RobotConfig.LIDAR_STACK_STRIDE, extra=None):
+    """Build the flat 668-D observation (672-D with `extra` = extra_kin(state) under v672) from
+    full-resolution stacks.
 
     Single source of truth for the obs layout so every consumer (training
     wrapper and the manual eval/deployment loops) stays consistent with the
@@ -99,6 +113,7 @@ def assemble_stacked_obs(kin_vec, goal_stack, pose_stack, lidar_stack,
     sel = strided_indices(goal_stack.shape[0], stride)
     return jnp.concatenate([
         kin_vec[:KIN_OBS_SIZE],      # KIN_OBS_SIZE=5 keeps goal_align (4 would drop it -> legacy v667)
+        jnp.zeros((0,), kin_vec.dtype) if extra is None else extra.astype(kin_vec.dtype),
         goal_stack[sel].flatten(),
         _ego_deltas(pose_stack[sel]).flatten(),
         lidar_stack[sel].flatten(),
@@ -139,7 +154,8 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3,
             goal_stack=goal_stack,
             pose_stack=pose_stack
         )
-        flat_obs = assemble_stacked_obs(kin_vec, goal_stack, pose_stack, lidar_stack, stride)
+        flat_obs = assemble_stacked_obs(kin_vec, goal_stack, pose_stack, lidar_stack, stride,
+                                        extra_kin(base_state))
         return flat_obs, stacked_state
 
     def step_stacked(key, state: StackedEnvState, action):
@@ -163,7 +179,8 @@ def make_stacked_env(base_reset_fn, base_step_fn, stack_dim: int = 3,
             goal_stack=new_goal_stack,
             pose_stack=new_pose_stack
         )
-        flat_obs = assemble_stacked_obs(new_kin_vec, new_goal_stack, new_pose_stack, new_lidar_stack, stride)
+        flat_obs = assemble_stacked_obs(new_kin_vec, new_goal_stack, new_pose_stack, new_lidar_stack, stride,
+                                        extra_kin(new_base_state))
         return flat_obs, new_stacked_state, reward, done, info
 
     return reset_stacked, step_stacked
