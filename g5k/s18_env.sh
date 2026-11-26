@@ -11,13 +11,6 @@ export LEGNAV_SOCIAL_FT=1                 # group-space / anticipation / feet / 
 export LEGNAV_FT_PRED=1                   # waypoint-aware space-time conflict replaces constant-velocity CPA
 export LEGNAV_GRP_CROSS_TERMINAL=1        # TRAINING ONLY: crossing a group link ends the episode (-60)
 export LEGNAV_PRIV_V2=1                   # critic sees waypoints, group flags, conflict weight, actuation
-if [ -n "${LEGNAV_FT_INIT:-}" ]; then
-  export LEGNAV_FT_INIT LEGNAV_FT_SCEN18_PROB="${LEGNAV_FT_SCEN18_PROB:-1.0}"
-else
-  export LEGNAV_FT_SCEN18_PROB="${LEGNAV_FT_SCEN18_PROB:-0.8}"
-  export LEGNAV_CALF_TEMPLATE="${LEGNAV_CALF_TEMPLATE:-checkpoints/multiseed_tiago_ft2/ppo_asym_ft/ft_final_calf.msgpack}"  # export container only
-fi
-export LEGNAV_TOTAL_STEPS="${LEGNAV_TOTAL_STEPS:-150000000}"   # run 1 (70M, 27 min): curriculum stuck at scen<=4 / 5.3 m, blended success ~57%
 
 # ── Run 3 fixes (s18_run2 post-mortem, legnav/evaluation/diag_s18.py) ─────────────────────────
 #   smoke   : base, 3M steps, snapshot every 2 updates (checks the new code paths + CALF export)
@@ -33,7 +26,11 @@ export LEGNAV_TOTAL_STEPS="${LEGNAV_TOTAL_STEPS:-150000000}"   # run 1 (70M, 27 
 # Run 5 (contacts at ~max_v, ~40% with standing people: the robot never brakes):
 #   brake   : cmdobs + stopping-distance speed barrier near people (LEGNAV_BRAKE_PEN, jax_env_multi)
 #   brakesmoke: brake, 3M steps, snapshot every 2 updates
-# All full variants run the same 150M schedule (entropy and LR anneal over the whole run), so the
+# Run 6 (scratch runs never leave scen<=4; the ideal-env v668 social policy ft2 scores det 85% / 5% active col
+# in the real env, 93% in the ideal one): fine-tune ft2 in the real env instead of training from scratch.
+#   ftreal  : FT_INIT=ft2 (v668 obs, deployable with the existing bridge), ghost 0.2, target-KL 0.02, 40M steps
+#   ftsmoke : ftreal, 1.5M steps, snapshot every 2 updates
+# All full scratch variants run the same 150M schedule (entropy and LR anneal over the whole run), so the
 # winner IS the deployable policy: no retraining with a different schedule afterwards.
 VARIANT="${VARIANT:-base}"
 if [ "$VARIANT" != "legacy" ]; then
@@ -53,10 +50,21 @@ case "$VARIANT" in
   cmdsmoke) export LEGNAV_OBS_CMD=1 LEGNAV_TARGET_KL=0.02 LEGNAV_TOTAL_STEPS=3000000 LEGNAV_FT_SNAP_EVERY=2 ;;
   brake)    export LEGNAV_OBS_CMD=1 LEGNAV_TARGET_KL=0.02 LEGNAV_BRAKE_PEN=1.0 ;;
   brakesmoke) export LEGNAV_OBS_CMD=1 LEGNAV_TARGET_KL=0.02 LEGNAV_BRAKE_PEN=1.0 LEGNAV_TOTAL_STEPS=3000000 LEGNAV_FT_SNAP_EVERY=2 ;;
+  ftreal|ftsmoke)
+    export LEGNAV_FT_INIT="${LEGNAV_FT_INIT:-checkpoints/multiseed_tiago_ft2/ppo_asym_ft/ft_final_calf.msgpack}"
+    export LEGNAV_FT_GHOST=0.2 LEGNAV_TARGET_KL=0.02 LEGNAV_TOTAL_STEPS=40000000 LEGNAV_FT_SNAP_EVERY=25
+    [ "$VARIANT" = ftsmoke ] && export LEGNAV_TOTAL_STEPS=1500000 LEGNAV_FT_SNAP_EVERY=2 ;;
   *) echo "unknown variant $VARIANT"; return 1 2>/dev/null || exit 1 ;;
 esac
+if [ -n "${LEGNAV_FT_INIT:-}" ]; then      # fine-tune: actor from a CALF checkpoint, curriculum pinned (FT_*)
+  export LEGNAV_FT_INIT LEGNAV_FT_SCEN18_PROB="${LEGNAV_FT_SCEN18_PROB:-1.0}"
+else
+  export LEGNAV_FT_SCEN18_PROB="${LEGNAV_FT_SCEN18_PROB:-0.8}"
+  export LEGNAV_CALF_TEMPLATE="${LEGNAV_CALF_TEMPLATE:-checkpoints/multiseed_tiago_ft2/ppo_asym_ft/ft_final_calf.msgpack}"  # export container only
+fi
+export LEGNAV_TOTAL_STEPS="${LEGNAV_TOTAL_STEPS:-150000000}"   # run 1 (70M, 27 min): curriculum stuck at scen<=4 / 5.3 m, blended success ~57%
 export LEGNAV_CKPT_ROOT="$PWD/checkpoints/s18_run3_${VARIANT}_${RUN_TAG:-local}"
 export PYTHONUNBUFFERED=1                 # live lines in the log
 echo "variant=$VARIANT  clip=${LEGNAV_REW_CLIP:-10} ent=${LEGNAV_S18_ENT:-curriculum} gate=${LEGNAV_S18_GATE:-0} \
 ghost=${LEGNAV_S18_GHOST:-curriculum} cmd_pen=${LEGNAV_CMD_PEN:-off} yield=${LEGNAV_FT_YIELD:-3} \
-obs_cmd=${LEGNAV_OBS_CMD:-0} brake=${LEGNAV_BRAKE_PEN:-off} target_kl=${LEGNAV_TARGET_KL:-off} steps=$LEGNAV_TOTAL_STEPS -> $LEGNAV_CKPT_ROOT"
+ft_init=${LEGNAV_FT_INIT:-none} obs_cmd=${LEGNAV_OBS_CMD:-0} brake=${LEGNAV_BRAKE_PEN:-off} target_kl=${LEGNAV_TARGET_KL:-off} steps=$LEGNAV_TOTAL_STEPS -> $LEGNAV_CKPT_ROOT"

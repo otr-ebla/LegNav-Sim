@@ -6,7 +6,7 @@
 #OAR -O logs/OAR_%jobid%.out
 #OAR -E logs/OAR_%jobid%.err
 # Asymmetric PPO, scenario 18 on Grid'5000. Flags and variants live in g5k/s18_env.sh (shared with jack).
-#   oarsub -S "./g5k/train_asym_scen18.oar.sh <variant>"     variants: smoke legacy base clip10 yield6 cmdobs cmdnokl cmdsmoke brake brakesmoke
+#   oarsub -S "./g5k/train_asym_scen18.oar.sh <variant>"     variants: smoke legacy base clip10 yield6 cmdobs cmdnokl cmdsmoke brake brakesmoke ftreal ftsmoke
 #   Fine-tune a checkpoint: add `export LEGNAV_FT_INIT=<ckpt.msgpack>` below (OAR does NOT forward the submit shell's env)
 set -euo pipefail
 cd "$HOME/legnav"
