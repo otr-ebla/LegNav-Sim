@@ -341,7 +341,9 @@ def train(total_env_steps: int = DEFAULT_TOTAL_ENV_STEPS):
     print(f"  VF_COEF={VF_COEF}  ENTROPY_COEF={ENTROPY_COEF}")
     print(f"  Continuous curriculum anchors: suc={list(_SUC_ANCHORS)}\n")
 
-    rng = jax.random.PRNGKey(42)
+    _seed = int(os.environ.get("LEGNAV_SEED", 42))
+    print(f"  Seed        : {_seed}")
+    rng = jax.random.PRNGKey(_seed)
     rng, init_rng, env_rng = jax.random.split(rng, 3)
 
     dummy_obs  = jnp.zeros((1, OBS_SIZE))
