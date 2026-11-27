@@ -18,7 +18,8 @@ Deploy contract (obs builder, parity check): `legnav/deployment/shelfy/`.
 | run2 | `checkpoints/s18_run2/final/` (Mac + shared home) | 76.4% / 12.7% | 64.2% / 20.1% | superseded by ft2 |
 | run3 base | u700 | 67.0% / 21.5% | 55.2% / 28.8% | worse than run2, kept u700 + final as reference |
 | run3 clip10 | u1100 | 65.4% / 25.3% | 53.8% / 32.7% | deleted |
-| ft2 (no real-env training) | `checkpoints/multiseed_tiago_ft2/ppo_asym_ft/ft_final_calf` | 85.2% / 5.0% | 73.2% / 11.9% | **best so far, fine-tune source** |
+| ft2 (no real-env training) | `checkpoints/multiseed_tiago_ft2/ppo_asym_ft/ft_final_calf` | 85.2% / 5.0% | 73.2% / 11.9% | fine-tune source |
+| **ftreal seed 2** | `s18_run3_ftreal_fermi_gpu0_20261126_1845/ppo_asym_ft/ft_final_calf` | **90.6% / 3.9%** | **77.5% / 9.6%** | **deploy candidate** |
 | run3 yield6 | u700 | 52.6% / 15.1% (static col 30%) | 44.8% / 21.1% | deleted |
 
 Training-log plateau shared by every run3/run4 variant: curriculum stuck at scen<=4, 5.1 m, training success
@@ -65,7 +66,7 @@ Success criterion at u200-300: Acol below 20% (base was 25-28% at the same updat
 Result: seed 42 u220 Acol 21.7%, seed 1 u260 Acol 27.4% (cmdobs 26.5% at u220): inside the seed noise, and the
 curriculum still stalls at scen<=3-4. Both runs stopped, checkpoints deleted. The flag stays in the code (off).
 
-### run6: fine-tune the ideal-env v668 policy in the real env (`ftreal`, in progress)
+### run6: fine-tune the ideal-env v668 policy in the real env (`ftreal`, done: deploy candidate)
 Key measurement (deterministic diag of existing policies, ALL episodes, success / active col):
 
 | Policy | ideal env ghost 0 | ideal env ghost 0.2 | real env ghost 0 | real env ghost 0.2 |
@@ -80,6 +81,24 @@ is ~8 points of success. `ftreal` = `LEGNAV_FT_INIT=ft2` in the real env: actor 
 target-KL 0.02, 40M steps (~305 updates), snapshots every 25. Obs stays v668: deployable with the existing bridge,
 as long as kin v,w is the measured odometry velocity (see `legnav/deployment/shelfy/`).
 Seeds: 42 (fermi GPU1), 2 (fermi GPU0), 1 (jack). Goal: real env >= 90% / <= 3% at ghost 0.
+
+Results (real env, deterministic, `ft_final_calf`, success / active col; ALL = 80% scen18 + 20% curriculum):
+
+| Policy | ghost 0 ALL | ghost 0 scen18 | ghost 0.2 ALL | ghost 0.2 scen18 |
+|---|---|---|---|---|
+| ft2 (start) | 85.2% / 5.0% | 86.1% / 4.4% | 73.2% / 11.9% | 74.4% / 11.2% |
+| ftreal seed 2 | **90.6% / 3.9%** | **93.7% / 2.2%** | **77.5% / 9.6%** | 80.2% / 8.5% |
+| ftreal seed 1 | 89.7% / 4.8% | 92.1% / 3.2% | 76.9% / 11.4% | 79.4% / 9.9% |
+| ftreal seed 42 | 86.2% / 3.9% | 93.2% / 2.6% | 74.8% / 10.1% | 80.8% / 8.9% |
+
+- All three seeds gain ~6-7 points on scenario 18 (86% -> 92-94% at ghost 0) and roughly halve the active
+  collisions: the fine-tune recovers almost all of the ideal-env performance (93%).
+- Seed 42 forgets the other scenarios (curriculum episodes: static collisions 23-29%), because ftreal trains on
+  scenario 18 only. Seed 2 keeps them (static col ~5%). A later run could use `LEGNAV_FT_SCEN18_PROB=0.8`.
+- Ghost 0.2 (20% of the people ignore the robot) stays the weak point: ~9% active + ~9% passive collisions,
+  mostly people walking into the robot.
+- **Deploy candidate: seed 2**, `checkpoints/s18_run3_ftreal_fermi_gpu0_20261126_1845/ppo_asym_ft/ft_final_calf.msgpack`
+  (copy on the Mac: `checkpoints/s18_ftreal_seed2/`). Seeds 1 and 42: final only, snapshots deleted.
 
 ## Housekeeping
 - Smoke runs (`smoke`, `cmdsmoke`, `brakesmoke`) only validate code paths: checkpoints deleted after passing.
